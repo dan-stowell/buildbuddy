@@ -3,6 +3,7 @@ package oci
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand"
@@ -300,13 +301,10 @@ func (r *Resolver) AuthenticateWithRegistry(ctx context.Context, imageName strin
 	}
 	log.CtxInfof(ctx, "Authenticating with registry %q", imageRef.Context().RegistryStr())
 
-	remoteOpts := r.getRemoteOpts(ctx, platform, credentials)
-	_, err = remote.Head(imageRef, remoteOpts...)
+	client := r.getRegistryClient(credentials)
+	_, err = client.headManifest(ctx, imageRef)
 	if err != nil {
-		if t, ok := err.(*transport.Error); ok && t.StatusCode == http.StatusUnauthorized {
-			return status.PermissionDeniedErrorf("not authorized to access image manifest: %s", err)
-		}
-		return status.UnavailableErrorf("could not authorize to remote registry: %s", err)
+		return err
 	}
 	return nil
 }
@@ -339,13 +337,10 @@ func (r *Resolver) ResolveImageDigest(ctx context.Context, imageName string, pla
 		r.mu.Unlock()
 	}
 
-	remoteOpts := r.getRemoteOpts(ctx, platform, credentials)
-	desc, err := remote.Head(tagRef, remoteOpts...)
+	client := r.getRegistryClient(credentials)
+	desc, err := client.headManifest(ctx, tagRef)
 	if err != nil {
-		if t, ok := err.(*transport.Error); ok && t.StatusCode == http.StatusUnauthorized {
-			return "", status.PermissionDeniedErrorf("not authorized to access image manifest: %s", err)
-		}
-		return "", status.UnavailableErrorf("could not authorize to remote registry: %s", err)
+		return "", err
 	}
 	imageNameWithDigest := tagRef.Context().Digest(desc.Digest.String()).String()
 	entryToAdd := tagToDigestEntry{
@@ -368,11 +363,8 @@ func (r *Resolver) Resolve(ctx context.Context, imageName string, platform *rgpb
 	}
 	log.CtxInfof(ctx, "Resolving image %q", imageRef)
 
-	remoteOpts := r.getRemoteOpts(ctx, platform, credentials)
-	puller, err := remote.NewPuller(remoteOpts...)
-	if err != nil {
-		return nil, status.InternalErrorf("error creating puller: %s", err)
-	}
+	client := r.getRegistryClient(credentials)
+	puller := newHTTPPuller(ctx, client)
 
 	useCache := false
 	if *useCachePercent >= 100 {
@@ -399,35 +391,32 @@ func (r *Resolver) Resolve(ctx context.Context, imageName string, platform *rgpb
 
 	remoteDesc, err := puller.Get(ctx, imageRef)
 	if err != nil {
-		if t, ok := err.(*transport.Error); ok && t.StatusCode == http.StatusUnauthorized {
-			return nil, status.PermissionDeniedErrorf("not authorized to retrieve image manifest: %s", err)
-		}
-		return nil, status.UnavailableErrorf("could not retrieve manifest from remote: %s", err)
+		return nil, err
 	}
 
-	// Image() should resolve both images and image indices to an appropriate image
-	img, err := remoteDesc.Image()
-	if err != nil {
-		switch remoteDesc.MediaType {
-		// This is an "image index", a meta-manifest that contains a list of
-		// {platform props, manifest hash} properties to allow client to decide
-		// which manifest they want to use based on platform.
-		case types.OCIImageIndex, types.DockerManifestList:
-			return nil, status.UnknownErrorf("could not get image in image index from descriptor: %s", err)
-		case types.OCIManifestSchema1, types.DockerManifestSchema2:
-			return nil, status.UnknownErrorf("could not get image from descriptor: %s", err)
-		default:
-			return nil, status.UnknownErrorf("descriptor has unknown media type %q, oci error: %s", remoteDesc.MediaType, err)
-		}
-	}
-	return img, nil
+	// The manifest was fetched - now we need to parse it and create an Image
+	return imageFromDescriptorAndManifest(
+		ctx,
+		imageRef.Context(),
+		remoteDesc.Descriptor,
+		remoteDesc.Manifest,
+		gcr.Platform{
+			Architecture: platform.GetArch(),
+			OS:           platform.GetOs(),
+			Variant:      platform.GetVariant(),
+		},
+		r.env.GetActionCacheClient(),
+		r.env.GetByteStreamClient(),
+		puller,
+		credentials.bypassRegistry,
+	)
 }
 
 // fetchImageFromCacheOrRemote first tries to fetch the manifest for the given image reference from the cache,
 // then falls back to fetching from the upstream remote registry.
 // If the referenced manifest is actually an image index, fetchImageFromCacheOrRemote will recur at most once
 // to fetch a child image matching the given platform.
-func fetchImageFromCacheOrRemote(ctx context.Context, digestOrTagRef gcrname.Reference, platform gcr.Platform, acClient repb.ActionCacheClient, bsClient bspb.ByteStreamClient, puller *remote.Puller, bypassRegistry bool) (gcr.Image, error) {
+func fetchImageFromCacheOrRemote(ctx context.Context, digestOrTagRef gcrname.Reference, platform gcr.Platform, acClient repb.ActionCacheClient, bsClient bspb.ByteStreamClient, puller *httpPuller, bypassRegistry bool) (gcr.Image, error) {
 	canUseCache := !isAnonymousUser(ctx)
 	if !canUseCache {
 		log.CtxInfof(ctx, "Anonymous user request, skipping manifest cache for %s", digestOrTagRef)
@@ -532,7 +521,7 @@ func fetchImageFromCacheOrRemote(ctx context.Context, digestOrTagRef gcrname.Ref
 // imageFromDescriptorAndManifest returns an Image from the given manifest (if the manifest is an image manifest),
 // finds a child image matching the given platform (and fetches a manifest for it) if the given manifest is an index,
 // and otherwise returns an error.
-func imageFromDescriptorAndManifest(ctx context.Context, repo gcrname.Repository, desc gcr.Descriptor, rawManifest []byte, platform gcr.Platform, acClient repb.ActionCacheClient, bsClient bspb.ByteStreamClient, puller *remote.Puller, bypassRegistry bool) (gcr.Image, error) {
+func imageFromDescriptorAndManifest(ctx context.Context, repo gcrname.Repository, desc gcr.Descriptor, rawManifest []byte, platform gcr.Platform, acClient repb.ActionCacheClient, bsClient bspb.ByteStreamClient, puller *httpPuller, bypassRegistry bool) (gcr.Image, error) {
 	if desc.MediaType.IsSchema1() {
 		return nil, status.UnknownErrorf("unsupported MediaType %q", desc.MediaType)
 	}
@@ -595,6 +584,14 @@ func (r *Resolver) getRemoteOpts(ctx context.Context, platform *rgpb.Platform, c
 		remoteOpts = append(remoteOpts, remote.WithTransport(tr))
 	}
 	return remoteOpts
+}
+
+func (r *Resolver) getRegistryClient(credentials Credentials) *registryClient {
+	tr := httpclient.New(r.allowedPrivateIPs, "oci").Transport
+	if len(*mirrors) > 0 {
+		tr = newMirrorTransport(tr, *mirrors)
+	}
+	return newRegistryClient(tr, credentials)
 }
 
 // RuntimePlatform returns the platform on which the program is being executed,
@@ -662,7 +659,7 @@ func (t *mirrorTransport) RoundTrip(in *http.Request) (out *http.Response, err e
 	return t.inner.RoundTrip(in)
 }
 
-func newImageFromRawManifest(ctx context.Context, repo gcrname.Repository, desc gcr.Descriptor, rawManifest []byte, acClient repb.ActionCacheClient, bsClient bspb.ByteStreamClient, puller *remote.Puller) *imageFromRawManifest {
+func newImageFromRawManifest(ctx context.Context, repo gcrname.Repository, desc gcr.Descriptor, rawManifest []byte, acClient repb.ActionCacheClient, bsClient bspb.ByteStreamClient, puller *httpPuller) *imageFromRawManifest {
 	i := &imageFromRawManifest{
 		repo:        repo,
 		desc:        desc,
@@ -712,7 +709,7 @@ type imageFromRawManifest struct {
 	ctx      context.Context
 	acClient repb.ActionCacheClient
 	bsClient bspb.ByteStreamClient
-	puller   *remote.Puller
+	puller   *httpPuller
 
 	fetchRawConfigOnce func() ([]byte, error)
 }
@@ -812,7 +809,7 @@ func (i *imageFromRawManifest) LayerByDiffID(diffID gcr.Hash) (gcr.Layer, error)
 	), nil
 }
 
-func newLayerFromDigest(repo gcrname.Repository, digest gcr.Hash, image *imageFromRawManifest, puller *remote.Puller, desc *gcr.Descriptor) *layerFromDigest {
+func newLayerFromDigest(repo gcrname.Repository, digest gcr.Hash, image *imageFromRawManifest, puller *httpPuller, desc *gcr.Descriptor) *layerFromDigest {
 	return &layerFromDigest{
 		repo:   repo,
 		digest: digest,
@@ -835,7 +832,7 @@ type layerFromDigest struct {
 	digest gcr.Hash
 	image  *imageFromRawManifest
 
-	puller *remote.Puller
+	puller *httpPuller
 	desc   *gcr.Descriptor
 
 	createRemoteLayer func() (gcr.Layer, error)
@@ -967,4 +964,409 @@ func (l *layerFromDigest) fetchLayerFromCache() (io.ReadCloser, error) {
 func isAnonymousUser(ctx context.Context) bool {
 	_, err := claims.ClaimsFromContext(ctx)
 	return authutil.IsAnonymousUserError(err)
+}
+
+// registryClient handles HTTP requests to OCI registries with authentication
+type registryClient struct {
+	transport   http.RoundTripper
+	credentials Credentials
+	// Cache for auth tokens per registry
+	tokenCache sync.Map // map[string]string (registry -> token)
+}
+
+// httpPuller is a replacement for remote.Puller that uses our HTTP client
+type httpPuller struct {
+	client *registryClient
+	ctx    context.Context
+}
+
+// remoteDescriptor mirrors the structure returned by remote.Puller.Get()
+type remoteDescriptor struct {
+	Descriptor gcr.Descriptor
+	Manifest   []byte
+	MediaType  types.MediaType
+	Digest     gcr.Hash
+}
+
+func (d *remoteDescriptor) Image() (gcr.Image, error) {
+	// This is called when we have a manifest and need to convert it to an Image
+	// We'll handle this in the calling code
+	return nil, status.UnimplementedError("Image() not implemented on httpPuller descriptor")
+}
+
+func newHTTPPuller(ctx context.Context, client *registryClient) *httpPuller {
+	return &httpPuller{
+		client: client,
+		ctx:    ctx,
+	}
+}
+
+func (p *httpPuller) Get(ctx context.Context, ref gcrname.Reference) (*remoteDescriptor, error) {
+	desc, manifest, err := p.client.getManifest(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	return &remoteDescriptor{
+		Descriptor: *desc,
+		Manifest:   manifest,
+		MediaType:  desc.MediaType,
+		Digest:     desc.Digest,
+	}, nil
+}
+
+func (p *httpPuller) Head(ctx context.Context, ref gcrname.Reference) (*gcr.Descriptor, error) {
+	return p.client.headManifest(ctx, ref)
+}
+
+func (p *httpPuller) Layer(ctx context.Context, ref gcrname.Reference) (gcr.Layer, error) {
+	// Extract digest from reference
+	digest, ok := ref.(gcrname.Digest)
+	if !ok {
+		return nil, status.InvalidArgumentError("Layer() requires a digest reference")
+	}
+	hash, err := gcr.NewHash(digest.DigestStr())
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a simple layer implementation
+	return &httpLayer{
+		puller: p,
+		repo:   ref.Context(),
+		digest: hash,
+	}, nil
+}
+
+// httpLayer implements gcr.Layer for blobs fetched via HTTP
+type httpLayer struct {
+	puller *httpPuller
+	repo   gcrname.Repository
+	digest gcr.Hash
+}
+
+func (l *httpLayer) Digest() (gcr.Hash, error) {
+	return l.digest, nil
+}
+
+func (l *httpLayer) DiffID() (gcr.Hash, error) {
+	// DiffID is typically computed from the uncompressed layer
+	// For now, we'll return an error since we don't have this info
+	return gcr.Hash{}, status.UnimplementedError("DiffID not available for httpLayer")
+}
+
+func (l *httpLayer) Compressed() (io.ReadCloser, error) {
+	return l.puller.client.getBlob(l.puller.ctx, l.repo, l.digest)
+}
+
+func (l *httpLayer) Uncompressed() (io.ReadCloser, error) {
+	cl, err := partial.CompressedToLayer(l)
+	if err != nil {
+		return nil, err
+	}
+	return cl.Uncompressed()
+}
+
+func (l *httpLayer) Size() (int64, error) {
+	return 0, status.UnimplementedError("Size not available for httpLayer")
+}
+
+func (l *httpLayer) MediaType() (types.MediaType, error) {
+	return "", status.UnimplementedError("MediaType not available for httpLayer")
+}
+
+func newRegistryClient(transport http.RoundTripper, credentials Credentials) *registryClient {
+	return &registryClient{
+		transport:   transport,
+		credentials: credentials,
+	}
+}
+
+// authChallenge represents a WWW-Authenticate challenge from a registry
+type authChallenge struct {
+	scheme string
+	realm  string
+	service string
+	scope  string
+}
+
+// parseAuthChallenge parses a WWW-Authenticate header value
+func parseAuthChallenge(header string) (*authChallenge, error) {
+	// Example: Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/ubuntu:pull"
+	parts := bytes.SplitN([]byte(header), []byte(" "), 2)
+	if len(parts) != 2 {
+		return nil, status.InvalidArgumentErrorf("invalid auth challenge format")
+	}
+
+	challenge := &authChallenge{
+		scheme: string(parts[0]),
+	}
+
+	// Parse key=value pairs
+	paramsStr := string(parts[1])
+	for _, param := range bytes.Split([]byte(paramsStr), []byte(",")) {
+		kv := bytes.SplitN(param, []byte("="), 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := string(bytes.TrimSpace(kv[0]))
+		value := string(bytes.Trim(bytes.TrimSpace(kv[1]), `"`))
+
+		switch key {
+		case "realm":
+			challenge.realm = value
+		case "service":
+			challenge.service = value
+		case "scope":
+			challenge.scope = value
+		}
+	}
+
+	return challenge, nil
+}
+
+// getBearerToken fetches a bearer token from the auth service
+func (c *registryClient) getBearerToken(ctx context.Context, challenge *authChallenge) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", challenge.realm, nil)
+	if err != nil {
+		return "", err
+	}
+
+	q := req.URL.Query()
+	if challenge.service != "" {
+		q.Set("service", challenge.service)
+	}
+	if challenge.scope != "" {
+		q.Set("scope", challenge.scope)
+	}
+	req.URL.RawQuery = q.Encode()
+
+	// Add basic auth if we have credentials
+	if !c.credentials.IsEmpty() {
+		req.SetBasicAuth(c.credentials.Username, c.credentials.Password)
+	}
+
+	client := &http.Client{Transport: c.transport}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", status.UnavailableErrorf("auth request failed with status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	// Parse token from response (usually JSON with "token" field)
+	var tokenResp struct {
+		Token       string `json:"token"`
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		return "", err
+	}
+
+	token := tokenResp.Token
+	if token == "" {
+		token = tokenResp.AccessToken
+	}
+
+	return token, nil
+}
+
+// doRequest performs an HTTP request with authentication handling
+func (c *registryClient) doRequest(ctx context.Context, method, url string, headers map[string]string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set headers
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	// Try with basic auth first if we have credentials
+	if !c.credentials.IsEmpty() {
+		req.SetBasicAuth(c.credentials.Username, c.credentials.Password)
+	}
+
+	client := &http.Client{Transport: c.transport}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// If unauthorized and we got a challenge, try token auth
+	if resp.StatusCode == http.StatusUnauthorized {
+		authHeader := resp.Header.Get("WWW-Authenticate")
+		resp.Body.Close()
+
+		if authHeader == "" {
+			return nil, status.PermissionDeniedError("unauthorized and no auth challenge provided")
+		}
+
+		challenge, err := parseAuthChallenge(authHeader)
+		if err != nil {
+			return nil, err
+		}
+
+		if challenge.scheme == "Bearer" {
+			token, err := c.getBearerToken(ctx, challenge)
+			if err != nil {
+				return nil, err
+			}
+
+			// Retry with token
+			req, err = http.NewRequestWithContext(ctx, method, url, nil)
+			if err != nil {
+				return nil, err
+			}
+			for k, v := range headers {
+				req.Header.Set(k, v)
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+
+			return client.Do(req)
+		}
+
+		return nil, status.PermissionDeniedError("unsupported auth scheme")
+	}
+
+	return resp, nil
+}
+
+// headManifest performs a HEAD request for a manifest
+func (c *registryClient) headManifest(ctx context.Context, ref gcrname.Reference) (*gcr.Descriptor, error) {
+	registry := ref.Context().RegistryStr()
+	repo := ref.Context().RepositoryStr()
+
+	var reference string
+	if digest, ok := ref.(gcrname.Digest); ok {
+		reference = digest.DigestStr()
+	} else if tag, ok := ref.(gcrname.Tag); ok {
+		reference = tag.TagStr()
+	} else {
+		reference = "latest"
+	}
+
+	url := fmt.Sprintf("https://%s/v2/%s/manifests/%s", registry, repo, reference)
+
+	headers := map[string]string{
+		"Accept": string(types.OCIManifestSchema1) + "," +
+			string(types.DockerManifestSchema2) + "," +
+			string(types.OCIImageIndex) + "," +
+			string(types.DockerManifestList),
+	}
+
+	resp, err := c.doRequest(ctx, "HEAD", url, headers)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, status.UnavailableErrorf("HEAD manifest failed with status %d", resp.StatusCode)
+	}
+
+	digestStr := resp.Header.Get("Docker-Content-Digest")
+	if digestStr == "" {
+		return nil, status.DataLossError("missing Docker-Content-Digest header")
+	}
+
+	digest, err := gcr.NewHash(digestStr)
+	if err != nil {
+		return nil, err
+	}
+
+	contentLength := resp.ContentLength
+	mediaType := types.MediaType(resp.Header.Get("Content-Type"))
+
+	return &gcr.Descriptor{
+		Digest:    digest,
+		Size:      contentLength,
+		MediaType: mediaType,
+	}, nil
+}
+
+// getManifest performs a GET request for a manifest
+func (c *registryClient) getManifest(ctx context.Context, ref gcrname.Reference) (*gcr.Descriptor, []byte, error) {
+	registry := ref.Context().RegistryStr()
+	repo := ref.Context().RepositoryStr()
+
+	var reference string
+	if digest, ok := ref.(gcrname.Digest); ok {
+		reference = digest.DigestStr()
+	} else if tag, ok := ref.(gcrname.Tag); ok {
+		reference = tag.TagStr()
+	} else {
+		reference = "latest"
+	}
+
+	url := fmt.Sprintf("https://%s/v2/%s/manifests/%s", registry, repo, reference)
+
+	headers := map[string]string{
+		"Accept": string(types.OCIManifestSchema1) + "," +
+			string(types.DockerManifestSchema2) + "," +
+			string(types.OCIImageIndex) + "," +
+			string(types.DockerManifestList),
+	}
+
+	resp, err := c.doRequest(ctx, "GET", url, headers)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, status.UnavailableErrorf("GET manifest failed with status %d", resp.StatusCode)
+	}
+
+	digestStr := resp.Header.Get("Docker-Content-Digest")
+	if digestStr == "" {
+		return nil, nil, status.DataLossError("missing Docker-Content-Digest header")
+	}
+
+	digest, err := gcr.NewHash(digestStr)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	contentLength := resp.ContentLength
+	mediaType := types.MediaType(resp.Header.Get("Content-Type"))
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return &gcr.Descriptor{
+		Digest:    digest,
+		Size:      contentLength,
+		MediaType: mediaType,
+	}, body, nil
+}
+
+// getBlob performs a GET request for a blob
+func (c *registryClient) getBlob(ctx context.Context, repo gcrname.Repository, digest gcr.Hash) (io.ReadCloser, error) {
+	registry := repo.RegistryStr()
+	repoName := repo.RepositoryStr()
+
+	url := fmt.Sprintf("https://%s/v2/%s/blobs/%s", registry, repoName, digest.String())
+
+	resp, err := c.doRequest(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, status.UnavailableErrorf("GET blob failed with status %d", resp.StatusCode)
+	}
+
+	return resp.Body, nil
 }
