@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -36,6 +37,11 @@ const (
 	// have the executable bit set. This allows distinguishing between executable
 	// and non-executable files which have the same content digests.
 	executableSuffix = "executable"
+
+	// ociLayerSuffix is a suffix for OCI layer marker files. These are sparse
+	// files that track OCI image layers in the filecache LRU for eviction
+	// purposes. When evicted, a callback is invoked to delete the actual layer.
+	ociLayerSuffix = "ocilayer"
 
 	// hitMetricLabel is the prometheus metric label applied to filecache hits.
 	hitMetricLabel = "hit"
@@ -88,6 +94,10 @@ type fileCache struct {
 	createParentDirLatency   prometheus.Observer
 	addFileLatency           prometheus.Observer
 	requestCounter           map[bool]prometheus.Counter
+
+	// ociLayerEvictedCallback is called when an OCI layer marker file is evicted.
+	// Access to this field is protected by lock.
+	ociLayerEvictedCallback interfaces.OCILayerEvictedCallback
 }
 
 // entry is used to hold a value in the evictList
@@ -104,16 +114,48 @@ func sizeFn(v *entry) int64 {
 	return v.sizeBytes
 }
 
-func evictFn(rootDir string) func(string, *entry, lru.EvictionReason) {
-	return func(key string, v *entry, reason lru.EvictionReason) {
-		fp := filecachePath(rootDir, key)
-		if err := syscall.Unlink(fp); err != nil {
-			log.Errorf("Failed to unlink filecache entry %q: %s", fp, err)
+func (c *fileCache) onEvict(key string, v *entry, reason lru.EvictionReason) {
+	// Check if this is an OCI layer marker file
+	if strings.HasSuffix(key, "."+ociLayerSuffix) {
+		// Extract the layer digest hash from the key
+		// Key format: ANON/<hash>.<size>.ocilayer or GR<id>/<hash>.<size>.ocilayer
+		base := filepath.Base(key)
+		base = strings.TrimSuffix(base, "."+ociLayerSuffix)
+		// Split off the size part
+		lastDot := strings.LastIndex(base, ".")
+		var layerDigestHash string
+		if lastDot > 0 {
+			layerDigestHash = base[:lastDot]
+		} else {
+			layerDigestHash = base // Fallback for old format without size
 		}
-		if reason == lru.SizeEviction {
-			age := time.Since(time.UnixMicro(v.addedAtUsec)).Microseconds()
-			metrics.FileCacheLastEvictionAgeUsec.Set(float64(age))
+
+		// Call the OCI layer eviction callback if registered.
+		// Note: we don't hold the lock when calling the callback to avoid
+		// potential deadlocks. The callback is set once during initialization
+		// and never changed after, so this is safe.
+		if c.ociLayerEvictedCallback != nil {
+			deleted := c.ociLayerEvictedCallback(layerDigestHash)
+			if !deleted {
+				log.Debugf("OCI layer %s was not deleted (likely still in use)", layerDigestHash)
+			}
 		}
+		// Always unlink the marker file from filecache
+		fp := filecachePath(c.rootDir, key)
+		if err := syscall.Unlink(fp); err != nil && !os.IsNotExist(err) {
+			log.Errorf("Failed to unlink OCI layer marker %q: %s", fp, err)
+		}
+		return
+	}
+
+	// Standard file eviction
+	fp := filecachePath(c.rootDir, key)
+	if err := syscall.Unlink(fp); err != nil {
+		log.Errorf("Failed to unlink filecache entry %q: %s", fp, err)
+	}
+	if reason == lru.SizeEviction {
+		age := time.Since(time.UnixMicro(v.addedAtUsec)).Microseconds()
+		metrics.FileCacheLastEvictionAgeUsec.Set(float64(age))
 	}
 }
 
@@ -133,13 +175,10 @@ func NewFileCache(rootDir string, maxSizeBytes int64, deleteContent bool) (*file
 	if err := disk.EnsureDirectoryExists(rootDir); err != nil {
 		return nil, err
 	}
-	l, err := lru.NewLRU[*entry](&lru.Config[*entry]{MaxSize: maxSizeBytes, OnEvict: evictFn(rootDir), SizeFn: sizeFn})
-	if err != nil {
-		return nil, err
-	}
+	// Create the fileCache struct first, then create the LRU with the eviction
+	// callback that references the fileCache.
 	c := &fileCache{
 		rootDir:                  rootDir,
-		l:                        l,
 		dirScanDone:              make(chan struct{}),
 		linkFromFileCacheLatency: metrics.FileCacheOpLatencyUsec.With(prometheus.Labels{metrics.OpLabel: "link_from_filecache"}),
 		linkIntoFileCacheLatency: metrics.FileCacheOpLatencyUsec.With(prometheus.Labels{metrics.OpLabel: "link_into_filecache"}),
@@ -150,6 +189,11 @@ func NewFileCache(rootDir string, maxSizeBytes int64, deleteContent bool) (*file
 			false: metrics.FileCacheRequests.With(prometheus.Labels{metrics.FileCacheRequestStatusLabel: missMetricLabel}),
 		},
 	}
+	l, err := lru.NewLRU[*entry](&lru.Config[*entry]{MaxSize: maxSizeBytes, OnEvict: c.onEvict, SizeFn: sizeFn})
+	if err != nil {
+		return nil, err
+	}
+	c.l = l
 	if err := os.RemoveAll(c.TempDir()); err != nil {
 		return nil, status.WrapErrorf(err, "failed to clear filecache temp dir")
 	}
@@ -216,6 +260,15 @@ func (c *fileCache) scanDir() {
 			return nil
 		}
 		fileCount += 1
+
+		// Handle OCI layer marker files specially
+		if strings.HasSuffix(path, "."+ociLayerSuffix) {
+			if err := c.scanOCILayerFile(path); err != nil {
+				log.Warningf("Failed to scan OCI layer file %q: %s", path, err)
+			}
+			return nil
+		}
+
 		// addFileToGroup uses the physical size, not the digest size, so just
 		// pass 0 for size here.
 		groupID, node, err := c.nodeFromPathAndSize(path, 0)
@@ -431,6 +484,111 @@ func (c *fileCache) DeleteFile(ctx context.Context, node *repb.FileNode) bool {
 
 func (c *fileCache) WaitForDirectoryScanToComplete() {
 	<-c.dirScanDone
+}
+
+// SetOCILayerEvictedCallback registers a callback that is invoked when an OCI
+// layer marker file is evicted from the cache. This should be called once
+// during initialization, before any layers are added.
+func (c *fileCache) SetOCILayerEvictedCallback(cb interfaces.OCILayerEvictedCallback) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.ociLayerEvictedCallback = cb
+}
+
+// AddOCILayerFile adds a marker file to track an OCI image layer in the
+// filecache LRU. The marker file is sparse (0 physical bytes on disk) but
+// counts as layerSizeBytes for eviction purposes. When the marker is evicted,
+// the registered OCILayerEvictedCallback is invoked.
+func (c *fileCache) AddOCILayerFile(ctx context.Context, layerDigestHash string, layerSizeBytes int64) error {
+	groupID := groupIDStringFromContext(ctx)
+	// Include size in filename so it can be recovered after restart
+	// Format: {hash}.{size}.ocilayer
+	key := fmt.Sprintf("%s/%s.%d.%s", groupID, layerDigestHash, layerSizeBytes, ociLayerSuffix)
+	fp := filecachePath(c.rootDir, key)
+
+	// Ensure parent directory exists
+	if err := disk.EnsureDirectoryExists(filepath.Dir(fp)); err != nil {
+		return status.InternalErrorf("failed to create parent directory for OCI layer marker: %s", err)
+	}
+
+	// Create a sparse file (empty file with no actual disk blocks)
+	f, err := os.Create(fp)
+	if err != nil {
+		return status.InternalErrorf("failed to create OCI layer marker file: %s", err)
+	}
+	if err := f.Close(); err != nil {
+		return status.InternalErrorf("failed to close OCI layer marker file: %s", err)
+	}
+
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	// If already tracked, just update access time (move to front of LRU)
+	if c.l.Contains(key) {
+		return nil
+	}
+
+	e := &entry{
+		addedAtUsec: time.Now().UnixMicro(),
+		sizeBytes:   layerSizeBytes,
+	}
+	if !c.l.Add(key, e) {
+		return status.InternalErrorf("failed to add OCI layer marker to LRU")
+	}
+
+	log.Debugf("Added OCI layer %s to filecache (size: %d bytes)", layerDigestHash, layerSizeBytes)
+	return nil
+}
+
+// scanOCILayerFile handles scanning of OCI layer marker files during directory scan.
+// The file format is: {groupID}/{hash}.{size}.ocilayer
+func (c *fileCache) scanOCILayerFile(path string) error {
+	if !strings.HasPrefix(path, c.rootDir) {
+		return status.FailedPreconditionErrorf("path %q not in rootDir: %q", path, c.rootDir)
+	}
+
+	subdirPath := strings.TrimPrefix(path, c.rootDir)
+	groupID, name := filepath.Split(subdirPath)
+	groupID = strings.Trim(groupID, sep)
+
+	// Handle potential subdir prefix format
+	if strings.Contains(groupID, sep) {
+		groupID = strings.TrimSuffix(groupID, sep)
+		groupID = strings.Trim(filepath.Dir(groupID), sep)
+	}
+
+	// Parse the filename: {hash}.{size}.ocilayer
+	name = strings.TrimSuffix(name, "."+ociLayerSuffix)
+	lastDot := strings.LastIndex(name, ".")
+	if lastDot <= 0 {
+		return status.InvalidArgumentErrorf("invalid OCI layer filename format: %s", name)
+	}
+
+	sizeStr := name[lastDot+1:]
+	layerSizeBytes, err := strconv.ParseInt(sizeStr, 10, 64)
+	if err != nil {
+		return status.InvalidArgumentErrorf("invalid size in OCI layer filename: %s", sizeStr)
+	}
+
+	// Reconstruct the key as it would be created by AddOCILayerFile
+	key := fmt.Sprintf("%s/%s.%d.%s", groupID, name[:lastDot], layerSizeBytes, ociLayerSuffix)
+
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	if c.l.Contains(key) {
+		return nil
+	}
+
+	e := &entry{
+		addedAtUsec: time.Now().UnixMicro(),
+		sizeBytes:   layerSizeBytes,
+	}
+	if !c.l.Add(key, e) {
+		return status.InternalErrorf("failed to add OCI layer to LRU during scan")
+	}
+	log.Debugf("Scanned OCI layer marker: %s (size: %d bytes)", name[:lastDot], layerSizeBytes)
+	return nil
 }
 
 // Read atomically reads a file from filecache.

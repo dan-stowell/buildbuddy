@@ -891,6 +891,12 @@ type RemoteExecutionService interface {
 	RedisAvailabilityMonitoringEnabled() bool
 }
 
+// OCILayerEvictedCallback is called when an OCI layer marker file is evicted
+// from the filecache. The callback receives the layer digest hash and should
+// return true if the layer was successfully deleted, or false if the layer
+// is still in use and should be retained.
+type OCILayerEvictedCallback func(layerDigestHash string) (deleted bool)
+
 type FileCache interface {
 	FastLinkFile(ctx context.Context, f *repb.FileNode, outputPath string) bool
 	DeleteFile(ctx context.Context, f *repb.FileNode) bool
@@ -912,6 +918,16 @@ type FileCache interface {
 	// as the filecache. The directory is not unique per call. Callers should
 	// generate globally unique file names under this directory.
 	TempDir() string
+
+	// AddOCILayerFile adds a marker file to track an OCI image layer in the
+	// filecache LRU. The marker file is sparse (0 physical bytes) but counts
+	// as layerSizeBytes for eviction purposes. When the marker is evicted,
+	// the registered OCILayerEvictedCallback is invoked.
+	AddOCILayerFile(ctx context.Context, layerDigestHash string, layerSizeBytes int64) error
+
+	// SetOCILayerEvictedCallback registers a callback that is invoked when
+	// an OCI layer marker file is evicted from the cache.
+	SetOCILayerEvictedCallback(cb OCILayerEvictedCallback)
 }
 
 type SchedulerService interface {

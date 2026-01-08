@@ -338,7 +338,7 @@ func NewProvider(env environment.Env, buildRoot, cacheRoot string) (*provider, e
 	if err != nil {
 		return nil, err
 	}
-	imageStore, err := NewImageStore(resolver, imageCacheRoot)
+	imageStore, err := NewImageStore(resolver, imageCacheRoot, env.GetFileCache())
 	if err != nil {
 		return nil, err
 	}
@@ -783,6 +783,13 @@ func (c *ociContainer) Remove(ctx context.Context) error {
 		c.releaseCPUs()
 	}
 
+	// Release layer references if we acquired them
+	if c.imageRef != "" {
+		if image, ok := c.imageStore.CachedImage(c.imageRef); ok {
+			c.imageStore.ReleaseLayersForRootfs(image)
+		}
+	}
+
 	return firstErr
 }
 
@@ -955,6 +962,9 @@ func (c *ociContainer) createRootfs(ctx context.Context) error {
 	if !ok {
 		return fmt.Errorf("bad state: attempted to create rootfs before pulling image")
 	}
+
+	// Acquire references to the layers so they won't be evicted while in use
+	c.imageStore.AcquireLayersForRootfs(ctx, image)
 
 	// Create workdir and upperdir.
 	workdir := filepath.Join(c.bundlePath(), "tmp", "rootfs.work")
@@ -1491,6 +1501,17 @@ type ImageStore struct {
 
 	mu           sync.RWMutex
 	cachedImages map[string]*Image
+
+	// fileCache is used to track layer sizes for LRU eviction.
+	fileCache interfaces.FileCache
+
+	// layerRefCount tracks the number of active containers using each layer.
+	// Key is the layer digest hash (e.g., sha256 hex string).
+	layerRefCount map[string]int
+
+	// pendingEviction tracks layers that were evicted from filecache while
+	// still in use. These will be deleted when their refcount reaches 0.
+	pendingEviction map[string]bool
 }
 
 // Image represents a cached image, including all layer digests and image
@@ -1508,14 +1529,24 @@ type Image struct {
 type ImageLayer struct {
 	// DiffID is the uncompressed image digest.
 	DiffID ctr.Hash
+	// SizeBytes is the uncompressed layer size in bytes.
+	SizeBytes int64
 }
 
-func NewImageStore(resolver *oci.Resolver, layersDir string) (*ImageStore, error) {
-	return &ImageStore{
-		resolver:     resolver,
-		layersDir:    layersDir,
-		cachedImages: map[string]*Image{},
-	}, nil
+func NewImageStore(resolver *oci.Resolver, layersDir string, fileCache interfaces.FileCache) (*ImageStore, error) {
+	s := &ImageStore{
+		resolver:        resolver,
+		layersDir:       layersDir,
+		cachedImages:    map[string]*Image{},
+		fileCache:       fileCache,
+		layerRefCount:   map[string]int{},
+		pendingEviction: map[string]bool{},
+	}
+	// Register the eviction callback if filecache is available
+	if fileCache != nil {
+		fileCache.SetOCILayerEvictedCallback(s.onLayerEvicted)
+	}
+	return s, nil
 }
 
 // Pull downloads and extracts image layers to a directory, skipping layers
@@ -1552,6 +1583,84 @@ func (s *ImageStore) CachedImage(imageName string) (image *Image, ok bool) {
 	return image, ok
 }
 
+// onLayerEvicted is called by the filecache when an OCI layer marker file
+// is evicted from the LRU. Returns true if the layer was deleted.
+func (s *ImageStore) onLayerEvicted(layerDigestHash string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// If the layer is still in use, mark it for pending eviction
+	if s.layerRefCount[layerDigestHash] > 0 {
+		log.Debugf("OCI layer %s evicted but still in use (refcount=%d), marking for pending eviction",
+			layerDigestHash, s.layerRefCount[layerDigestHash])
+		s.pendingEviction[layerDigestHash] = true
+		return false
+	}
+
+	// Layer is not in use, delete it
+	return s.deleteLayerLocked(layerDigestHash)
+}
+
+// deleteLayerLocked deletes a layer directory. Must be called with mu held.
+func (s *ImageStore) deleteLayerLocked(layerDigestHash string) bool {
+	// Construct the layer path (assumes sha256 algorithm)
+	layerDir := filepath.Join(s.layersDir, imageCacheVersion, "sha256", layerDigestHash)
+	if err := os.RemoveAll(layerDir); err != nil {
+		log.Errorf("Failed to delete OCI layer directory %q: %s", layerDir, err)
+		return false
+	}
+	log.Infof("Deleted OCI layer %s", layerDigestHash)
+	delete(s.pendingEviction, layerDigestHash)
+	return true
+}
+
+// AcquireLayersForRootfs increments the refcount for all layers in the image.
+// This should be called when a container is about to use the image layers.
+func (s *ImageStore) AcquireLayersForRootfs(ctx context.Context, image *Image) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, layer := range image.Layers {
+		hash := layer.DiffID.Hex
+		s.layerRefCount[hash]++
+		log.Debugf("Acquired OCI layer %s (refcount=%d)", hash, s.layerRefCount[hash])
+
+		// If the layer was pending eviction, re-add it to filecache
+		if s.pendingEviction[hash] && s.fileCache != nil {
+			delete(s.pendingEviction, hash)
+			// Re-add to filecache asynchronously to avoid holding the lock
+			go func(layerHash string, size int64) {
+				if err := s.fileCache.AddOCILayerFile(ctx, layerHash, size); err != nil {
+					log.Warningf("Failed to re-add OCI layer %s to filecache: %s", layerHash, err)
+				}
+			}(hash, layer.SizeBytes)
+		}
+	}
+}
+
+// ReleaseLayersForRootfs decrements the refcount for all layers in the image.
+// If a layer's refcount reaches 0 and it was pending eviction, the layer is deleted.
+func (s *ImageStore) ReleaseLayersForRootfs(image *Image) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, layer := range image.Layers {
+		hash := layer.DiffID.Hex
+		if s.layerRefCount[hash] > 0 {
+			s.layerRefCount[hash]--
+			log.Debugf("Released OCI layer %s (refcount=%d)", hash, s.layerRefCount[hash])
+		}
+
+		// If refcount is 0 and pending eviction, delete the layer
+		if s.layerRefCount[hash] == 0 {
+			delete(s.layerRefCount, hash)
+			if s.pendingEviction[hash] {
+				s.deleteLayerLocked(hash)
+			}
+		}
+	}
+}
+
 func (s *ImageStore) pull(ctx context.Context, imageName string, creds oci.Credentials) (*Image, error) {
 	img, err := s.resolver.Resolve(ctx, imageName, oci.RuntimePlatform(), creds)
 	if err != nil {
@@ -1582,32 +1691,54 @@ func (s *ImageStore) pull(ctx context.Context, imageName string, creds oci.Crede
 
 			destDir := layerPath(s.layersDir, d)
 
-			// If the destination directory already exists then we can skip
-			// the download.
+			// Check if the layer already exists on disk
+			layerExists := false
 			if _, err := os.Stat(destDir); err != nil {
 				if !os.IsNotExist(err) {
 					return status.UnavailableErrorf("stat layer directory: %s", err)
 				}
 			} else {
-				return nil
+				layerExists = true
 			}
 
-			size, err := layer.Size()
+			// Download layer if it doesn't exist
+			if !layerExists {
+				size, err := layer.Size()
+				if err != nil {
+					return status.UnavailableErrorf("get layer size: %s", err)
+				}
+				start := time.Now()
+				log.CtxDebugf(ctx, "Pulling layer %s (%.2f MiB)", d.Hex, float64(size)/1e6)
+				defer func() { log.CtxDebugf(ctx, "Pulled layer %s in %s", d.Hex, time.Since(start)) }()
+
+				// Images often share layers - dedupe individual layer pulls.
+				// Note that each layer pull is also authorized, so include
+				// the credentials in the key here too.
+				key := hash.Strings(destDir, creds.Username, creds.Password)
+				_, _, err = s.layerPullGroup.Do(ctx, key, func(ctx context.Context) (any, error) {
+					return nil, downloadLayer(ctx, layer, destDir)
+				})
+				if err != nil {
+					return err
+				}
+			}
+
+			// Calculate the actual layer size on disk for filecache accounting
+			layerSizeBytes, err := disk.DirSize(destDir)
 			if err != nil {
-				return status.UnavailableErrorf("get layer size: %s", err)
+				log.Warningf("Failed to calculate size of layer %s: %s", d.Hex, err)
+				layerSizeBytes = 0 // Use 0 as fallback, layer won't be tracked properly
 			}
-			start := time.Now()
-			log.CtxDebugf(ctx, "Pulling layer %s (%.2f MiB)", d.Hex, float64(size)/1e6)
-			defer func() { log.CtxDebugf(ctx, "Pulled layer %s in %s", d.Hex, time.Since(start)) }()
+			resolvedLayer.SizeBytes = layerSizeBytes
 
-			// Images often share layers - dedupe individual layer pulls.
-			// Note that each layer pull is also authorized, so include
-			// the credentials in the key here too.
-			key := hash.Strings(destDir, creds.Username, creds.Password)
-			_, _, err = s.layerPullGroup.Do(ctx, key, func(ctx context.Context) (any, error) {
-				return nil, downloadLayer(ctx, layer, destDir)
-			})
-			return err
+			// Register the layer with filecache for LRU tracking
+			if s.fileCache != nil {
+				if err := s.fileCache.AddOCILayerFile(ctx, d.Hex, layerSizeBytes); err != nil {
+					log.Warningf("Failed to register OCI layer %s with filecache: %s", d.Hex, err)
+				}
+			}
+
+			return nil
 		})
 	}
 	// Fetch image config file concurrently with layer downloads.

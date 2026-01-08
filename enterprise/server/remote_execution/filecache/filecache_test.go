@@ -839,3 +839,107 @@ func TestFileCacheWriteCleansUpTempFile(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, matches, "expected temp file(s) to be deleted: %v", matches)
 }
+
+func TestOCILayerEviction(t *testing.T) {
+	ctx := context.Background()
+	fcDir := testfs.MakeTempDir(t)
+	// Create a small filecache that can only hold 1000 bytes
+	fc, err := filecache.NewFileCache(fcDir, 1000, false)
+	require.NoError(t, err)
+	fc.WaitForDirectoryScanToComplete()
+
+	// Track which layers were evicted
+	var evictedLayers []string
+	fc.SetOCILayerEvictedCallback(func(layerDigestHash string) bool {
+		evictedLayers = append(evictedLayers, layerDigestHash)
+		return true // pretend we deleted it
+	})
+
+	// Add OCI layer files that exceed the cache size
+	layer1Hash := "abc123"
+	layer2Hash := "def456"
+	layer3Hash := "ghi789"
+
+	// Add first layer (500 bytes) - should fit
+	err = fc.AddOCILayerFile(ctx, layer1Hash, 500)
+	require.NoError(t, err)
+	assert.Empty(t, evictedLayers, "no layers should be evicted yet")
+
+	// Add second layer (500 bytes) - still fits
+	err = fc.AddOCILayerFile(ctx, layer2Hash, 500)
+	require.NoError(t, err)
+	assert.Empty(t, evictedLayers, "no layers should be evicted yet")
+
+	// Add third layer (500 bytes) - should trigger eviction of layer1
+	err = fc.AddOCILayerFile(ctx, layer3Hash, 500)
+	require.NoError(t, err)
+	assert.Len(t, evictedLayers, 1, "one layer should be evicted")
+	assert.Equal(t, layer1Hash, evictedLayers[0], "layer1 should be evicted")
+}
+
+func TestOCILayerEvictionCallbackReturnsFalse(t *testing.T) {
+	ctx := context.Background()
+	fcDir := testfs.MakeTempDir(t)
+	// Create a small filecache
+	fc, err := filecache.NewFileCache(fcDir, 1000, false)
+	require.NoError(t, err)
+	fc.WaitForDirectoryScanToComplete()
+
+	// Track which layers were evicted
+	var evictedLayers []string
+	fc.SetOCILayerEvictedCallback(func(layerDigestHash string) bool {
+		evictedLayers = append(evictedLayers, layerDigestHash)
+		return false // pretend layer is still in use
+	})
+
+	layer1Hash := "abc123"
+	layer2Hash := "def456"
+
+	// Add layers that exceed cache size
+	err = fc.AddOCILayerFile(ctx, layer1Hash, 600)
+	require.NoError(t, err)
+
+	err = fc.AddOCILayerFile(ctx, layer2Hash, 600)
+	require.NoError(t, err)
+
+	// Layer1 should have been evicted from LRU, callback should have been called
+	assert.Len(t, evictedLayers, 1, "one layer should have eviction callback")
+	assert.Equal(t, layer1Hash, evictedLayers[0], "layer1 should have eviction callback")
+}
+
+func TestOCILayerPersistenceAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	fcDir := testfs.MakeTempDir(t)
+
+	// Create first filecache instance and add OCI layer
+	fc1, err := filecache.NewFileCache(fcDir, 10000, false)
+	require.NoError(t, err)
+	fc1.WaitForDirectoryScanToComplete()
+
+	layerHash := "abc123deadbeef"
+	layerSize := int64(5000)
+
+	err = fc1.AddOCILayerFile(ctx, layerHash, layerSize)
+	require.NoError(t, err)
+
+	// Simulate restart by creating a new filecache instance on the same directory
+	fc2, err := filecache.NewFileCache(fcDir, 10000, false)
+	require.NoError(t, err)
+	fc2.WaitForDirectoryScanToComplete()
+
+	// Track evictions on the new instance
+	var evictedLayers []string
+	fc2.SetOCILayerEvictedCallback(func(hash string) bool {
+		evictedLayers = append(evictedLayers, hash)
+		return true
+	})
+
+	// Add enough data to trigger eviction of the scanned layer
+	for i := 0; i < 3; i++ {
+		err = fc2.AddOCILayerFile(ctx, fmt.Sprintf("newlayer%d", i), 4000)
+		require.NoError(t, err)
+	}
+
+	// The original layer should have been evicted
+	assert.Contains(t, evictedLayers, layerHash, "original layer should be evicted after exceeding cache size")
+}

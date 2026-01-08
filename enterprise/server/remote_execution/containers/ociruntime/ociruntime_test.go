@@ -1453,7 +1453,7 @@ func TestPathSanitization(t *testing.T) {
 			resolver, err := oci.NewResolver(te)
 			require.NoError(t, err)
 			require.NotNil(t, resolver)
-			imageStore, err := ociruntime.NewImageStore(resolver, cacheRoot)
+			imageStore, err := ociruntime.NewImageStore(resolver, cacheRoot, nil)
 			require.NoError(t, err)
 			// Load busybox oci image
 			busyboxImg := testregistry.ImageFromRlocationpath(t, busyboxImageRlocationpath)
@@ -1863,7 +1863,7 @@ func TestPullImage(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, resolver)
 			layerDir := t.TempDir()
-			imgStore, err := ociruntime.NewImageStore(resolver, layerDir)
+			imgStore, err := ociruntime.NewImageStore(resolver, layerDir, nil)
 			require.NoError(t, err)
 
 			ctx := context.Background()
