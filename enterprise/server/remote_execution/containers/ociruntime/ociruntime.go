@@ -338,7 +338,7 @@ func NewProvider(env environment.Env, buildRoot, cacheRoot string) (*provider, e
 	if err != nil {
 		return nil, err
 	}
-	imageStore, err := NewImageStore(resolver, imageCacheRoot)
+	imageStore, err := NewImageStore(resolver, imageCacheRoot, env.GetFileCache())
 	if err != nil {
 		return nil, err
 	}
@@ -1486,6 +1486,7 @@ func layerPath(imageCacheRoot string, hash ctr.Hash) string {
 type ImageStore struct {
 	resolver       *oci.Resolver
 	layersDir      string
+	fileCache      interfaces.FileCache
 	imagePullGroup singleflight.Group[string, *Image]
 	layerPullGroup singleflight.Group[string, any]
 
@@ -1510,12 +1511,141 @@ type ImageLayer struct {
 	DiffID ctr.Hash
 }
 
-func NewImageStore(resolver *oci.Resolver, layersDir string) (*ImageStore, error) {
-	return &ImageStore{
+func NewImageStore(resolver *oci.Resolver, layersDir string, fileCache interfaces.FileCache) (*ImageStore, error) {
+	s := &ImageStore{
 		resolver:     resolver,
 		layersDir:    layersDir,
+		fileCache:    fileCache,
 		cachedImages: map[string]*Image{},
-	}, nil
+	}
+	// Scan existing layers on disk and register them with the filecache.
+	// This ensures layers from previous runs are tracked for LRU eviction.
+	if fileCache != nil {
+		if err := s.scanExistingLayers(); err != nil {
+			log.Warningf("Failed to scan existing OCI layers: %s", err)
+		}
+	}
+	return s, nil
+}
+
+// ociLayerGroupID is a fixed group ID used for OCI layer entries in filecache.
+// OCI layers are content-addressed and shared across all groups.
+const ociLayerGroupID = "_OCI"
+
+// layerFileNode creates a FileNode for tracking an OCI layer in filecache.
+// The hash includes the algorithm prefix to ensure uniqueness.
+func layerFileNode(h ctr.Hash) *repb.FileNode {
+	return &repb.FileNode{
+		Digest: &repb.Digest{
+			// Use algorithm/hash as the digest hash to ensure uniqueness
+			Hash: h.Algorithm + "/" + h.Hex,
+			// Size will be calculated by AddDirectory
+			SizeBytes: 0,
+		},
+	}
+}
+
+// ociLayerContext returns a context with claims for the OCI layer group.
+func ociLayerContext(ctx context.Context) context.Context {
+	return claims.AuthContext(ctx, &claims.Claims{GroupID: ociLayerGroupID})
+}
+
+// scanExistingLayers scans the layers directory and registers existing layers
+// with the filecache for LRU tracking.
+func (s *ImageStore) scanExistingLayers() error {
+	versionDir := filepath.Join(s.layersDir, imageCacheVersion)
+	if _, err := os.Stat(versionDir); os.IsNotExist(err) {
+		return nil // No layers yet
+	} else if err != nil {
+		return err
+	}
+
+	ctx := ociLayerContext(context.Background())
+	var layerCount int
+
+	// Walk through algorithm directories (e.g., "sha256")
+	algoDirs, err := os.ReadDir(versionDir)
+	if err != nil {
+		return err
+	}
+	for _, algoDir := range algoDirs {
+		if !algoDir.IsDir() {
+			continue
+		}
+		algoPath := filepath.Join(versionDir, algoDir.Name())
+		hashDirs, err := os.ReadDir(algoPath)
+		if err != nil {
+			log.Warningf("Failed to read OCI layer algorithm dir %s: %s", algoPath, err)
+			continue
+		}
+		for _, hashDir := range hashDirs {
+			if !hashDir.IsDir() {
+				continue
+			}
+			// Skip temp directories
+			if strings.HasSuffix(hashDir.Name(), ".tmp") {
+				continue
+			}
+			h := ctr.Hash{
+				Algorithm: algoDir.Name(),
+				Hex:       hashDir.Name(),
+			}
+			dirPath := layerPath(s.layersDir, h)
+			node := layerFileNode(h)
+			if err := s.fileCache.AddDirectory(ctx, node, dirPath); err != nil {
+				log.Warningf("Failed to add existing OCI layer %s to filecache: %s", dirPath, err)
+				continue
+			}
+			layerCount++
+		}
+	}
+
+	if layerCount > 0 {
+		log.Infof("Registered %d existing OCI layers with filecache", layerCount)
+	}
+	return nil
+}
+
+// isLayerCached checks if a layer exists both on disk and in the filecache.
+// If the layer exists on disk but not in filecache, it's re-registered.
+func (s *ImageStore) isLayerCached(ctx context.Context, h ctr.Hash) bool {
+	destDir := layerPath(s.layersDir, h)
+
+	// First check if directory exists on disk
+	if _, err := os.Stat(destDir); err != nil {
+		return false
+	}
+
+	// If no filecache, just check disk existence
+	if s.fileCache == nil {
+		return true
+	}
+
+	// Check if it's tracked in filecache
+	node := layerFileNode(h)
+	layerCtx := ociLayerContext(ctx)
+	if s.fileCache.ContainsDirectory(layerCtx, node) {
+		return true
+	}
+
+	// Layer exists on disk but not in filecache - re-register it.
+	// This can happen if the layer was downloaded before filecache integration,
+	// or if filecache was cleared.
+	if err := s.fileCache.AddDirectory(layerCtx, node, destDir); err != nil {
+		log.Warningf("Failed to re-register OCI layer %s with filecache: %s", h.Hex, err)
+	}
+	return true
+}
+
+// registerLayerWithFileCache adds a downloaded layer to the filecache for LRU tracking.
+func (s *ImageStore) registerLayerWithFileCache(ctx context.Context, h ctr.Hash) error {
+	if s.fileCache == nil {
+		return nil
+	}
+	dirPath := layerPath(s.layersDir, h)
+	node := layerFileNode(h)
+	layerCtx := ociLayerContext(ctx)
+	return s.fileCache.AddDirectory(layerCtx, node, dirPath)
 }
 
 // Pull downloads and extracts image layers to a directory, skipping layers
@@ -1580,15 +1710,11 @@ func (s *ImageStore) pull(ctx context.Context, imageName string, creds oci.Crede
 			}
 			resolvedLayer.DiffID = d
 
-			destDir := layerPath(s.layersDir, d)
-
-			// If the destination directory already exists then we can skip
-			// the download.
-			if _, err := os.Stat(destDir); err != nil {
-				if !os.IsNotExist(err) {
-					return status.UnavailableErrorf("stat layer directory: %s", err)
-				}
-			} else {
+			// Check if layer is already cached (both on disk and tracked in filecache).
+			// The filecache check is important because a layer might exist on disk
+			// but have been evicted from the filecache, in which case we need to
+			// re-register it.
+			if s.isLayerCached(ctx, d) {
 				return nil
 			}
 
@@ -1603,9 +1729,17 @@ func (s *ImageStore) pull(ctx context.Context, imageName string, creds oci.Crede
 			// Images often share layers - dedupe individual layer pulls.
 			// Note that each layer pull is also authorized, so include
 			// the credentials in the key here too.
+			destDir := layerPath(s.layersDir, d)
 			key := hash.Strings(destDir, creds.Username, creds.Password)
 			_, _, err = s.layerPullGroup.Do(ctx, key, func(ctx context.Context) (any, error) {
-				return nil, downloadLayer(ctx, layer, destDir)
+				if err := downloadLayer(ctx, layer, destDir); err != nil {
+					return nil, err
+				}
+				// Register the downloaded layer with filecache for LRU tracking
+				if err := s.registerLayerWithFileCache(ctx, d); err != nil {
+					log.CtxWarningf(ctx, "Failed to register layer %s with filecache: %s", d.Hex, err)
+				}
+				return nil, nil
 			})
 			return err
 		})

@@ -912,6 +912,19 @@ type FileCache interface {
 	// as the filecache. The directory is not unique per call. Callers should
 	// generate globally unique file names under this directory.
 	TempDir() string
+
+	// AddDirectory adds a directory to the cache. Unlike files, directories
+	// are stored at their original path (not linked into the cache) and are
+	// removed via os.RemoveAll when evicted. This is useful for managing
+	// extracted OCI image layers.
+	AddDirectory(ctx context.Context, node *repb.FileNode, dirPath string) error
+
+	// ContainsDirectory checks if a directory with the given node is tracked
+	// in the cache.
+	ContainsDirectory(ctx context.Context, node *repb.FileNode) bool
+
+	// GetDirectoryPath returns the path to a cached directory if it exists.
+	GetDirectoryPath(ctx context.Context, node *repb.FileNode) (path string, ok bool)
 }
 
 type SchedulerService interface {

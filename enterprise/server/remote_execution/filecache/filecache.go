@@ -98,6 +98,11 @@ type entry struct {
 	// sizeBytes is the file size as reported by the original FileNode metadata
 	// when the file was added to the file cache.
 	sizeBytes int64
+	// dirPath, if non-empty, indicates this entry is a directory (such as an
+	// OCI layer). The directory at this path is removed via os.RemoveAll when
+	// the entry is evicted. For directory entries, no file is stored in the
+	// filecache rootDir; only the LRU tracks the entry.
+	dirPath string
 }
 
 func sizeFn(v *entry) int64 {
@@ -106,9 +111,18 @@ func sizeFn(v *entry) int64 {
 
 func evictFn(rootDir string) func(string, *entry, lru.EvictionReason) {
 	return func(key string, v *entry, reason lru.EvictionReason) {
-		fp := filecachePath(rootDir, key)
-		if err := syscall.Unlink(fp); err != nil {
-			log.Errorf("Failed to unlink filecache entry %q: %s", fp, err)
+		if v.dirPath != "" {
+			// This is a directory entry (e.g., OCI layer). Remove the entire
+			// directory tree.
+			if err := os.RemoveAll(v.dirPath); err != nil {
+				log.Errorf("Failed to remove filecache directory entry %q: %s", v.dirPath, err)
+			}
+		} else {
+			// Regular file entry - just unlink the file.
+			fp := filecachePath(rootDir, key)
+			if err := syscall.Unlink(fp); err != nil {
+				log.Errorf("Failed to unlink filecache entry %q: %s", fp, err)
+			}
 		}
 		if reason == lru.SizeEviction {
 			age := time.Since(time.UnixMicro(v.addedAtUsec)).Microseconds()
@@ -431,6 +445,142 @@ func (c *fileCache) DeleteFile(ctx context.Context, node *repb.FileNode) bool {
 
 func (c *fileCache) WaitForDirectoryScanToComplete() {
 	<-c.dirScanDone
+}
+
+// AddDirectory adds a directory to the cache, tracking it for LRU eviction.
+// Unlike regular file entries, directories are stored at their original path
+// (not copied/linked into the filecache rootDir), and are removed via
+// os.RemoveAll when evicted.
+//
+// The key is constructed from the FileNode digest, using the groupID from
+// the context. The sizeBytes field of the digest should reflect the total
+// on-disk size of the directory.
+//
+// This is useful for managing extracted OCI image layers which are directories
+// that should be evicted when disk space is needed.
+func (c *fileCache) AddDirectory(ctx context.Context, node *repb.FileNode, dirPath string) error {
+	info, err := os.Stat(dirPath)
+	if err != nil {
+		return wrapOSError(err, "stat directory")
+	}
+	if !info.IsDir() {
+		return status.InvalidArgumentErrorf("%q is not a directory", dirPath)
+	}
+
+	// Calculate total size of the directory
+	var sizeOnDisk int64
+	err = filepath.WalkDir(dirPath, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		estimated, err := disk.EstimatedFileDiskUsage(info)
+		if err != nil {
+			return err
+		}
+		sizeOnDisk += estimated
+		return nil
+	})
+	if err != nil {
+		return wrapOSError(err, "calculate directory size")
+	}
+
+	k := key(ctx, node)
+
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	// Remove any existing entry first
+	c.l.Remove(k)
+
+	e := &entry{
+		addedAtUsec: time.Now().UnixMicro(),
+		sizeBytes:   sizeOnDisk,
+		dirPath:     dirPath,
+	}
+	metrics.FileCacheAddedFileSizeBytes.Observe(float64(e.sizeBytes))
+	success := c.l.Add(k, e)
+	if !success {
+		return status.InternalErrorf("could not add directory %s to filecache lru", k)
+	}
+	return nil
+}
+
+// ContainsDirectory checks if a directory with the given node is tracked in
+// the cache.
+func (c *fileCache) ContainsDirectory(ctx context.Context, node *repb.FileNode) bool {
+	k := key(ctx, node)
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	return c.l.Contains(k)
+}
+
+// LinkDirectory creates a symlink at outputPath pointing to the cached
+// directory. Returns true if the directory is cached and the symlink was
+// created successfully.
+func (c *fileCache) LinkDirectory(ctx context.Context, node *repb.FileNode, outputPath string) (hit bool) {
+	defer func() {
+		c.requestCounter[hit].Inc()
+	}()
+
+	k := key(ctx, node)
+
+	c.lock.Lock()
+	e, ok := c.l.Get(k)
+	c.lock.Unlock()
+	if !ok || e.dirPath == "" {
+		return false
+	}
+
+	// Verify the directory still exists
+	if _, err := os.Stat(e.dirPath); err != nil {
+		if os.IsNotExist(err) {
+			// Directory was removed externally; remove from cache
+			c.lock.Lock()
+			c.l.Remove(k)
+			c.lock.Unlock()
+		}
+		return false
+	}
+
+	// Create symlink to the cached directory
+	if err := os.Symlink(e.dirPath, outputPath); err != nil {
+		log.Warningf("Failed to symlink directory from cache: %s", err)
+		return false
+	}
+	return true
+}
+
+// GetDirectoryPath returns the path to a cached directory if it exists.
+// This is useful when you need the actual path rather than a symlink.
+func (c *fileCache) GetDirectoryPath(ctx context.Context, node *repb.FileNode) (string, bool) {
+	k := key(ctx, node)
+
+	c.lock.Lock()
+	e, ok := c.l.Get(k)
+	c.lock.Unlock()
+	if !ok || e.dirPath == "" {
+		return "", false
+	}
+
+	// Verify the directory still exists
+	if _, err := os.Stat(e.dirPath); err != nil {
+		if os.IsNotExist(err) {
+			// Directory was removed externally; remove from cache
+			c.lock.Lock()
+			c.l.Remove(k)
+			c.lock.Unlock()
+		}
+		return "", false
+	}
+
+	return e.dirPath, true
 }
 
 // Read atomically reads a file from filecache.

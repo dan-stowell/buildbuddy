@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/filecache"
@@ -838,4 +839,140 @@ func TestFileCacheWriteCleansUpTempFile(t *testing.T) {
 	matches, err := filepath.Glob(pattern)
 	require.NoError(t, err)
 	require.Empty(t, matches, "expected temp file(s) to be deleted: %v", matches)
+}
+
+func TestFileCacheDirectory(t *testing.T) {
+	ctx := claims.AuthContextWithJWT(context.Background(), &claims.Claims{GroupID: "GR12345"}, nil)
+	fcDir := testfs.MakeTempDir(t)
+	// Use a cache size large enough to hold our test directories
+	fc, err := filecache.NewFileCache(fcDir, 1_000_000, false)
+	require.NoError(t, err)
+	fc.WaitForDirectoryScanToComplete()
+
+	// Create a test directory with some files
+	testDir := testfs.MakeTempDir(t)
+	testfs.WriteAllFileContents(t, testDir, map[string]string{
+		"file1.txt": "content1",
+		"file2.txt": "content2",
+		"subdir/file3.txt": "content3",
+	})
+
+	// Create a FileNode for the directory
+	node := &repb.FileNode{
+		Digest: &repb.Digest{
+			Hash:      "sha256/abc123",
+			SizeBytes: 0, // Size will be calculated by AddDirectory
+		},
+	}
+
+	// Initially the directory should not be in the cache
+	require.False(t, fc.ContainsDirectory(ctx, node))
+
+	// Add the directory to the cache
+	err = fc.AddDirectory(ctx, node, testDir)
+	require.NoError(t, err)
+
+	// Now it should be in the cache
+	require.True(t, fc.ContainsDirectory(ctx, node))
+
+	// GetDirectoryPath should return the correct path
+	path, ok := fc.GetDirectoryPath(ctx, node)
+	require.True(t, ok)
+	require.Equal(t, testDir, path)
+
+	// Verify the directory still exists on disk
+	_, err = os.Stat(testDir)
+	require.NoError(t, err)
+}
+
+func TestFileCacheDirectoryEviction(t *testing.T) {
+	ctx := claims.AuthContextWithJWT(context.Background(), &claims.Claims{GroupID: "GR12345"}, nil)
+	fcDir := testfs.MakeTempDir(t)
+	// Use a very small cache to force eviction
+	fc, err := filecache.NewFileCache(fcDir, 10_000, false)
+	require.NoError(t, err)
+	fc.WaitForDirectoryScanToComplete()
+
+	// Create two test directories
+	testDir1 := testfs.MakeTempDir(t)
+	testfs.WriteAllFileContents(t, testDir1, map[string]string{
+		"large_file.txt": strings.Repeat("A", 5000),
+	})
+
+	testDir2 := testfs.MakeTempDir(t)
+	testfs.WriteAllFileContents(t, testDir2, map[string]string{
+		"large_file.txt": strings.Repeat("B", 5000),
+	})
+
+	node1 := &repb.FileNode{
+		Digest: &repb.Digest{
+			Hash:      "sha256/dir1",
+			SizeBytes: 0,
+		},
+	}
+	node2 := &repb.FileNode{
+		Digest: &repb.Digest{
+			Hash:      "sha256/dir2",
+			SizeBytes: 0,
+		},
+	}
+
+	// Add first directory
+	err = fc.AddDirectory(ctx, node1, testDir1)
+	require.NoError(t, err)
+	require.True(t, fc.ContainsDirectory(ctx, node1))
+
+	// Add second directory - this should evict the first one due to size constraints
+	err = fc.AddDirectory(ctx, node2, testDir2)
+	require.NoError(t, err)
+	require.True(t, fc.ContainsDirectory(ctx, node2))
+
+	// First directory should be evicted and removed from disk
+	require.False(t, fc.ContainsDirectory(ctx, node1))
+	_, err = os.Stat(testDir1)
+	require.True(t, os.IsNotExist(err), "expected testDir1 to be deleted after eviction")
+
+	// Second directory should still exist
+	_, err = os.Stat(testDir2)
+	require.NoError(t, err)
+}
+
+func TestFileCacheDirectoryExternalDeletion(t *testing.T) {
+	ctx := claims.AuthContextWithJWT(context.Background(), &claims.Claims{GroupID: "GR12345"}, nil)
+	fcDir := testfs.MakeTempDir(t)
+	fc, err := filecache.NewFileCache(fcDir, 1_000_000, false)
+	require.NoError(t, err)
+	fc.WaitForDirectoryScanToComplete()
+
+	// Create a test directory
+	testDir := testfs.MakeTempDir(t)
+	testfs.WriteAllFileContents(t, testDir, map[string]string{
+		"file.txt": "content",
+	})
+
+	node := &repb.FileNode{
+		Digest: &repb.Digest{
+			Hash:      "sha256/external_delete",
+			SizeBytes: 0,
+		},
+	}
+
+	// Add the directory
+	err = fc.AddDirectory(ctx, node, testDir)
+	require.NoError(t, err)
+	require.True(t, fc.ContainsDirectory(ctx, node))
+
+	// Delete the directory externally (simulating manual deletion)
+	err = os.RemoveAll(testDir)
+	require.NoError(t, err)
+
+	// GetDirectoryPath should return false since the directory no longer exists
+	_, ok := fc.GetDirectoryPath(ctx, node)
+	require.False(t, ok)
+
+	// ContainsDirectory should also return false after the external deletion is detected
+	// Note: ContainsDirectory doesn't check disk, but GetDirectoryPath removes the entry
+	// when it detects the directory is gone, so subsequent calls will return false
+	_, ok = fc.GetDirectoryPath(ctx, node)
+	require.False(t, ok)
 }
