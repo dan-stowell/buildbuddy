@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -278,6 +279,149 @@ func TestServerHappyPath(t *testing.T) {
 			assertRequests(t, counter, map[string]int{})
 		})
 	}
+}
+
+func TestFetchBlobSingleFlightConcurrentRequests(t *testing.T) {
+	var firstBlobGet atomic.Bool
+	firstBlobSeen := make(chan struct{})
+	releaseFirst := make(chan struct{})
+
+	reg, counter := setupRegistry(t, nil, func(w http.ResponseWriter, r *http.Request) bool {
+		if strings.Contains(r.URL.Path, "/blobs/") && r.Method == http.MethodGet {
+			if !firstBlobGet.Swap(true) {
+				close(firstBlobSeen)
+				<-releaseFirst
+			}
+		}
+		return true
+	})
+	imageName, img := reg.PushNamedImage(t, "test-image", nil)
+
+	layers, err := img.Layers()
+	require.NoError(t, err)
+	require.NotEmpty(t, layers)
+
+	layer := layers[0]
+	digest, err := layer.Digest()
+	require.NoError(t, err)
+	expectedData := layerData(t, layer)
+
+	_, bsClient, acClient := setupCacheEnv(t)
+	server := newTestServerWithCache(t, bsClient, acClient)
+
+	firstStream := &mockFetchBlobServer{ctx: context.Background()}
+	firstErr := make(chan error, 1)
+	go func() {
+		firstErr <- server.FetchBlob(&ofpb.FetchBlobRequest{
+			Ref: imageName + "@" + digest.String(),
+		}, firstStream)
+	}()
+
+	<-firstBlobSeen
+
+	const reqCount = 5
+	var wg sync.WaitGroup
+	wg.Add(reqCount - 1)
+	errCh := make(chan error, reqCount-1)
+	streams := make([]*mockFetchBlobServer, 0, reqCount-1)
+
+	for i := 0; i < reqCount-1; i++ {
+		stream := &mockFetchBlobServer{ctx: context.Background()}
+		streams = append(streams, stream)
+		go func(s *mockFetchBlobServer) {
+			defer wg.Done()
+			errCh <- server.FetchBlob(&ofpb.FetchBlobRequest{
+				Ref: imageName + "@" + digest.String(),
+			}, s)
+		}(stream)
+	}
+
+	close(releaseFirst)
+
+	require.NoError(t, <-firstErr)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		require.NoError(t, err)
+	}
+
+	require.Equal(t, expectedData, firstStream.collectData())
+	for _, s := range streams {
+		require.Equal(t, expectedData, s.collectData())
+	}
+
+	blobRequests := counter.Snapshot()[http.MethodGet+" /v2/test-image/blobs/"+digest.String()]
+	require.Equal(t, 1, blobRequests, "expected a single upstream blob request")
+}
+
+func TestFetchBlobSingleFlight_FirstRequestFails(t *testing.T) {
+	var firstBlobGet atomic.Bool
+	firstBlobSeen := make(chan struct{})
+	releaseFirst := make(chan struct{})
+
+	reg, counter := setupRegistry(t, nil, func(w http.ResponseWriter, r *http.Request) bool {
+		if strings.Contains(r.URL.Path, "/blobs/") && r.Method == http.MethodGet {
+			if !firstBlobGet.Swap(true) {
+				close(firstBlobSeen)
+				<-releaseFirst
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+			return false
+		}
+		return true
+	})
+	imageName, img := reg.PushNamedImage(t, "test-image", nil)
+
+	layers, err := img.Layers()
+	require.NoError(t, err)
+	require.NotEmpty(t, layers)
+
+	layer := layers[0]
+	digest, err := layer.Digest()
+	require.NoError(t, err)
+
+	server := newTestServer(t)
+
+	firstStream := &mockFetchBlobServer{ctx: context.Background()}
+	firstErr := make(chan error, 1)
+	go func() {
+		firstErr <- server.FetchBlob(&ofpb.FetchBlobRequest{
+			Ref: imageName + "@" + digest.String(),
+		}, firstStream)
+	}()
+
+	<-firstBlobSeen
+
+	const reqCount = 3
+	var wg sync.WaitGroup
+	wg.Add(reqCount - 1)
+	errCh := make(chan error, reqCount-1)
+
+	for i := 0; i < reqCount-1; i++ {
+		stream := &mockFetchBlobServer{ctx: context.Background()}
+		go func(s *mockFetchBlobServer) {
+			defer wg.Done()
+			errCh <- server.FetchBlob(&ofpb.FetchBlobRequest{
+				Ref: imageName + "@" + digest.String(),
+			}, s)
+		}(stream)
+	}
+
+	close(releaseFirst)
+
+	leaderErr := <-firstErr
+	require.Error(t, leaderErr)
+	require.True(t, status.IsUnavailableError(leaderErr), "expected unavailable error, got: %v", leaderErr)
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		require.Error(t, err)
+		require.True(t, status.IsUnavailableError(err), "expected unavailable error, got: %v", err)
+	}
+
+	blobRequests := counter.Snapshot()[http.MethodGet+" /v2/test-image/blobs/"+digest.String()]
+	require.Equal(t, 2, blobRequests, "expected a single retry attempt shared by all callers")
 }
 
 func TestServerMissingAndInvalidCredentials(t *testing.T) {
