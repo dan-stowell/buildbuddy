@@ -28,6 +28,19 @@ var (
 	inputSizeBytes     = flag.Int("input_size_bytes", 100_000, "Size of each input file")
 )
 
+// minimalModuleBazelLock is a minimal MODULE.bazel.lock file for an empty MODULE.bazel.
+// This prevents Bazel from contacting the Bazel Central Registry (BCR) to resolve modules.
+// The lockFileVersion corresponds to Bazel 8.x; older versions may use different formats
+// but will typically regenerate the lockfile as needed.
+const minimalModuleBazelLock = `{
+  "lockFileVersion": 24,
+  "registryFileHashes": {},
+  "selectedYankedVersions": {},
+  "moduleExtensions": {},
+  "facts": {}
+}
+`
+
 // createEchoRule creates a target that generates an action that echoes the contents of each input file to a separate
 // output file.
 func createEchoRule(targetName string, inputs, outputs []string) (string, error) {
@@ -65,6 +78,11 @@ func createWorkspace(dir string, numTargets, numInputsPerTarget, inputSizeBytes 
 	err := os.WriteFile(filepath.Join(dir, "MODULE.bazel"), []byte(""), 0644)
 	if err != nil {
 		return err
+	}
+
+	// Write a minimal MODULE.bazel.lock to prevent network requests to BCR.
+	if err := os.WriteFile(filepath.Join(dir, "MODULE.bazel.lock"), []byte(minimalModuleBazelLock), 0644); err != nil {
+		return fmt.Errorf("failed to write MODULE.bazel.lock: %w", err)
 	}
 
 	if *proberName != "" {
