@@ -179,7 +179,7 @@ func (c *bareCommandContainer) exec(ctx context.Context, cmd *repb.Command, work
 }
 
 func (c *bareCommandContainer) IsImageCached(ctx context.Context) (bool, error) { return false, nil }
-func (c *bareCommandContainer) PullImage(ctx context.Context, creds oci.Credentials) error {
+func (c *bareCommandContainer) PullImage(ctx context.Context, creds oci.Credentials, useOCIFetcher bool) error {
 	return nil
 }
 func (c *bareCommandContainer) Start(ctx context.Context) error { return nil }

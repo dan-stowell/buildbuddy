@@ -116,7 +116,7 @@ func TestDockerLifecycleControl(t *testing.T) {
 	})
 
 	err = container.PullImageIfNecessary(
-		ctx, env, c, oci.Credentials{},
+		ctx, env, c, oci.Credentials{}, false, /*=useOCIFetcher*/
 		"mirror.gcr.io/library/busybox",
 	)
 	require.NoError(t, err)
@@ -190,7 +190,7 @@ func TestDockerRun_Timeout_StdoutStderrStillVisible(t *testing.T) {
 	c := docker.NewDockerContainer(env, dc, "mirror.gcr.io/library/busybox", rootDir, cfg)
 	// Ensure the image is cached
 	err = container.PullImageIfNecessary(
-		ctx, env, c, oci.Credentials{}, "mirror.gcr.io/library/busybox")
+		ctx, env, c, oci.Credentials{}, false /*=useOCIFetcher*/, "mirror.gcr.io/library/busybox")
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -253,7 +253,7 @@ func TestDockerExec_Timeout_StdoutStderrStillVisible(t *testing.T) {
 	c := docker.NewDockerContainer(env, dc, "mirror.gcr.io/library/busybox", rootDir, cfg)
 	// Ensure the image is cached
 	err = container.PullImageIfNecessary(
-		ctx, env, c, oci.Credentials{}, "mirror.gcr.io/library/busybox")
+		ctx, env, c, oci.Credentials{}, false /*=useOCIFetcher*/, "mirror.gcr.io/library/busybox")
 	require.NoError(t, err)
 
 	err = c.Create(ctx, workDir)
@@ -311,7 +311,7 @@ func TestDockerExec_Stdio(t *testing.T) {
 	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
 	c := docker.NewDockerContainer(env, dc, "mirror.gcr.io/library/busybox", rootDir, cfg)
 	err = container.PullImageIfNecessary(
-		ctx, env, c, oci.Credentials{},
+		ctx, env, c, oci.Credentials{}, false, /*=useOCIFetcher*/
 		"mirror.gcr.io/library/busybox",
 	)
 	require.NoError(t, err)

@@ -424,7 +424,7 @@ func TestCreateExecRemove(t *testing.T) {
 	require.NoError(t, err)
 
 	// Pull and create
-	err = c.PullImage(ctx, oci.Credentials{})
+	err = c.PullImage(ctx, oci.Credentials{}, false /*=useOCIFetcher*/)
 	require.NoError(t, err)
 	err = c.Create(ctx, wd)
 	require.NoError(t, err)
@@ -504,7 +504,7 @@ func TestTini_CreateExec(t *testing.T) {
 
 	// Pull
 	require.NoError(t, err)
-	err = c.PullImage(ctx, oci.Credentials{})
+	err = c.PullImage(ctx, oci.Credentials{}, false /*=useOCIFetcher*/)
 	require.NoError(t, err)
 
 	// Create
@@ -566,7 +566,7 @@ func TestExecUsageStats(t *testing.T) {
 		ContainerImage: image,
 	}})
 	require.NoError(t, err)
-	err = c.PullImage(ctx, oci.Credentials{})
+	err = c.PullImage(ctx, oci.Credentials{}, false /*=useOCIFetcher*/)
 	require.NoError(t, err)
 	err = c.Create(ctx, wd)
 	require.NoError(t, err)
@@ -617,7 +617,7 @@ func TestStatsPostExec(t *testing.T) {
 		err := c.Remove(ctx)
 		require.NoError(t, err)
 	})
-	err = c.PullImage(ctx, oci.Credentials{})
+	err = c.PullImage(ctx, oci.Credentials{}, false /*=useOCIFetcher*/)
 	require.NoError(t, err)
 	err = c.Create(ctx, wd)
 	require.NoError(t, err)
@@ -675,7 +675,7 @@ func TestPullCreateExecRemove(t *testing.T) {
 	require.NoError(t, err)
 
 	// Pull
-	err = c.PullImage(ctx, oci.Credentials{})
+	err = c.PullImage(ctx, oci.Credentials{}, false /*=useOCIFetcher*/)
 	require.NoError(t, err)
 
 	// Ensure cached
@@ -754,7 +754,7 @@ func TestCreateExecPauseUnpause(t *testing.T) {
 	require.NoError(t, err)
 
 	// Pull and create
-	err = c.PullImage(ctx, oci.Credentials{})
+	err = c.PullImage(ctx, oci.Credentials{}, false /*=useOCIFetcher*/)
 	require.NoError(t, err)
 	err = c.Create(ctx, wd)
 	require.NoError(t, err)
@@ -1467,7 +1467,7 @@ func TestPathSanitization(t *testing.T) {
 
 			// Make sure we get an error when pulling this image.
 			ctx := context.Background()
-			_, err = imageStore.Pull(ctx, image, oci.Credentials{})
+			_, err = imageStore.Pull(ctx, image, oci.Credentials{}, false /*=useOCIFetcher*/)
 			require.Error(t, err)
 			assert.True(t, status.IsInvalidArgumentError(err), "expected InvalidArgument, got %T", err)
 			assert.Contains(t, err.Error(), test.ExpectedError)
@@ -1506,7 +1506,7 @@ func TestPersistentWorker(t *testing.T) {
 	require.NoError(t, err)
 
 	// Pull and create
-	err = c.PullImage(ctx, oci.Credentials{})
+	err = c.PullImage(ctx, oci.Credentials{}, false /*=useOCIFetcher*/)
 	require.NoError(t, err)
 	err = c.Create(ctx, ws.Path())
 	require.NoError(t, err)
@@ -1585,7 +1585,7 @@ func TestPersistentWorker_WorkerCrashesBeforeReadingRequest(t *testing.T) {
 	require.NoError(t, err)
 
 	// Pull and create
-	err = c.PullImage(ctx, oci.Credentials{})
+	err = c.PullImage(ctx, oci.Credentials{}, false /*=useOCIFetcher*/)
 	require.NoError(t, err)
 	err = c.Create(ctx, ws.Path())
 	require.NoError(t, err)
@@ -1646,7 +1646,7 @@ func TestPersistentWorker_WorkerCrashesAfterReadingRequest(t *testing.T) {
 	require.NoError(t, err)
 
 	// Pull and create
-	err = c.PullImage(ctx, oci.Credentials{})
+	err = c.PullImage(ctx, oci.Credentials{}, false /*=useOCIFetcher*/)
 	require.NoError(t, err)
 	err = c.Create(ctx, ws.Path())
 	require.NoError(t, err)
@@ -1755,7 +1755,7 @@ func TestCancelExec(t *testing.T) {
 	}})
 	require.NoError(t, err)
 	// Pull and create
-	err = c.PullImage(ctx, oci.Credentials{})
+	err = c.PullImage(ctx, oci.Credentials{}, false /*=useOCIFetcher*/)
 	require.NoError(t, err)
 	err = c.Create(ctx, wd)
 	require.NoError(t, err)
@@ -1867,7 +1867,7 @@ func TestPullImage(t *testing.T) {
 			require.NoError(t, err)
 
 			ctx := context.Background()
-			img, err := imgStore.Pull(ctx, tc.image, oci.Credentials{})
+			img, err := imgStore.Pull(ctx, tc.image, oci.Credentials{}, false /*=useOCIFetcher*/)
 			require.NoError(t, err)
 			require.NotNil(t, img)
 		})

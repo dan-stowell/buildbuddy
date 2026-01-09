@@ -54,7 +54,7 @@ func TestPullsNotDeduped(t *testing.T) {
 	eg := errgroup.Group{}
 	for i := 0; i < 5; i++ {
 		eg.Go(func() error {
-			return container.PullImage(ctx, oci.Credentials{})
+			return container.PullImage(ctx, oci.Credentials{}, false /*=useOCIFetcher*/)
 		})
 	}
 	require.NoError(t, eg.Wait())

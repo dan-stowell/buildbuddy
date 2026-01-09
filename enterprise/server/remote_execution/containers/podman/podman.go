@@ -365,7 +365,8 @@ func (c *podmanCommandContainer) Run(ctx context.Context, command *repb.Command,
 		ExitCode:           commandutil.NoExitCode,
 	}
 
-	if err := container.PullImageIfNecessary(ctx, c.env, c, creds, c.image); err != nil {
+	// Podman container doesn't support useOCIFetcher
+	if err := container.PullImageIfNecessary(ctx, c.env, c, creds, c.image, false /*=useOCIFetcher*/); err != nil {
 		result.Error = status.UnavailableErrorf("failed to pull docker image: %s", err)
 		return result
 	}
@@ -534,7 +535,9 @@ func (c *podmanCommandContainer) IsImageCached(ctx context.Context) (bool, error
 	return true, nil
 }
 
-func (c *podmanCommandContainer) PullImage(ctx context.Context, creds oci.Credentials) error {
+func (c *podmanCommandContainer) PullImage(ctx context.Context, creds oci.Credentials, useOCIFetcher bool) error {
+	// Podman uses its own image pulling mechanism, useOCIFetcher is not supported
+	_ = useOCIFetcher
 	psi, _ := pullOperations.LoadOrStore(c.image, &pullStatus{&sync.RWMutex{}, false})
 	ps, ok := psi.(*pullStatus)
 	if !ok {

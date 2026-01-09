@@ -415,7 +415,7 @@ func TestFirecrackerLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !cached {
-		if err := c.PullImage(ctx, oci.Credentials{}); err != nil {
+		if err := c.PullImage(ctx, oci.Credentials{}, false /*=useOCIFetcher*/); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -474,7 +474,7 @@ func TestFirecrackerSnapshotAndResume(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage); err != nil {
+		if err := container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, false /*=useOCIFetcher*/, opts.ContainerImage); err != nil {
 			t.Fatalf("unable to pull image: %s", err)
 		}
 
@@ -591,7 +591,7 @@ func TestFirecracker_LocalSnapshotSharing(t *testing.T) {
 	baseVM, err := firecracker.NewContainer(ctx, env, task, opts)
 	require.NoError(t, err)
 	containersToCleanup = append(containersToCleanup, baseVM)
-	err = container.PullImageIfNecessary(ctx, env, baseVM, oci.Credentials{}, opts.ContainerImage)
+	err = container.PullImageIfNecessary(ctx, env, baseVM, oci.Credentials{}, false /*=useOCIFetcher*/, opts.ContainerImage)
 	require.NoError(t, err)
 	err = baseVM.Create(ctx, opts.ActionWorkingDirectory)
 	require.NoError(t, err)
@@ -744,7 +744,7 @@ func TestFirecracker_LocalSnapshotSharing_DontResave(t *testing.T) {
 	baseVM, err := firecracker.NewContainer(ctx, env, task, opts)
 	require.NoError(t, err)
 	containersToCleanup = append(containersToCleanup, baseVM)
-	err = container.PullImageIfNecessary(ctx, env, baseVM, oci.Credentials{}, opts.ContainerImage)
+	err = container.PullImageIfNecessary(ctx, env, baseVM, oci.Credentials{}, false /*=useOCIFetcher*/, opts.ContainerImage)
 	require.NoError(t, err)
 	err = baseVM.Create(ctx, opts.ActionWorkingDirectory)
 	require.NoError(t, err)
@@ -898,7 +898,7 @@ func TestFirecracker_RemoteSnapshotSharing_SavePolicy(t *testing.T) {
 				vm, err := firecracker.NewContainer(ctx, env, task, opts)
 				require.NoError(t, err)
 				containersToCleanup = append(containersToCleanup, vm)
-				require.NoError(t, container.PullImageIfNecessary(ctx, env, vm, oci.Credentials{}, opts.ContainerImage))
+				require.NoError(t, container.PullImageIfNecessary(ctx, env, vm, oci.Credentials{}, false /*=useOCIFetcher*/, opts.ContainerImage))
 				err = vm.Create(ctx, workDir)
 				require.NoError(t, err)
 				cmd := appendToLog(stringToLog)
@@ -1089,7 +1089,7 @@ func TestFirecracker_SnapshotSharing_ReadPolicy(t *testing.T) {
 				vm, err := firecracker.NewContainer(ctx, env, task, opts)
 				require.NoError(t, err)
 				containersToCleanup = append(containersToCleanup, vm)
-				require.NoError(t, container.PullImageIfNecessary(ctx, env, vm, oci.Credentials{}, opts.ContainerImage))
+				require.NoError(t, container.PullImageIfNecessary(ctx, env, vm, oci.Credentials{}, false /*=useOCIFetcher*/, opts.ContainerImage))
 				err = vm.Create(ctx, workDir)
 				require.NoError(t, err)
 				cmd := appendToLog(stringToLog)
@@ -1248,7 +1248,7 @@ func TestFirecracker_SnapshotSharing_ReadPolicy_FallbackSnapshot(t *testing.T) {
 				vm, err := firecracker.NewContainer(ctx, env, task, opts)
 				require.NoError(t, err)
 				containersToCleanup = append(containersToCleanup, vm)
-				require.NoError(t, container.PullImageIfNecessary(ctx, env, vm, oci.Credentials{}, opts.ContainerImage))
+				require.NoError(t, container.PullImageIfNecessary(ctx, env, vm, oci.Credentials{}, false /*=useOCIFetcher*/, opts.ContainerImage))
 				err = vm.Create(ctx, workDir)
 				require.NoError(t, err)
 				cmd := appendToLog(stringToLog)
@@ -1324,7 +1324,7 @@ printf '%s' $ATTEMPT_NUMBER | tee ./attempts
 		task.ExecuteRequest.InstanceName = instanceName
 		c, err := firecracker.NewContainer(ctx, env, task, opts)
 		require.NoError(t, err)
-		container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage)
+		container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, false /*=useOCIFetcher*/, opts.ContainerImage)
 		err = c.Create(ctx, workdir)
 		require.NoError(t, err)
 		res := c.Exec(ctx, cmd, nil)
@@ -1424,7 +1424,7 @@ cat ./attempts
 
 		c, err := firecracker.NewContainer(ctx, env, task, opts)
 		require.NoError(t, err)
-		container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage)
+		container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, false /*=useOCIFetcher*/, opts.ContainerImage)
 		err = c.Create(ctx, workdir)
 		require.NoError(t, err)
 		res := c.Exec(ctx, cmd, nil)
@@ -1490,7 +1490,7 @@ printf '%s' $ATTEMPT_NUMBER | tee ./attempts
 	run := func(expectedLogs string, expectedVersionNumber int64) {
 		c, err := firecracker.NewContainer(ctx, env, task, opts)
 		require.NoError(t, err)
-		container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage)
+		container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, false /*=useOCIFetcher*/, opts.ContainerImage)
 		err = c.Create(ctx, workdir)
 		require.NoError(t, err)
 		res := c.Exec(ctx, cmd, nil)
@@ -1605,7 +1605,7 @@ func TestFirecracker_RemoteSnapshotSharing_CacheProxy(t *testing.T) {
 		err := vm.Remove(ctx)
 		assert.NoError(t, err)
 	})
-	err = container.PullImageIfNecessary(ctx, env, vm, oci.Credentials{}, opts.ContainerImage)
+	err = container.PullImageIfNecessary(ctx, env, vm, oci.Credentials{}, false /*=useOCIFetcher*/, opts.ContainerImage)
 	require.NoError(t, err)
 	err = vm.Create(ctx, opts.ActionWorkingDirectory)
 	require.NoError(t, err)
@@ -1673,7 +1673,7 @@ func TestFirecrackerBalloon(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage); err != nil {
+	if err := container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, false /*=useOCIFetcher*/, opts.ContainerImage); err != nil {
 		t.Fatalf("unable to pull image: %s", err)
 	}
 
@@ -1760,7 +1760,7 @@ func TestFirecrackerBalloon_DecreasesMemorySnapshotSize(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage); err != nil {
+		if err := container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, false /*=useOCIFetcher*/, opts.ContainerImage); err != nil {
 			t.Fatalf("unable to pull image: %s", err)
 		}
 
@@ -2003,7 +2003,7 @@ func TestSnapshotAndResumeWithNetwork(t *testing.T) {
 	}
 	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{Command: cmd}, opts)
 	require.NoError(t, err)
-	require.NoError(t, container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage))
+	require.NoError(t, container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, false /*=useOCIFetcher*/, opts.ContainerImage))
 	err = c.Create(ctx, opts.ActionWorkingDirectory)
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -2581,7 +2581,7 @@ func TestFirecrackerVMNotRecycledIfWorkspaceDeviceStillBusy(t *testing.T) {
 		err := c.Remove(ctx)
 		require.NoError(t, err)
 	})
-	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage)
+	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, false /*=useOCIFetcher*/, opts.ContainerImage)
 	require.NoError(t, err)
 	err = c.Create(ctx, workDir)
 	require.NoError(t, err)
@@ -2622,7 +2622,7 @@ func TestFirecrackerExecWithRecycledWorkspaceWithNewContents(t *testing.T) {
 	}
 	c, err := firecracker.NewContainer(ctx, env, task, opts)
 	require.NoError(t, err)
-	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage)
+	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, false /*=useOCIFetcher*/, opts.ContainerImage)
 	require.NoError(t, err)
 	err = c.Create(ctx, opts.ActionWorkingDirectory)
 	require.NoError(t, err)
@@ -2717,7 +2717,7 @@ func TestFirecrackerExecWithRecycledWorkspaceWithDocker(t *testing.T) {
 		},
 	}, opts)
 	require.NoError(t, err)
-	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage)
+	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, false /*=useOCIFetcher*/, opts.ContainerImage)
 	require.NoError(t, err)
 	err = c.Create(ctx, opts.ActionWorkingDirectory)
 	require.NoError(t, err)
@@ -2825,7 +2825,7 @@ func TestFirecrackerExecWithDockerFromSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage); err != nil {
+	if err := container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, false /*=useOCIFetcher*/, opts.ContainerImage); err != nil {
 		t.Fatalf("unable to pull image: %s", err)
 	}
 
@@ -2954,7 +2954,7 @@ func TestFirecrackerExec_Timeout_DebugOutputIsAvailable(t *testing.T) {
 		},
 	}, opts)
 	require.NoError(t, err)
-	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage)
+	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, false /*=useOCIFetcher*/, opts.ContainerImage)
 	require.NoError(t, err)
 	err = c.Create(ctx, opts.ActionWorkingDirectory)
 	require.NoError(t, err)
@@ -3194,7 +3194,7 @@ func TestFirecrackerHealthChecking(t *testing.T) {
 	}
 	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
 	require.NoError(t, err)
-	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage)
+	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, false /*=useOCIFetcher*/, opts.ContainerImage)
 	require.NoError(t, err)
 	err = c.Create(ctx, workDir)
 	require.NoError(t, err)
@@ -3298,7 +3298,7 @@ func TestFirecrackerStressIO(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		if err := c.PullImage(ctx, oci.Credentials{}); err != nil {
+		if err := c.PullImage(ctx, oci.Credentials{}, false /*=useOCIFetcher*/); err != nil {
 			return nil, err
 		}
 		if err := c.Create(ctx, opts.ActionWorkingDirectory); err != nil {

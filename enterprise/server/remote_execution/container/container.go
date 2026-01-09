@@ -409,7 +409,7 @@ type CommandContainer interface {
 	// PullImage pulls the container image from the remote. It always
 	// re-authenticates the request, but may serve the image from a local cache
 	// if needed.
-	PullImage(ctx context.Context, creds oci.Credentials) error
+	PullImage(ctx context.Context, creds oci.Credentials, useOCIFetcher bool) error
 
 	// Create creates a new container and starts a top-level process inside it
 	// (`sleep infinity`) so that it stays alive and running until explicitly
@@ -493,7 +493,7 @@ type VM interface {
 
 // PullImageIfNecessary pulls the image configured for the container if it
 // is not cached locally.
-func PullImageIfNecessary(ctx context.Context, env environment.Env, ctr CommandContainer, creds oci.Credentials, imageRef string) error {
+func PullImageIfNecessary(ctx context.Context, env environment.Env, ctr CommandContainer, creds oci.Credentials, imageRef string, useOCIFetcher bool) error {
 	if *debugUseLocalImagesOnly || imageRef == "" {
 		return nil
 	}
@@ -507,7 +507,7 @@ func PullImageIfNecessary(ctx context.Context, env environment.Env, ctr CommandC
 		defer cancel()
 	}
 
-	if err := pullImageIfNecessary(ctx, env, ctr, creds, imageRef); err != nil {
+	if err := pullImageIfNecessary(ctx, env, ctr, creds, imageRef, useOCIFetcher); err != nil {
 		// make sure we always return Unavailable if the context deadline
 		// was exceeded
 		if err == context.DeadlineExceeded || ctx.Err() != nil {
@@ -518,7 +518,7 @@ func PullImageIfNecessary(ctx context.Context, env environment.Env, ctr CommandC
 	return nil
 }
 
-func pullImageIfNecessary(ctx context.Context, env environment.Env, ctr CommandContainer, creds oci.Credentials, imageRef string) error {
+func pullImageIfNecessary(ctx context.Context, env environment.Env, ctr CommandContainer, creds oci.Credentials, imageRef string, useOCIFetcher bool) error {
 	cacheAuth := env.GetImageCacheAuthenticator()
 	if cacheAuth == nil || env.GetAuthenticator() == nil {
 		// If we don't have an authenticator available, fall back to
@@ -526,7 +526,7 @@ func pullImageIfNecessary(ctx context.Context, env environment.Env, ctr CommandC
 		slowPullWarnOnce.Do(func() {
 			log.CtxWarningf(ctx, "Authentication is not properly configured; this will result in slower image pulls.")
 		})
-		return ctr.PullImage(ctx, creds)
+		return ctr.PullImage(ctx, creds, useOCIFetcher)
 	}
 
 	// TODO(iain): the auth/existence/pull synchronization is getting unruly.
@@ -553,7 +553,7 @@ func pullImageIfNecessary(ctx context.Context, env environment.Env, ctr CommandC
 	if isCached && cacheAuth.IsAuthorized(cacheToken) {
 		return nil
 	}
-	if err := ctr.PullImage(ctx, creds); err != nil {
+	if err := ctr.PullImage(ctx, creds, useOCIFetcher); err != nil {
 		return err
 	}
 	// Pull was successful, which means auth was successful. Refresh the token so
@@ -709,7 +709,7 @@ func (t *TracedCommandContainer) IsImageCached(ctx context.Context) (bool, error
 	return t.Delegate.IsImageCached(ctx)
 }
 
-func (t *TracedCommandContainer) PullImage(ctx context.Context, creds oci.Credentials) error {
+func (t *TracedCommandContainer) PullImage(ctx context.Context, creds oci.Credentials, useOCIFetcher bool) error {
 	ctx, span := tracing.StartSpan(ctx, trace.WithAttributes(t.implAttr))
 	defer span.End()
 
@@ -719,7 +719,7 @@ func (t *TracedCommandContainer) PullImage(ctx context.Context, creds oci.Creden
 		return ErrRemoved
 	}
 
-	return t.Delegate.PullImage(ctx, creds)
+	return t.Delegate.PullImage(ctx, creds, useOCIFetcher)
 }
 
 func (t *TracedCommandContainer) Create(ctx context.Context, workingDir string) error {

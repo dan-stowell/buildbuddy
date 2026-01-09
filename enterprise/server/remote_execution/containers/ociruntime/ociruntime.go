@@ -583,8 +583,8 @@ func (c *ociContainer) IsImageCached(ctx context.Context) (bool, error) {
 	return ok, nil
 }
 
-func (c *ociContainer) PullImage(ctx context.Context, creds oci.Credentials) error {
-	if _, err := c.imageStore.Pull(ctx, c.imageRef, creds); err != nil {
+func (c *ociContainer) PullImage(ctx context.Context, creds oci.Credentials, useOCIFetcher bool) error {
+	if _, err := c.imageStore.Pull(ctx, c.imageRef, creds, useOCIFetcher); err != nil {
 		return status.WrapError(err, "pull OCI image")
 	}
 	return nil
@@ -598,7 +598,8 @@ func (c *ociContainer) Run(ctx context.Context, cmd *repb.Command, workDir strin
 	}
 	c.cid = cid
 
-	if err := container.PullImageIfNecessary(ctx, c.env, c, creds, c.imageRef); err != nil {
+	// ociContainer.Run doesn't have access to a task, so useOCIFetcher is always false
+	if err := container.PullImageIfNecessary(ctx, c.env, c, creds, c.imageRef, false /*=useOCIFetcher*/); err != nil {
 		return commandutil.ErrorResult(status.UnavailableErrorf("pull image: %s", err))
 	}
 	if err := c.createNetwork(ctx); err != nil {
@@ -1524,10 +1525,10 @@ func NewImageStore(resolver *oci.Resolver, layersDir string) (*ImageStore, error
 // Pull always re-authenticates the credentials with the image registry.
 // Each layer is extracted to a subdirectory given by {algorithm}/{hash}, e.g.
 // "sha256/abc123".
-func (s *ImageStore) Pull(ctx context.Context, imageName string, creds oci.Credentials) (*Image, error) {
+func (s *ImageStore) Pull(ctx context.Context, imageName string, creds oci.Credentials, useOCIFetcher bool) (*Image, error) {
 	key := hash.Strings(imageName, creds.Username, creds.Password)
 	image, _, err := s.imagePullGroup.Do(ctx, key, func(ctx context.Context) (*Image, error) {
-		image, err := s.pull(ctx, imageName, creds)
+		image, err := s.pull(ctx, imageName, creds, useOCIFetcher)
 		if err != nil {
 			return nil, err
 		}
@@ -1552,8 +1553,8 @@ func (s *ImageStore) CachedImage(imageName string) (image *Image, ok bool) {
 	return image, ok
 }
 
-func (s *ImageStore) pull(ctx context.Context, imageName string, creds oci.Credentials) (*Image, error) {
-	img, err := s.resolver.Resolve(ctx, imageName, oci.RuntimePlatform(), creds)
+func (s *ImageStore) pull(ctx context.Context, imageName string, creds oci.Credentials, useOCIFetcher bool) (*Image, error) {
+	img, err := s.resolver.Resolve(ctx, imageName, oci.RuntimePlatform(), creds, useOCIFetcher)
 	if err != nil {
 		return nil, status.WrapError(err, "resolve image")
 	}

@@ -1981,7 +1981,8 @@ func (c *FirecrackerContainer) Run(ctx context.Context, command *repb.Command, a
 	// there's no need to Create the machine.
 	if c.machine == nil {
 		log.CtxInfof(ctx, "Pulling image %q", c.containerImage)
-		if err := container.PullImageIfNecessary(ctx, c.env, c, creds, c.containerImage); err != nil {
+		useOCIFetcher := slices.Contains(c.task.GetExperiments(), "use-ocifetcher")
+		if err := container.PullImageIfNecessary(ctx, c.env, c, creds, c.containerImage, useOCIFetcher); err != nil {
 			return nonCmdExit(ctx, err)
 		}
 
@@ -2555,7 +2556,7 @@ func (c *FirecrackerContainer) IsImageCached(ctx context.Context) (bool, error) 
 // PullImage pulls the container image from the remote. It always
 // re-authenticates the request, but may serve the image from a local cache
 // in order to avoid re-downloading the image.
-func (c *FirecrackerContainer) PullImage(ctx context.Context, creds oci.Credentials) error {
+func (c *FirecrackerContainer) PullImage(ctx context.Context, creds oci.Credentials, useOCIFetcher bool) error {
 	if c.pulled {
 		return nil
 	}
@@ -2576,7 +2577,7 @@ func (c *FirecrackerContainer) PullImage(ctx context.Context, creds oci.Credenti
 		log.CtxDebugf(ctx, "PullImage took %s", time.Since(start))
 	}()
 
-	_, err := ociconv.CreateDiskImage(ctx, c.resolver, c.executorConfig.CacheRoot, c.containerImage, creds)
+	_, err := ociconv.CreateDiskImage(ctx, c.resolver, c.executorConfig.CacheRoot, c.containerImage, creds, useOCIFetcher)
 	if err != nil {
 		return err
 	}

@@ -290,7 +290,7 @@ func TestSlowRun(t *testing.T) {
 	})
 
 	// Ensure the image is cached
-	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, busyboxImage)
+	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, false /*=useOCIFetcher*/, busyboxImage)
 	require.NoError(t, err)
 
 	cmd := &repb.Command{Arguments: []string{
@@ -336,7 +336,7 @@ func TestRun_Timeout(t *testing.T) {
 	})
 
 	// Ensure the image is cached
-	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, props.ContainerImage)
+	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, false /*=useOCIFetcher*/, props.ContainerImage)
 	require.NoError(t, err)
 
 	runCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -390,7 +390,7 @@ func TestExec_Timeout(t *testing.T) {
 	})
 
 	// Ensure the image is cached
-	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, props.ContainerImage)
+	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, false /*=useOCIFetcher*/, props.ContainerImage)
 	require.NoError(t, err)
 
 	runCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -454,7 +454,7 @@ func TestIsImageCached(t *testing.T) {
 		c, err := provider.New(ctx, &container.Init{Props: props})
 		require.NoError(t, err)
 		if tc.want {
-			err := c.PullImage(ctx, oci.Credentials{})
+			err := c.PullImage(ctx, oci.Credentials{}, false /*=useOCIFetcher*/)
 			require.NoError(t, err)
 		}
 		actual, err := c.IsImageCached(ctx)

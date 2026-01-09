@@ -335,7 +335,7 @@ func (c *sandbox) Signal(ctx context.Context, sig syscall.Signal) error {
 }
 
 func (c *sandbox) IsImageCached(ctx context.Context) (bool, error)            { return false, nil }
-func (c *sandbox) PullImage(ctx context.Context, creds oci.Credentials) error { return nil }
+func (c *sandbox) PullImage(ctx context.Context, creds oci.Credentials, useOCIFetcher bool) error { return nil }
 func (c *sandbox) Start(ctx context.Context) error                            { return nil }
 func (c *sandbox) Remove(ctx context.Context) error                           { return nil }
 func (c *sandbox) Pause(ctx context.Context) error                            { return nil }

@@ -365,7 +365,7 @@ func TestResolve(t *testing.T) {
 						context.Background(),
 						registry.ImageAddress(nameToResolve),
 						tc.args.platform,
-						tc.args.credentials,
+						tc.args.credentials, false /*=useOCIFetcher*/,
 					)
 					if tc.checkError != nil {
 						require.True(t, tc.checkError(err))
@@ -464,7 +464,7 @@ func TestResolve_Layers_DiffIDs(t *testing.T) {
 						context.Background(),
 						registry.ImageAddress(nameToResolve),
 						tc.args.platform,
-						tc.args.credentials,
+						tc.args.credentials, false /*=useOCIFetcher*/,
 					)
 					require.NoError(t, err)
 
@@ -572,7 +572,7 @@ func TestResolve_FallsBackToOriginalWhenMirrorFails(t *testing.T) {
 			Arch: runtime.GOARCH,
 			Os:   runtime.GOOS,
 		},
-		oci.Credentials{},
+		oci.Credentials{}, false, /*=useOCIFetcher*/
 	)
 	require.NoError(t, err)
 
@@ -595,7 +595,7 @@ func pushAndFetchRandomImage(t *testing.T, te *testenv.TestEnv, registry *testre
 			Arch: runtime.GOARCH,
 			Os:   runtime.GOOS,
 		},
-		oci.Credentials{})
+		oci.Credentials{}, false /*=useOCIFetcher*/)
 	return err
 }
 
@@ -881,7 +881,7 @@ func TestResolve_Concurrency(t *testing.T) {
 			Arch: runtime.GOARCH,
 			Os:   runtime.GOOS,
 		},
-		oci.Credentials{},
+		oci.Credentials{}, false, /*=useOCIFetcher*/
 	)
 	require.NoError(t, err)
 
@@ -967,7 +967,7 @@ func resolveAndCheck(t *testing.T, tc resolveTestCase, te *testenv.TestEnv, imag
 		testContext,
 		imageAddress,
 		tc.args.platform,
-		tc.args.credentials,
+		tc.args.credentials, false /*=useOCIFetcher*/,
 	)
 	require.NoError(t, err)
 

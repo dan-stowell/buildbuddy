@@ -210,7 +210,8 @@ func (r *dockerCommandContainer) Run(ctx context.Context, command *repb.Command,
 
 	// explicitly pull the image before running to avoid the
 	// pull output logs spilling into the execution logs.
-	if err := container.PullImageIfNecessary(ctx, r.env, r, creds, r.image); err != nil {
+	// Docker container doesn't support useOCIFetcher
+	if err := container.PullImageIfNecessary(ctx, r.env, r, creds, r.image, false /*=useOCIFetcher*/); err != nil {
 		result.Error = wrapDockerErr(err, fmt.Sprintf("failed to pull docker image %q", r.image))
 		return result
 	}
@@ -480,7 +481,9 @@ func (r *dockerCommandContainer) IsImageCached(ctx context.Context) (bool, error
 	return false, nil
 }
 
-func (r *dockerCommandContainer) PullImage(ctx context.Context, creds oci.Credentials) error {
+func (r *dockerCommandContainer) PullImage(ctx context.Context, creds oci.Credentials, useOCIFetcher bool) error {
+	// Docker uses its own image pulling mechanism, useOCIFetcher is not supported
+	_ = useOCIFetcher
 	return PullImage(ctx, r.client, r.image, creds)
 }
 

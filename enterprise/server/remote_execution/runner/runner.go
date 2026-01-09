@@ -272,9 +272,10 @@ func (r *taskRunner) PrepareForTask(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	useOCIFetcher := slices.Contains(r.task.GetExperiments(), "use-ocifetcher")
 	err = container.PullImageIfNecessary(
 		ctx, r.env,
-		r.Container, creds, r.PlatformProperties.ContainerImage,
+		r.Container, creds, r.PlatformProperties.ContainerImage, useOCIFetcher,
 	)
 	if err != nil {
 		return status.UnavailableErrorf("Error pulling container: %s", err)
@@ -424,9 +425,10 @@ func (r *taskRunner) Run(ctx context.Context, ioStats *repb.IOStats) (res *inter
 		if err != nil {
 			return commandutil.ErrorResult(err)
 		}
+		useOCIFetcher := slices.Contains(r.task.GetExperiments(), "use-ocifetcher")
 		err = container.PullImageIfNecessary(
 			ctx, r.env,
-			r.Container, creds, r.PlatformProperties.ContainerImage,
+			r.Container, creds, r.PlatformProperties.ContainerImage, useOCIFetcher,
 		)
 		if err != nil {
 			return commandutil.ErrorResult(err)
@@ -952,7 +954,8 @@ func (p *pool) warmupImage(ctx context.Context, cfg *WarmupConfig) error {
 	// Note: intentionally bypassing PullImageIfNecessary here to avoid caching
 	// the auth result, since it makes it tricker to debug per-action
 	// misconfiguration.
-	if err := c.PullImage(ctx, creds); err != nil {
+	// Warmup doesn't have a task, so useOCIFetcher is always false.
+	if err := c.PullImage(ctx, creds, false /*=useOCIFetcher*/); err != nil {
 		return err
 	}
 	log.Infof("Warmup: %s pulled image %q in %s", cfg.Isolation, platProps.ContainerImage, time.Since(start))
