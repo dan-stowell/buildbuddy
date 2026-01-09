@@ -868,6 +868,17 @@ func (s *ExecutionServer) dispatch(ctx context.Context, req *repb.ExecuteRequest
 				executionTask.Experiments = append(executionTask.Experiments, routingConfigExperimentName+":"+v)
 			}
 		}
+
+		// Check if the use-ocifetcher experiment is enabled for this request.
+		const useOCIFetcherExperiment = "use-ocifetcher"
+		useOCIFetcher, useOCIFetcherDetails := exp.BooleanDetails(ctx, useOCIFetcherExperiment, false)
+		if useOCIFetcher {
+			if v := useOCIFetcherDetails.Variant(); v != "" && v != "default" {
+				executionTask.Experiments = append(executionTask.Experiments, useOCIFetcherExperiment+":"+v)
+			} else {
+				executionTask.Experiments = append(executionTask.Experiments, useOCIFetcherExperiment)
+			}
+		}
 	}
 
 	metrics.RemoteExecutionRequests.With(prometheus.Labels{metrics.GroupID: taskGroupID, metrics.OS: props.OS, metrics.Arch: props.Arch}).Inc()
