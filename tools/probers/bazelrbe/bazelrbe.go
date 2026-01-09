@@ -141,6 +141,8 @@ func runProbe() error {
 	args = append(args,
 		"build",
 		"//"+*proberName+":all",
+		"--enable_bzlmod",
+		"--lockfile_mode=off",
 	)
 	if *bazelArgs != "" {
 		extraArgs := strings.Split(*bazelArgs, " ")
