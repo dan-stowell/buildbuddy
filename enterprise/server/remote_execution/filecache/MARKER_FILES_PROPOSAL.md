@@ -99,12 +99,6 @@ func (c *fileCache) GetMarkerFile(
     node *repb.FileNode,
 ) (resourcePath string, ok bool)
 
-// TouchMarkerFile updates the access time of a marker file, moving it to
-// the front of the LRU. Returns false if the marker doesn't exist.
-func (c *fileCache) TouchMarkerFile(
-    ctx context.Context,
-    node *repb.FileNode,
-) bool
 ```
 
 ### Implementation Details

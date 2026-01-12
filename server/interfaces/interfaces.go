@@ -915,6 +915,35 @@ type FileCache interface {
 	// as the filecache. The directory is not unique per call. Callers should
 	// generate globally unique file names under this directory.
 	TempDir() string
+
+	// Marker file support: marker files represent external on-disk resources
+	// (like OCI image layers or ext4 disk images) that should be tracked by
+	// the filecache LRU but whose actual data lives outside the filecache.
+
+	// AddMarkerFile adds a marker file to the cache representing an external
+	// resource at resourcePath. The sizeBytes parameter is used for LRU
+	// capacity accounting. When eviction is needed, the policy is consulted.
+	AddMarkerFile(ctx context.Context, node *repb.FileNode, resourcePath string, sizeBytes int64, policy MarkerEvictionPolicy) error
+
+	// GetMarkerFile returns the resource path for a marker file if it exists.
+	// This also updates the entry's LRU position (marks it as recently used).
+	GetMarkerFile(ctx context.Context, node *repb.FileNode) (resourcePath string, ok bool)
+}
+
+// MarkerEvictionPolicy controls eviction of marker files from the filecache.
+// Marker files represent external resources that may be in use and cannot
+// always be evicted immediately.
+type MarkerEvictionPolicy interface {
+	// CanEvict returns true if the resource at resourcePath can be safely
+	// deleted. Returns false if the resource is currently in use (e.g.,
+	// mounted by a running container). If false, the filecache will skip
+	// this entry and try evicting other entries first.
+	CanEvict(ctx context.Context, resourcePath string) bool
+
+	// Evict deletes the external resource at resourcePath. Called only after
+	// CanEvict returns true. The marker entry is removed from the filecache
+	// after this returns, regardless of any error.
+	Evict(ctx context.Context, resourcePath string) error
 }
 
 type SchedulerService interface {
