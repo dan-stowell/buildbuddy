@@ -5,7 +5,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/filecache"
+	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 )
 
@@ -16,7 +16,7 @@ import (
 
 // LayerCache manages OCI image layers with filecache-backed eviction.
 type LayerCache struct {
-	fc     *filecache.FileCache
+	fc     interfaces.FileCache
 	policy *layerEvictionPolicy
 }
 
@@ -66,7 +66,7 @@ func (p *layerEvictionPolicy) Release(layerPath string) {
 }
 
 // NewLayerCache creates a new layer cache backed by the given filecache.
-func NewLayerCache(fc *filecache.FileCache) *LayerCache {
+func NewLayerCache(fc interfaces.FileCache) *LayerCache {
 	return &LayerCache{
 		fc:     fc,
 		policy: newLayerEvictionPolicy(),

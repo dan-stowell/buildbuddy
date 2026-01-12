@@ -2,31 +2,26 @@ package filecache
 
 import (
 	"context"
+	"time"
+
+	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+	"github.com/buildbuddy-io/buildbuddy/server/metrics"
+	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+	"github.com/prometheus/client_golang/prometheus"
 
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 )
 
-// MarkerEvictionPolicy controls how marker files are evicted from the cache.
-//
-// Marker files represent external on-disk resources (like OCI image layers or
-// ext4 disk images). When the filecache needs to evict a marker file to free
-// space, it consults the policy to determine if eviction is allowed and to
-// perform the actual cleanup.
-type MarkerEvictionPolicy interface {
-	// CanEvict is called when the filecache wants to evict a marker file.
-	// It returns true if the resource can be safely deleted, false if it's
-	// currently in use (e.g., mounted by a running container).
-	//
-	// If CanEvict returns false, the filecache will skip this entry and try
-	// evicting other entries first. The entry remains in the LRU and may be
-	// retried later.
-	CanEvict(ctx context.Context, resourcePath string) bool
+// MarkerEvictionPolicy is an alias for interfaces.MarkerEvictionPolicy.
+// It's exported here for convenience.
+type MarkerEvictionPolicy = interfaces.MarkerEvictionPolicy
 
-	// Evict is called after CanEvict returns true. It should delete the
-	// external resource at resourcePath. The marker file entry in the
-	// filecache LRU will be removed after Evict returns, regardless of
-	// whether Evict returns an error.
-	Evict(ctx context.Context, resourcePath string) error
+// markerFileSuffix is appended to marker file keys to distinguish them from
+// regular file entries with the same digest.
+const markerFileSuffix = ".marker"
+
+func markerKey(ctx context.Context, node *repb.FileNode) string {
+	return key(ctx, node) + markerFileSuffix
 }
 
 // AddMarkerFile adds a marker file to the cache that represents an external
@@ -45,7 +40,34 @@ func (c *fileCache) AddMarkerFile(
 	sizeBytes int64,
 	policy MarkerEvictionPolicy,
 ) error {
-	// TODO: implement
+	k := markerKey(ctx, node)
+
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	// Remove any existing entry with this key
+	c.l.Remove(k)
+
+	e := &entry{
+		addedAtUsec:  time.Now().UnixMicro(),
+		sizeBytes:    sizeBytes,
+		isMarker:     true,
+		resourcePath: resourcePath,
+		evictPolicy:  policy,
+	}
+
+	groupID := groupIDStringFromContext(ctx)
+	metrics.FileCacheAddedFileSizeBytes.Observe(float64(e.sizeBytes))
+	metrics.FileCacheAddedFileBytesCount.With(prometheus.Labels{
+		metrics.GroupID: groupID,
+	}).Add(float64(e.sizeBytes))
+
+	if !c.l.Add(k, e) {
+		log.CtxWarningf(ctx, "Failed to add marker file %q to filecache LRU (cache full of non-evictable entries?)", k)
+		// Note: we don't return an error here because the resource still exists
+		// on disk, it just won't be tracked by the LRU. The caller can still
+		// use the resource.
+	}
 	return nil
 }
 
@@ -59,6 +81,19 @@ func (c *fileCache) GetMarkerFile(
 	ctx context.Context,
 	node *repb.FileNode,
 ) (resourcePath string, ok bool) {
-	// TODO: implement
-	return "", false
+	k := markerKey(ctx, node)
+
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	e, ok := c.l.Get(k)
+	if !ok {
+		return "", false
+	}
+	if !e.isMarker {
+		// Shouldn't happen, but be defensive
+		log.CtxWarningf(ctx, "GetMarkerFile called but entry %q is not a marker file", k)
+		return "", false
+	}
+	return e.resourcePath, true
 }

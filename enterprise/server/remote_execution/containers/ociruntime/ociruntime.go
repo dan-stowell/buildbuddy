@@ -338,7 +338,7 @@ func NewProvider(env environment.Env, buildRoot, cacheRoot string) (*provider, e
 	if err != nil {
 		return nil, err
 	}
-	imageStore, err := NewImageStore(resolver, imageCacheRoot)
+	imageStore, err := NewImageStore(resolver, imageCacheRoot, env.GetFileCache())
 	if err != nil {
 		return nil, err
 	}
@@ -423,6 +423,7 @@ type ociContainer struct {
 	network                *networking.ContainerNetwork
 	lxcfsMount             string
 	releaseCPUs            func()
+	releaseLayers          func() // releases layer usage when container is removed
 	isPersistentWorker     bool
 
 	imageRef       string
@@ -783,6 +784,10 @@ func (c *ociContainer) Remove(ctx context.Context) error {
 		c.releaseCPUs()
 	}
 
+	if c.releaseLayers != nil {
+		c.releaseLayers()
+	}
+
 	return firstErr
 }
 
@@ -954,6 +959,12 @@ func (c *ociContainer) createRootfs(ctx context.Context) error {
 	image, ok := c.imageStore.CachedImage(c.imageRef)
 	if !ok {
 		return fmt.Errorf("bad state: attempted to create rootfs before pulling image")
+	}
+
+	// Acquire layers to prevent eviction while mounted.
+	c.imageStore.AcquireLayers(image.Layers)
+	c.releaseLayers = func() {
+		c.imageStore.ReleaseLayers(image.Layers)
 	}
 
 	// Create workdir and upperdir.
@@ -1486,11 +1497,17 @@ func layerPath(imageCacheRoot string, hash ctr.Hash) string {
 type ImageStore struct {
 	resolver       *oci.Resolver
 	layersDir      string
+	fileCache      interfaces.FileCache
 	imagePullGroup singleflight.Group[string, *Image]
 	layerPullGroup singleflight.Group[string, any]
 
 	mu           sync.RWMutex
 	cachedImages map[string]*Image
+
+	// layerUsage tracks how many containers are currently using each layer.
+	// Key is the layer path, value is the reference count.
+	layerUsageMu sync.Mutex
+	layerUsage   map[string]int
 }
 
 // Image represents a cached image, including all layer digests and image
@@ -1510,11 +1527,13 @@ type ImageLayer struct {
 	DiffID ctr.Hash
 }
 
-func NewImageStore(resolver *oci.Resolver, layersDir string) (*ImageStore, error) {
+func NewImageStore(resolver *oci.Resolver, layersDir string, fileCache interfaces.FileCache) (*ImageStore, error) {
 	return &ImageStore{
 		resolver:     resolver,
 		layersDir:    layersDir,
+		fileCache:    fileCache,
 		cachedImages: map[string]*Image{},
+		layerUsage:   map[string]int{},
 	}, nil
 }
 
@@ -1552,6 +1571,46 @@ func (s *ImageStore) CachedImage(imageName string) (image *Image, ok bool) {
 	return image, ok
 }
 
+// CanEvict implements filecache.MarkerEvictionPolicy.
+// Returns true if the layer at resourcePath is not currently in use.
+func (s *ImageStore) CanEvict(ctx context.Context, resourcePath string) bool {
+	s.layerUsageMu.Lock()
+	defer s.layerUsageMu.Unlock()
+	return s.layerUsage[resourcePath] == 0
+}
+
+// Evict implements filecache.MarkerEvictionPolicy.
+// Removes the layer directory from disk.
+func (s *ImageStore) Evict(ctx context.Context, resourcePath string) error {
+	return os.RemoveAll(resourcePath)
+}
+
+// AcquireLayers marks the given layers as in-use by a container.
+// Call ReleaseLayers when the container is done using them.
+func (s *ImageStore) AcquireLayers(layers []*ImageLayer) {
+	s.layerUsageMu.Lock()
+	defer s.layerUsageMu.Unlock()
+	for _, layer := range layers {
+		path := layerPath(s.layersDir, layer.DiffID)
+		s.layerUsage[path]++
+	}
+}
+
+// ReleaseLayers marks the given layers as no longer in-use.
+func (s *ImageStore) ReleaseLayers(layers []*ImageLayer) {
+	s.layerUsageMu.Lock()
+	defer s.layerUsageMu.Unlock()
+	for _, layer := range layers {
+		path := layerPath(s.layersDir, layer.DiffID)
+		if s.layerUsage[path] > 0 {
+			s.layerUsage[path]--
+		}
+		if s.layerUsage[path] == 0 {
+			delete(s.layerUsage, path)
+		}
+	}
+}
+
 func (s *ImageStore) pull(ctx context.Context, imageName string, creds oci.Credentials) (*Image, error) {
 	img, err := s.resolver.Resolve(ctx, imageName, oci.RuntimePlatform(), creds)
 	if err != nil {
@@ -1582,32 +1641,72 @@ func (s *ImageStore) pull(ctx context.Context, imageName string, creds oci.Crede
 
 			destDir := layerPath(s.layersDir, d)
 
+			size, err := layer.Size()
+			if err != nil {
+				return status.UnavailableErrorf("get layer size: %s", err)
+			}
+
+			// Check if layer is already tracked in filecache
+			if s.fileCache != nil {
+				node := &repb.FileNode{
+					Digest: &repb.Digest{
+						Hash:      d.Hex,
+						SizeBytes: size,
+					},
+				}
+				if _, ok := s.fileCache.GetMarkerFile(ctx, node); ok {
+					// Layer is tracked in filecache (and now marked as recently used)
+					return nil
+				}
+			}
+
 			// If the destination directory already exists then we can skip
-			// the download.
+			// the download, but we still need to register with filecache.
+			needsDownload := true
 			if _, err := os.Stat(destDir); err != nil {
 				if !os.IsNotExist(err) {
 					return status.UnavailableErrorf("stat layer directory: %s", err)
 				}
 			} else {
-				return nil
+				needsDownload = false
 			}
 
-			size, err := layer.Size()
-			if err != nil {
-				return status.UnavailableErrorf("get layer size: %s", err)
-			}
-			start := time.Now()
-			log.CtxDebugf(ctx, "Pulling layer %s (%.2f MiB)", d.Hex, float64(size)/1e6)
-			defer func() { log.CtxDebugf(ctx, "Pulled layer %s in %s", d.Hex, time.Since(start)) }()
+			if needsDownload {
+				start := time.Now()
+				log.CtxDebugf(ctx, "Pulling layer %s (%.2f MiB)", d.Hex, float64(size)/1e6)
+				defer func() { log.CtxDebugf(ctx, "Pulled layer %s in %s", d.Hex, time.Since(start)) }()
 
-			// Images often share layers - dedupe individual layer pulls.
-			// Note that each layer pull is also authorized, so include
-			// the credentials in the key here too.
-			key := hash.Strings(destDir, creds.Username, creds.Password)
-			_, _, err = s.layerPullGroup.Do(ctx, key, func(ctx context.Context) (any, error) {
-				return nil, downloadLayer(ctx, layer, destDir)
-			})
-			return err
+				// Images often share layers - dedupe individual layer pulls.
+				// Note that each layer pull is also authorized, so include
+				// the credentials in the key here too.
+				key := hash.Strings(destDir, creds.Username, creds.Password)
+				_, _, err = s.layerPullGroup.Do(ctx, key, func(ctx context.Context) (any, error) {
+					return nil, downloadLayer(ctx, layer, destDir)
+				})
+				if err != nil {
+					return err
+				}
+			}
+
+			// Register layer with filecache for LRU tracking
+			if s.fileCache != nil {
+				// Get actual disk usage of the layer directory
+				diskUsage, err := disk.DirSize(destDir)
+				if err != nil {
+					log.CtxWarningf(ctx, "Failed to get layer disk usage for %s: %s", d.Hex, err)
+					diskUsage = size // Fall back to compressed size
+				}
+				node := &repb.FileNode{
+					Digest: &repb.Digest{
+						Hash:      d.Hex,
+						SizeBytes: size,
+					},
+				}
+				if err := s.fileCache.AddMarkerFile(ctx, node, destDir, diskUsage, s); err != nil {
+					log.CtxWarningf(ctx, "Failed to register layer %s with filecache: %s", d.Hex, err)
+				}
+			}
+			return nil
 		})
 	}
 	// Fetch image config file concurrently with layer downloads.

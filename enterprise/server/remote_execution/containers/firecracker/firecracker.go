@@ -663,11 +663,13 @@ type FirecrackerContainer struct {
 	cpuWeightMillis int64                // milliCPU for cgroup CPU weight
 	cgroupParent    string               // parent cgroup path (root-relative)
 	cgroupSettings  *scpb.CgroupSettings // jailer cgroup settings
-	blockDevice     *block_io.Device     // block device for cgroup IO settings
-	machine         *fcclient.Machine    // the firecracker machine object.
-	vmLog           *VMLog
-	env             environment.Env
-	resolver        *oci.Resolver
+	blockDevice      *block_io.Device       // block device for cgroup IO settings
+	machine          *fcclient.Machine      // the firecracker machine object.
+	vmLog            *VMLog
+	env              environment.Env
+	resolver         *oci.Resolver
+	ext4ImageStore   *ociconv.Ext4ImageStore // manages ext4 images with filecache integration
+	releaseImage     func()                  // releases ext4 image when VM is removed
 
 	vmCtx context.Context
 	// cancelVmCtx cancels the Machine context, stopping the VMM if it hasn't
@@ -720,6 +722,8 @@ func NewContainer(ctx context.Context, env environment.Env, task *repb.Execution
 		return nil, err
 	}
 
+	ext4ImageStore := ociconv.NewExt4ImageStore(resolver, opts.ExecutorConfig.CacheRoot, env.GetFileCache())
+
 	c := &FirecrackerContainer{
 		vmConfig:               opts.VMConfiguration.CloneVT(),
 		executorConfig:         opts.ExecutorConfig,
@@ -735,6 +739,7 @@ func NewContainer(ctx context.Context, env environment.Env, task *repb.Execution
 		blockDevice:            opts.BlockDevice,
 		env:                    env,
 		resolver:               resolver,
+		ext4ImageStore:         ext4ImageStore,
 		task:                   task,
 		loader:                 loader,
 		vmLog:                  vmLog,
@@ -2066,7 +2071,16 @@ func (c *FirecrackerContainer) create(ctx context.Context) error {
 	if imageExt4Path == "" {
 		return status.UnavailableErrorf("container image not found: %s", c.containerImage)
 	}
+
+	// Acquire the image to prevent eviction while the VM is running
+	c.ext4ImageStore.AcquireImage(imageExt4Path)
+	c.releaseImage = func() {
+		c.ext4ImageStore.ReleaseImage(imageExt4Path)
+	}
+
 	if err := os.Link(imageExt4Path, containerFSPath); err != nil {
+		c.releaseImage()
+		c.releaseImage = nil
 		return err
 	}
 
@@ -2576,7 +2590,7 @@ func (c *FirecrackerContainer) PullImage(ctx context.Context, creds oci.Credenti
 		log.CtxDebugf(ctx, "PullImage took %s", time.Since(start))
 	}()
 
-	_, err := ociconv.CreateDiskImage(ctx, c.resolver, c.executorConfig.CacheRoot, c.containerImage, creds)
+	_, err := c.ext4ImageStore.GetDiskImage(ctx, c.containerImage, creds)
 	if err != nil {
 		return err
 	}
@@ -2679,6 +2693,11 @@ func (c *FirecrackerContainer) remove(ctx context.Context) error {
 	if c.releaseCPUs != nil {
 		c.releaseCPUs()
 	}
+
+	if c.releaseImage != nil {
+		c.releaseImage()
+	}
+
 	return lastErr
 }
 

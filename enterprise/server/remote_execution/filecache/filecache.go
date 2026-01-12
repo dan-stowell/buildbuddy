@@ -98,6 +98,11 @@ type entry struct {
 	// sizeBytes is the file size as reported by the original FileNode metadata
 	// when the file was added to the file cache.
 	sizeBytes int64
+
+	// Marker file fields (only set if isMarker is true)
+	isMarker     bool
+	resourcePath string
+	evictPolicy  MarkerEvictionPolicy
 }
 
 func sizeFn(v *entry) int64 {
@@ -106,14 +111,35 @@ func sizeFn(v *entry) int64 {
 
 func evictFn(rootDir string) func(string, *entry, lru.EvictionReason) {
 	return func(key string, v *entry, reason lru.EvictionReason) {
-		fp := filecachePath(rootDir, key)
-		if err := syscall.Unlink(fp); err != nil {
-			log.Errorf("Failed to unlink filecache entry %q: %s", fp, err)
+		if v.isMarker {
+			// Marker file: delegate cleanup to the eviction policy
+			ctx := context.Background()
+			if err := v.evictPolicy.Evict(ctx, v.resourcePath); err != nil {
+				log.Warningf("Failed to evict marker file resource %q: %s", v.resourcePath, err)
+			}
+		} else {
+			// Regular file: unlink the hardlink
+			fp := filecachePath(rootDir, key)
+			if err := syscall.Unlink(fp); err != nil {
+				log.Errorf("Failed to unlink filecache entry %q: %s", fp, err)
+			}
 		}
 		if reason == lru.SizeEviction {
 			age := time.Since(time.UnixMicro(v.addedAtUsec)).Microseconds()
 			metrics.FileCacheLastEvictionAgeUsec.Set(float64(age))
 		}
+	}
+}
+
+// canEvictFn returns a function that checks if an entry can be evicted.
+// Regular files can always be evicted; marker files consult their policy.
+func canEvictFn() func(string, *entry) bool {
+	return func(key string, v *entry) bool {
+		if !v.isMarker {
+			return true
+		}
+		ctx := context.Background()
+		return v.evictPolicy.CanEvict(ctx, v.resourcePath)
 	}
 }
 
@@ -133,7 +159,12 @@ func NewFileCache(rootDir string, maxSizeBytes int64, deleteContent bool) (*file
 	if err := disk.EnsureDirectoryExists(rootDir); err != nil {
 		return nil, err
 	}
-	l, err := lru.NewLRU[*entry](&lru.Config[*entry]{MaxSize: maxSizeBytes, OnEvict: evictFn(rootDir), SizeFn: sizeFn})
+	l, err := lru.NewLRU[*entry](&lru.Config[*entry]{
+		MaxSize:  maxSizeBytes,
+		OnEvict:  evictFn(rootDir),
+		CanEvict: canEvictFn(),
+		SizeFn:   sizeFn,
+	})
 	if err != nil {
 		return nil, err
 	}

@@ -12,11 +12,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/ext4"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/oci"
+	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
 	"github.com/buildbuddy-io/buildbuddy/server/util/hash"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
@@ -25,6 +27,8 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/third_party/singleflight"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"golang.org/x/sys/unix"
+
+	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 )
 
 const (
@@ -40,6 +44,159 @@ var (
 	// Single-flight group used to dedupe firecracker image conversions.
 	conversionGroup singleflight.Group[string, string]
 )
+
+// Ext4ImageStore manages ext4 disk images for Firecracker VMs, integrating
+// with the filecache for LRU-based eviction.
+type Ext4ImageStore struct {
+	resolver  *oci.Resolver
+	cacheRoot string
+	fileCache interfaces.FileCache
+
+	// imageUsage tracks how many VMs are currently using each image.
+	// Key is the image path, value is the reference count.
+	imageMu    sync.Mutex
+	imageUsage map[string]int
+}
+
+// NewExt4ImageStore creates a new Ext4ImageStore.
+func NewExt4ImageStore(resolver *oci.Resolver, cacheRoot string, fileCache interfaces.FileCache) *Ext4ImageStore {
+	return &Ext4ImageStore{
+		resolver:   resolver,
+		cacheRoot:  cacheRoot,
+		fileCache:  fileCache,
+		imageUsage: make(map[string]int),
+	}
+}
+
+// CanEvict implements filecache.MarkerEvictionPolicy.
+// Returns true if the image at resourcePath is not currently in use.
+func (s *Ext4ImageStore) CanEvict(ctx context.Context, resourcePath string) bool {
+	s.imageMu.Lock()
+	defer s.imageMu.Unlock()
+	return s.imageUsage[resourcePath] == 0
+}
+
+// Evict implements filecache.MarkerEvictionPolicy.
+// Removes the ext4 image file and its parent directory from disk.
+func (s *Ext4ImageStore) Evict(ctx context.Context, resourcePath string) error {
+	// Remove the ext4 file
+	if err := os.Remove(resourcePath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	// Try to remove the parent directory (will fail if not empty, which is fine)
+	_ = os.Remove(filepath.Dir(resourcePath))
+	return nil
+}
+
+// AcquireImage marks an image as in-use by a VM.
+// Call ReleaseImage when the VM is done using it.
+func (s *Ext4ImageStore) AcquireImage(imagePath string) {
+	s.imageMu.Lock()
+	defer s.imageMu.Unlock()
+	s.imageUsage[imagePath]++
+}
+
+// ReleaseImage marks an image as no longer in-use.
+func (s *Ext4ImageStore) ReleaseImage(imagePath string) {
+	s.imageMu.Lock()
+	defer s.imageMu.Unlock()
+	if s.imageUsage[imagePath] > 0 {
+		s.imageUsage[imagePath]--
+	}
+	if s.imageUsage[imagePath] == 0 {
+		delete(s.imageUsage, imagePath)
+	}
+}
+
+// GetDiskImage returns the path to a cached ext4 disk image, or creates one
+// if it doesn't exist. The image is registered with the filecache for LRU
+// tracking. If the image exists but isn't tracked yet, it will be registered.
+func (s *Ext4ImageStore) GetDiskImage(ctx context.Context, containerImage string, creds oci.Credentials) (string, error) {
+	ctx, span := tracing.StartSpan(ctx)
+	defer span.End()
+
+	// Check if image is already tracked in filecache
+	if s.fileCache != nil {
+		node := s.imageNode(containerImage)
+		if path, ok := s.fileCache.GetMarkerFile(ctx, node); ok {
+			// Image is tracked and now marked as recently used
+			return path, nil
+		}
+	}
+
+	// Check if image exists on disk
+	existingPath, err := CachedDiskImagePath(ctx, s.cacheRoot, containerImage)
+	if err != nil {
+		return "", err
+	}
+
+	if existingPath != "" {
+		// Image exists on disk - authenticate and register with filecache
+		if err := authenticateWithRegistry(ctx, s.resolver, containerImage, creds); err != nil {
+			return "", err
+		}
+		s.registerWithFilecache(ctx, containerImage, existingPath)
+		return existingPath, nil
+	}
+
+	// Need to create the image
+	log.CtxInfof(ctx, "Downloading image %s and converting to ext4 format", containerImage)
+	start := time.Now()
+	defer func() {
+		log.CtxInfof(ctx, "Converted %s to ext4 format in %s", containerImage, time.Since(start))
+	}()
+
+	// Dedupe image conversion operations
+	conversionOpKey := hash.Strings(
+		s.cacheRoot, containerImage, creds.Username, creds.Password,
+	)
+	imagePath, _, err := conversionGroup.Do(ctx, conversionOpKey, func(ctx context.Context) (string, error) {
+		ctx, cancel := context.WithTimeout(ctx, imageConversionTimeout)
+		defer cancel()
+		return createExt4Image(ctx, s.resolver, s.cacheRoot, containerImage, creds)
+	})
+	if err != nil {
+		return "", err
+	}
+
+	s.registerWithFilecache(ctx, containerImage, imagePath)
+	return imagePath, nil
+}
+
+func (s *Ext4ImageStore) imageNode(containerImage string) *repb.FileNode {
+	// Use a hash of the container image name as the digest hash
+	// This ensures consistent cache keys
+	return &repb.FileNode{
+		Digest: &repb.Digest{
+			Hash:      hash.String(containerImage),
+			SizeBytes: 0, // Size will be set when registering
+		},
+	}
+}
+
+func (s *Ext4ImageStore) registerWithFilecache(ctx context.Context, containerImage, imagePath string) {
+	if s.fileCache == nil {
+		return
+	}
+
+	// Get the file size
+	info, err := os.Stat(imagePath)
+	if err != nil {
+		log.CtxWarningf(ctx, "Failed to stat ext4 image %s: %s", imagePath, err)
+		return
+	}
+
+	node := &repb.FileNode{
+		Digest: &repb.Digest{
+			Hash:      hash.String(containerImage),
+			SizeBytes: info.Size(),
+		},
+	}
+
+	if err := s.fileCache.AddMarkerFile(ctx, node, imagePath, info.Size(), s); err != nil {
+		log.CtxWarningf(ctx, "Failed to register ext4 image %s with filecache: %s", imagePath, err)
+	}
+}
 
 func hashFile(filename string) (string, error) {
 	f, err := os.Open(filename)

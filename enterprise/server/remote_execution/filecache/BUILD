@@ -8,7 +8,10 @@ package(default_visibility = [
 
 go_library(
     name = "filecache",
-    srcs = ["filecache.go"],
+    srcs = [
+        "filecache.go",
+        "marker.go",
+    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/filecache",
     deps = [
         "//proto:remote_execution_go_proto",
