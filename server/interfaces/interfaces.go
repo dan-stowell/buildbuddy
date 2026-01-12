@@ -915,6 +915,29 @@ type FileCache interface {
 	// as the filecache. The directory is not unique per call. Callers should
 	// generate globally unique file names under this directory.
 	TempDir() string
+
+	// AddMarkerFile adds a marker file to the cache. Marker files represent
+	// external resources (like OCI image layers) that are managed outside
+	// the filecache but whose lifecycle should be tracked by it.
+	// resourceSizeBytes is used for LRU accounting instead of the marker
+	// file's physical size. The file at existingPath is linked into the cache.
+	AddMarkerFile(ctx context.Context, node *repb.FileNode, resourceSizeBytes int64, existingPath string) error
+
+	// GetMarkerFile returns a lease for a marker file if it exists in the cache.
+	// The marker cannot be evicted while the lease is held. Callers must call
+	// Release() on the returned lease when done using the associated resource.
+	// Returns NotFoundError if the marker doesn't exist.
+	GetMarkerFile(ctx context.Context, node *repb.FileNode) (MarkerLease, error)
+}
+
+// MarkerLease represents a hold on a marker file in the filecache.
+// While the lease is held, the marker file cannot be evicted.
+type MarkerLease interface {
+	// Path returns the path to the marker file in the cache.
+	Path() string
+	// Release releases the lease, allowing the marker to be evicted.
+	// Must be called when done using the associated resource.
+	Release()
 }
 
 type SchedulerService interface {

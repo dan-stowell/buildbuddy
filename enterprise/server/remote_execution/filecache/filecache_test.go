@@ -839,3 +839,221 @@ func TestFileCacheWriteCleansUpTempFile(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, matches, "expected temp file(s) to be deleted: %v", matches)
 }
+
+func TestMarkerFileBasic(t *testing.T) {
+	ctx := context.Background()
+	fcDir := testfs.MakeTempDir(t)
+	fc, err := filecache.NewFileCache(fcDir, 100000, false)
+	require.NoError(t, err)
+	fc.WaitForDirectoryScanToComplete()
+
+	// Create a marker file
+	baseDir := testfs.MakeTempDir(t)
+	markerPath := writeFileContent(t, baseDir, "marker", "marker-content", false)
+	node := nodeFromString("test-marker", false)
+
+	// Add marker file
+	err = fc.AddMarkerFile(ctx, node, 1000, markerPath)
+	require.NoError(t, err)
+
+	// Get marker file
+	lease, err := fc.GetMarkerFile(ctx, node)
+	require.NoError(t, err)
+	require.NotNil(t, lease)
+
+	// Verify path exists and has expected content
+	path := lease.Path()
+	assert.FileExists(t, path)
+	assertFileContents(t, path, "marker-content")
+
+	// Release the lease
+	lease.Release()
+}
+
+func TestMarkerFileNotFound(t *testing.T) {
+	ctx := context.Background()
+	fcDir := testfs.MakeTempDir(t)
+	fc, err := filecache.NewFileCache(fcDir, 100000, false)
+	require.NoError(t, err)
+	fc.WaitForDirectoryScanToComplete()
+
+	node := nodeFromString("nonexistent-marker", false)
+	_, err = fc.GetMarkerFile(ctx, node)
+	require.Error(t, err)
+	assert.True(t, status.IsNotFoundError(err), "expected NotFoundError, got: %v", err)
+}
+
+func TestMarkerFileEvictionPrevention(t *testing.T) {
+	ctx := context.Background()
+	fcDir := testfs.MakeTempDir(t)
+	// Filecache that can hold two markers but not three
+	fc, err := filecache.NewFileCache(fcDir, 2500, false)
+	require.NoError(t, err)
+	fc.WaitForDirectoryScanToComplete()
+
+	baseDir := testfs.MakeTempDir(t)
+
+	// Add first marker file with size 1000
+	marker1Path := writeFileContent(t, baseDir, "marker1", "content1", false)
+	node1 := nodeFromString("marker1", false)
+	err = fc.AddMarkerFile(ctx, node1, 1000, marker1Path)
+	require.NoError(t, err)
+
+	// Add second marker file with size 1000
+	marker2Path := writeFileContent(t, baseDir, "marker2", "content2", false)
+	node2 := nodeFromString("marker2", false)
+	err = fc.AddMarkerFile(ctx, node2, 1000, marker2Path)
+	require.NoError(t, err)
+
+	// Now marker1 is oldest, marker2 is newest.
+	// Adding a third marker should evict marker1 (oldest, no lease)
+	marker3Path := writeFileContent(t, baseDir, "marker3", "content3", false)
+	node3 := nodeFromString("marker3", false)
+	err = fc.AddMarkerFile(ctx, node3, 1000, marker3Path)
+	require.NoError(t, err)
+
+	// First marker should now be evicted (oldest)
+	_, err = fc.GetMarkerFile(ctx, node1)
+	require.Error(t, err)
+	assert.True(t, status.IsNotFoundError(err), "expected NotFoundError after eviction")
+
+	// Second and third markers should still be accessible
+	lease2, err := fc.GetMarkerFile(ctx, node2)
+	require.NoError(t, err)
+	lease2.Release()
+
+	lease3, err := fc.GetMarkerFile(ctx, node3)
+	require.NoError(t, err)
+	lease3.Release()
+}
+
+func TestMarkerFilePinnedEvictionPrevention(t *testing.T) {
+	ctx := context.Background()
+	fcDir := testfs.MakeTempDir(t)
+	// Filecache that can hold two markers but not three
+	fc, err := filecache.NewFileCache(fcDir, 2500, false)
+	require.NoError(t, err)
+	fc.WaitForDirectoryScanToComplete()
+
+	baseDir := testfs.MakeTempDir(t)
+
+	// Add first marker file with size 1000
+	marker1Path := writeFileContent(t, baseDir, "marker1", "content1", false)
+	node1 := nodeFromString("marker1", false)
+	err = fc.AddMarkerFile(ctx, node1, 1000, marker1Path)
+	require.NoError(t, err)
+
+	// Get a lease on the first marker - this pins it
+	lease1, err := fc.GetMarkerFile(ctx, node1)
+	require.NoError(t, err)
+
+	// Add second marker file with size 1000
+	marker2Path := writeFileContent(t, baseDir, "marker2", "content2", false)
+	node2 := nodeFromString("marker2", false)
+	err = fc.AddMarkerFile(ctx, node2, 1000, marker2Path)
+	require.NoError(t, err)
+
+	// Add third marker - this would normally evict marker1 (oldest)
+	// but marker1 has a lease, so marker2 should be evicted instead
+	marker3Path := writeFileContent(t, baseDir, "marker3", "content3", false)
+	node3 := nodeFromString("marker3", false)
+	err = fc.AddMarkerFile(ctx, node3, 1000, marker3Path)
+	require.NoError(t, err)
+
+	// First marker should still exist because it has a lease
+	lease1Check, err := fc.GetMarkerFile(ctx, node1)
+	require.NoError(t, err)
+	lease1Check.Release()
+
+	// Second marker should be evicted (it was evictable, marker1 wasn't)
+	_, err = fc.GetMarkerFile(ctx, node2)
+	require.Error(t, err)
+	assert.True(t, status.IsNotFoundError(err), "expected marker2 to be evicted")
+
+	// Third marker should exist
+	lease3, err := fc.GetMarkerFile(ctx, node3)
+	require.NoError(t, err)
+	lease3.Release()
+
+	// Release the lease on marker1
+	lease1.Release()
+}
+
+func TestMarkerFileMultipleLeases(t *testing.T) {
+	ctx := context.Background()
+	fcDir := testfs.MakeTempDir(t)
+	fc, err := filecache.NewFileCache(fcDir, 100000, false)
+	require.NoError(t, err)
+	fc.WaitForDirectoryScanToComplete()
+
+	baseDir := testfs.MakeTempDir(t)
+	markerPath := writeFileContent(t, baseDir, "marker", "content", false)
+	node := nodeFromString("multi-lease-marker", false)
+
+	err = fc.AddMarkerFile(ctx, node, 1000, markerPath)
+	require.NoError(t, err)
+
+	// Get multiple leases on the same marker
+	lease1, err := fc.GetMarkerFile(ctx, node)
+	require.NoError(t, err)
+
+	lease2, err := fc.GetMarkerFile(ctx, node)
+	require.NoError(t, err)
+
+	lease3, err := fc.GetMarkerFile(ctx, node)
+	require.NoError(t, err)
+
+	// All leases should return the same path
+	assert.Equal(t, lease1.Path(), lease2.Path())
+	assert.Equal(t, lease2.Path(), lease3.Path())
+
+	// Release leases
+	lease1.Release()
+	lease2.Release()
+	lease3.Release()
+
+	// Marker should still be accessible after all leases released
+	lease4, err := fc.GetMarkerFile(ctx, node)
+	require.NoError(t, err)
+	lease4.Release()
+}
+
+func TestMarkerFileResourceSizeAccounting(t *testing.T) {
+	ctx := context.Background()
+	fcDir := testfs.MakeTempDir(t)
+	// Filecache with exact size for one 5000-byte resource
+	fc, err := filecache.NewFileCache(fcDir, 5000, false)
+	require.NoError(t, err)
+	fc.WaitForDirectoryScanToComplete()
+
+	baseDir := testfs.MakeTempDir(t)
+
+	// Add a marker with resourceSizeBytes=5000 (even though file is tiny)
+	markerPath := writeFileContent(t, baseDir, "marker", "x", false)
+	node := nodeFromString("big-resource-marker", false)
+
+	err = fc.AddMarkerFile(ctx, node, 5000, markerPath)
+	require.NoError(t, err)
+
+	// Verify the marker was added
+	lease, err := fc.GetMarkerFile(ctx, node)
+	require.NoError(t, err)
+	lease.Release()
+
+	// Add another marker that should cause eviction
+	marker2Path := writeFileContent(t, baseDir, "marker2", "y", false)
+	node2 := nodeFromString("second-marker", false)
+
+	err = fc.AddMarkerFile(ctx, node2, 5000, marker2Path)
+	require.NoError(t, err)
+
+	// First marker should be evicted due to size accounting
+	_, err = fc.GetMarkerFile(ctx, node)
+	require.Error(t, err)
+	assert.True(t, status.IsNotFoundError(err))
+
+	// Second marker should exist
+	lease2, err := fc.GetMarkerFile(ctx, node2)
+	require.NoError(t, err)
+	lease2.Release()
+}

@@ -37,6 +37,10 @@ const (
 	// and non-executable files which have the same content digests.
 	executableSuffix = "executable"
 
+	// markerSuffix is a suffix appended to marker files in filecache.
+	// Marker files represent external resources managed outside the filecache.
+	markerSuffix = "marker"
+
 	// hitMetricLabel is the prometheus metric label applied to filecache hits.
 	hitMetricLabel = "hit"
 	// missMetricLabel is the prometheus metric label applied to filecache misses.
@@ -98,6 +102,12 @@ type entry struct {
 	// sizeBytes is the file size as reported by the original FileNode metadata
 	// when the file was added to the file cache.
 	sizeBytes int64
+	// isMarker indicates whether this entry is a marker file.
+	// Marker files represent external resources and support reference counting.
+	isMarker bool
+	// refCount tracks the number of active leases on this marker file.
+	// Only used when isMarker is true. Entries with refCount > 0 cannot be evicted.
+	refCount int64
 }
 
 func sizeFn(v *entry) int64 {
@@ -117,6 +127,14 @@ func evictFn(rootDir string) func(string, *entry, lru.EvictionReason) {
 	}
 }
 
+// canEvictFn returns false for marker entries that have active leases (refCount > 0).
+func canEvictFn(key string, v *entry) bool {
+	if v.isMarker && v.refCount > 0 {
+		return false
+	}
+	return true
+}
+
 // NewFileCache constructs an fileCache with maxSize that will cache files
 // in rootDir.
 // If deleteContent is true, the root dir will be deleted and recreated.
@@ -133,7 +151,12 @@ func NewFileCache(rootDir string, maxSizeBytes int64, deleteContent bool) (*file
 	if err := disk.EnsureDirectoryExists(rootDir); err != nil {
 		return nil, err
 	}
-	l, err := lru.NewLRU[*entry](&lru.Config[*entry]{MaxSize: maxSizeBytes, OnEvict: evictFn(rootDir), SizeFn: sizeFn})
+	l, err := lru.NewLRU[*entry](&lru.Config[*entry]{
+		MaxSize:  maxSizeBytes,
+		OnEvict:  evictFn(rootDir),
+		SizeFn:   sizeFn,
+		CanEvict: canEvictFn,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -602,4 +625,89 @@ func wrapOSError(err error, message string) error {
 		return status.NotFoundErrorf("%s: %s", message, err)
 	}
 	return status.InternalErrorf("%s: %s", message, err)
+}
+
+// markerKey returns the cache key for a marker file.
+func markerKey(ctx context.Context, node *repb.FileNode) string {
+	groupID := groupIDStringFromContext(ctx)
+	return groupID + "/" + node.GetDigest().GetHash() + "." + markerSuffix
+}
+
+// markerLease implements interfaces.MarkerLease.
+type markerLease struct {
+	fc   *fileCache
+	key  string
+	path string
+}
+
+func (l *markerLease) Path() string {
+	return l.path
+}
+
+func (l *markerLease) Release() {
+	l.fc.lock.Lock()
+	defer l.fc.lock.Unlock()
+
+	e, ok := l.fc.l.Get(l.key)
+	if !ok {
+		return
+	}
+	if e.refCount > 0 {
+		e.refCount--
+	}
+}
+
+func (c *fileCache) AddMarkerFile(ctx context.Context, node *repb.FileNode, resourceSizeBytes int64, existingPath string) error {
+	k := markerKey(ctx, node)
+	fp := filecachePath(c.rootDir, k)
+
+	// Ensure parent directory exists.
+	if err := disk.EnsureDirectoryExists(filepath.Dir(fp)); err != nil {
+		return err
+	}
+
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	// Remove any existing entry.
+	c.l.Remove(k)
+
+	groupID := groupIDStringFromContext(ctx)
+	if err := cloneOrLink(groupID, existingPath, fp); err != nil {
+		return err
+	}
+
+	e := &entry{
+		addedAtUsec: time.Now().UnixMicro(),
+		sizeBytes:   resourceSizeBytes,
+		isMarker:    true,
+		refCount:    0,
+	}
+	if !c.l.Add(k, e) {
+		return status.InternalErrorf("could not add marker key %s to filecache lru", k)
+	}
+	return nil
+}
+
+func (c *fileCache) GetMarkerFile(ctx context.Context, node *repb.FileNode) (interfaces.MarkerLease, error) {
+	k := markerKey(ctx, node)
+
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	e, ok := c.l.Get(k)
+	if !ok {
+		return nil, status.NotFoundErrorf("marker file not found: %s", node.GetDigest().GetHash())
+	}
+	if !e.isMarker {
+		return nil, status.NotFoundErrorf("entry is not a marker file: %s", node.GetDigest().GetHash())
+	}
+
+	e.refCount++
+
+	return &markerLease{
+		fc:   c,
+		key:  k,
+		path: filecachePath(c.rootDir, k),
+	}, nil
 }

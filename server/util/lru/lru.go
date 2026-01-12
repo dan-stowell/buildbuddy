@@ -31,6 +31,11 @@ const (
 type EvictedCallback[V any] func(key string, value V, reason EvictionReason)
 type SizeFn[V any] func(value V) int64
 
+// CanEvictCallback is a function that returns whether an entry can be evicted.
+// If it returns false, the LRU will skip this entry and try to evict the next
+// oldest entry instead.
+type CanEvictCallback[V any] func(key string, value V) bool
+
 // Config specifies how the LRU cache is to be constructed.
 // MaxSize & SizeFn are required.
 type Config[V any] struct {
@@ -38,6 +43,9 @@ type Config[V any] struct {
 	SizeFn SizeFn[V]
 	// Optional callback for cache eviction events.
 	OnEvict EvictedCallback[V]
+	// Optional callback to check if an entry can be evicted.
+	// If not set, all entries are evictable.
+	CanEvict CanEvictCallback[V]
 	// Maximum amount of data to store in the cache.
 	// The size of each entry is determined by SizeFn.
 	MaxSize int64
@@ -53,6 +61,7 @@ type LRU[V any] struct {
 	evictList     *list.List
 	items         map[string]*list.Element
 	onEvict       EvictedCallback[V]
+	canEvict      CanEvictCallback[V]
 	maxSize       int64
 	currentSize   int64
 	updateInPlace bool
@@ -78,6 +87,7 @@ func NewLRU[V any](config *Config[V]) (*LRU[V], error) {
 		evictList:     list.New(),
 		items:         make(map[string]*list.Element),
 		onEvict:       config.OnEvict,
+		canEvict:      config.CanEvict,
 		sizeFn:        config.SizeFn,
 		updateInPlace: config.UpdateInPlace,
 	}
@@ -86,26 +96,45 @@ func NewLRU[V any](config *Config[V]) (*LRU[V], error) {
 
 // Add adds a value to the cache. Returns true if the key was added.
 func (c *LRU[V]) Add(key string, value V) bool {
+	newSize := c.sizeFn(value)
+
 	if ent, ok := c.items[key]; ok {
 		if c.updateInPlace {
 			// Replace the existing item, moving it to the front.
 			oldSize := c.sizeFn(ent.Value.(*Entry[V]).value)
-			newSize := c.sizeFn(value)
 			c.currentSize += (newSize - oldSize)
 			c.evictList.MoveToFront(ent)
 			ent.Value.(*Entry[V]).value = value
+			// Evict if we're now over capacity
+			for c.currentSize > c.maxSize {
+				if !c.removeOldest() {
+					break
+				}
+			}
 		} else {
-			// Remove the existing item and re-insert
+			// Remove the existing item and re-insert.
+			// We need to evict before adding to ensure we don't evict
+			// the item we're about to add.
 			c.removeElement(ent, ConflictEviction)
-			c.addItem(key, value, c.sizeFn(value), true /*=front*/)
+			for c.currentSize+newSize > c.maxSize {
+				if !c.removeOldest() {
+					break
+				}
+			}
+			c.addItem(key, value, newSize, true /*=front*/)
 		}
 	} else {
+		// Evict items to make room for the new item before adding it.
+		// This ensures we don't evict the item we're about to add.
+		for c.currentSize+newSize > c.maxSize {
+			if !c.removeOldest() {
+				// Nothing could be evicted (all entries are pinned).
+				// The cache will be over capacity after adding.
+				break
+			}
+		}
 		// Add new item
-		c.addItem(key, value, c.sizeFn(value), true /*=front*/)
-	}
-
-	for c.currentSize > c.maxSize {
-		c.removeOldest()
+		c.addItem(key, value, newSize, true /*=front*/)
 	}
 	return true
 }
@@ -169,13 +198,16 @@ func (c *LRU[V]) Remove(key string) (present bool) {
 	return false
 }
 
-// RemoveOldest removes the oldest item from the cache.
+// RemoveOldest removes the oldest evictable item from the cache.
+// If canEvict is set, it skips entries that cannot be evicted.
 // The OnEvict callback treats this as a SizeEviction.
 func (c *LRU[V]) RemoveOldest() (V, bool) {
-	ent := c.evictList.Back()
-	if ent != nil {
-		c.removeElement(ent, SizeEviction)
-		return ent.Value.(*Entry[V]).value, true
+	for ent := c.evictList.Back(); ent != nil; ent = ent.Prev() {
+		kv := ent.Value.(*Entry[V])
+		if c.canEvict == nil || c.canEvict(kv.key, kv.value) {
+			c.removeElement(ent, SizeEviction)
+			return kv.value, true
+		}
 	}
 	var v V
 	return v, false
@@ -194,12 +226,18 @@ func (c *LRU[V]) MaxSize() int64 {
 	return c.maxSize
 }
 
-// removeOldest is just like RemoveOldest, but without any return values.
-func (c *LRU[V]) removeOldest() {
-	ent := c.evictList.Back()
-	if ent != nil {
-		c.removeElement(ent, SizeEviction)
+// removeOldest removes the oldest evictable item from the cache.
+// If canEvict is set, it skips entries that cannot be evicted.
+// Returns true if an item was removed, false if nothing could be evicted.
+func (c *LRU[V]) removeOldest() bool {
+	for ent := c.evictList.Back(); ent != nil; ent = ent.Prev() {
+		kv := ent.Value.(*Entry[V])
+		if c.canEvict == nil || c.canEvict(kv.key, kv.value) {
+			c.removeElement(ent, SizeEviction)
+			return true
+		}
 	}
+	return false
 }
 
 // addElement adds a new item to the cache. It does not perform any
