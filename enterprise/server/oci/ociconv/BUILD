@@ -28,10 +28,10 @@ go_library(
 
 go_test(
     name = "ociconv_test",
-    srcs = ["ociconv_test.go"],
+    srcs = ["ociconv_test.go", "export_test.go"],
+    embed = [":ociconv"],
     target_compatible_with = ["@platforms//os:linux"],
     deps = [
-        ":ociconv",
         "//enterprise/server/remote_execution/filecache",
         "//enterprise/server/testutil/testregistry",
         "//enterprise/server/util/ext4",

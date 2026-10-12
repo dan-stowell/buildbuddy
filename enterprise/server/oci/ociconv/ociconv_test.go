@@ -370,6 +370,7 @@ func TestConcurrentConversionAcrossCredentials(t *testing.T) {
 	for _, localCache := range []bool{false, true} {
 		t.Run(fmt.Sprintf("filecache=%t", localCache), func(t *testing.T) {
 			flags.Set(t, "executor.serialize_ext4_conversions", true)
+			lockWaiting := ociconv.ObserveConversionLockForTest(t)
 			flags.Set(t, "executor.local_cache_store_ext4_images", localCache)
 			flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
 			te := testenv.GetTestEnv(t)
@@ -410,13 +411,12 @@ func TestConcurrentConversionAcrossCredentials(t *testing.T) {
 			}
 			holder := call(context.Background(), 0)
 			awaitConversionSignal(t, entered)
-			ctx := &conversionWaitContext{Context: context.Background(), waiting: make(chan struct{})}
-			waiter := call(ctx, 1)
-			awaitConversionSignal(t, ctx.waiting)
+			waiter := call(context.Background(), 1)
+			awaitConversionSignal(t, lockWaiting)
 			select {
 			case err := <-waiter:
 				t.Fatalf("waiter completed while conversion holder was blocked: %v", err)
-			case <-time.After(100 * time.Millisecond):
+			default:
 			}
 			gate.Do(func() { close(release) })
 			require.NoError(t, awaitConversionResult(t, holder))
@@ -430,19 +430,6 @@ func TestConcurrentConversionAcrossCredentials(t *testing.T) {
 
 		})
 	}
-}
-
-// Observing Done establishes that the caller registered with singleflight and
-// reached its wait, before the test releases the registry or cancels it.
-type conversionWaitContext struct {
-	context.Context
-	waiting chan struct{}
-	once    sync.Once
-}
-
-func (c *conversionWaitContext) Done() <-chan struct{} {
-	c.once.Do(func() { close(c.waiting) })
-	return c.Context.Done()
 }
 
 func awaitConversionSignal(t *testing.T, signal <-chan struct{}) {
@@ -469,6 +456,7 @@ func TestConcurrentConversionAuthentication(t *testing.T) {
 	for _, invalidFirst := range []bool{true, false} {
 		t.Run(fmt.Sprintf("invalid-first=%t", invalidFirst), func(t *testing.T) {
 			flags.Set(t, "executor.serialize_ext4_conversions", true)
+			lockWaiting := ociconv.ObserveConversionLockForTest(t)
 			flags.Set(t, "executor.local_cache_store_ext4_images", true)
 			flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
 			entered, release := make(chan struct{}), make(chan struct{})
@@ -510,13 +498,12 @@ func TestConcurrentConversionAuthentication(t *testing.T) {
 			}
 			leader := call(context.Background(), firstCreds, "first")
 			awaitConversionSignal(t, entered)
-			ctx := &conversionWaitContext{Context: context.Background(), waiting: make(chan struct{})}
-			waiter := call(ctx, secondCreds, "second")
-			awaitConversionSignal(t, ctx.waiting)
+			waiter := call(context.Background(), secondCreds, "second")
+			awaitConversionSignal(t, lockWaiting)
 			select {
 			case err := <-waiter:
 				t.Fatalf("waiter completed while conversion holder was blocked: %v", err)
-			case <-time.After(100 * time.Millisecond):
+			default:
 			}
 			gate.Do(func() { close(release) })
 			leaderErr := awaitConversionResult(t, leader)
@@ -536,6 +523,7 @@ func TestConcurrentConversionAuthentication(t *testing.T) {
 
 func TestCancelConversionLockWaiter(t *testing.T) {
 	flags.Set(t, "executor.serialize_ext4_conversions", true)
+	lockWaiting := ociconv.ObserveConversionLockForTest(t)
 	flags.Set(t, "executor.local_cache_store_ext4_images", true)
 	flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
 	entered, release := make(chan struct{}), make(chan struct{})
@@ -573,16 +561,14 @@ func TestCancelConversionLockWaiter(t *testing.T) {
 	awaitConversionSignal(t, entered)
 	cancelCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ctx := &conversionWaitContext{Context: cancelCtx, waiting: make(chan struct{})}
-	cancelled := call(ctx, "cancelled")
-	awaitConversionSignal(t, ctx.waiting)
-	otherCtx := &conversionWaitContext{Context: context.Background(), waiting: make(chan struct{})}
-	other := call(otherCtx, "other")
-	awaitConversionSignal(t, otherCtx.waiting)
+	cancelled := call(cancelCtx, "cancelled")
+	awaitConversionSignal(t, lockWaiting)
+	other := call(context.Background(), "other")
+	awaitConversionSignal(t, lockWaiting)
 	select {
 	case err := <-other:
 		t.Fatalf("other waiter completed while holder was blocked: %v", err)
-	case <-time.After(100 * time.Millisecond):
+	default:
 	}
 	require.Equal(t, int64(1), blobs.Load(), "waiters must not fetch while the holder owns the conversion lock")
 	cancel()

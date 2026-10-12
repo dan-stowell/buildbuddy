@@ -50,6 +50,8 @@ var (
 	// Single-flight group used to dedupe firecracker image conversions.
 	conversionGroup singleflight.Group[string, string]
 	conversionLocks = lockmap.New[string]()
+	// Overridden only by tests to observe a contended acquisition.
+	lockConversion = conversionLocks.Lock
 
 	serializeExt4Conversions    = flag.Bool("executor.serialize_ext4_conversions", false, "Serialize conversion cache misses across credentials, without sharing registry authentication errors.", flag.Internal)
 	localCacheStoreExt4Images   = flag.Bool("executor.local_cache_store_ext4_images", true, "If true, store converted Firecracker ext4 images in filecache instead of cacheRoot/images/ext4.")
@@ -279,7 +281,7 @@ func CreateDiskImage(ctx context.Context, resolver *oci.Resolver, fileCache inte
 		defer cancel()
 
 		if *serializeExt4Conversions {
-			unlock := conversionLocks.Lock(conversionCacheKey)
+			unlock := lockConversion(conversionCacheKey)
 			defer unlock()
 			if err := ctx.Err(); err != nil {
 				return "", err

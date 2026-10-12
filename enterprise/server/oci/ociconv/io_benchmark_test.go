@@ -82,9 +82,12 @@ func TestConversionIO(t *testing.T) {
 	if os.Getenv("OCICONV_IO_BENCH") != "1" {
 		t.Skip("opt-in real-image disk IO benchmark")
 	}
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to drop caches and mount images")
+	}
 	flags.Set(t, "executor.mmap_memory_bytes", int64(256*1024*1024))
 	require.NoError(t, resources.Configure(true))
-	require.Equal(t, 0, os.Geteuid(), "run as root to drop caches and mount images")
+
 	images := []string{"mirror.gcr.io/library/alpine:3.20", "mirror.gcr.io/library/ubuntu:24.04", "gcr.io/flame-public/rbe-ubuntu24-04:latest"}
 	if s := os.Getenv("OCICONV_IO_IMAGES"); s != "" {
 		images = strings.Split(s, ",")

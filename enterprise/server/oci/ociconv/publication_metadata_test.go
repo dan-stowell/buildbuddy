@@ -24,7 +24,9 @@ func TestPublicationMetadata(t *testing.T) {
 	if os.Getenv("OCICONV_METADATA_CHECK") != "1" {
 		t.Skip("opt-in mounted metadata fixture")
 	}
-	require.Equal(t, 0, os.Geteuid())
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to create device nodes and mount images")
+	}
 	ctx := context.Background()
 	root := t.TempDir()
 	tree := filepath.Join(root, "tree")

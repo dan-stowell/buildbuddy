@@ -110,11 +110,16 @@ Validation:
 
 Concurrent authentication tests hold the first registry request open until the second caller is waiting. With invalid credentials first, that caller receives a 401 and the valid caller independently converts and links the image. With valid credentials first, conversion succeeds and the invalid caller reuses the populated cache, preserving the existing cached-image access behavior.
 
-The cancellation test blocks the holder's layer fetch, starts two callers with different credentials, and cancels one while it waits for the conversion lock. It returns `context.Canceled` within one second, before the holder is released. The holder and remaining waiter then succeed, share an inode, and fetch the layer only once.
+The cancellation test blocks the holder's layer fetch and starts two callers with different credentials. A test-only lock implementation signals only after a worker fails `TryLock` on the held per-key mutex. The test waits for both contention signals before cancelling one caller; no sleeps establish ordering. It returns `context.Canceled` within one second, before the holder is released. The holder and remaining waiter then succeed, share an inode, and fetch the layer only once.
 
-The concurrent successful-caller test now runs in both filecache and legacy-cache modes (`executor.local_cache_store_ext4_images=false`). A blocked layer fetch keeps the holder in flight while the other credential pair waits; both outputs share an inode and only one layer GET occurs. These added tests require no root privileges. No production behavior changes were needed.
+The concurrent successful-caller test now runs in both filecache and legacy-cache modes (`executor.local_cache_store_ext4_images=false`). A blocked layer fetch keeps the holder in flight while the other credential pair waits; both outputs share an inode and only one layer GET occurs. These added tests require no root privileges. The same contention hook now orders the authentication and successful serialization tests as well. Production still uses the existing lockmap; only its acquisition function is replaceable by tests, with no conversion behavior changes.
 
-Validation for this follow-up: `bazel test --nocache_test_results //enterprise/server/oci/ociconv:ociconv_test //enterprise/server/oci/ociconv:io_benchmark_test` passes both targets. All added cases ran without skips; the unchanged opt-in benchmark and mounted metadata fixture skip in the default run.
+The opt-in IO benchmark and mounted metadata fixture now skip cleanly when enabled without root, before performing privileged setup.
+
+Validation for this follow-up (both targets pass uncached):
+
+- Non-root: `bazel test --nocache_test_results --test_env=OCICONV_IO_BENCH=1 --test_env=OCICONV_METADATA_CHECK=1 //enterprise/server/oci/ociconv:ociconv_test //enterprise/server/oci/ociconv:io_benchmark_test`. All conversion/concurrency tests run; both enabled privileged tests report their root-required skip reasons.
+- Root: `bazel test --nocache_test_results --test_strategy=standalone --spawn_strategy=local --test_arg=-test.v --run_under='sudo -n env OCICONV_IO_BENCH=1 OCICONV_METADATA_CHECK=1 OCICONV_IO_IMAGES=mirror.gcr.io/library/alpine:3.20 OCICONV_IO_RUNS=1' //enterprise/server/oci/ociconv:ociconv_test //enterprise/server/oci/ociconv:io_benchmark_test`. All concurrency cases run. The benchmark executes one Alpine sample for each of the four publication modes, and the mounted metadata fixture executes baseline plus all four modes, including byte equality, e2fsck, device, xattr, ownership, hardlink and timestamp checks.
 
 ## Reproduce
 
