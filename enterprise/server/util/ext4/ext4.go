@@ -282,6 +282,11 @@ func ImageToDirectory(ctx context.Context, inputFile, outputDir string, paths []
 // rootfs tar. Requires mke2fs >= 1.47.1 and runtime libarchive support. Callers
 // must return readers whose Close interrupts a blocked Read (mutate.Extract does).
 func TarToImageAutoSize(ctx context.Context, open tarstream.Open, outputFile string, excludeDev bool) error {
+	return tarToImageAutoSize(ctx, open, outputFile, excludeDev, exec.CommandContext)
+}
+
+// command is injected only by internal subprocess lifecycle tests.
+func tarToImageAutoSize(ctx context.Context, open tarstream.Open, outputFile string, excludeDev bool, command func(context.Context, string, ...string) *exec.Cmd) error {
 	if err := checkImageOutputPath(outputFile); err != nil {
 		return err
 	}
@@ -320,7 +325,7 @@ func TarToImageAutoSize(ctx context.Context, open tarstream.Open, outputFile str
 		return err
 	}
 	defer pr.Close()
-	cmd := exec.CommandContext(ctx, mke2fsPath, "-L", "''", "-N", fmt.Sprint(entries+11), "-O", "^64bit", "-d", "-", "-m", "5", "-r", "1", "-b", fmt.Sprint(blockSize), "-t", "ext4", outputFile, fmt.Sprintf("%dK", size/iecKilobyte))
+	cmd := command(ctx, mke2fsPath, "-L", "''", "-N", fmt.Sprint(entries+11), "-O", "^64bit", "-d", "-", "-m", "5", "-r", "1", "-b", fmt.Sprint(blockSize), "-t", "ext4", outputFile, fmt.Sprintf("%dK", size/iecKilobyte))
 	cmd.Stdin = pr
 	var out strings.Builder
 	cmd.Stdout, cmd.Stderr = &out, &out

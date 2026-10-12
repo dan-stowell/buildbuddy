@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"path"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -129,6 +131,26 @@ func excluded(name string, excludeDev bool) bool {
 // been added. GNU tar without --xattrs (the current baseline) ignores archive
 // xattrs, so strip those here too. Only use this with an already flattened tar.
 func Normalize(ctx context.Context, r io.Reader, w io.Writer, excludeDev bool) error {
+	// Read Linux's umask without changing process-global state.
+	status, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return fmt.Errorf("read process umask: %w", err)
+	}
+	var parentMode int64
+	found := false
+	for line := range strings.SplitSeq(string(status), "\n") {
+		if value, ok := strings.CutPrefix(line, "Umask:"); ok {
+			mask, err := strconv.ParseInt(strings.TrimSpace(value), 8, 32)
+			if err != nil {
+				return fmt.Errorf("parse process umask: %w", err)
+			}
+			parentMode, found = 0777&^mask, true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("process status missing umask")
+	}
 	bw := bufio.NewWriterSize(w, 256*1024)
 	tr, tw := tar.NewReader(r), tar.NewWriter(bw)
 	created := map[string]bool{".": true}
@@ -145,7 +167,7 @@ func Normalize(ctx context.Context, r io.Reader, w io.Writer, excludeDev bool) e
 		if err := parents(path.Dir(name)); err != nil {
 			return err
 		}
-		h := &tar.Header{Name: name, Typeflag: tar.TypeDir, Mode: 0755, ModTime: time.Now(), Format: tar.FormatPAX}
+		h := &tar.Header{Name: name, Typeflag: tar.TypeDir, Mode: parentMode, ModTime: time.Now(), Format: tar.FormatPAX}
 		if err := tw.WriteHeader(h); err != nil {
 			return err
 		}
@@ -179,6 +201,10 @@ func Normalize(ctx context.Context, r io.Reader, w io.Writer, excludeDev bool) e
 		// bytes as a regular file; mke2fs turns zero blocks back into holes.
 		if h.Typeflag == tar.TypeGNUSparse {
 			h.Typeflag = tar.TypeReg
+		}
+		// Linux creates symlinks with 0777 regardless of the archive mode.
+		if h.Typeflag == tar.TypeSymlink {
+			h.Mode = 0777
 		}
 		h.Xattrs = nil
 		for k := range h.PAXRecords {
