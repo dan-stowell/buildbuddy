@@ -9,6 +9,7 @@ go_library(
     target_compatible_with = ["@platforms//os:linux"],
     deps = select({
         "@io_bazel_rules_go//go/platform:linux": [
+            "//enterprise/server/util/ext4/tarstream",
             "//server/metrics",
             "//server/util/flag",
             "//server/util/log",
@@ -43,4 +44,15 @@ go_test(
         ],
         "//conditions:default": [],
     }),
+)
+
+
+go_test(
+    name = "stream_internal_test",
+    exec_properties = {
+        "test.container-image": "docker://mirror.gcr.io/library/ubuntu@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78",
+    },
+    srcs = ["stream_internal_test.go"],
+    embed = [":ext4"],
+    target_compatible_with = ["@platforms//os:linux"],
 )

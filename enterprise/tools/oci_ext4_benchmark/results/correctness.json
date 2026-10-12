@@ -1,0 +1,6724 @@
+{
+  "alpine": {
+    "hcsshim-normalized": {
+      "fsck_exit": 4,
+      "baseline_entries": 519,
+      "candidate_entries": 519,
+      "generated_mtimes": [
+        {
+          "path": ".",
+          "baseline": 1791823063000000000,
+          "candidate": 0
+        },
+        {
+          "path": "lost+found",
+          "baseline": 1791823063000000000,
+          "candidate": 0
+        }
+      ],
+      "differences": []
+    },
+    "hcsshim": {
+      "fsck_exit": 4,
+      "baseline_entries": 519,
+      "candidate_entries": 519,
+      "generated_mtimes": [
+        {
+          "path": ".",
+          "baseline": 1791823063000000000,
+          "candidate": 0
+        },
+        {
+          "path": "lost+found",
+          "baseline": 1791823063000000000,
+          "candidate": 0
+        }
+      ],
+      "differences": []
+    },
+    "mke2fs-raw": {
+      "fsck_exit": 0,
+      "baseline_entries": 519,
+      "candidate_entries": 519,
+      "generated_mtimes": [
+        {
+          "path": ".",
+          "baseline": 1791823063000000000,
+          "candidate": 1791823064000000000
+        },
+        {
+          "path": "lost+found",
+          "baseline": 1791823063000000000,
+          "candidate": 1791823064000000000
+        }
+      ],
+      "differences": []
+    },
+    "mke2fs-strict": {
+      "fsck_exit": 0,
+      "baseline_entries": 519,
+      "candidate_entries": 519,
+      "generated_mtimes": [
+        {
+          "path": ".",
+          "baseline": 1791823063000000000,
+          "candidate": 1791823641000000000
+        },
+        {
+          "path": "lost+found",
+          "baseline": 1791823063000000000,
+          "candidate": 1791823641000000000
+        }
+      ],
+      "differences": []
+    },
+    "mke2fs": {
+      "fsck_exit": 0,
+      "baseline_entries": 519,
+      "candidate_entries": 519,
+      "generated_mtimes": [],
+      "differences": []
+    },
+    "tmpfs": {
+      "fsck_exit": 0,
+      "baseline_entries": 519,
+      "candidate_entries": 519,
+      "generated_mtimes": [
+        {
+          "path": ".",
+          "baseline": 1791823063000000000,
+          "candidate": 1791823065000000000
+        },
+        {
+          "path": "lost+found",
+          "baseline": 1791823063000000000,
+          "candidate": 1791823065000000000
+        }
+      ],
+      "differences": []
+    },
+    "baseline": {
+      "fsck_exit": 0
+    }
+  },
+  "ubuntu": {
+    "hcsshim-normalized": {
+      "fsck_exit": 4,
+      "baseline_entries": 3445,
+      "candidate_entries": 3445,
+      "generated_mtimes": [
+        {
+          "path": ".",
+          "baseline": 1791823068000000000,
+          "candidate": 0
+        },
+        {
+          "path": "lost+found",
+          "baseline": 1791823068000000000,
+          "candidate": 0
+        }
+      ],
+      "differences": []
+    },
+    "hcsshim": {
+      "fsck_exit": 4,
+      "baseline_entries": 3445,
+      "candidate_entries": 3445,
+      "generated_mtimes": [
+        {
+          "path": ".",
+          "baseline": 1791823068000000000,
+          "candidate": 0
+        },
+        {
+          "path": "lost+found",
+          "baseline": 1791823068000000000,
+          "candidate": 0
+        }
+      ],
+      "differences": []
+    },
+    "mke2fs-raw": {
+      "fsck_exit": 0,
+      "baseline_entries": 3445,
+      "candidate_entries": 3445,
+      "generated_mtimes": [
+        {
+          "path": ".",
+          "baseline": 1791823068000000000,
+          "candidate": 1791823076000000000
+        },
+        {
+          "path": "lost+found",
+          "baseline": 1791823068000000000,
+          "candidate": 1791823076000000000
+        }
+      ],
+      "differences": []
+    },
+    "mke2fs-strict": {
+      "fsck_exit": 0,
+      "baseline_entries": 3445,
+      "candidate_entries": 3445,
+      "generated_mtimes": [
+        {
+          "path": ".",
+          "baseline": 1791823068000000000,
+          "candidate": 1791823645000000000
+        },
+        {
+          "path": "lost+found",
+          "baseline": 1791823068000000000,
+          "candidate": 1791823645000000000
+        }
+      ],
+      "differences": []
+    },
+    "mke2fs": {
+      "fsck_exit": 0,
+      "baseline_entries": 3445,
+      "candidate_entries": 3445,
+      "generated_mtimes": [
+        {
+          "path": ".",
+          "baseline": 1791823068000000000,
+          "candidate": 1791823072000000000
+        },
+        {
+          "path": "lost+found",
+          "baseline": 1791823068000000000,
+          "candidate": 1791823072000000000
+        }
+      ],
+      "differences": []
+    },
+    "tmpfs": {
+      "fsck_exit": 0,
+      "baseline_entries": 3445,
+      "candidate_entries": 3445,
+      "generated_mtimes": [
+        {
+          "path": ".",
+          "baseline": 1791823068000000000,
+          "candidate": 1791823083000000000
+        },
+        {
+          "path": "lost+found",
+          "baseline": 1791823068000000000,
+          "candidate": 1791823083000000000
+        }
+      ],
+      "differences": []
+    },
+    "baseline": {
+      "fsck_exit": 0
+    }
+  },
+  "large": {
+    "hcsshim-normalized": {
+      "fsck_exit": 4,
+      "baseline_entries": 16760,
+      "candidate_entries": 16760,
+      "generated_mtimes": [
+        {
+          "path": ".",
+          "baseline": 1791823117000000000,
+          "candidate": 0
+        },
+        {
+          "path": "lost+found",
+          "baseline": 1791823117000000000,
+          "candidate": 0
+        }
+      ],
+      "differences": [
+        {
+          "path": "etc",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923435000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/X11/Xsession.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923426000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/apt",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612199000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/apt/apt.conf.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923399000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/apt/sources.list.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823113000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923415000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/default",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923427000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/dpkg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923377000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/init.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923427000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/kernel",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923387000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/pam.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923409000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "home",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923435000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "root",
+          "baseline": {
+            "mode": "0o40700",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40700",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923400000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "run/systemd",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923388000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/include",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923407000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/include/x86_64-linux-gnu",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923375000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/gnupg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923429000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/locale",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923434000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/lsb",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612548000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/lsb/init-functions.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923387000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/mime/packages",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923408000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/sysctl.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/systemd/system",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923421000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/tmpfiles.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923407000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/udev/rules.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923387000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/x86_64-linux-gnu",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923422000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/x86_64-linux-gnu/security",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923390000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/libexec",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923420000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/local",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612192000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/local/share",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923398000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/sbin",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/apport/package-hooks",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/bash-completion/completions",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923421000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/bug",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923407000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc-base",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923350000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/bsdutils",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923383000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/dpkg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923376000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/gpgv",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923358000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libblkid1",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923385000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libc6",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923346000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libcap2",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923385000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/liblzma5",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923372000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libsmartcols1",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923388000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libssl3t64",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923386000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libuuid1",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923386000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/perl-base",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923370000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/dpkg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923376000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/gdb/auto-load",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923350000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/gnupg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923414000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/info",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923408000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/lintian",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612191000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/lintian/overrides",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/af",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/be",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ga",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/hr",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ia",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ka",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/kk",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ms",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/sr",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923390000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ta",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923390000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/pam-configs",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923390000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/perl5",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923408000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/perl5/Debian",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923393000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/pixmaps",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923350000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/polkit-1/actions",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923394000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/python3",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923393000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/zsh/vendor-completions",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923421000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612576000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/cache",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/cache/debconf",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923408000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/apt",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/dpkg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/dpkg/alternatives",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923434000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/dpkg/info",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/dpkg/triggers",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923398000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823114000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923388000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd/deb-systemd-helper-enabled",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923427000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd/deb-systemd-helper-enabled/multi-user.target.wants",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923427000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd/deb-systemd-user-helper-enabled",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923415000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd/deb-systemd-user-helper-enabled/sockets.target.wants",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923415000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/log",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923388000000000,
+            "xattrs": {}
+          }
+        }
+      ]
+    },
+    "hcsshim": {
+      "fsck_exit": 4,
+      "baseline_entries": 16760,
+      "candidate_entries": 16760,
+      "generated_mtimes": [
+        {
+          "path": ".",
+          "baseline": 1791823117000000000,
+          "candidate": 0
+        },
+        {
+          "path": "lost+found",
+          "baseline": 1791823117000000000,
+          "candidate": 0
+        }
+      ],
+      "differences": [
+        {
+          "path": "etc",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923435000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/X11/Xsession.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923426000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/apt",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612199000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/apt/apt.conf.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923399000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/apt/sources.list.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823113000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923415000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/default",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923427000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/dpkg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923377000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/init.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923427000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/kernel",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923387000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/pam.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923409000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "home",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923435000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "root",
+          "baseline": {
+            "mode": "0o40700",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40700",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923400000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "run/systemd",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923388000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/include",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923407000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/include/x86_64-linux-gnu",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923375000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/gnupg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923429000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/locale",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923434000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/lsb",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612548000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/lsb/init-functions.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923387000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/mime/packages",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923408000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/sysctl.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/systemd/system",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923421000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/tmpfiles.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923407000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/udev/rules.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923387000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/x86_64-linux-gnu",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923422000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-ptp-helper",
+          "baseline": {
+            "mode": "0o100755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1734440028000000000,
+            "xattrs": {},
+            "size": 534872,
+            "sha256": "b29f66a95a5a99cfa956120c86409550a1c43a9a38dffe9faaa5b8313900a945",
+            "hardlinks": [
+              "usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-ptp-helper"
+            ]
+          },
+          "candidate": {
+            "mode": "0o100755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1734440028000000000,
+            "xattrs": {
+              "security.capability": "0100000200148000000000000000000000000000"
+            },
+            "size": 534872,
+            "sha256": "b29f66a95a5a99cfa956120c86409550a1c43a9a38dffe9faaa5b8313900a945",
+            "hardlinks": [
+              "usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-ptp-helper"
+            ]
+          }
+        },
+        {
+          "path": "usr/lib/x86_64-linux-gnu/security",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923390000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/libexec",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923420000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/local",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612192000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/local/share",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923398000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/sbin",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/apport/package-hooks",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/bash-completion/completions",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923421000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/bug",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923407000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc-base",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923350000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/bsdutils",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923383000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/dpkg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923376000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/gpgv",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923358000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libblkid1",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923385000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libc6",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923346000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libcap2",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923385000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/liblzma5",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923372000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libsmartcols1",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923388000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libssl3t64",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923386000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libuuid1",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923386000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/perl-base",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923370000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/dpkg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923376000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/gdb/auto-load",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923350000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/gnupg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923414000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/info",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923408000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/lintian",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612191000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/lintian/overrides",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/af",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/be",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ga",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/hr",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ia",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ka",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/kk",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ms",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/sr",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923390000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ta",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923390000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/pam-configs",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923390000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/perl5",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923408000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/perl5/Debian",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923393000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/pixmaps",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923350000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/polkit-1/actions",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923394000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/python3",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923393000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/zsh/vendor-completions",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923421000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612576000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/cache",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/cache/debconf",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923408000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/apt",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/dpkg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/dpkg/alternatives",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923434000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/dpkg/info",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/dpkg/triggers",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923398000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823114000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923388000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd/deb-systemd-helper-enabled",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923427000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd/deb-systemd-helper-enabled/multi-user.target.wants",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923427000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd/deb-systemd-user-helper-enabled",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923415000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd/deb-systemd-user-helper-enabled/sockets.target.wants",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923415000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/log",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923388000000000,
+            "xattrs": {}
+          }
+        }
+      ]
+    },
+    "mke2fs-raw": {
+      "fsck_exit": 0,
+      "baseline_entries": 16760,
+      "candidate_entries": 16760,
+      "generated_mtimes": [
+        {
+          "path": ".",
+          "baseline": 1791823117000000000,
+          "candidate": 1791823202000000000
+        },
+        {
+          "path": "lost+found",
+          "baseline": 1791823117000000000,
+          "candidate": 1791823202000000000
+        }
+      ],
+      "differences": [
+        {
+          "path": "etc",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923435000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/X11/Xsession.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923426000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/apt",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612199000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/apt/apt.conf.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923399000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/apt/sources.list.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823113000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923415000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/default",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923427000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/dpkg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923377000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/init.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923427000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/kernel",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923387000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/pam.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923409000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "home",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923435000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "root",
+          "baseline": {
+            "mode": "0o40700",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40700",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923400000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "run/systemd",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923388000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/include",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923407000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/include/x86_64-linux-gnu",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923375000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/gnupg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923429000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/locale",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923434000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/lsb",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612548000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/lsb/init-functions.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923387000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/mime/packages",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923408000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/sysctl.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/systemd/system",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923421000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/tmpfiles.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923407000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/udev/rules.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923387000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/x86_64-linux-gnu",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923422000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-ptp-helper",
+          "baseline": {
+            "mode": "0o100755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1734440028000000000,
+            "xattrs": {},
+            "size": 534872,
+            "sha256": "b29f66a95a5a99cfa956120c86409550a1c43a9a38dffe9faaa5b8313900a945",
+            "hardlinks": [
+              "usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-ptp-helper"
+            ]
+          },
+          "candidate": {
+            "mode": "0o100755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1734440028000000000,
+            "xattrs": {
+              "security.capability": "0100000200148000000000000000000000000000"
+            },
+            "size": 534872,
+            "sha256": "b29f66a95a5a99cfa956120c86409550a1c43a9a38dffe9faaa5b8313900a945",
+            "hardlinks": [
+              "usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-ptp-helper"
+            ]
+          }
+        },
+        {
+          "path": "usr/lib/x86_64-linux-gnu/security",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923390000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/libexec",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923420000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/local",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612192000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/local/share",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923398000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/sbin",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/apport/package-hooks",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/bash-completion/completions",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923421000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/bug",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923407000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc-base",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923350000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/bsdutils",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923383000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/dpkg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923376000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/gpgv",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923358000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libblkid1",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923385000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libc6",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923346000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libcap2",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923385000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/liblzma5",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923372000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libsmartcols1",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923388000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libssl3t64",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923386000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libuuid1",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923386000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/perl-base",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923370000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/dpkg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923376000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/gdb/auto-load",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923350000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/gnupg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923414000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/info",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923408000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/lintian",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612191000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/lintian/overrides",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/af",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/be",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ga",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/hr",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ia",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ka",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/kk",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ms",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/sr",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923390000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ta",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923390000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/pam-configs",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923390000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/perl5",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923408000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/perl5/Debian",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923393000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/pixmaps",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923350000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/polkit-1/actions",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923394000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/python3",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923393000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/zsh/vendor-completions",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923421000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612576000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/cache",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/cache/debconf",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923408000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/apt",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/dpkg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/dpkg/alternatives",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923434000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/dpkg/info",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/dpkg/triggers",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923398000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823114000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923388000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd/deb-systemd-helper-enabled",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923427000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd/deb-systemd-helper-enabled/multi-user.target.wants",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923427000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd/deb-systemd-user-helper-enabled",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923415000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd/deb-systemd-user-helper-enabled/sockets.target.wants",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923415000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/log",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923388000000000,
+            "xattrs": {}
+          }
+        }
+      ]
+    },
+    "mke2fs": {
+      "fsck_exit": 0,
+      "baseline_entries": 16760,
+      "candidate_entries": 16760,
+      "generated_mtimes": [
+        {
+          "path": ".",
+          "baseline": 1791823117000000000,
+          "candidate": 1791823157000000000
+        },
+        {
+          "path": "lost+found",
+          "baseline": 1791823117000000000,
+          "candidate": 1791823157000000000
+        }
+      ],
+      "differences": [
+        {
+          "path": "etc",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923435000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/X11/Xsession.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923426000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/apt",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612199000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/apt/apt.conf.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923399000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/apt/sources.list.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823113000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923415000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/default",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923427000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/dpkg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923377000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/init.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923427000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/kernel",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923387000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "etc/pam.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923409000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "home",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923435000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "root",
+          "baseline": {
+            "mode": "0o40700",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40700",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923400000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "run/systemd",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923388000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/include",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923407000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/include/x86_64-linux-gnu",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923375000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/gnupg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923429000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/locale",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923434000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/lsb",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612548000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/lsb/init-functions.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923387000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/mime/packages",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923408000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/sysctl.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/systemd/system",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923421000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/tmpfiles.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923407000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/udev/rules.d",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923387000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/x86_64-linux-gnu",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923422000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/lib/x86_64-linux-gnu/security",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923390000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/libexec",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923420000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/local",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612192000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/local/share",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923398000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/sbin",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/apport/package-hooks",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/bash-completion/completions",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923421000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/bug",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923407000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc-base",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923350000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/bsdutils",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923383000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/dpkg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923376000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/gpgv",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923358000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libblkid1",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923385000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libc6",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923346000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libcap2",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923385000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/liblzma5",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923372000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libsmartcols1",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923388000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libssl3t64",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923386000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/libuuid1",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923386000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/doc/perl-base",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923370000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/dpkg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923376000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/gdb/auto-load",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923350000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/gnupg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923414000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/info",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923408000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/lintian",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612191000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/lintian/overrides",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/af",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/be",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ga",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/hr",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ia",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ka",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/kk",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ms",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923389000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/sr",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923390000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/locale/ta",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923390000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/pam-configs",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923390000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/perl5",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923408000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/perl5/Debian",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923393000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/pixmaps",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923350000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/polkit-1/actions",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923394000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/python3",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923393000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "usr/share/zsh/vendor-completions",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923421000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1728612576000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/cache",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923419000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/cache/debconf",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923408000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/apt",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/dpkg",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/dpkg/alternatives",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923434000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/dpkg/info",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923433000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/dpkg/triggers",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923398000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823114000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923388000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd/deb-systemd-helper-enabled",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923427000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd/deb-systemd-helper-enabled/multi-user.target.wants",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923427000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd/deb-systemd-user-helper-enabled",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923415000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/lib/systemd/deb-systemd-user-helper-enabled/sockets.target.wants",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823116000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923415000000000,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "var/log",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1791823117000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1744923388000000000,
+            "xattrs": {}
+          }
+        }
+      ]
+    },
+    "baseline": {
+      "fsck_exit": 0
+    }
+  },
+  "fixture": {
+    "hcsshim-normalized": {
+      "fsck_exit": 4,
+      "baseline_entries": 12,
+      "candidate_entries": 12,
+      "generated_mtimes": [
+        {
+          "path": ".",
+          "baseline": 1791823674000000000,
+          "candidate": 0
+        },
+        {
+          "path": "lost+found",
+          "baseline": 1791823674000000000,
+          "candidate": 0
+        }
+      ],
+      "differences": [
+        {
+          "path": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "baseline": {
+            "mode": "0o100644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {},
+            "size": 9,
+            "sha256": "e634cc1daabcf0e599ab0e2123095ab4386337e2dda988ff10ec813c8141c245",
+            "hardlinks": [
+              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ]
+          },
+          "candidate": {
+            "mode": "0o100644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {},
+            "size": 9,
+            "sha256": "e634cc1daabcf0e599ab0e2123095ab4386337e2dda988ff10ec813c8141c245",
+            "hardlinks": [
+              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ]
+          }
+        },
+        {
+          "path": "dev",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "dev/block",
+          "baseline": {
+            "mode": "0o60644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {},
+            "major": 8,
+            "minor": 1
+          },
+          "candidate": {
+            "mode": "0o60644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {},
+            "major": 8,
+            "minor": 1
+          }
+        },
+        {
+          "path": "dev/null",
+          "baseline": {
+            "mode": "0o20644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {},
+            "major": 1,
+            "minor": 3
+          },
+          "candidate": {
+            "mode": "0o20644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {},
+            "major": 1,
+            "minor": 3
+          }
+        },
+        {
+          "path": "dir",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "dir/file",
+          "baseline": {
+            "mode": "0o106750",
+            "uid": 123,
+            "gid": 456,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {},
+            "size": 17,
+            "sha256": "6c846f500e74439d5a2d4ac6012759970373b4d59e352b0a95a0b83306566b78",
+            "hardlinks": [
+              "dir/file",
+              "dir/hard"
+            ]
+          },
+          "candidate": {
+            "mode": "0o106750",
+            "uid": 123,
+            "gid": 456,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {},
+            "size": 17,
+            "sha256": "6c846f500e74439d5a2d4ac6012759970373b4d59e352b0a95a0b83306566b78",
+            "hardlinks": [
+              "dir/file",
+              "dir/hard"
+            ]
+          }
+        },
+        {
+          "path": "dir/hard",
+          "baseline": {
+            "mode": "0o106750",
+            "uid": 123,
+            "gid": 456,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {},
+            "size": 17,
+            "sha256": "6c846f500e74439d5a2d4ac6012759970373b4d59e352b0a95a0b83306566b78",
+            "hardlinks": [
+              "dir/file",
+              "dir/hard"
+            ]
+          },
+          "candidate": {
+            "mode": "0o106750",
+            "uid": 123,
+            "gid": 456,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {},
+            "size": 17,
+            "sha256": "6c846f500e74439d5a2d4ac6012759970373b4d59e352b0a95a0b83306566b78",
+            "hardlinks": [
+              "dir/file",
+              "dir/hard"
+            ]
+          }
+        },
+        {
+          "path": "fifo",
+          "baseline": {
+            "mode": "0o10644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o10644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "sparse",
+          "baseline": {
+            "mode": "0o100644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {},
+            "size": 33554432,
+            "sha256": "4a0e4476be5b7b89845a9a2ab8a611a7e96df938eca8feb30c6520ccfe27bf17",
+            "hardlinks": [
+              "sparse"
+            ]
+          },
+          "candidate": {
+            "mode": "0o100644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {},
+            "size": 33554432,
+            "sha256": "4a0e4476be5b7b89845a9a2ab8a611a7e96df938eca8feb30c6520ccfe27bf17",
+            "hardlinks": [
+              "sparse"
+            ]
+          }
+        }
+      ]
+    },
+    "hcsshim": {
+      "fsck_exit": 4,
+      "baseline_entries": 12,
+      "candidate_entries": 12,
+      "generated_mtimes": [
+        {
+          "path": ".",
+          "baseline": 1791823674000000000,
+          "candidate": 1600000000123456789
+        },
+        {
+          "path": "lost+found",
+          "baseline": 1791823674000000000,
+          "candidate": 0
+        }
+      ],
+      "differences": [
+        {
+          "path": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "baseline": {
+            "mode": "0o100644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {},
+            "size": 9,
+            "sha256": "e634cc1daabcf0e599ab0e2123095ab4386337e2dda988ff10ec813c8141c245",
+            "hardlinks": [
+              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ]
+          },
+          "candidate": {
+            "mode": "0o100644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {},
+            "size": 9,
+            "sha256": "e634cc1daabcf0e599ab0e2123095ab4386337e2dda988ff10ec813c8141c245",
+            "hardlinks": [
+              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ]
+          }
+        },
+        {
+          "path": "dev",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "dev/block",
+          "baseline": {
+            "mode": "0o60644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {},
+            "major": 8,
+            "minor": 1
+          },
+          "candidate": {
+            "mode": "0o60644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {},
+            "major": 8,
+            "minor": 1
+          }
+        },
+        {
+          "path": "dev/null",
+          "baseline": {
+            "mode": "0o20644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {},
+            "major": 1,
+            "minor": 3
+          },
+          "candidate": {
+            "mode": "0o20644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {},
+            "major": 1,
+            "minor": 3
+          }
+        },
+        {
+          "path": "dir",
+          "baseline": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o40755",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "dir/file",
+          "baseline": {
+            "mode": "0o106750",
+            "uid": 123,
+            "gid": 456,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {},
+            "size": 17,
+            "sha256": "6c846f500e74439d5a2d4ac6012759970373b4d59e352b0a95a0b83306566b78",
+            "hardlinks": [
+              "dir/file",
+              "dir/hard"
+            ]
+          },
+          "candidate": {
+            "mode": "0o106750",
+            "uid": 123,
+            "gid": 456,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {
+              "security.capability": "0100000200040000000000000000000000000000",
+              "user.example": "66697874757265"
+            },
+            "size": 17,
+            "sha256": "6c846f500e74439d5a2d4ac6012759970373b4d59e352b0a95a0b83306566b78",
+            "hardlinks": [
+              "dir/file",
+              "dir/hard"
+            ]
+          }
+        },
+        {
+          "path": "dir/hard",
+          "baseline": {
+            "mode": "0o106750",
+            "uid": 123,
+            "gid": 456,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {},
+            "size": 17,
+            "sha256": "6c846f500e74439d5a2d4ac6012759970373b4d59e352b0a95a0b83306566b78",
+            "hardlinks": [
+              "dir/file",
+              "dir/hard"
+            ]
+          },
+          "candidate": {
+            "mode": "0o106750",
+            "uid": 123,
+            "gid": 456,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {
+              "security.capability": "0100000200040000000000000000000000000000",
+              "user.example": "66697874757265"
+            },
+            "size": 17,
+            "sha256": "6c846f500e74439d5a2d4ac6012759970373b4d59e352b0a95a0b83306566b78",
+            "hardlinks": [
+              "dir/file",
+              "dir/hard"
+            ]
+          }
+        },
+        {
+          "path": "fifo",
+          "baseline": {
+            "mode": "0o10644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {}
+          },
+          "candidate": {
+            "mode": "0o10644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {}
+          }
+        },
+        {
+          "path": "sparse",
+          "baseline": {
+            "mode": "0o100644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {},
+            "size": 33554432,
+            "sha256": "4a0e4476be5b7b89845a9a2ab8a611a7e96df938eca8feb30c6520ccfe27bf17",
+            "hardlinks": [
+              "sparse"
+            ]
+          },
+          "candidate": {
+            "mode": "0o100644",
+            "uid": 0,
+            "gid": 0,
+            "mtime_ns": 1600000000123456789,
+            "xattrs": {},
+            "size": 33554432,
+            "sha256": "4a0e4476be5b7b89845a9a2ab8a611a7e96df938eca8feb30c6520ccfe27bf17",
+            "hardlinks": [
+              "sparse"
+            ]
+          }
+        }
+      ]
+    },
+    "mke2fs-raw": {
+      "fsck_exit": 0,
+      "baseline_entries": 12,
+      "candidate_entries": 12,
+      "generated_mtimes": [
+        {
+          "path": ".",
+          "baseline": 1791823674000000000,
+          "candidate": 1600000000000000000
+        },
+        {
+          "path": "lost+found",
+          "baseline": 1791823674000000000,
+          "candidate": 1791823675000000000
+        }
+      ],
+      "differences": [
+        {
+          "path": "dir/file",
+          "baseline": {
+            "mode": "0o106750",
+            "uid": 123,
+            "gid": 456,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {},
+            "size": 17,
+            "sha256": "6c846f500e74439d5a2d4ac6012759970373b4d59e352b0a95a0b83306566b78",
+            "hardlinks": [
+              "dir/file",
+              "dir/hard"
+            ]
+          },
+          "candidate": {
+            "mode": "0o106750",
+            "uid": 123,
+            "gid": 456,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {
+              "security.capability": "0100000200040000000000000000000000000000"
+            },
+            "size": 17,
+            "sha256": "6c846f500e74439d5a2d4ac6012759970373b4d59e352b0a95a0b83306566b78",
+            "hardlinks": [
+              "dir/file",
+              "dir/hard"
+            ]
+          }
+        },
+        {
+          "path": "dir/hard",
+          "baseline": {
+            "mode": "0o106750",
+            "uid": 123,
+            "gid": 456,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {},
+            "size": 17,
+            "sha256": "6c846f500e74439d5a2d4ac6012759970373b4d59e352b0a95a0b83306566b78",
+            "hardlinks": [
+              "dir/file",
+              "dir/hard"
+            ]
+          },
+          "candidate": {
+            "mode": "0o106750",
+            "uid": 123,
+            "gid": 456,
+            "mtime_ns": 1600000000000000000,
+            "xattrs": {
+              "security.capability": "0100000200040000000000000000000000000000"
+            },
+            "size": 17,
+            "sha256": "6c846f500e74439d5a2d4ac6012759970373b4d59e352b0a95a0b83306566b78",
+            "hardlinks": [
+              "dir/file",
+              "dir/hard"
+            ]
+          }
+        }
+      ]
+    },
+    "mke2fs-strict": {
+      "fsck_exit": 0,
+      "baseline_entries": 12,
+      "candidate_entries": 12,
+      "generated_mtimes": [],
+      "differences": []
+    },
+    "mke2fs": {
+      "fsck_exit": 0,
+      "baseline_entries": 12,
+      "candidate_entries": 12,
+      "generated_mtimes": [],
+      "differences": []
+    },
+    "baseline": {
+      "fsck_exit": 0
+    }
+  }
+}

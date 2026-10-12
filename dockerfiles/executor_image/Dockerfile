@@ -12,6 +12,8 @@ RUN \
     apt-get install -y \
     # Necessary for firecracker
     e2fsprogs \
+    # Runtime tar support for mke2fs -d - (executor.stream_ext4_images).
+    libarchive13t64 \
     # FUSE support, used by vbd and vfs packages.
     # TODO: probably not needed since we use DirectMountStrict now?
     fuse \

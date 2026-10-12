@@ -1,0 +1,2 @@
+image=mirror.gcr.io/library/ubuntu:24.04 digest=sha256:f610ab94648195aa356059f5b41d6085c9d4d903c072430cdd1af7bdb646106b compressed_layers=29764422
+flattened_payload=78176728 entries=3443

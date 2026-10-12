@@ -3,9 +3,11 @@ package ociconv_test
 import (
 	"archive/tar"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -310,4 +312,37 @@ func TestLinkCachedImage_LegacyStorageWhenFileCacheDisabled(t *testing.T) {
 	content, err := os.ReadFile(linkedPath)
 	require.NoError(t, err)
 	require.Equal(t, "legacy-ext4", string(content))
+}
+
+func TestConvertContainerToExt4FS_Streaming(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("streaming OCI conversion requires root; non-root fallback is covered by TestStreamingFallbackMetadata")
+	}
+	// The baseline invokes tar via PATH. Fail if conversion silently unpacks.
+	bin := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "tar"), []byte("#!/bin/sh\necho unexpected baseline extraction >&2\nexit 99\n"), 0755))
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	out, err := exec.Command("/sbin/mke2fs", "-V").CombinedOutput()
+	require.NoError(t, err)
+	var major, minor, patch int
+	_, err = fmt.Sscanf(string(out), "mke2fs %d.%d.%d", &major, &minor, &patch)
+	require.NoError(t, err)
+	if major == 1 && (minor < 47 || minor == 47 && patch < 1) {
+		t.Skip("requires mke2fs 1.47.1+")
+	}
+	flags.Set(t, "executor.stream_ext4_images", true)
+	reg := testregistry.Run(t, testregistry.Opts{})
+	_, img := reg.PushNamedImageWithFiles(t, "streaming", map[string][]byte{"/nested/file": []byte("contents")}, nil)
+	root := t.TempDir()
+	image := filepath.Join(root, "root.ext4")
+	require.NoError(t, ociconv.ConvertContainerToExt4FS(t.Context(), img, root, "streaming", image))
+	files, err := os.ReadDir(root)
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	require.Equal(t, "root.ext4", files[0].Name())
+	dir := t.TempDir()
+	require.NoError(t, ext4.ImageToDirectory(t.Context(), image, dir, []string{"/nested/file"}))
+	contents, err := os.ReadFile(filepath.Join(dir, "nested/file"))
+	require.NoError(t, err)
+	require.Equal(t, "contents", string(contents))
 }
