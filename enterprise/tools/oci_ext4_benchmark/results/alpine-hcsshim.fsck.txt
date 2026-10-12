@@ -1,0 +1,12 @@
+e2fsck 1.47.0 (5-Feb-2023)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Pass 5: Checking group summary information
+Padding at end of inode bitmap is not set. Fix? no
+
+
+/tmp/oci-bench/alpine/hcsshim.ext4: ********** WARNING: Filesystem still has errors **********
+
+/tmp/oci-bench/alpine/hcsshim.ext4: 528/528 files (0.0% non-contiguous), 2106/2106 blocks

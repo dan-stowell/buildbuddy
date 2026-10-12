@@ -1,0 +1,2 @@
+image=mirror.gcr.io/library/alpine:3.20 digest=sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e compressed_layers=3630321
+flattened_payload=7802737 entries=517

@@ -1,0 +1,2 @@
+image=fixture:/tmp/oci-fixture-final.tar digest=sha256:33fd60cf1490511eeeede1775b1297394e6cdbfe2a3b239cc6d79b00861be145 compressed_layers=1046
+flattened_payload=33554458 entries=11

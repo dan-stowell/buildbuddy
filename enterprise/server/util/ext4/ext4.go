@@ -13,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/ext4/tarstream"
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
@@ -273,6 +274,81 @@ func ImageToDirectory(ctx context.Context, inputFile, outputDir string, paths []
 				metrics.CommandName: "debugfs",
 			}).Add(float64(rusage.Oublock))
 		}
+	}
+	return nil
+}
+
+// TarToImageAutoSize populates ext4 directly from two passes over a flattened
+// rootfs tar. Requires mke2fs >= 1.47.1 and runtime libarchive support. Callers
+// must return readers whose Close interrupts a blocked Read (mutate.Extract does).
+func TarToImageAutoSize(ctx context.Context, open tarstream.Open, outputFile string, excludeDev bool) error {
+	if err := checkImageOutputPath(outputFile); err != nil {
+		return err
+	}
+	if *reproducibleImages {
+		return status.FailedPreconditionError("streaming ext4 is incompatible with reproducible_ext4_images")
+	}
+	ctx, span := tracing.StartSpan(ctx)
+	defer span.End()
+	rc, err := open()
+	if err != nil {
+		return err
+	}
+	estimateReader := rc
+	stopEstimate := context.AfterFunc(ctx, func() { estimateReader.Close() })
+	size, entries, estimateErr := tarstream.EstimateCompatible(ctx, rc, excludeDev)
+	stopEstimate()
+	closeErr := rc.Close()
+	if estimateErr != nil {
+		return status.WrapError(estimateErr, "estimate tar disk usage")
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	rc, err = open()
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	stopPopulate := context.AfterFunc(ctx, func() { rc.Close() })
+	defer stopPopulate()
+	// An OS pipe avoids exec's stdin-copy goroutine hiding a source error and
+	// lets us close the reader when mke2fs exits early (unsupported version,
+	// ENOSPC, etc.). Normalization runs concurrently with the subprocess.
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	defer pr.Close()
+	cmd := exec.CommandContext(ctx, mke2fsPath, "-L", "''", "-N", fmt.Sprint(entries+11), "-O", "^64bit", "-d", "-", "-m", "5", "-r", "1", "-b", fmt.Sprint(blockSize), "-t", "ext4", outputFile, fmt.Sprintf("%dK", size/iecKilobyte))
+	cmd.Stdin = pr
+	var out strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		pw.Close()
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { err := tarstream.Normalize(ctx, rc, pw, excludeDev); pw.Close(); done <- err }()
+	runErr := cmd.Wait()
+	if cmd.ProcessState != nil {
+		if span.IsRecording() {
+			span.SetAttributes(attribute.Int64("cpu_millis", (cmd.ProcessState.UserTime()+cmd.ProcessState.SystemTime()).Milliseconds()), attribute.Int64("tar_estimated_image_bytes", size))
+		}
+		if rusage, _ := cmd.ProcessState.SysUsage().(*syscall.Rusage); rusage != nil {
+			metrics.FirecrackerWorkspaceDiskWriteOps.With(prometheus.Labels{metrics.CommandName: "mke2fs"}).Add(float64(rusage.Oublock))
+		}
+	}
+	pr.Close()
+	rc.Close()
+	streamErr := <-done
+	if runErr != nil {
+		os.Remove(outputFile)
+		return status.InternalErrorf("streaming mke2fs: %s: %s", runErr, out.String())
+	}
+	if streamErr != nil {
+		os.Remove(outputFile)
+		return status.WrapError(streamErr, "stream rootfs tar")
 	}
 	return nil
 }

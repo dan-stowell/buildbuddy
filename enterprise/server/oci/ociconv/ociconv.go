@@ -50,6 +50,7 @@ var (
 	conversionGroup singleflight.Group[string, string]
 
 	localCacheStoreExt4Images = flag.Bool("executor.local_cache_store_ext4_images", true, "If true, store converted Firecracker ext4 images in filecache instead of cacheRoot/images/ext4.")
+	streamExt4Images          = flag.Bool("executor.stream_ext4_images", false, "Populate OCI rootfs ext4 images directly from two flattened tar passes, without an unpack directory. Requires e2fsprogs >=1.47.1 and libarchive. Experimental; rejects non-contiguous directory subtrees to preserve GNU tar mtime semantics, and is incompatible with reproducible_ext4_images.", flag.Internal)
 	excludeRootDeviceNodes    = flag.Bool("executor.exclude_root_device_nodes", false, "If true, omit entries under the root /dev directory when converting OCI images to ext4. Intended for conversion actions without mknod support.", flag.Internal)
 )
 
@@ -353,6 +354,13 @@ func ConvertContainerToExt4FS(ctx context.Context, img ctr.Image, workspaceDir, 
 	log.CtxInfof(ctx, "Downloading image %s and converting to ext4 format", containerImage)
 	start := time.Now()
 
+	if *streamExt4Images {
+		if err := ext4.TarToImageAutoSize(ctx, func() (io.ReadCloser, error) { return mutate.Extract(img), nil }, outputPath, *excludeRootDeviceNodes); err != nil {
+			return err
+		}
+		log.CtxInfof(ctx, "Converted %s to ext4 format in %s", containerImage, time.Since(start))
+		return nil
+	}
 	rc := mutate.Extract(img)
 	defer rc.Close()
 
