@@ -51,6 +51,7 @@ var (
 
 	localCacheStoreExt4Images = flag.Bool("executor.local_cache_store_ext4_images", true, "If true, store converted Firecracker ext4 images in filecache instead of cacheRoot/images/ext4.")
 	excludeRootDeviceNodes    = flag.Bool("executor.exclude_root_device_nodes", false, "If true, omit entries under the root /dev directory when converting OCI images to ext4. Intended for conversion actions without mknod support.", flag.Internal)
+	unpackTmpfsBytes          = flag.Int64("executor.oci_unpack_tmpfs_bytes", 0, "If positive, try extracting OCI images into a private tmpfs of at most this many bytes. Fall back to disk if mounting or extraction fails. Images with compressed layers exceeding this limit use disk directly. Requires mount privileges; each concurrent conversion can consume this much memory.", flag.Internal)
 )
 
 func hashFile(filename string) (string, error) {
@@ -353,14 +354,34 @@ func ConvertContainerToExt4FS(ctx context.Context, img ctr.Image, workspaceDir, 
 	log.CtxInfof(ctx, "Downloading image %s and converting to ext4 format", containerImage)
 	start := time.Now()
 
-	rc := mutate.Extract(img)
-	defer rc.Close()
-
 	tempUnpackDir, err := os.MkdirTemp(workspaceDir, "unpack-*")
 	if err != nil {
 		return status.UnavailableErrorf("error creating temp unpack dir: %s", err)
 	}
 	defer os.RemoveAll(tempUnpackDir)
+	tmpfsMounted := false
+	if *unpackTmpfsBytes > 0 && fitsTmpfs(img, *unpackTmpfsBytes) {
+		// Use a private, size-limited mount rather than a shared /dev/shm
+		// directory, so an unexpectedly large expansion cannot exhaust it.
+		options := fmt.Sprintf("size=%d,mode=0700", *unpackTmpfsBytes)
+		if err := unix.Mount("tmpfs", tempUnpackDir, "tmpfs", unix.MS_NODEV|unix.MS_NOSUID, options); err == nil {
+			tmpfsMounted = true
+			defer func() {
+				if tmpfsMounted {
+					if err := unix.Unmount(tempUnpackDir, 0); err != nil {
+						log.CtxWarningf(ctx, "Unmount temp unpack dir %q: %s", tempUnpackDir, err)
+						// Detach a busy mount so cleanup does not leave a mount
+						// behind. The kernel frees it when its last user closes.
+						if err := unix.Unmount(tempUnpackDir, unix.MNT_DETACH); err != nil {
+							log.CtxWarningf(ctx, "Detach temp unpack dir %q: %s", tempUnpackDir, err)
+						}
+					}
+				}
+			}()
+		} else {
+			log.CtxDebugf(ctx, "Could not mount unpack tmpfs; using disk: %s", err)
+		}
+	}
 
 	tarArgs := []string{
 		"--extract",
@@ -376,6 +397,50 @@ func ConvertContainerToExt4FS(ctx context.Context, img ctr.Image, workspaceDir, 
 			"--exclude", "dev/*",
 		)
 	}
+	if err := extractRootfs(ctx, img, tarArgs); err != nil {
+		if !tmpfsMounted || ctx.Err() != nil {
+			return err
+		}
+		// The compressed size only filters obvious oversize images. If the
+		// expanded tree exceeds the mount's hard limit (or tmpfs cannot
+		// represent an entry), retry the unchanged pipeline on disk.
+		log.CtxInfof(ctx, "Tmpfs extraction failed; retrying on disk: %s", err)
+		if err := unix.Unmount(tempUnpackDir, 0); err != nil {
+			return status.UnavailableErrorf("unmount unpack tmpfs before disk fallback: %s", err)
+		}
+		tmpfsMounted = false
+		if err := extractRootfs(ctx, img, tarArgs); err != nil {
+			return err
+		}
+	}
+
+	// Take the rootfs and write it into an ext4 image.
+	if err := ext4.DirectoryToImageAutoSize(ctx, tempUnpackDir, outputPath); err != nil {
+		return err
+	}
+	log.CtxInfof(ctx, "Converted %s to ext4 format in %s", containerImage, time.Since(start))
+	return nil
+}
+
+// fitsTmpfs is a cheap filter, not an estimate of the expanded tree. The mount
+// size enforces the actual limit. Do not read/decompress every layer to size it.
+func fitsTmpfs(img ctr.Image, limit int64) bool {
+	m, err := img.Manifest()
+	if err != nil || limit <= 0 {
+		return false
+	}
+	for _, layer := range m.Layers {
+		if layer.Size < 0 || layer.Size > limit {
+			return false
+		}
+		limit -= layer.Size
+	}
+	return true
+}
+
+func extractRootfs(ctx context.Context, img ctr.Image, tarArgs []string) error {
+	rc := mutate.Extract(img)
+	defer rc.Close()
 	cmd := exec.CommandContext(ctx, "tar", tarArgs...)
 	var stderr bytes.Buffer
 	cmd.Stdin = rc
@@ -384,12 +449,6 @@ func ConvertContainerToExt4FS(ctx context.Context, img ctr.Image, workspaceDir, 
 	if err := cmd.Run(); err != nil {
 		return status.UnavailableErrorf("download and extract layer tarball: %s: %q", err, stderr.String())
 	}
-
-	// Take the rootfs and write it into an ext4 image.
-	if err := ext4.DirectoryToImageAutoSize(ctx, tempUnpackDir, outputPath); err != nil {
-		return err
-	}
-	log.CtxInfof(ctx, "Converted %s to ext4 format in %s", containerImage, time.Since(start))
 	return nil
 }
 

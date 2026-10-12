@@ -52,6 +52,7 @@ const (
 )
 
 var (
+	prezeroedImages    = flag.Bool("executor.prezeroed_ext4_images", false, "If true, skip inode table and journal zeroing when creating new ext4 image files. The new, empty regular file already reads as zeros. Keeps the journal and avoids allocating zero extents and deferred inode table initialization.", flag.Internal)
 	reproducibleImages = flag.Bool("executor.reproducible_ext4_images", false, "If true, fix the filesystem UUID and directory hash seed of ext4 images created from directories, skip copying extended attributes, and clamp all timestamps newer than 2026-01-01 to that date, so that a freshly extracted directory tree produces a byte-identical image on every run. Files newer than that date lose their mtime, which breaks pre-warmed Bazel install bases. Requires e2fsprogs 1.47.2 or later.", flag.Internal)
 )
 
@@ -94,6 +95,13 @@ func DirectoryToImage(ctx context.Context, inputDir, outputFile string, sizeByte
 		"-t", "ext4",
 	}
 	var env []string
+	var extendedOptions []string
+	if *prezeroedImages {
+		// checkImageOutputPath only accepts a new or empty file. Its holes
+		// already read as zeros, so there is no old journal or inode data to
+		// erase. Marking tables initialized also avoids guest-side lazy writes.
+		extendedOptions = append(extendedOptions, "assume_storage_prezeroed=1", "nodiscard")
+	}
 	if *reproducibleImages {
 		// Remove all sources of non-determinism:
 		// - Set filesystem UUID to a fixed value (-U)
@@ -102,8 +110,12 @@ func DirectoryToImage(ctx context.Context, inputDir, outputFile string, sizeByte
 		//   extraction-time atimes and ctimes, to that date (SOURCE_DATE_EPOCH)
 		// - Skip xattrs, which may contain host-assigned security.selinux
 		//   labels on SELinux hosts (-E no_copy_xattrs)
-		args = append(args, "-U", reproducibleUUID, "-E", "hash_seed="+reproducibleHashSeed+",no_copy_xattrs")
+		args = append(args, "-U", reproducibleUUID)
+		extendedOptions = append(extendedOptions, "hash_seed="+reproducibleHashSeed, "no_copy_xattrs")
 		env = append(os.Environ(), fmt.Sprintf("SOURCE_DATE_EPOCH=%d", reproducibleImageEpoch))
+	}
+	if len(extendedOptions) > 0 {
+		args = append(args, "-E", strings.Join(extendedOptions, ","))
 	}
 	args = append(args, outputFile, fmt.Sprintf("%dK", sizeBytes/iecKilobyte))
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
@@ -149,9 +161,11 @@ func MakeEmptyImage(ctx context.Context, outputFile string, sizeBytes int64) err
 		"-r", "1",
 		"-b", fmt.Sprintf("%d", blockSize),
 		"-t", "ext4",
-		outputFile,
-		fmt.Sprintf("%dK", sizeBytes/iecKilobyte),
 	}
+	if *prezeroedImages {
+		args = append(args, "-E", "assume_storage_prezeroed=1,nodiscard")
+	}
+	args = append(args, outputFile, fmt.Sprintf("%dK", sizeBytes/iecKilobyte))
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		log.Errorf("Error running %q: %s %s", cmd.String(), err, out)
@@ -169,6 +183,9 @@ func checkImageOutputPath(path string) error {
 	}
 	if stat != nil && stat.Size() > 0 {
 		return status.InternalErrorf("failed to create disk image %s: file already exists and is not empty", path)
+	}
+	if stat != nil && !stat.Mode().IsRegular() {
+		return status.InternalErrorf("failed to create disk image %s: output must be a regular file", path)
 	}
 	return nil
 }

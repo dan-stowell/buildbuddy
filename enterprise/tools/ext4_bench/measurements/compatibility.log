@@ -1,0 +1,37 @@
+Creating regular file /var/tmp/ext4-bench/compatibility-tmpfs/baseline.ext4
+Creating regular file /var/tmp/ext4-bench/compatibility-tmpfs/prezeroed.ext4
+Creating regular file /var/tmp/ext4-bench/compatibility-tmpfs/no-journal.ext4
+Creating regular file /var/tmp/ext4-bench/compatibility-tmpfs/tmpfs-prezeroed.ext4
+image trees match (contents, modes, uid/gid, links, devices, xattrs, mtimes)
+baseline.ext4: writable mount and EXT4_IOC_RESIZE_FS succeeded
+e2fsck 1.47.0 (5-Feb-2023)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Pass 5: Checking group summary information
+/var/tmp/ext4-bench/compatibility-tmpfs/baseline.ext4: 19/131072 files (0.0% non-contiguous), 12356/131072 blocks
+prezeroed.ext4: writable mount and EXT4_IOC_RESIZE_FS succeeded
+e2fsck 1.47.0 (5-Feb-2023)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Pass 5: Checking group summary information
+/var/tmp/ext4-bench/compatibility-tmpfs/prezeroed.ext4: 19/131072 files (0.0% non-contiguous), 12356/131072 blocks
+no-journal.ext4: writable mount and EXT4_IOC_RESIZE_FS succeeded
+e2fsck 1.47.0 (5-Feb-2023)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Pass 5: Checking group summary information
+/var/tmp/ext4-bench/compatibility-tmpfs/no-journal.ext4: 19/131072 files (0.0% non-contiguous), 8260/131072 blocks
+tmpfs-prezeroed.ext4: writable mount and EXT4_IOC_RESIZE_FS succeeded
+e2fsck 1.47.0 (5-Feb-2023)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Pass 5: Checking group summary information
+/var/tmp/ext4-bench/compatibility-tmpfs/tmpfs-prezeroed.ext4: 19/131072 files (0.0% non-contiguous), 12356/131072 blocks

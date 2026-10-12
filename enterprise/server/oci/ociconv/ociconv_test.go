@@ -3,6 +3,7 @@ package ociconv_test
 import (
 	"archive/tar"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -48,84 +49,89 @@ func sharedDiskImageNode(containerImage string) *repb.FileNode {
 }
 
 func TestOciconv(t *testing.T) {
-	te := testenv.GetTestEnv(t)
-	flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
-	flags.Set(t, "executor.local_cache_store_ext4_images", true)
+	for _, prezeroed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("prezeroed=%t", prezeroed), func(t *testing.T) {
+			flags.Set(t, "executor.prezeroed_ext4_images", prezeroed)
+			te := testenv.GetTestEnv(t)
+			flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
+			flags.Set(t, "executor.local_cache_store_ext4_images", true)
 
-	ctx := context.Background()
-	root := testfs.MakeTempDir(t)
-	fc, err := filecache.NewFileCache(filepath.Join(root, "filecache"), 1_000_000_000, false)
-	require.NoError(t, err)
-	te.SetFileCache(fc)
+			ctx := context.Background()
+			root := testfs.MakeTempDir(t)
+			fc, err := filecache.NewFileCache(filepath.Join(root, "filecache"), 1_000_000_000, false)
+			require.NoError(t, err)
+			te.SetFileCache(fc)
 
-	reg := testregistry.Run(t, testregistry.Opts{})
+			reg := testregistry.Run(t, testregistry.Opts{})
 
-	ref, img := reg.PushNamedImage(t, "ociconv-test-image:latest", nil)
+			ref, img := reg.PushNamedImage(t, "ociconv-test-image:latest", nil)
 
-	resolver, err := oci.NewResolver(te)
-	require.NoError(t, err)
-	require.NotNil(t, resolver)
+			resolver, err := oci.NewResolver(te)
+			require.NoError(t, err)
+			require.NotNil(t, resolver)
 
-	path := filepath.Join(root, "materialized.ext4")
-	err = ociconv.CreateDiskImage(ctx, resolver, fc, root, ref, oci.Credentials{}, false /*=useOCIFetcher*/, path)
-	require.NoError(t, err)
+			path := filepath.Join(root, "materialized.ext4")
+			err = ociconv.CreateDiskImage(ctx, resolver, fc, root, ref, oci.Credentials{}, false /*=useOCIFetcher*/, path)
+			require.NoError(t, err)
 
-	fi, err := os.Stat(path)
-	require.NoError(t, err)
-	require.False(t, fi.IsDir())
-	require.Greater(t, fi.Size(), int64(0))
+			fi, err := os.Stat(path)
+			require.NoError(t, err)
+			require.False(t, fi.IsDir())
+			require.Greater(t, fi.Size(), int64(0))
 
-	// Extract ext4 image.
-	outDir := testfs.MakeTempDir(t)
-	err = ext4.ImageToDirectory(ctx, path, outDir, []string{"/"})
-	require.NoError(t, err)
+			// Extract ext4 image.
+			outDir := testfs.MakeTempDir(t)
+			err = ext4.ImageToDirectory(ctx, path, outDir, []string{"/"})
+			require.NoError(t, err)
 
-	// Build path->size map from the container image (regular files only).
-	rc := mutate.Extract(img)
-	defer rc.Close()
-	tr := tar.NewReader(rc)
-	imageFiles := make(map[string]int64)
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		require.NoError(t, err)
-		if hdr == nil {
-			continue
-		}
-		switch hdr.Typeflag {
-		case tar.TypeReg, tar.TypeRegA:
-			name := strings.TrimPrefix(hdr.Name, "./")
-			name = strings.TrimPrefix(name, "/")
-			if name == "" {
-				continue
+			// Build path->size map from the container image (regular files only).
+			rc := mutate.Extract(img)
+			defer rc.Close()
+			tr := tar.NewReader(rc)
+			imageFiles := make(map[string]int64)
+			for {
+				hdr, err := tr.Next()
+				if err == io.EOF {
+					break
+				}
+				require.NoError(t, err)
+				if hdr == nil {
+					continue
+				}
+				switch hdr.Typeflag {
+				case tar.TypeReg, tar.TypeRegA:
+					name := strings.TrimPrefix(hdr.Name, "./")
+					name = strings.TrimPrefix(name, "/")
+					if name == "" {
+						continue
+					}
+					imageFiles[name] = hdr.Size
+				}
 			}
-			imageFiles[name] = hdr.Size
-		}
-	}
 
-	// Build path->size map from the extracted ext4 directory (regular files only).
-	extractedFiles := make(map[string]int64)
-	err = filepath.Walk(outDir, func(p string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.Mode().IsRegular() {
-			rel, err := filepath.Rel(outDir, p)
-			if err != nil {
-				return err
-			}
-			if rel == "." {
+			// Build path->size map from the extracted ext4 directory (regular files only).
+			extractedFiles := make(map[string]int64)
+			err = filepath.Walk(outDir, func(p string, info os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				if info.Mode().IsRegular() {
+					rel, err := filepath.Rel(outDir, p)
+					if err != nil {
+						return err
+					}
+					if rel == "." {
+						return nil
+					}
+					extractedFiles[rel] = info.Size()
+				}
 				return nil
-			}
-			extractedFiles[rel] = info.Size()
-		}
-		return nil
-	})
-	require.NoError(t, err)
+			})
+			require.NoError(t, err)
 
-	require.Empty(t, cmp.Diff(imageFiles, extractedFiles))
+			require.Empty(t, cmp.Diff(imageFiles, extractedFiles))
+		})
+	}
 }
 
 func TestCreateDiskImage_UsesCredentialsOnCacheMiss(t *testing.T) {
@@ -310,4 +316,52 @@ func TestLinkCachedImage_LegacyStorageWhenFileCacheDisabled(t *testing.T) {
 	content, err := os.ReadFile(linkedPath)
 	require.NoError(t, err)
 	require.Equal(t, "legacy-ext4", string(content))
+}
+
+func TestConvertContainerToExt4FS_Tmpfs(t *testing.T) {
+	reg := testregistry.Run(t, testregistry.Opts{})
+	// Highly compressible content fits the compressed-size filter but exceeds
+	// the 1 MiB mount, exercising the disk retry when mount privileges exist.
+	content := []byte(strings.Repeat("rootfs content\n", 150_000))
+	ref, img := reg.PushNamedImageWithFiles(t, "tmpfs-test:latest", map[string][]byte{"data": content}, nil)
+	for _, limit := range []int64{0, 1, 1 << 20, 64 << 20} {
+		t.Run(fmt.Sprintf("limit=%d", limit), func(t *testing.T) {
+			flags.Set(t, "executor.oci_unpack_tmpfs_bytes", limit)
+			flags.Set(t, "executor.prezeroed_ext4_images", true)
+			root := testfs.MakeTempDir(t)
+			image := filepath.Join(root, "output.ext4")
+			require.NoError(t, ociconv.ConvertContainerToExt4FS(context.Background(), img, root, ref, image))
+			entries, err := os.ReadDir(root)
+			require.NoError(t, err)
+			require.Len(t, entries, 1, "unpack directories must be removed after success or retry")
+			output := testfs.MakeTempDir(t)
+			require.NoError(t, ext4.ImageToDirectory(context.Background(), image, output, []string{"/data"}))
+			actual, err := os.ReadFile(filepath.Join(output, "data"))
+			require.NoError(t, err)
+			require.Equal(t, content, actual)
+		})
+	}
+	t.Run("cancelled extraction cleans up", func(t *testing.T) {
+		flags.Set(t, "executor.oci_unpack_tmpfs_bytes", int64(64<<20))
+		root := testfs.MakeTempDir(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		require.Error(t, ociconv.ConvertContainerToExt4FS(ctx, img, root, ref, filepath.Join(root, "output.ext4")))
+		entries, err := os.ReadDir(root)
+		require.NoError(t, err)
+		require.Empty(t, entries)
+	})
+	t.Run("mkfs failure cleans up", func(t *testing.T) {
+		flags.Set(t, "executor.oci_unpack_tmpfs_bytes", int64(64<<20))
+		root := testfs.MakeTempDir(t)
+		image := filepath.Join(root, "existing.ext4")
+		require.NoError(t, os.WriteFile(image, []byte("existing image"), 0644))
+		require.Error(t, ociconv.ConvertContainerToExt4FS(context.Background(), img, root, ref, image))
+		entries, err := os.ReadDir(root)
+		require.NoError(t, err)
+		require.Len(t, entries, 1)
+		data, err := os.ReadFile(image)
+		require.NoError(t, err)
+		require.Equal(t, "existing image", string(data))
+	})
 }

@@ -1,0 +1,121 @@
+{"image": "alpine", "config": "default", "size_mib": 66, "success": true}
+{"image": "alpine", "config": "default", "size_mib": 34, "success": true}
+{"image": "alpine", "config": "default", "size_mib": 18, "success": true}
+{"image": "alpine", "config": "default", "size_mib": 10, "success": false}
+{"image": "alpine", "config": "default", "size_mib": 14, "success": true}
+{"image": "alpine", "config": "default", "size_mib": 12, "success": false}
+{"image": "alpine", "config": "default", "size_mib": 13, "success": true}
+{"image": "alpine", "config": "default", "minimum_mib": 13, "estimate": 10592256, "entries": 518}
+{"image": "alpine", "config": "count", "size_mib": 66, "success": true}
+{"image": "alpine", "config": "count", "size_mib": 34, "success": true}
+{"image": "alpine", "config": "count", "size_mib": 18, "success": true}
+{"image": "alpine", "config": "count", "size_mib": 10, "success": false}
+{"image": "alpine", "config": "count", "size_mib": 14, "success": true}
+{"image": "alpine", "config": "count", "size_mib": 12, "success": false}
+{"image": "alpine", "config": "count", "size_mib": 13, "success": true}
+{"image": "alpine", "config": "count", "minimum_mib": 13, "estimate": 10592256, "entries": 518}
+{"image": "alpine", "config": "i65536", "size_mib": 66, "success": true}
+{"image": "alpine", "config": "i65536", "size_mib": 34, "success": true}
+{"image": "alpine", "config": "i65536", "size_mib": 18, "success": false}
+{"image": "alpine", "config": "i65536", "size_mib": 26, "success": false}
+{"image": "alpine", "config": "i65536", "size_mib": 30, "success": false}
+{"image": "alpine", "config": "i65536", "size_mib": 32, "success": false}
+{"image": "alpine", "config": "i65536", "size_mib": 33, "success": true}
+{"image": "alpine", "config": "i65536", "minimum_mib": 33, "estimate": 10592256, "entries": 518}
+{"image": "alpine", "config": "i131072", "size_mib": 66, "success": true}
+{"image": "alpine", "config": "i131072", "size_mib": 34, "success": false}
+{"image": "alpine", "config": "i131072", "size_mib": 50, "success": false}
+{"image": "alpine", "config": "i131072", "size_mib": 58, "success": false}
+{"image": "alpine", "config": "i131072", "size_mib": 62, "success": false}
+{"image": "alpine", "config": "i131072", "size_mib": 64, "success": false}
+{"image": "alpine", "config": "i131072", "size_mib": 65, "success": true}
+{"image": "alpine", "config": "i131072", "minimum_mib": 65, "estimate": 10592256, "entries": 518}
+{"image": "ubuntu", "config": "default", "size_mib": 249, "success": true}
+{"image": "ubuntu", "config": "default", "size_mib": 126, "success": true}
+{"image": "ubuntu", "config": "default", "size_mib": 64, "success": false}
+{"image": "ubuntu", "config": "default", "size_mib": 95, "success": true}
+{"image": "ubuntu", "config": "default", "size_mib": 79, "success": false}
+{"image": "ubuntu", "config": "default", "size_mib": 87, "success": false}
+{"image": "ubuntu", "config": "default", "size_mib": 91, "success": false}
+{"image": "ubuntu", "config": "default", "size_mib": 93, "success": false}
+{"image": "ubuntu", "config": "default", "size_mib": 94, "success": true}
+{"image": "ubuntu", "config": "default", "minimum_mib": 94, "estimate": 105738240, "entries": 3444}
+{"image": "ubuntu", "config": "count", "size_mib": 249, "success": true}
+{"image": "ubuntu", "config": "count", "size_mib": 126, "success": true}
+{"image": "ubuntu", "config": "count", "size_mib": 64, "success": false}
+{"image": "ubuntu", "config": "count", "size_mib": 95, "success": true}
+{"image": "ubuntu", "config": "count", "size_mib": 79, "success": false}
+{"image": "ubuntu", "config": "count", "size_mib": 87, "success": false}
+{"image": "ubuntu", "config": "count", "size_mib": 91, "success": true}
+{"image": "ubuntu", "config": "count", "size_mib": 89, "success": true}
+{"image": "ubuntu", "config": "count", "size_mib": 88, "success": false}
+{"image": "ubuntu", "config": "count", "minimum_mib": 89, "estimate": 105738240, "entries": 3444}
+{"image": "ubuntu", "config": "i65536", "size_mib": 249, "success": true}
+{"image": "ubuntu", "config": "i65536", "size_mib": 126, "success": false}
+{"image": "ubuntu", "config": "i65536", "size_mib": 187, "success": false}
+{"image": "ubuntu", "config": "i65536", "size_mib": 218, "success": true}
+{"image": "ubuntu", "config": "i65536", "size_mib": 202, "success": false}
+{"image": "ubuntu", "config": "i65536", "size_mib": 210, "success": false}
+{"image": "ubuntu", "config": "i65536", "size_mib": 214, "success": false}
+{"image": "ubuntu", "config": "i65536", "size_mib": 216, "success": true}
+{"image": "ubuntu", "config": "i65536", "size_mib": 215, "success": true}
+{"image": "ubuntu", "config": "i65536", "minimum_mib": 215, "estimate": 105738240, "entries": 3444}
+{"image": "ubuntu", "config": "i131072", "size_mib": 249, "success": false}
+{"image": "ubuntu", "config": "i131072", "size_mib": 372, "success": false}
+{"image": "ubuntu", "config": "i131072", "size_mib": 434, "success": true}
+{"image": "ubuntu", "config": "i131072", "size_mib": 403, "success": false}
+{"image": "ubuntu", "config": "i131072", "size_mib": 418, "success": false}
+{"image": "ubuntu", "config": "i131072", "size_mib": 426, "success": true}
+{"image": "ubuntu", "config": "i131072", "size_mib": 422, "success": false}
+{"image": "ubuntu", "config": "i131072", "size_mib": 424, "success": false}
+{"image": "ubuntu", "config": "i131072", "size_mib": 425, "success": true}
+{"image": "ubuntu", "config": "i131072", "minimum_mib": 425, "estimate": 105738240, "entries": 3444}
+{"image": "rbe", "config": "default", "size_mib": 1081, "success": false}
+{"image": "rbe", "config": "default", "size_mib": 1620, "success": true}
+{"image": "rbe", "config": "default", "size_mib": 1350, "success": true}
+{"image": "rbe", "config": "default", "size_mib": 1215, "success": true}
+{"image": "rbe", "config": "default", "size_mib": 1148, "success": true}
+{"image": "rbe", "config": "default", "size_mib": 1114, "success": true}
+{"image": "rbe", "config": "default", "size_mib": 1097, "success": true}
+{"image": "rbe", "config": "default", "size_mib": 1089, "success": false}
+{"image": "rbe", "config": "default", "size_mib": 1093, "success": false}
+{"image": "rbe", "config": "default", "size_mib": 1095, "success": false}
+{"image": "rbe", "config": "default", "size_mib": 1096, "success": true}
+{"image": "rbe", "config": "default", "minimum_mib": 1096, "estimate": 1172025344, "entries": 16759}
+{"image": "rbe", "config": "count", "size_mib": 1081, "success": false}
+{"image": "rbe", "config": "count", "size_mib": 1620, "success": true}
+{"image": "rbe", "config": "count", "size_mib": 1350, "success": true}
+{"image": "rbe", "config": "count", "size_mib": 1215, "success": true}
+{"image": "rbe", "config": "count", "size_mib": 1148, "success": true}
+{"image": "rbe", "config": "count", "size_mib": 1114, "success": true}
+{"image": "rbe", "config": "count", "size_mib": 1097, "success": true}
+{"image": "rbe", "config": "count", "size_mib": 1089, "success": true}
+{"image": "rbe", "config": "count", "size_mib": 1085, "success": true}
+{"image": "rbe", "config": "count", "size_mib": 1083, "success": true}
+{"image": "rbe", "config": "count", "size_mib": 1082, "success": false}
+{"image": "rbe", "config": "count", "minimum_mib": 1083, "estimate": 1172025344, "entries": 16759}
+{"image": "rbe", "config": "i65536", "size_mib": 1081, "success": false}
+{"image": "rbe", "config": "i65536", "size_mib": 1620, "success": true}
+{"image": "rbe", "config": "i65536", "size_mib": 1350, "success": true}
+{"image": "rbe", "config": "i65536", "size_mib": 1215, "success": true}
+{"image": "rbe", "config": "i65536", "size_mib": 1148, "success": true}
+{"image": "rbe", "config": "i65536", "size_mib": 1114, "success": true}
+{"image": "rbe", "config": "i65536", "size_mib": 1097, "success": true}
+{"image": "rbe", "config": "i65536", "size_mib": 1089, "success": true}
+{"image": "rbe", "config": "i65536", "size_mib": 1085, "success": true}
+{"image": "rbe", "config": "i65536", "size_mib": 1083, "success": true}
+{"image": "rbe", "config": "i65536", "size_mib": 1082, "success": false}
+{"image": "rbe", "config": "i65536", "minimum_mib": 1083, "estimate": 1172025344, "entries": 16759}
+{"image": "rbe", "config": "i131072", "size_mib": 1081, "success": false}
+{"image": "rbe", "config": "i131072", "size_mib": 1620, "success": false}
+{"image": "rbe", "config": "i131072", "size_mib": 1890, "success": false}
+{"image": "rbe", "config": "i131072", "size_mib": 2025, "success": false}
+{"image": "rbe", "config": "i131072", "size_mib": 2092, "success": true}
+{"image": "rbe", "config": "i131072", "size_mib": 2058, "success": false}
+{"image": "rbe", "config": "i131072", "size_mib": 2075, "success": true}
+{"image": "rbe", "config": "i131072", "size_mib": 2066, "success": false}
+{"image": "rbe", "config": "i131072", "size_mib": 2070, "success": false}
+{"image": "rbe", "config": "i131072", "size_mib": 2072, "success": false}
+{"image": "rbe", "config": "i131072", "size_mib": 2073, "success": false}
+{"image": "rbe", "config": "i131072", "size_mib": 2074, "success": false}
+{"image": "rbe", "config": "i131072", "minimum_mib": 2075, "estimate": 1172025344, "entries": 16759}
