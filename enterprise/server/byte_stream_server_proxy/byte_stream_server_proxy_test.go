@@ -663,6 +663,111 @@ func TestRead(t *testing.T) {
 	}
 }
 
+// Count bytes accepted by the local cache writer, including writes whose commit fails.
+type writeCountingCache struct {
+	interfaces.Cache
+	bytesWritten atomic.Int64
+}
+
+func (c *writeCountingCache) Writer(ctx context.Context, rn *rspb.ResourceName) (interfaces.CommittedWriteCloser, error) {
+	w, err := c.Cache.Writer(ctx, rn)
+	if err != nil {
+		return nil, err
+	}
+	return &countingCacheWriter{CommittedWriteCloser: w, bytesWritten: &c.bytesWritten}, nil
+}
+
+type countingCacheWriter struct {
+	interfaces.CommittedWriteCloser
+	bytesWritten *atomic.Int64
+}
+
+func (w *countingCacheWriter) Write(p []byte) (int, error) {
+	n, err := w.CommittedWriteCloser.Write(p)
+	w.bytesWritten.Add(int64(n))
+	return n, err
+}
+
+func TestPartialReadMissLocalWrites(t *testing.T) {
+	flags.Set(t, "cache.zstd_transcoding_enabled", true)
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+			flags.Set(t, "cache_proxy.skip_partial_read_cache_writes", enabled)
+			for _, tc := range []struct {
+				name          string
+				offset, limit int64
+				compressed    bool
+			}{
+				{name: "offset", offset: 100},
+				{name: "limit", limit: 200},
+				{name: "offset_limit", offset: 100, limit: 200},
+				{name: "zstd_offset", offset: 100, compressed: true},
+				{name: "zstd_limit", limit: 200, compressed: true},
+				{name: "zstd_offset_limit", offset: 100, limit: 200, compressed: true},
+				{name: "full"},
+				{name: "zstd_full", compressed: true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					ctx := testContext()
+					remoteEnv := testenv.GetTestEnv(t)
+					proxyEnv := testenv.GetTestEnv(t)
+					local := &writeCountingCache{Cache: proxyEnv.GetCache()}
+					proxyEnv.SetCache(local)
+					remote, _, _, reads := runRemoteServices(ctx, remoteEnv, t)
+					proxy := runBSProxy(ctx, remote, proxyEnv, t)
+					ctx, err := prefix.AttachUserPrefixToContext(ctx, proxyEnv.GetAuthenticator())
+					require.NoError(t, err)
+					rn, data := testdigest.NewRandomResourceAndBuf(t, 4096, rspb.CacheType_CAS, "")
+					require.NoError(t, remoteEnv.GetCache().Set(ctx, rn, data))
+					downloadRN, err := digest.CASResourceNameFromProto(rn)
+					require.NoError(t, err)
+					if tc.compressed {
+						downloadRN.SetCompressor(repb.Compressor_ZSTD)
+					}
+					end := int64(len(data))
+					if tc.limit > 0 {
+						end = tc.offset + tc.limit
+					}
+					partial := tc.offset != 0 || tc.limit != 0
+					for i := 1; i <= 2; i++ {
+						stream, err := proxy.Read(ctx, &bspb.ReadRequest{ResourceName: downloadRN.DownloadString(), ReadOffset: tc.offset, ReadLimit: tc.limit})
+						require.NoError(t, err)
+						var got []byte
+						for {
+							resp, err := stream.Recv()
+							if err == io.EOF {
+								break
+							}
+							require.NoError(t, err)
+							got = append(got, resp.GetData()...)
+						}
+						if tc.compressed {
+							got, err = compression.DecompressZstd(nil, got)
+							require.NoError(t, err)
+						}
+						require.Equal(t, data[tc.offset:end], got)
+						if partial {
+							require.Equal(t, int32(i), reads.Load())
+							if enabled {
+								require.Zero(t, local.bytesWritten.Load())
+							} else {
+								require.Equal(t, int64(i)*(end-tc.offset), local.bytesWritten.Load())
+							}
+							exists, err := local.Contains(ctx, rn)
+							require.NoError(t, err)
+							require.False(t, exists)
+						} else {
+							require.Equal(t, int32(1), reads.Load())
+							require.Equal(t, int64(len(data)), local.bytesWritten.Load())
+						}
+					}
+					t.Logf("remote reads=%d, local bytes written=%d", reads.Load(), local.bytesWritten.Load())
+				})
+			}
+		})
+	}
+}
+
 func TestRead_RemoteAtimeUpdated(t *testing.T) {
 	rn, blob := testdigest.RandomCompressibleCASResourceBuf(t, 5e4, "" /*instanceName*/)
 	d := rn.Digest

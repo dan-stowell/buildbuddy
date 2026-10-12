@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
-	"flag"
 	"fmt"
 	"hash"
 	"io"
@@ -31,6 +30,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/claims"
 	"github.com/buildbuddy-io/buildbuddy/server/util/compression"
 	"github.com/buildbuddy-io/buildbuddy/server/util/findmissing"
+	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/lib/set"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
@@ -53,8 +53,9 @@ const (
 )
 
 var (
-	disableCDC          = flag.Bool("cache_proxy.disable_cdc", false, "If true, disable proxy-side CDC behavior, including chunked reads and intercepting/chunking large writes.")
-	skipWriteValidation = flag.Bool("cache_proxy.skip_write_validation", false, "If true, skip local cache write validation and rely on remote validation for cache proxy dual writes.")
+	skipPartialReadCacheWrites = flag.Bool("cache_proxy.skip_partial_read_cache_writes", false, "If true, skip local cache writes on read misses with a nonzero offset or limit.", flag.Internal)
+	disableCDC                 = flag.Bool("cache_proxy.disable_cdc", false, "If true, disable proxy-side CDC behavior, including chunked reads and intercepting/chunking large writes.")
+	skipWriteValidation        = flag.Bool("cache_proxy.skip_write_validation", false, "If true, skip local cache write validation and rely on remote validation for cache proxy dual writes.")
 )
 
 func groupIDForMetrics(ctx context.Context) string {
@@ -780,6 +781,13 @@ func (r *readThroughCacheStream) Context() context.Context { return r.ctx }
 func (s *ByteStreamServerProxy) readRemoteWriteLocal(req *bspb.ReadRequest, stream bspb.ByteStream_ReadServer) error {
 	ctx, spn := tracing.StartSpan(stream.Context())
 	defer spn.End()
+
+	if *skipPartialReadCacheWrites && (req.GetReadOffset() != 0 || req.GetReadLimit() != 0) {
+		// Partial responses cannot validate against the full blob digest. Forward
+		// the original request, including compressed resource names, without
+		// starting a local upload of potentially incomplete data.
+		return s.readRemoteOnly(ctx, req, stream)
+	}
 
 	// Rewrite the resource name so we can write to the local server
 	rn, err := digest.ParseDownloadResourceName(req.GetResourceName())

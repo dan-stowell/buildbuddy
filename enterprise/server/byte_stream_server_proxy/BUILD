@@ -27,6 +27,7 @@ go_library(
         "//server/util/claims",
         "//server/util/compression",
         "//server/util/findmissing",
+        "//server/util/flag",
         "//server/util/lib/set",
         "//server/util/log",
         "//server/util/prefix",
