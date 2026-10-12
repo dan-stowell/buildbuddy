@@ -3,11 +3,15 @@ package ociconv_test
 import (
 	"archive/tar"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -16,6 +20,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testregistry"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/ext4"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/oci"
+	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
 	"github.com/buildbuddy-io/buildbuddy/server/util/claims"
@@ -48,6 +53,15 @@ func sharedDiskImageNode(containerImage string) *repb.FileNode {
 }
 
 func TestOciconv(t *testing.T) {
+	for _, localTemp := range []bool{false, true} {
+		t.Run(fmt.Sprint(localTemp), func(t *testing.T) {
+			flags.Set(t, "executor.ext4_image_temp_in_filecache", localTemp)
+			testOciconv(t)
+		})
+	}
+}
+
+func testOciconv(t *testing.T) {
 	te := testenv.GetTestEnv(t)
 	flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
 	flags.Set(t, "executor.local_cache_store_ext4_images", true)
@@ -129,6 +143,15 @@ func TestOciconv(t *testing.T) {
 }
 
 func TestCreateDiskImage_UsesCredentialsOnCacheMiss(t *testing.T) {
+	for _, serialize := range []bool{false, true} {
+		t.Run(fmt.Sprint(serialize), func(t *testing.T) {
+			flags.Set(t, "executor.serialize_ext4_conversions", serialize)
+			testCreateDiskImageUsesCredentials(t)
+		})
+	}
+}
+
+func testCreateDiskImageUsesCredentials(t *testing.T) {
 	te := testenv.GetTestEnv(t)
 	flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
 	flags.Set(t, "executor.local_cache_store_ext4_images", true)
@@ -310,4 +333,297 @@ func TestLinkCachedImage_LegacyStorageWhenFileCacheDisabled(t *testing.T) {
 	content, err := os.ReadFile(linkedPath)
 	require.NoError(t, err)
 	require.Equal(t, "legacy-ext4", string(content))
+}
+
+func TestLegacyManifestDigest(t *testing.T) {
+	flags.Set(t, "executor.local_cache_store_ext4_images", false)
+	flags.Set(t, "executor.legacy_ext4_use_manifest_digest", true)
+	flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
+	te := testenv.GetTestEnv(t)
+	reg := testregistry.Run(t, testregistry.Opts{})
+	ref, img := reg.PushNamedImage(t, "legacy-digest:latest", nil)
+	resolver, err := oci.NewResolver(te)
+	require.NoError(t, err)
+	root := t.TempDir()
+	output := filepath.Join(root, "linked.ext4")
+	require.NoError(t, ociconv.CreateDiskImage(context.Background(), resolver, nil, root, ref, oci.Credentials{}, false, output))
+	d, err := img.Digest()
+	require.NoError(t, err)
+	cachedPath := filepath.Join(root, "images", "ext4", hash.String(ref), d.Algorithm+"-"+d.Hex, "containerfs.ext4")
+	a, err := os.Stat(cachedPath)
+	require.NoError(t, err)
+	b, err := os.Stat(output)
+	require.NoError(t, err)
+	require.True(t, os.SameFile(a, b))
+	cached, err := ociconv.IsImageCached(context.Background(), nil, root, ref)
+	require.NoError(t, err)
+	require.True(t, cached)
+	// The new generation directory also works with migration.
+	flags.Set(t, "executor.local_cache_store_ext4_images", true)
+	fc, err := filecache.NewFileCache(filepath.Join(root, "filecache"), 1_000_000_000, false)
+	require.NoError(t, err)
+	require.NoError(t, ociconv.MigrateImagesToFileCache(context.Background(), fc, root))
+	require.True(t, fc.ContainsFile(fc.WithSharedDirectory(context.Background(), "ext4_images"), sharedDiskImageNode(ref)))
+}
+
+func TestConcurrentConversionAcrossCredentials(t *testing.T) {
+	for _, localCache := range []bool{false, true} {
+		t.Run(fmt.Sprintf("filecache=%t", localCache), func(t *testing.T) {
+			flags.Set(t, "executor.serialize_ext4_conversions", true)
+			lockWaiting := ociconv.ObserveConversionLockForTest(t)
+			flags.Set(t, "executor.local_cache_store_ext4_images", localCache)
+			flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
+			te := testenv.GetTestEnv(t)
+			entered, release := make(chan struct{}), make(chan struct{})
+			var gate sync.Once
+			var first atomic.Bool
+			defer gate.Do(func() { close(release) })
+			var blobs atomic.Int64
+			reg := testregistry.Run(t, testregistry.Opts{HttpInterceptor: func(w http.ResponseWriter, r *http.Request) bool {
+				if r.Method == "GET" && strings.Contains(r.URL.Path, "/blobs/") {
+					blobs.Add(1)
+					if first.CompareAndSwap(false, true) {
+						close(entered)
+						<-release
+					}
+				}
+				return true
+			}})
+			t.Cleanup(func() { reg.Shutdown() })
+			ref, _ := reg.PushNamedImage(t, "concurrent-conversion:latest", nil)
+			blobs.Store(0)
+			resolver, err := oci.NewResolver(te)
+			require.NoError(t, err)
+			root := t.TempDir()
+			var fc interfaces.FileCache
+			if localCache {
+				cache, err := filecache.NewFileCache(filepath.Join(root, "filecache"), 1_000_000_000, false)
+				require.NoError(t, err)
+				defer cache.Close()
+				fc = cache
+			}
+			call := func(ctx context.Context, i int) <-chan error {
+				result := make(chan error, 1)
+				go func() {
+					result <- ociconv.CreateDiskImage(ctx, resolver, fc, root, ref, oci.Credentials{Username: fmt.Sprint(i), Password: "password"}, false, filepath.Join(root, fmt.Sprintf("output-%d.ext4", i)))
+				}()
+				return result
+			}
+			holder := call(context.Background(), 0)
+			awaitConversionSignal(t, entered)
+			waiter := call(context.Background(), 1)
+			awaitConversionSignal(t, lockWaiting)
+			select {
+			case err := <-waiter:
+				t.Fatalf("waiter completed while conversion holder was blocked: %v", err)
+			default:
+			}
+			gate.Do(func() { close(release) })
+			require.NoError(t, awaitConversionResult(t, holder))
+			require.NoError(t, awaitConversionResult(t, waiter))
+			require.Equal(t, int64(1), blobs.Load(), "one layer fetch across credential-specific cache misses")
+			a, err := os.Stat(filepath.Join(root, "output-0.ext4"))
+			require.NoError(t, err)
+			b, err := os.Stat(filepath.Join(root, "output-1.ext4"))
+			require.NoError(t, err)
+			require.True(t, os.SameFile(a, b))
+
+		})
+	}
+}
+
+func awaitConversionSignal(t *testing.T, signal <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for conversion")
+	}
+}
+
+func awaitConversionResult(t *testing.T, result <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for conversion result")
+		return nil
+	}
+}
+
+func TestConcurrentConversionAuthentication(t *testing.T) {
+	for _, invalidFirst := range []bool{true, false} {
+		t.Run(fmt.Sprintf("invalid-first=%t", invalidFirst), func(t *testing.T) {
+			flags.Set(t, "executor.serialize_ext4_conversions", true)
+			lockWaiting := ociconv.ObserveConversionLockForTest(t)
+			flags.Set(t, "executor.local_cache_store_ext4_images", true)
+			flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
+			entered, release := make(chan struct{}), make(chan struct{})
+			var gate sync.Once
+			defer gate.Do(func() { close(release) })
+			var enabled atomic.Bool
+			var first atomic.Bool
+			creds := &testregistry.BasicAuthCreds{Username: "valid", Password: "password"}
+			reg := testregistry.Run(t, testregistry.Opts{Creds: creds, HttpInterceptor: func(w http.ResponseWriter, r *http.Request) bool {
+				if enabled.Load() && r.Method == "GET" {
+					if first.CompareAndSwap(false, true) {
+						close(entered)
+						<-release
+					}
+				}
+				return true
+			}})
+			t.Cleanup(func() { reg.Shutdown() })
+			ref, _ := reg.PushNamedImage(t, "concurrent-auth:latest", creds)
+			enabled.Store(true)
+			resolver, err := oci.NewResolver(testenv.GetTestEnv(t))
+			require.NoError(t, err)
+			root := t.TempDir()
+			fc, err := filecache.NewFileCache(filepath.Join(root, "filecache"), 1_000_000_000, false)
+			require.NoError(t, err)
+			defer fc.Close()
+			valid := oci.Credentials{Username: creds.Username, Password: creds.Password}
+			invalid := oci.Credentials{Username: "invalid", Password: "wrong"}
+			firstCreds, secondCreds := valid, invalid
+			if invalidFirst {
+				firstCreds, secondCreds = invalid, valid
+			}
+			call := func(ctx context.Context, creds oci.Credentials, name string) <-chan error {
+				result := make(chan error, 1)
+				go func() {
+					result <- ociconv.CreateDiskImage(ctx, resolver, fc, root, ref, creds, false, filepath.Join(root, name+".ext4"))
+				}()
+				return result
+			}
+			leader := call(context.Background(), firstCreds, "first")
+			awaitConversionSignal(t, entered)
+			waiter := call(context.Background(), secondCreds, "second")
+			awaitConversionSignal(t, lockWaiting)
+			select {
+			case err := <-waiter:
+				t.Fatalf("waiter completed while conversion holder was blocked: %v", err)
+			default:
+			}
+			gate.Do(func() { close(release) })
+			leaderErr := awaitConversionResult(t, leader)
+			if invalidFirst {
+				require.ErrorContains(t, leaderErr, "401 Unauthorized")
+				require.NoFileExists(t, filepath.Join(root, "first.ext4"))
+			} else {
+				require.NoError(t, leaderErr)
+				require.FileExists(t, filepath.Join(root, "first.ext4"))
+			}
+			// With a valid leader, the other credentials use the populated cache.
+			require.NoError(t, awaitConversionResult(t, waiter))
+			require.FileExists(t, filepath.Join(root, "second.ext4"))
+		})
+	}
+}
+
+func TestCancelConversionLockWaiter(t *testing.T) {
+	flags.Set(t, "executor.serialize_ext4_conversions", true)
+	lockWaiting := ociconv.ObserveConversionLockForTest(t)
+	flags.Set(t, "executor.local_cache_store_ext4_images", true)
+	flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
+	entered, release := make(chan struct{}), make(chan struct{})
+	var gate sync.Once
+	var first atomic.Bool
+	defer gate.Do(func() { close(release) })
+	var blobs atomic.Int64
+	reg := testregistry.Run(t, testregistry.Opts{HttpInterceptor: func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == "GET" && strings.Contains(r.URL.Path, "/blobs/") {
+			blobs.Add(1)
+			if first.CompareAndSwap(false, true) {
+				close(entered)
+				<-release
+			}
+		}
+		return true
+	}})
+	t.Cleanup(func() { reg.Shutdown() })
+	ref, _ := reg.PushNamedImage(t, "cancel-waiter:latest", nil)
+	blobs.Store(0)
+	resolver, err := oci.NewResolver(testenv.GetTestEnv(t))
+	require.NoError(t, err)
+	root := t.TempDir()
+	fc, err := filecache.NewFileCache(filepath.Join(root, "filecache"), 1_000_000_000, false)
+	require.NoError(t, err)
+	defer fc.Close()
+	call := func(ctx context.Context, name string) <-chan error {
+		result := make(chan error, 1)
+		go func() {
+			result <- ociconv.CreateDiskImage(ctx, resolver, fc, root, ref, oci.Credentials{Username: name}, false, filepath.Join(root, name+".ext4"))
+		}()
+		return result
+	}
+	holder := call(context.Background(), "holder")
+	awaitConversionSignal(t, entered)
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelled := call(cancelCtx, "cancelled")
+	awaitConversionSignal(t, lockWaiting)
+	other := call(context.Background(), "other")
+	awaitConversionSignal(t, lockWaiting)
+	select {
+	case err := <-other:
+		t.Fatalf("other waiter completed while holder was blocked: %v", err)
+	default:
+	}
+	require.Equal(t, int64(1), blobs.Load(), "waiters must not fetch while the holder owns the conversion lock")
+	cancel()
+	select {
+	case err := <-cancelled:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("lock waiter did not return promptly on cancellation")
+	}
+	require.NoFileExists(t, filepath.Join(root, "cancelled.ext4"))
+	select {
+	case err := <-holder:
+		t.Fatalf("holder completed before registry release: %v", err)
+	default:
+	}
+	gate.Do(func() { close(release) })
+	require.NoError(t, awaitConversionResult(t, holder))
+	require.NoError(t, awaitConversionResult(t, other))
+	require.Equal(t, int64(1), blobs.Load())
+	a, err := os.Stat(filepath.Join(root, "holder.ext4"))
+	require.NoError(t, err)
+	b, err := os.Stat(filepath.Join(root, "other.ext4"))
+	require.NoError(t, err)
+	require.True(t, os.SameFile(a, b))
+}
+
+func TestConversionTempAcrossFilesystems(t *testing.T) {
+	flags.Set(t, "executor.ext4_image_temp_in_filecache", true)
+	flags.Set(t, "executor.local_cache_store_ext4_images", true)
+	flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
+	cacheRoot, err := os.MkdirTemp("/dev/shm", "ociconv-test-*")
+	if err != nil {
+		t.Skipf("tmpfs unavailable: %s", err)
+	}
+	defer os.RemoveAll(cacheRoot)
+	root := t.TempDir()
+	a, err := os.Stat(root)
+	require.NoError(t, err)
+	b, err := os.Stat(cacheRoot)
+	require.NoError(t, err)
+	if a.Sys().(*syscall.Stat_t).Dev == b.Sys().(*syscall.Stat_t).Dev {
+		t.Skip("requires distinct filesystems")
+	}
+	fc, err := filecache.NewFileCache(filepath.Join(root, "filecache"), 1_000_000_000, false)
+	require.NoError(t, err)
+	defer fc.Close()
+	te := testenv.GetTestEnv(t)
+	resolver, err := oci.NewResolver(te)
+	require.NoError(t, err)
+	reg := testregistry.Run(t, testregistry.Opts{})
+	ref, _ := reg.PushNamedImage(t, "cross-filesystem:latest", nil)
+	output := filepath.Join(root, "linked.ext4")
+	require.NoError(t, ociconv.CreateDiskImage(context.Background(), resolver, fc, cacheRoot, ref, oci.Credentials{}, false, output))
+	require.FileExists(t, output)
+	entries, err := os.ReadDir(fc.TempDir())
+	require.NoError(t, err)
+	require.Empty(t, entries, "temporary image was removed after linking")
 }
