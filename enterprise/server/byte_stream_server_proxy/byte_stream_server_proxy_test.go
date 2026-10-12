@@ -1678,6 +1678,11 @@ func TestReadChunkedFastPathSkipsSplitBlob(t *testing.T) {
 
 func TestReadChunkedEncryptedRemoteOnly(t *testing.T) {
 	testProvider := memprovider.NewInMemoryProvider(map[string]memprovider.InMemoryFlag{
+		"cache_proxy.local_read_fast_path": {
+			State:          memprovider.Enabled,
+			DefaultVariant: "true",
+			Variants:       map[string]any{"true": true},
+		},
 		"cache_proxy.attempt_chunked_reads": {
 			State:          memprovider.Enabled,
 			DefaultVariant: "true",
@@ -1834,6 +1839,11 @@ func TestReadChunkedEncryptedRemoteOnly(t *testing.T) {
 
 func TestReadChunkedEncryptedRemoteOnlyFallsBackToFullBlob(t *testing.T) {
 	testProvider := memprovider.NewInMemoryProvider(map[string]memprovider.InMemoryFlag{
+		"cache_proxy.local_read_fast_path": {
+			State:          memprovider.Enabled,
+			DefaultVariant: "true",
+			Variants:       map[string]any{"true": true},
+		},
 		"cache_proxy.attempt_chunked_reads": {
 			State:          memprovider.Enabled,
 			DefaultVariant: "true",
@@ -2372,7 +2382,20 @@ func TestReadChunkedWithOffset(t *testing.T) {
 }
 
 func TestReadChunkedFallsBackToLocalBlob(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+			testReadChunkedFallsBackToLocalBlob(t, enabled)
+		})
+	}
+}
+
+func testReadChunkedFallsBackToLocalBlob(t *testing.T, enabled bool) {
 	testProvider := memprovider.NewInMemoryProvider(map[string]memprovider.InMemoryFlag{
+		"cache_proxy.local_read_fast_path": {
+			State:          memprovider.Enabled,
+			DefaultVariant: "value",
+			Variants:       map[string]any{"value": enabled},
+		},
 		"cache_proxy.attempt_chunked_reads": {
 			State:          memprovider.Enabled,
 			DefaultVariant: "true",
@@ -2438,21 +2461,50 @@ func TestReadChunkedFallsBackToLocalBlob(t *testing.T) {
 	blobRN := digest.NewCASResourceName(blobDigest, "", repb.DigestFunction_BLAKE3)
 	require.NoError(t, proxyEnv.GetCache().Set(ctx, blobRN.ToProto(), originalData))
 
-	downloadStream, err := proxy.Read(ctx, &bspb.ReadRequest{ResourceName: blobRN.DownloadString()})
-	require.NoError(t, err)
-
-	var got []byte
-	for {
-		res, err := downloadStream.Recv()
-		if err == io.EOF {
-			break
-		}
-		require.NoError(t, err)
-		got = append(got, res.Data...)
+	flags.Set(t, "cache.zstd_transcoding_enabled", true)
+	for _, tc := range []struct {
+		name          string
+		offset, limit int64
+		compressor    repb.Compressor_Value
+	}{
+		{name: "full"},
+		{name: "offset", offset: 12345},
+		{name: "limit", offset: 12345, limit: 4567},
+		{name: "compressed", compressor: repb.Compressor_ZSTD},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			blobRN.SetCompressor(tc.compressor)
+			before := splitBlobCalls.Load()
+			downloadStream, err := proxy.Read(ctx, &bspb.ReadRequest{
+				ResourceName: blobRN.DownloadString(), ReadOffset: tc.offset, ReadLimit: tc.limit,
+			})
+			require.NoError(t, err)
+			var got []byte
+			for {
+				res, err := downloadStream.Recv()
+				if err == io.EOF {
+					break
+				}
+				require.NoError(t, err)
+				got = append(got, res.Data...)
+			}
+			if tc.compressor == repb.Compressor_ZSTD {
+				got, err = compression.DecompressZstd(nil, got)
+				require.NoError(t, err)
+			}
+			want := originalData[tc.offset:]
+			if tc.limit > 0 {
+				want = want[:tc.limit]
+			}
+			require.Equal(t, want, got)
+			wantSplitCalls := int32(0)
+			if !enabled && tc.limit == 0 {
+				wantSplitCalls = 1
+			}
+			require.Equal(t, wantSplitCalls, splitBlobCalls.Load()-before)
+		})
 	}
 
-	require.Equal(t, originalData, got)
-	require.Equal(t, int32(1), splitBlobCalls.Load(), "chunked-eligible reads should try SplitBlob first")
 }
 
 func TestReadChunkedPartialLocalFailure(t *testing.T) {
@@ -2617,7 +2669,25 @@ func TestReadRemoteChunkRetryClassification(t *testing.T) {
 }
 
 func TestWriteChunked(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+			testWriteChunked(t, enabled)
+		})
+	}
+}
+
+func testWriteChunked(t *testing.T, enabled bool) {
 	testProvider := memprovider.NewInMemoryProvider(map[string]memprovider.InMemoryFlag{
+		"cache_proxy.attempt_chunked_reads": {
+			State:          memprovider.Enabled,
+			DefaultVariant: "true",
+			Variants:       map[string]any{"true": true},
+		},
+		"cache_proxy.local_read_fast_path": {
+			State:          memprovider.Enabled,
+			DefaultVariant: "value",
+			Variants:       map[string]any{"value": enabled},
+		},
 		"cache_proxy.intercept_and_chunk_large_writes": {
 			State:          memprovider.Enabled,
 			DefaultVariant: "true",
@@ -2658,7 +2728,15 @@ func TestWriteChunked(t *testing.T) {
 	bspb.RegisterByteStreamServer(remoteGRPC, remoteBSS)
 	repb.RegisterContentAddressableStorageServer(remoteGRPC, remoteCAS)
 	go remoteRun()
-	remoteConn, err := testenv.LocalGRPCConn(t, ctx, remoteLis)
+	var splitBlobCalls atomic.Int32
+	remoteConn, err := testenv.LocalGRPCConn(t, ctx, remoteLis, grpc.WithUnaryInterceptor(func(
+		ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption,
+	) error {
+		if strings.HasSuffix(method, "/SplitBlob") {
+			splitBlobCalls.Add(1)
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}))
 	require.NoError(t, err)
 	t.Cleanup(func() { remoteConn.Close() })
 	bsClient := bspb.NewByteStreamClient(remoteConn)
@@ -2707,6 +2785,11 @@ func TestWriteChunked(t *testing.T) {
 	writeChunkBytesBefore := testutil.ToFloat64(metrics.ByteStreamChunkedWriteChunkBytes.With(writeLabels))
 	writeDedupedBytesBefore := testutil.ToFloat64(metrics.ByteStreamChunkedWriteDedupedChunkBytes.With(writeLabels))
 
+	storeCounter := metrics.ByteStreamChunkedReadLocalManifestStoreAttempts.With(prometheus.Labels{
+		metrics.StatusHumanReadableLabel: "OK",
+	})
+	storesBeforeUpload := testutil.ToFloat64(storeCounter)
+
 	uploadStream, err := proxy.Write(ctx)
 	require.NoError(t, err)
 	remaining := compressedData
@@ -2727,6 +2810,15 @@ func TestWriteChunked(t *testing.T) {
 	_, err = uploadStream.CloseAndRecv()
 	require.NoError(t, err)
 
+	manifest, manifestErr := chunking.LoadManifest(ctx, proxyEnv.GetCache(), blobDigest, "", repb.DigestFunction_BLAKE3)
+	if enabled {
+		require.NoError(t, manifestErr)
+		require.Equal(t, blobDigest, manifest.BlobDigest)
+		require.Greater(t, len(manifest.ChunkDigests), 1)
+	} else {
+		require.True(t, status.IsNotFoundError(manifestErr), "disabled: successful SpliceBlob does not store a local manifest: %v", manifestErr)
+	}
+
 	writeBlobBytesAfter := testutil.ToFloat64(metrics.ByteStreamChunkedWriteBlobBytes.With(writeLabels))
 	writeChunksTotalAfter := testutil.ToFloat64(metrics.ByteStreamChunkedWriteChunksTotal.With(writeLabelsWithGroup))
 	writeChunksDedupedAfter := testutil.ToFloat64(metrics.ByteStreamChunkedWriteChunksDeduped.With(writeLabelsWithGroup))
@@ -2738,6 +2830,13 @@ func TestWriteChunked(t *testing.T) {
 	require.Equal(t, float64(0), writeChunksDedupedAfter-writeChunksDedupedBefore, "first write: no chunks existed on remote yet")
 	require.Greater(t, writeChunkBytesAfter-writeChunkBytesBefore, float64(0), "chunk bytes = sum of all chunk sizes")
 	require.Equal(t, float64(0), writeDedupedBytesAfter-writeDedupedBytesBefore, "first write: no bytes deduped")
+
+	storesBeforeReads := testutil.ToFloat64(storeCounter)
+	wantUploadStores := float64(0)
+	if enabled {
+		wantUploadStores = 1
+	}
+	require.Equal(t, wantUploadStores, storesBeforeReads-storesBeforeUpload)
 
 	downloadRN := digest.NewCASResourceName(blobDigest, "", repb.DigestFunction_BLAKE3)
 	downloadRN.SetCompressor(repb.Compressor_ZSTD)
@@ -2773,10 +2872,22 @@ func TestWriteChunked(t *testing.T) {
 	}
 
 	require.Equal(t, originalData, reconstructedData)
+	wantSplitCalls := int32(2)
+	if enabled {
+		wantSplitCalls = 0
+	}
+	require.Equal(t, wantSplitCalls, splitBlobCalls.Load(), "warm compressed and identity reads")
+	require.Equal(t, float64(wantSplitCalls), testutil.ToFloat64(storeCounter)-storesBeforeReads, "warm reads should not rewrite the manifest when enabled")
+
 }
 
 func TestWriteChunkedEncryptedRemoteOnly(t *testing.T) {
 	testProvider := memprovider.NewInMemoryProvider(map[string]memprovider.InMemoryFlag{
+		"cache_proxy.local_read_fast_path": {
+			State:          memprovider.Enabled,
+			DefaultVariant: "true",
+			Variants:       map[string]any{"true": true},
+		},
 		"cache_proxy.intercept_and_chunk_large_writes": {
 			State:          memprovider.Enabled,
 			DefaultVariant: "true",
@@ -3650,4 +3761,113 @@ func BenchmarkReadChunkedMixedLocalRemote(b *testing.B) {
 			})
 		}
 	}
+}
+
+// These streams exercise auth and partial failures without relying on gRPC
+// interceptors to reject the request before it reaches the local read path.
+type contextReadServer struct {
+	recordingByteStreamReadServer
+	ctx context.Context
+}
+
+func (s *contextReadServer) Context() context.Context { return s.ctx }
+
+func (s *contextReadServer) Send(response *bspb.ReadResponse) error {
+	// ByteStream servers may reuse their frame buffers after Send returns.
+	s.responses = append(s.responses, &bspb.ReadResponse{Data: bytes.Clone(response.Data)})
+	return nil
+}
+
+type notFoundCASClient struct {
+	repb.ContentAddressableStorageClient
+}
+
+func (c *notFoundCASClient) SplitBlob(ctx context.Context, req *repb.SplitBlobRequest, opts ...grpc.CallOption) (*repb.SplitBlobResponse, error) {
+	return nil, status.NotFoundError("no remote manifest")
+}
+
+type partialFailureLocalServer struct{ interfaces.ByteStreamServer }
+
+func (s *partialFailureLocalServer) ReadCASResource(ctx context.Context, rn *digest.CASResourceName, offset, limit int64, stream bspb.ByteStream_ReadServer) error {
+	if err := stream.Send(&bspb.ReadResponse{Data: []byte("partial")}); err != nil {
+		return err
+	}
+	return status.InternalError("local read failed after sending data")
+}
+
+func localReadFastPathProvider(t *testing.T) interfaces.ExperimentFlagProvider {
+	t.Helper()
+	provider := memprovider.NewInMemoryProvider(map[string]memprovider.InMemoryFlag{
+		"cache_proxy.local_read_fast_path": {
+			State: memprovider.Enabled, DefaultVariant: "true", Variants: map[string]any{"true": true},
+		},
+	})
+	require.NoError(t, openfeature.SetNamedProviderAndWait(t.Name(), provider))
+	fp, err := experiments.NewFlagProvider(t.Name())
+	require.NoError(t, err)
+	return fp
+}
+
+func TestLocalReadFastPathAuthIsolation(t *testing.T) {
+	env := testenv.GetTestEnv(t)
+	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("a", "group-a", "b", "group-b"))
+	env.SetAuthenticator(ta)
+	local, err := byte_stream_server.NewByteStreamServer(env)
+	require.NoError(t, err)
+	remoteEnv := testenv.GetTestEnv(t)
+	bs, _, _, _ := runRemoteServices(context.Background(), remoteEnv, t)
+	s := &ByteStreamServerProxy{
+		authenticator: ta, local: local, localCache: env.GetCache(),
+		remote: bs, remoteCAS: &notFoundCASClient{}, efp: localReadFastPathProvider(t),
+	}
+	ctxA, err := ta.WithAuthenticatedUser(context.Background(), "a")
+	require.NoError(t, err)
+	ctxA, err = prefix.AttachUserPrefixToContext(ctxA, ta)
+	require.NoError(t, err)
+	rn, data := testdigest.RandomCASResourceBuf(t, 5*1024*1024)
+	require.NoError(t, env.GetCache().Set(ctxA, rn, data))
+	casRN, err := digest.CASResourceNameFromProto(rn)
+	require.NoError(t, err)
+	ctxB, err := ta.WithAuthenticatedUser(context.Background(), "b")
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name    string
+		ctx     context.Context
+		allowed bool
+	}{
+		{"owner", ctxA, true},
+		{"other_group", ctxB, false},
+		{"invalid_credentials", ta.AuthContextFromAPIKey(context.Background(), "unknown"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stream := &contextReadServer{ctx: tc.ctx}
+			err := s.Read(&bspb.ReadRequest{ResourceName: casRN.DownloadString()}, stream)
+			if tc.allowed {
+				require.NoError(t, err)
+				var got []byte
+				for _, response := range stream.responses {
+					got = append(got, response.Data...)
+				}
+				require.Equal(t, data, got)
+			} else {
+				require.Error(t, err)
+				require.Empty(t, stream.responses)
+			}
+		})
+	}
+}
+
+func TestLocalReadFastPathPartialFailureDoesNotFallBack(t *testing.T) {
+	env := testenv.GetTestEnv(t)
+	s := &ByteStreamServerProxy{
+		authenticator: env.GetAuthenticator(), local: &partialFailureLocalServer{},
+		localCache: env.GetCache(), remoteCAS: &noOpCASClient{}, efp: localReadFastPathProvider(t),
+		// A fallback would panic on the unset remote clients.
+	}
+	rn := digest.NewCASResourceName(&repb.Digest{Hash: strings.Repeat("a", 64), SizeBytes: 5 * 1024 * 1024}, "", repb.DigestFunction_SHA256)
+	stream := &contextReadServer{ctx: context.Background()}
+	err := s.Read(&bspb.ReadRequest{ResourceName: rn.DownloadString()}, stream)
+	require.True(t, status.IsInternalError(err))
+	require.Len(t, stream.responses, 1)
+	require.Equal(t, []byte("partial"), stream.responses[0].Data)
 }

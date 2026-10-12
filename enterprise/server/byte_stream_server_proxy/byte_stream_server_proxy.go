@@ -221,7 +221,23 @@ func (s *ByteStreamServerProxy) read(ctx context.Context, req *bspb.ReadRequest,
 		}, nil
 	}
 
-	if s.shouldReadChunked(ctx, req, rn) {
+	shouldReadChunked := s.shouldReadChunked(ctx, req, rn)
+	var localErr error
+	localReadAttempted := false
+	if shouldReadChunked && !remoteOnly && s.localReadFastPathEnabled(ctx) {
+		// Use the normal local read path, including its authentication and group
+		// namespacing, before asking the remote for chunk metadata.
+		localReadAttempted = true
+		localErr = s.local.ReadCASResource(ctx, rn, req.GetReadOffset(), req.GetReadLimit(), stream)
+		if localErr == nil || stream.frames > 0 {
+			return readMetrics{
+				cacheStatus: metrics.HitStatusLabel,
+				compressor:  rn.GetCompressor().String(),
+			}, localErr
+		}
+	}
+
+	if shouldReadChunked {
 		chunkMetrics, err := s.readChunked(ctx, req, stream, rn, remoteOnly)
 		if err == nil {
 			cacheStatus := metrics.MissStatusLabel
@@ -262,7 +278,9 @@ func (s *ByteStreamServerProxy) read(ctx context.Context, req *bspb.ReadRequest,
 		}, s.readRemoteOnly(ctx, req, stream)
 	}
 
-	localErr := s.local.ReadCASResource(ctx, rn, req.GetReadOffset(), req.GetReadLimit(), stream)
+	if !localReadAttempted {
+		localErr = s.local.ReadCASResource(ctx, rn, req.GetReadOffset(), req.GetReadLimit(), stream)
+	}
 	// If some responses were streamed to the client, just return the
 	// error. Otherwise, fall-back to remote. We might be able to continue
 	// streaming to the client by doing an offset read from the remote
@@ -279,6 +297,12 @@ func (s *ByteStreamServerProxy) read(ctx context.Context, req *bspb.ReadRequest,
 			compressor:  rn.GetCompressor().String(),
 		}, localErr
 	}
+}
+
+// localReadFastPathEnabled gates both full-blob local reads before SplitBlob and
+// storing manifests on upload so subsequent chunked reads can stay local.
+func (s *ByteStreamServerProxy) localReadFastPathEnabled(ctx context.Context) bool {
+	return s.efp != nil && s.efp.Boolean(ctx, "cache_proxy.local_read_fast_path", false)
 }
 
 func (s *ByteStreamServerProxy) shouldReadChunked(ctx context.Context, req *bspb.ReadRequest, rn *digest.CASResourceName) bool {
@@ -423,7 +447,7 @@ func sendChunkFrames(stream bspb.ByteStream_ReadServer, data []byte) error {
 
 func (s *ByteStreamServerProxy) chunkDigests(ctx context.Context, rn *digest.CASResourceName, remoteOnly bool) ([]*repb.Digest, error) {
 	fastPathEnabled := s.efp != nil && s.efp.Boolean(ctx, "cache_proxy.cdc_read_fast_path", false)
-	if fastPathEnabled && !remoteOnly {
+	if (fastPathEnabled || s.localReadFastPathEnabled(ctx)) && !remoteOnly {
 		if chunkDigests, ok := s.localChunkDigests(ctx, rn); ok {
 			return chunkDigests, nil
 		}
@@ -1472,6 +1496,13 @@ func (s *ByteStreamServerProxy) writeChunked(ctx context.Context, stream bspb.By
 	}
 
 	result.remoteDuration = time.Since(remoteStart)
+
+	if !remoteOnly && s.localReadFastPathEnabled(ctx) {
+		// SpliceBlob has accepted the manifest and all local chunk writes have
+		// completed. A best-effort store must not fail a successful upload.
+		s.storeLocalChunkedManifest(ctx, digest.NewCASResourceName(rn.GetDigest(), instanceName, digestFunction), chunkDigests)
+	}
+
 	return result, stream.SendAndClose(&bspb.WriteResponse{CommittedSize: bytesReceived})
 }
 
