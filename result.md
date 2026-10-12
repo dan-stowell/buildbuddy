@@ -1,4 +1,4 @@
-# ext4 conversion IO investigation
+# Reduce ext4 conversion IO with opt-in prezeroed images and bounded tmpfs unpacking
 
 ## Recommendation and changes
 
@@ -10,6 +10,21 @@ Keep the unpack-directory pipeline and keep the journal. Two internal, opt-in fl
 The large image's **net conversion writes fell from 2,088.823 MiB to 1,049.419 MiB (49.8%)** with tmpfs plus prezeroed initialization; mean conversion time fell from **4.267 s to 2.798 s (34.4%)**. For Alpine/Ubuntu, unpack writes were already cancelled before writeback, so tmpfs did **not** materially reduce net writes. Prezeroed initialization alone mainly saves allocated space: approximately **4 MiB, 4 MiB, and 32 MiB** for Alpine, Ubuntu, and the large image respectively. It does not halve conversion IO.
 
 Use the prezeroed flag for a controlled rollout on supported e2fsprogs versions. Enable tmpfs only with an explicit memory/concurrency budget and a threshold appropriate to the workload. A 256 MiB threshold covers the two small images here; the large image requires a higher limit (the measurements used 2 GiB). Leave sizing, inode policy, tar ownership/permission handling, journaling, and fsync unchanged. Existing cached images are not regenerated when flags change; improvements apply to new conversions.
+
+## Tests added
+
+- Privileged extraction tests assert `statfs` reports `TMPFS_MAGIC` on the unpack directory. A compressible 2.1 MB file passes the compressed-size filter but exhausts a 1 MiB mount; the test observes exactly two extraction attempts, verifies the retry uses the workspace filesystem, compares the final image content, and checks directory/mount cleanup. The successful tmpfs case asserts only one attempt. Mount tests skip cleanly without root or mount capabilities.
+- Cancellation tests pause the real tar process after it writes part of a file, on both disk and tmpfs. They assert prompt termination and process reaping, no extraction retry, no remaining unpack directory or mount, and no partial output image.
+- Direct `fitsTmpfs` cases cover manifest errors, disabled/negative limits, empty manifests, invalid/oversize layer sizes, cumulative sizes across layers, and the exact-limit boundary (including a trailing zero-size layer).
+
+Validation on this VM (uncached, with e2fsprogs 1.47.0):
+
+```sh
+bazel test --nocache_test_results //enterprise/server/oci/ociconv/... --test_output=errors
+bazel test --nocache_test_results --run_under='sudo -n' --test_strategy=standalone --strategy=TestRunner=local --test_arg=-test.v --test_output=all //enterprise/server/oci/ociconv:unpack_test
+```
+
+Both package test targets passed as the ordinary user, with privileged cases skipped cleanly. The root run passed every new test without skips, including actual tmpfs size exhaustion and disk retry. Repository static analysis also passed. No production behavior changes were needed.
 
 ## Environment and method
 
