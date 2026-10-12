@@ -47,3 +47,18 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+go_test(
+    name = "unpack_test",
+    srcs = ["unpack_test.go"],
+    embed = [":ociconv"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        "//enterprise/server/testutil/testregistry",
+        "//enterprise/server/util/ext4",
+        "//server/util/testing/flags",
+        "@com_github_google_go_containerregistry//pkg/v1:pkg",
+        "@com_github_stretchr_testify//require",
+        "@org_golang_x_sys//unix",
+    ],
+)

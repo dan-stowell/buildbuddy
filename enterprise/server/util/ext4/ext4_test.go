@@ -4,10 +4,13 @@ package ext4_test
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -107,44 +110,49 @@ func TestDirectoryToImageAutoSize_DanglingSymlink(t *testing.T) {
 }
 
 func TestDirectoryToImageAutoSize_Reproducible(t *testing.T) {
-	flags.Set(t, "executor.reproducible_ext4_images", true)
-	ctx := t.Context()
-	root := testfs.MakeTempDir(t)
+	for _, prezeroed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("prezeroed=%t", prezeroed), func(t *testing.T) {
+			flags.Set(t, "executor.reproducible_ext4_images", true)
+			flags.Set(t, "executor.prezeroed_ext4_images", prezeroed)
+			ctx := t.Context()
+			root := testfs.MakeTempDir(t)
 
-	// Build a tree with a nested directory, a symlink, and files with
-	// different mtimes, all of which end up in the image metadata. Like a
-	// freshly extracted archive, the files keep their creation-time atimes.
-	inputDir := testfs.MakeDirAll(t, root, "input")
-	testfs.WriteAllFileContents(t, inputDir, map[string]string{
-		"a.txt":     "hello",
-		"dir/b.txt": "world",
-	})
-	err := os.Symlink("a.txt", filepath.Join(inputDir, "link"))
-	require.NoError(t, err)
-	err = os.Chtimes(filepath.Join(inputDir, "a.txt"), time.Now(), time.Unix(1_600_000_000, 0))
-	require.NoError(t, err)
+			// Build a tree with a nested directory, a symlink, and files with
+			// different mtimes, all of which end up in the image metadata. Like a
+			// freshly extracted archive, the files keep their creation-time atimes.
+			inputDir := testfs.MakeDirAll(t, root, "input")
+			testfs.WriteAllFileContents(t, inputDir, map[string]string{
+				"a.txt":     "hello",
+				"dir/b.txt": "world",
+			})
+			err := os.Symlink("a.txt", filepath.Join(inputDir, "link"))
+			require.NoError(t, err)
+			err = os.Chtimes(filepath.Join(inputDir, "a.txt"), time.Now(), time.Unix(1_600_000_000, 0))
+			require.NoError(t, err)
 
-	firstImage := filepath.Join(root, "first.ext4")
-	err = ext4.DirectoryToImageAutoSize(ctx, inputDir, firstImage)
-	require.NoError(t, err)
+			firstImage := filepath.Join(root, "first.ext4")
+			err = ext4.DirectoryToImageAutoSize(ctx, inputDir, firstImage)
+			require.NoError(t, err)
 
-	// Bump the atime of a file, which also updates its ctime, the way a fresh
-	// extraction of the same content on another machine would. Converting the
-	// tree again should still produce a byte-identical image, since these
-	// timestamps carry no information about the content.
-	b := filepath.Join(inputDir, "dir/b.txt")
-	info, err := os.Stat(b)
-	require.NoError(t, err)
-	err = os.Chtimes(b, time.Now().Add(time.Hour), info.ModTime())
-	require.NoError(t, err)
+			// Bump the atime of a file, which also updates its ctime, the way a fresh
+			// extraction of the same content on another machine would. Converting the
+			// tree again should still produce a byte-identical image, since these
+			// timestamps carry no information about the content.
+			b := filepath.Join(inputDir, "dir/b.txt")
+			info, err := os.Stat(b)
+			require.NoError(t, err)
+			err = os.Chtimes(b, time.Now().Add(time.Hour), info.ModTime())
+			require.NoError(t, err)
 
-	secondImage := filepath.Join(root, "second.ext4")
-	err = ext4.DirectoryToImageAutoSize(ctx, inputDir, secondImage)
-	require.NoError(t, err)
+			secondImage := filepath.Join(root, "second.ext4")
+			err = ext4.DirectoryToImageAutoSize(ctx, inputDir, secondImage)
+			require.NoError(t, err)
 
-	firstDigest := fileDigest(t, firstImage)
-	secondDigest := fileDigest(t, secondImage)
-	require.Equal(t, firstDigest, secondDigest)
+			firstDigest := fileDigest(t, firstImage)
+			secondDigest := fileDigest(t, secondImage)
+			require.Equal(t, firstDigest, secondDigest)
+		})
+	}
 }
 
 func fileDigest(t *testing.T, path string) string {
@@ -311,4 +319,63 @@ func TestImageToDirectory(t *testing.T) {
 			testfs.AssertExactFileContents(t, outputDir, test.expected)
 		})
 	}
+}
+
+func TestPrezeroedImages(t *testing.T) {
+	flags.Set(t, "executor.prezeroed_ext4_images", true)
+	for _, populated := range []bool{false, true} {
+		t.Run(fmt.Sprintf("populated=%t", populated), func(t *testing.T) {
+			root := testfs.MakeTempDir(t)
+			input := filepath.Join(root, "input")
+			require.NoError(t, os.Mkdir(input, 0755))
+			if populated {
+				require.NoError(t, os.WriteFile(filepath.Join(input, "data"), []byte("preserved data"), 0751))
+				require.NoError(t, os.Symlink("data", filepath.Join(input, "link")))
+				require.NoError(t, os.Link(filepath.Join(input, "data"), filepath.Join(input, "hardlink")))
+			}
+			image := filepath.Join(root, "image.ext4")
+			if populated {
+				require.NoError(t, ext4.DirectoryToImage(context.Background(), input, image, 256<<20))
+			} else {
+				require.NoError(t, ext4.MakeEmptyImage(context.Background(), image, 256<<20))
+			}
+			info, err := os.Stat(image)
+			require.NoError(t, err)
+			require.Less(t, info.Sys().(*syscall.Stat_t).Blocks*512, int64(2<<20))
+			out, err := exec.Command("/sbin/e2fsck", "-fn", image).CombinedOutput()
+			require.NoError(t, err, "%s", out)
+			header, err := exec.Command("/sbin/dumpe2fs", "-h", image).CombinedOutput()
+			require.NoError(t, err)
+			require.Contains(t, string(header), "has_journal")
+			if populated {
+				dest := testfs.MakeTempDir(t)
+				require.NoError(t, ext4.ImageToDirectory(context.Background(), image, dest, []string{"/"}))
+				data, err := os.ReadFile(filepath.Join(dest, "data"))
+				require.NoError(t, err)
+				require.Equal(t, "preserved data", string(data))
+				target, err := os.Readlink(filepath.Join(dest, "link"))
+				require.NoError(t, err)
+				require.Equal(t, "data", target)
+				// debugfs rdump doesn't preserve hardlink identity; inspect the image.
+				a, err := exec.Command("/sbin/debugfs", "-R", "stat /data", image).CombinedOutput()
+				require.NoError(t, err)
+				b, err := exec.Command("/sbin/debugfs", "-R", "stat /hardlink", image).CombinedOutput()
+				require.NoError(t, err)
+				require.Equal(t, strings.Split(string(a), "\n")[1], strings.Split(string(b), "\n")[1])
+			}
+		})
+	}
+}
+
+func TestPrezeroedImages_RejectExistingContents(t *testing.T) {
+	flags.Set(t, "executor.prezeroed_ext4_images", true)
+	root := testfs.MakeTempDir(t)
+	image := filepath.Join(root, "existing")
+	require.NoError(t, os.WriteFile(image, []byte("must not overwrite"), 0644))
+	require.ErrorContains(t, ext4.MakeEmptyImage(context.Background(), image, 32<<20), "not empty")
+	require.ErrorContains(t, ext4.DirectoryToImage(context.Background(), root, image, 32<<20), "not empty")
+	data, err := os.ReadFile(image)
+	require.NoError(t, err)
+	require.Equal(t, "must not overwrite", string(data))
+	require.Error(t, ext4.MakeEmptyImage(context.Background(), "/dev/null", 32<<20))
 }
