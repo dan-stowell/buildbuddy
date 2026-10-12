@@ -315,6 +315,13 @@ func TestLinkCachedImage_LegacyStorageWhenFileCacheDisabled(t *testing.T) {
 }
 
 func TestConvertContainerToExt4FS_Streaming(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("streaming OCI conversion requires root; non-root fallback is covered by TestStreamingFallbackMetadata")
+	}
+	// The baseline invokes tar via PATH. Fail if conversion silently unpacks.
+	bin := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "tar"), []byte("#!/bin/sh\necho unexpected baseline extraction >&2\nexit 99\n"), 0755))
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
 	out, err := exec.Command("/sbin/mke2fs", "-V").CombinedOutput()
 	require.NoError(t, err)
 	var major, minor, patch int

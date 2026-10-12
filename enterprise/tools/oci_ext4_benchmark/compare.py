@@ -25,11 +25,13 @@ def tree(root):
                     for b in iter(lambda: f.read(1024*1024), b''):
                         h.update(b)
                 item.update(size=s.st_size, sha256=h.hexdigest())
-                groups.setdefault(s.st_ino, []).append(rel)
             elif stat.S_ISLNK(s.st_mode):
                 item['target'] = os.readlink(p)
             elif stat.S_ISCHR(s.st_mode) or stat.S_ISBLK(s.st_mode):
                 item.update(major=os.major(s.st_rdev), minor=os.minor(s.st_rdev))
+            # Directories have structural links, not archive hardlink classes.
+            if not stat.S_ISDIR(s.st_mode):
+                groups.setdefault((s.st_dev, s.st_ino), []).append(rel)
             result[rel] = item
     for paths in groups.values():
         for p in paths:
