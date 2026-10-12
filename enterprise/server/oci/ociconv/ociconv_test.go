@@ -3,11 +3,15 @@ package ociconv_test
 import (
 	"archive/tar"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -48,6 +52,15 @@ func sharedDiskImageNode(containerImage string) *repb.FileNode {
 }
 
 func TestOciconv(t *testing.T) {
+	for _, localTemp := range []bool{false, true} {
+		t.Run(fmt.Sprint(localTemp), func(t *testing.T) {
+			flags.Set(t, "executor.ext4_image_temp_in_filecache", localTemp)
+			testOciconv(t)
+		})
+	}
+}
+
+func testOciconv(t *testing.T) {
 	te := testenv.GetTestEnv(t)
 	flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
 	flags.Set(t, "executor.local_cache_store_ext4_images", true)
@@ -129,6 +142,15 @@ func TestOciconv(t *testing.T) {
 }
 
 func TestCreateDiskImage_UsesCredentialsOnCacheMiss(t *testing.T) {
+	for _, serialize := range []bool{false, true} {
+		t.Run(fmt.Sprint(serialize), func(t *testing.T) {
+			flags.Set(t, "executor.serialize_ext4_conversions", serialize)
+			testCreateDiskImageUsesCredentials(t)
+		})
+	}
+}
+
+func testCreateDiskImageUsesCredentials(t *testing.T) {
 	te := testenv.GetTestEnv(t)
 	flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
 	flags.Set(t, "executor.local_cache_store_ext4_images", true)
@@ -310,4 +332,111 @@ func TestLinkCachedImage_LegacyStorageWhenFileCacheDisabled(t *testing.T) {
 	content, err := os.ReadFile(linkedPath)
 	require.NoError(t, err)
 	require.Equal(t, "legacy-ext4", string(content))
+}
+
+func TestLegacyManifestDigest(t *testing.T) {
+	flags.Set(t, "executor.local_cache_store_ext4_images", false)
+	flags.Set(t, "executor.legacy_ext4_use_manifest_digest", true)
+	flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
+	te := testenv.GetTestEnv(t)
+	reg := testregistry.Run(t, testregistry.Opts{})
+	ref, img := reg.PushNamedImage(t, "legacy-digest:latest", nil)
+	resolver, err := oci.NewResolver(te)
+	require.NoError(t, err)
+	root := t.TempDir()
+	output := filepath.Join(root, "linked.ext4")
+	require.NoError(t, ociconv.CreateDiskImage(context.Background(), resolver, nil, root, ref, oci.Credentials{}, false, output))
+	d, err := img.Digest()
+	require.NoError(t, err)
+	cachedPath := filepath.Join(root, "images", "ext4", hash.String(ref), d.Algorithm+"-"+d.Hex, "containerfs.ext4")
+	a, err := os.Stat(cachedPath)
+	require.NoError(t, err)
+	b, err := os.Stat(output)
+	require.NoError(t, err)
+	require.True(t, os.SameFile(a, b))
+	cached, err := ociconv.IsImageCached(context.Background(), nil, root, ref)
+	require.NoError(t, err)
+	require.True(t, cached)
+	// The new generation directory also works with migration.
+	flags.Set(t, "executor.local_cache_store_ext4_images", true)
+	fc, err := filecache.NewFileCache(filepath.Join(root, "filecache"), 1_000_000_000, false)
+	require.NoError(t, err)
+	require.NoError(t, ociconv.MigrateImagesToFileCache(context.Background(), fc, root))
+	require.True(t, fc.ContainsFile(fc.WithSharedDirectory(context.Background(), "ext4_images"), sharedDiskImageNode(ref)))
+}
+
+func TestConcurrentConversionAcrossCredentials(t *testing.T) {
+	flags.Set(t, "executor.serialize_ext4_conversions", true)
+	flags.Set(t, "executor.local_cache_store_ext4_images", true)
+	flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
+	te := testenv.GetTestEnv(t)
+	var blobs atomic.Int64
+	reg := testregistry.Run(t, testregistry.Opts{HttpInterceptor: func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == "GET" && strings.Contains(r.URL.Path, "/blobs/") {
+			blobs.Add(1)
+		}
+		return true
+	}})
+	ref, _ := reg.PushNamedImage(t, "concurrent-conversion:latest", nil)
+	blobs.Store(0)
+	resolver, err := oci.NewResolver(te)
+	require.NoError(t, err)
+	root := t.TempDir()
+	fc, err := filecache.NewFileCache(filepath.Join(root, "filecache"), 1_000_000_000, false)
+	require.NoError(t, err)
+	defer fc.Close()
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	start := make(chan struct{})
+	for i := range 2 {
+		wg.Go(func() {
+			<-start
+			errs <- ociconv.CreateDiskImage(context.Background(), resolver, fc, root, ref, oci.Credentials{Username: fmt.Sprint(i), Password: "password"}, false, filepath.Join(root, fmt.Sprintf("output-%d.ext4", i)))
+		})
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	require.Equal(t, int64(1), blobs.Load(), "one layer fetch across credential-specific cache misses")
+	a, err := os.Stat(filepath.Join(root, "output-0.ext4"))
+	require.NoError(t, err)
+	b, err := os.Stat(filepath.Join(root, "output-1.ext4"))
+	require.NoError(t, err)
+	require.True(t, os.SameFile(a, b))
+}
+
+func TestConversionTempAcrossFilesystems(t *testing.T) {
+	flags.Set(t, "executor.ext4_image_temp_in_filecache", true)
+	flags.Set(t, "executor.local_cache_store_ext4_images", true)
+	flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
+	cacheRoot, err := os.MkdirTemp("/dev/shm", "ociconv-test-*")
+	if err != nil {
+		t.Skipf("tmpfs unavailable: %s", err)
+	}
+	defer os.RemoveAll(cacheRoot)
+	root := t.TempDir()
+	a, err := os.Stat(root)
+	require.NoError(t, err)
+	b, err := os.Stat(cacheRoot)
+	require.NoError(t, err)
+	if a.Sys().(*syscall.Stat_t).Dev == b.Sys().(*syscall.Stat_t).Dev {
+		t.Skip("requires distinct filesystems")
+	}
+	fc, err := filecache.NewFileCache(filepath.Join(root, "filecache"), 1_000_000_000, false)
+	require.NoError(t, err)
+	defer fc.Close()
+	te := testenv.GetTestEnv(t)
+	resolver, err := oci.NewResolver(te)
+	require.NoError(t, err)
+	reg := testregistry.Run(t, testregistry.Opts{})
+	ref, _ := reg.PushNamedImage(t, "cross-filesystem:latest", nil)
+	output := filepath.Join(root, "linked.ext4")
+	require.NoError(t, ociconv.CreateDiskImage(context.Background(), resolver, fc, cacheRoot, ref, oci.Credentials{}, false, output))
+	require.FileExists(t, output)
+	entries, err := os.ReadDir(fc.TempDir())
+	require.NoError(t, err)
+	require.Empty(t, entries, "temporary image was removed after linking")
 }

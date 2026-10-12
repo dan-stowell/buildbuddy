@@ -21,6 +21,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/hash"
+	"github.com/buildbuddy-io/buildbuddy/server/util/lockmap"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/tracing"
@@ -48,9 +49,13 @@ var (
 
 	// Single-flight group used to dedupe firecracker image conversions.
 	conversionGroup singleflight.Group[string, string]
+	conversionLocks = lockmap.New[string]()
 
-	localCacheStoreExt4Images = flag.Bool("executor.local_cache_store_ext4_images", true, "If true, store converted Firecracker ext4 images in filecache instead of cacheRoot/images/ext4.")
-	excludeRootDeviceNodes    = flag.Bool("executor.exclude_root_device_nodes", false, "If true, omit entries under the root /dev directory when converting OCI images to ext4. Intended for conversion actions without mknod support.", flag.Internal)
+	serializeExt4Conversions    = flag.Bool("executor.serialize_ext4_conversions", false, "Serialize conversion cache misses across credentials, without sharing registry authentication errors.", flag.Internal)
+	localCacheStoreExt4Images   = flag.Bool("executor.local_cache_store_ext4_images", true, "If true, store converted Firecracker ext4 images in filecache instead of cacheRoot/images/ext4.")
+	ext4ImageTempInFileCache    = flag.Bool("executor.ext4_image_temp_in_filecache", false, "Create converted ext4 images in the filecache temp directory so cache insertion can hardlink even when cacheRoot is on another filesystem.", flag.Internal)
+	legacyExt4UseManifestDigest = flag.Bool("executor.legacy_ext4_use_manifest_digest", false, "Use the OCI manifest digest for legacy ext4 cache generation directories instead of hashing the entire converted image.", flag.Internal)
+	excludeRootDeviceNodes      = flag.Bool("executor.exclude_root_device_nodes", false, "If true, omit entries under the root /dev directory when converting OCI images to ext4. Intended for conversion actions without mknod support.", flag.Internal)
 )
 
 func hashFile(filename string) (string, error) {
@@ -255,13 +260,16 @@ func CreateDiskImage(ctx context.Context, resolver *oci.Resolver, fileCache inte
 	ctx, span := tracing.StartSpan(ctx)
 	defer span.End()
 
-	// Note: creds are included in the singleflight key here, so it looks like
-	// we might be doing unnecessary concurrent pulls for the same image. In
-	// practice however, container.PullImageIfNecessary only allows one
-	// concurrent pull per image ref, so this should be fine.
+	// Keep credential-specific singleflight results: a failed authentication
+	// must not fail another caller using valid credentials. A separate lock
+	// can serialize population of the shared cache across credentials.
+	cacheScope := []string{"legacy", cacheRoot, containerImage}
+	if *localCacheStoreExt4Images {
+		cacheScope = []string{"filecache", fileCache.TempDir(), containerImage}
+	}
+	conversionCacheKey := hash.Strings(cacheScope...)
 	conversionOpKeyParts := []string{cacheRoot, containerImage, creds.Username, creds.Password}
 	if *localCacheStoreExt4Images {
-		// Dedupe image conversion operations since they are disk IO-heavy.
 		conversionOpKeyParts = append([]string{cacheRoot, fileCache.TempDir()}, conversionOpKeyParts[1:]...)
 	} else {
 		conversionOpKeyParts = append([]string{"legacy"}, conversionOpKeyParts...)
@@ -269,6 +277,14 @@ func CreateDiskImage(ctx context.Context, resolver *oci.Resolver, fileCache inte
 	_, _, err := conversionGroup.Do(ctx, hash.Strings(conversionOpKeyParts...), func(ctx context.Context) (string, error) {
 		ctx, cancel := context.WithTimeout(ctx, imageConversionTimeout)
 		defer cancel()
+
+		if *serializeExt4Conversions {
+			unlock := conversionLocks.Lock(conversionCacheKey)
+			defer unlock()
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+		}
 
 		// Re-check the cache here so we can avoid duplicate conversion work if
 		// another caller populated the cache after the caller's initial lookup.
@@ -305,7 +321,7 @@ func CreateDiskImage(ctx context.Context, resolver *oci.Resolver, fileCache inte
 func createExt4Image(ctx context.Context, resolver *oci.Resolver, fileCache interfaces.FileCache, cacheRoot, containerImage string, creds oci.Credentials, useOCIFetcher bool) (string, error) {
 	ctx, span := tracing.StartSpan(ctx)
 	defer span.End()
-	tmpImage, err := os.CreateTemp(cacheRoot, "containerfs-*.ext4")
+	tmpImage, err := createTempDiskImage(fileCache, cacheRoot)
 	if err != nil {
 		return "", err
 	}
@@ -325,10 +341,37 @@ func createExt4Image(ctx context.Context, resolver *oci.Resolver, fileCache inte
 	if err := ConvertContainerToExt4FS(ctx, img, cacheRoot, containerImage, tmpImagePath); err != nil {
 		return "", err
 	}
+	return publishDiskImage(ctx, img, fileCache, cacheRoot, containerImage, tmpImagePath)
+}
+
+func createTempDiskImage(fileCache interfaces.FileCache, cacheRoot string) (*os.File, error) {
+	// AddFile links rather than moves the image. Keeping the source on the
+	// cache filesystem avoids EXDEV; it does not change image contents.
+	tmpDir := cacheRoot
+	if *ext4ImageTempInFileCache && *localCacheStoreExt4Images && fileCache != nil {
+		tmpDir = fileCache.TempDir()
+	}
+	return os.CreateTemp(tmpDir, "containerfs-*.ext4")
+}
+
+func publishDiskImage(ctx context.Context, img ctr.Image, fileCache interfaces.FileCache, cacheRoot, containerImage, tmpImagePath string) (string, error) {
+	var err error
 	if !*localCacheStoreExt4Images || fileCache == nil {
-		imageHash, err := hashFile(tmpImagePath)
-		if err != nil {
-			return "", err
+		var imageHash string
+		if *legacyExt4UseManifestDigest {
+			// Legacy readers only use this name to identify a generation; they
+			// do not validate it against the ext4 bytes. Include the algorithm
+			// to distinguish this layout from the legacy SHA256 image hash.
+			digest, err := img.Digest()
+			if err != nil {
+				return "", err
+			}
+			imageHash = digest.Algorithm + "-" + digest.Hex
+		} else {
+			imageHash, err = hashFile(tmpImagePath)
+			if err != nil {
+				return "", err
+			}
 		}
 		containerImageHome := filepath.Join(getDiskImagesPath(cacheRoot, containerImage), imageHash)
 		if err := disk.EnsureDirectoryExists(containerImageHome); err != nil {

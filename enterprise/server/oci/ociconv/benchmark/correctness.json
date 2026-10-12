@@ -1,0 +1,88 @@
+{
+  "real_images": [
+    {
+      "image": "mirror.gcr.io/library/alpine:3.20",
+      "variants_checked": 3,
+      "entries": 519,
+      "regular": 87,
+      "symlinks": 334,
+      "hardlink_groups": 0,
+      "strict_differences": 2,
+      "exception_fields": [
+        "root mtime",
+        "empty lost+found mtime"
+      ],
+      "remaining_differences": 0
+    },
+    {
+      "image": "mirror.gcr.io/library/ubuntu:24.04",
+      "variants_checked": 3,
+      "entries": 3445,
+      "regular": 2587,
+      "symlinks": 197,
+      "hardlink_groups": 2,
+      "strict_differences": 2,
+      "exception_fields": [
+        "root mtime",
+        "empty lost+found mtime"
+      ],
+      "remaining_differences": 0
+    },
+    {
+      "image": "gcr.io/flame-public/rbe-ubuntu24-04:latest",
+      "variants_checked": 3,
+      "entries": 16760,
+      "regular": 13263,
+      "symlinks": 1296,
+      "hardlink_groups": 6,
+      "strict_differences": 87,
+      "exception_fields": [
+        "root mtime",
+        "empty lost+found mtime",
+        "85 directory mtimes confirmed to vary in a second baseline conversion"
+      ],
+      "remaining_differences": 0
+    }
+  ],
+  "all_twelve_real_images": {
+    "e2fsck_fn": "pass",
+    "loop_readonly_mount": "pass",
+    "checked_fields": [
+      "contents SHA256",
+      "mode/type",
+      "uid",
+      "gid",
+      "symlink target",
+      "hardlink topology",
+      "device major/minor",
+      "xattrs",
+      "mtime"
+    ]
+  },
+  "frozen_metadata_fixture": {
+    "publication_modes": [
+      "filecache-baseline",
+      "filecache-local-temp",
+      "legacy-hash",
+      "legacy-manifest"
+    ],
+    "identical_entire_image_sha256": true,
+    "loop_readonly_mount": "pass",
+    "e2fsck_fn": "pass",
+    "positive_coverage": [
+      "user xattr",
+      "character device 1:3",
+      "hardlink",
+      "symlink",
+      "mode 0751",
+      "uid 1234/gid 2345",
+      "mtime 1234567890"
+    ]
+  },
+  "touched_package_tests": "pass",
+  "untouched_ext4_test_failure": {
+    "test": "TestDirectoryToImageAutoSize_Reproducible",
+    "installed_mke2fs": "1.47.0",
+    "required_mke2fs": "1.47.2+"
+  }
+}
