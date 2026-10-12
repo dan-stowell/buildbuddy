@@ -106,6 +106,16 @@ Validation:
 - Root-only `TestPublicationMetadata`: baseline plus all four modes pass exact byte equality, loop mounts, metadata assertions and e2fsck.
 - The additionally attempted, untouched `//enterprise/server/util/ext4:ext4_test` has one pre-existing failure: `TestDirectoryToImageAutoSize_Reproducible` gives different hashes after the test changes atime/ctime. Installed mke2fs is 1.47.0; the existing reproducibility flag explicitly requires 1.47.2+. Other ext4 tests pass. Reproducibility mode was not used in these measurements or changed to hide this failure.
 
+## Tests added
+
+Concurrent authentication tests hold the first registry request open until the second caller is waiting. With invalid credentials first, that caller receives a 401 and the valid caller independently converts and links the image. With valid credentials first, conversion succeeds and the invalid caller reuses the populated cache, preserving the existing cached-image access behavior.
+
+The cancellation test blocks the holder's layer fetch, starts two callers with different credentials, and cancels one while it waits for the conversion lock. It returns `context.Canceled` within one second, before the holder is released. The holder and remaining waiter then succeed, share an inode, and fetch the layer only once.
+
+The concurrent successful-caller test now runs in both filecache and legacy-cache modes (`executor.local_cache_store_ext4_images=false`). A blocked layer fetch keeps the holder in flight while the other credential pair waits; both outputs share an inode and only one layer GET occurs. These added tests require no root privileges. No production behavior changes were needed.
+
+Validation for this follow-up: `bazel test --nocache_test_results //enterprise/server/oci/ociconv:ociconv_test //enterprise/server/oci/ociconv:io_benchmark_test` passes both targets. All added cases ran without skips; the unchanged opt-in benchmark and mounted metadata fixture skip in the default run.
+
 ## Reproduce
 
 Run from the repository root on a dedicated machine. The opt-in benchmark drops the host page cache. Build once, then run the binary as root outside the Bazel sandbox:
