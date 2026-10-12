@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -192,5 +193,26 @@ func TestCompatibleDirectoryOrder(t *testing.T) {
 				t.Fatalf("error=%v wantError=%v", err, tc.wantError)
 			}
 		})
+	}
+}
+
+func TestEstimateCompatibleRejectsHardlinksToSymlinks(t *testing.T) {
+	for _, headers := range [][]*tar.Header{
+		{{Name: "sym", Typeflag: tar.TypeSymlink, Linkname: "file"}, {Name: "hard", Typeflag: tar.TypeLink, Linkname: "sym"}},
+		{{Name: "hard", Typeflag: tar.TypeLink, Linkname: "sym"}, {Name: "sym", Typeflag: tar.TypeSymlink, Linkname: "file"}},
+		{{Name: "second", Typeflag: tar.TypeLink, Linkname: "hard"}, {Name: "hard", Typeflag: tar.TypeLink, Linkname: "sym"}, {Name: "sym", Typeflag: tar.TypeSymlink, Linkname: "file"}},
+	} {
+		data := archive(t, headers...)
+		if _, _, err := EstimateCompatible(t.Context(), bytes.NewReader(data), false); !errors.Is(err, ErrIncompatible) {
+			t.Fatalf("expected incompatible archive, got %v", err)
+		}
+		if _, _, err := Estimate(t.Context(), bytes.NewReader(data), false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Excluded device entries cannot trigger a fallback.
+	data := archive(t, &tar.Header{Name: "dev/sym", Typeflag: tar.TypeSymlink, Linkname: "file"}, &tar.Header{Name: "dev/hard", Typeflag: tar.TypeLink, Linkname: "dev/sym"})
+	if _, _, err := EstimateCompatible(t.Context(), bytes.NewReader(data), true); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/ext4"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/ext4/tarstream"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/oci"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
@@ -44,13 +46,11 @@ const (
 )
 
 var (
-	isRoot = os.Getuid() == 0
-
 	// Single-flight group used to dedupe firecracker image conversions.
 	conversionGroup singleflight.Group[string, string]
 
 	localCacheStoreExt4Images = flag.Bool("executor.local_cache_store_ext4_images", true, "If true, store converted Firecracker ext4 images in filecache instead of cacheRoot/images/ext4.")
-	streamExt4Images          = flag.Bool("executor.stream_ext4_images", false, "Populate OCI rootfs ext4 images directly from two flattened tar passes, without an unpack directory. Requires e2fsprogs >=1.47.1 and libarchive. Experimental; rejects non-contiguous directory subtrees to preserve GNU tar mtime semantics, and is incompatible with reproducible_ext4_images.", flag.Internal)
+	streamExt4Images          = flag.Bool("executor.stream_ext4_images", false, "Populate OCI rootfs ext4 images directly from two flattened tar passes, without an unpack directory. Requires e2fsprogs >=1.47.1 and libarchive. Experimental; only used as root; falls back for hardlinks to symlinks; rejects non-contiguous directory subtrees to preserve GNU tar mtime semantics, and is incompatible with reproducible_ext4_images.", flag.Internal)
 	excludeRootDeviceNodes    = flag.Bool("executor.exclude_root_device_nodes", false, "If true, omit entries under the root /dev directory when converting OCI images to ext4. Intended for conversion actions without mknod support.", flag.Internal)
 )
 
@@ -351,15 +351,25 @@ func createExt4Image(ctx context.Context, resolver *oci.Resolver, fileCache inte
 // ConvertContainerToExt4FS writes a resolved OCI image's root filesystem to an
 // ext4 image at outputPath. containerImage identifies the image in log messages.
 func ConvertContainerToExt4FS(ctx context.Context, img ctr.Image, workspaceDir, containerImage, outputPath string) error {
+	return convertContainerToExt4FS(ctx, img, workspaceDir, containerImage, outputPath, os.Geteuid() == 0)
+}
+
+func convertContainerToExt4FS(ctx context.Context, img ctr.Image, workspaceDir, containerImage, outputPath string, root bool) error {
 	log.CtxInfof(ctx, "Downloading image %s and converting to ext4 format", containerImage)
 	start := time.Now()
 
-	if *streamExt4Images {
-		if err := ext4.TarToImageAutoSize(ctx, func() (io.ReadCloser, error) { return mutate.Extract(img), nil }, outputPath, *excludeRootDeviceNodes); err != nil {
+	// Unprivileged GNU tar applies the extracting user's ownership and umask.
+	// Preserve those semantics by using the baseline pipeline for non-root users.
+	if *streamExt4Images && root {
+		err := ext4.TarToImageAutoSize(ctx, func() (io.ReadCloser, error) { return mutate.Extract(img), nil }, outputPath, *excludeRootDeviceNodes)
+		if err == nil {
+			log.CtxInfof(ctx, "Converted %s to ext4 format in %s", containerImage, time.Since(start))
+			return nil
+		}
+		if !errors.Is(err, tarstream.ErrIncompatible) {
 			return err
 		}
-		log.CtxInfof(ctx, "Converted %s to ext4 format in %s", containerImage, time.Since(start))
-		return nil
+		log.CtxInfof(ctx, "Using unpack-directory conversion for %s: %s", containerImage, err)
 	}
 	rc := mutate.Extract(img)
 	defer rc.Close()

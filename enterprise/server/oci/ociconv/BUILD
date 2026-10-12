@@ -9,6 +9,7 @@ go_library(
     target_compatible_with = ["@platforms//os:linux"],
     deps = [
         "//enterprise/server/util/ext4",
+        "//enterprise/server/util/ext4/tarstream",
         "//enterprise/server/util/oci",
         "//proto:remote_execution_go_proto",
         "//server/interfaces",
@@ -45,5 +46,17 @@ go_test(
         "@com_github_google_go_containerregistry//pkg/v1/mutate",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
+    ],
+)
+
+go_test(
+    name = "fallback_test",
+    srcs = ["fallback_test.go"],
+    embed = [":ociconv"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        "@com_github_google_go_containerregistry//pkg/v1/empty",
+        "@com_github_google_go_containerregistry//pkg/v1/mutate",
+        "@com_github_google_go_containerregistry//pkg/v1/tarball",
     ],
 )

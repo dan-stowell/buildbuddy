@@ -6,6 +6,7 @@ import (
 	"archive/tar"
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -19,6 +20,10 @@ import (
 )
 
 const blockSize int64 = 4096
+
+// ErrIncompatible indicates an archive that requires GNU tar extraction.
+// It is returned during sizing, before an output image is created.
+var ErrIncompatible = errors.New("archive requires unpack-directory conversion")
 
 // Open must return the same flattened archive on each call. A second pass is
 // necessary because mke2fs needs the filesystem size before reading stdin.
@@ -37,6 +42,9 @@ func Estimate(ctx context.Context, r io.Reader, excludeDev bool) (size int64, en
 // reset that directory's mtime to extraction time. A tar writer that restores
 // archive metadata at the end cannot reproduce this behavior. Reject these
 // archives before creating an image, rather than silently changing guest mtimes.
+// Hardlinks targeting symlinks also require baseline extraction: directory
+// population copies them as independent symlinks, while tar population links
+// their inodes. ErrIncompatible identifies this fallback case.
 // This check is conservative: even a revisit that would not modify the parent
 // directory is rejected.
 func EstimateCompatible(ctx context.Context, r io.Reader, excludeDev bool) (int64, int64, error) {
@@ -48,6 +56,8 @@ func estimate(ctx context.Context, r io.Reader, excludeDev, requireCompatible bo
 	var directoryStack []string
 	closed := make(map[string]bool)
 	seen := map[string]bool{".": true}
+	symlinks := make(map[string]bool)
+	hardlinks := make(map[string]string)
 	total := int64(2 * blockSize)
 	for {
 		if err := ctx.Err(); err != nil {
@@ -68,6 +78,16 @@ func estimate(ctx context.Context, r io.Reader, excludeDev, requireCompatible bo
 			continue
 		}
 		if requireCompatible {
+			if h.Typeflag == tar.TypeSymlink {
+				symlinks[name] = true
+			}
+			if h.Typeflag == tar.TypeLink {
+				target, err := clean(h.Linkname)
+				if err != nil {
+					return 0, 0, err
+				}
+				hardlinks[target] = name
+			}
 			for len(directoryStack) > 0 {
 				dir := directoryStack[len(directoryStack)-1]
 				if strings.HasPrefix(name, dir+"/") {
@@ -95,6 +115,16 @@ func estimate(ctx context.Context, r io.Reader, excludeDev, requireCompatible bo
 				return 0, 0, fmt.Errorf("tar size overflow")
 			}
 			total += ((h.Size + blockSize - 1) / blockSize) * blockSize
+		}
+	}
+	// Keep all referenced targets, including forward links and overwritten
+	// entries. Every chain ending at a symlink contains a direct link to it.
+	// Conservatively reject even if later headers replace that symlink.
+	if requireCompatible {
+		for target, name := range hardlinks {
+			if symlinks[target] {
+				return 0, 0, fmt.Errorf("%w: hardlink %q targets symlink %q", ErrIncompatible, name, target)
+			}
 		}
 	}
 	// Drain the underlying stream so errors delivered after tar EOF (including
