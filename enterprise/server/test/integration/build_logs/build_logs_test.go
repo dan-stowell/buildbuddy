@@ -134,7 +134,8 @@ func publishFinished(t *testing.T, bep *build_event_publisher.Publisher) {
 }
 
 func waitForInvocation(t *testing.T, ctx context.Context, bbClient bbspb.BuildBuddyServiceClient, invocationID string) {
-	for delay := 1 * time.Microsecond; delay < time.Second; delay *= 2 {
+	deadline := time.Now().Add(2 * time.Second)
+	for delay := time.Microsecond; time.Now().Before(deadline); delay = min(2*delay, 10*time.Millisecond) {
 		_, err := bbClient.GetInvocation(ctx, &inpb.GetInvocationRequest{
 			Lookup: &inpb.InvocationLookup{InvocationId: invocationID},
 		})
@@ -144,7 +145,7 @@ func waitForInvocation(t *testing.T, ctx context.Context, bbClient bbspb.BuildBu
 		if !status.IsNotFoundError(err) && !strings.Contains(err.Error(), "not found") {
 			require.FailNowf(t, "wait for invocation", "Error while waiting for invocation: %s", err)
 		}
-		time.Sleep(delay)
+		time.Sleep(min(delay, time.Until(deadline)))
 	}
 	require.FailNowf(t, "timed out", "Timed out waiting for invocation %q to be created", invocationID)
 }
@@ -156,12 +157,13 @@ func getLogs(t *testing.T, ctx context.Context, log *invocationLog) string {
 }
 
 func waitForLogsToEqual(t *testing.T, ctx context.Context, log *invocationLog, expected string) {
-	for delay := 1 * time.Microsecond; delay < time.Second; delay *= 2 {
+	deadline := time.Now().Add(2 * time.Second)
+	for delay := time.Microsecond; time.Now().Before(deadline); delay = min(2*delay, 10*time.Millisecond) {
 		logs := getLogs(t, ctx, log)
 		if logs == expected {
 			return
 		}
-		time.Sleep(delay)
+		time.Sleep(min(delay, time.Until(deadline)))
 	}
 
 	// One last attempt, showing a nice diff if it fails.
