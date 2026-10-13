@@ -3,6 +3,7 @@ package execution_search_service_test
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +26,12 @@ import (
 	stpb "github.com/buildbuddy-io/buildbuddy/proto/stats"
 	olaptables "github.com/buildbuddy-io/buildbuddy/server/util/clickhouse/schema"
 )
+
+var clickhouseServer testclickhouse.SharedServer
+
+func TestMain(m *testing.M) {
+	os.Exit(clickhouseServer.Run(m))
+}
 
 func makeExecutionID(actionDigest *repb.Digest) string {
 	return digest.NewCASResourceName(actionDigest, "buildbuddy-io/buildbuddy", repb.DigestFunction_SHA256).NewUploadString()
@@ -57,7 +64,7 @@ func TestSearchExecutions(t *testing.T) {
 
 	ctx := context.Background()
 	env := testenv.GetTestEnv(t)
-	testclickhouse.Configure(t, env)
+	clickhouseServer.Configure(t, env)
 	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1", "US2", "GR2"))
 	env.SetAuthenticator(ta)
 
@@ -225,7 +232,7 @@ func TestSearchExecutions_SkipsEmptyInvocationUUID(t *testing.T) {
 
 	ctx := context.Background()
 	env := testenv.GetTestEnv(t)
-	testclickhouse.Configure(t, env)
+	clickhouseServer.Configure(t, env)
 	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1"))
 	env.SetAuthenticator(ta)
 
@@ -285,7 +292,7 @@ func TestSearchExecutions_Pagination(t *testing.T) {
 
 	ctx := context.Background()
 	env := testenv.GetTestEnv(t)
-	testclickhouse.Configure(t, env)
+	clickhouseServer.Configure(t, env)
 	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1"))
 	env.SetAuthenticator(ta)
 
@@ -347,7 +354,7 @@ func TestSearchExecutions_PaginationWithEmptyInvocationUUIDs(t *testing.T) {
 
 	ctx := context.Background()
 	env := testenv.GetTestEnv(t)
-	testclickhouse.Configure(t, env)
+	clickhouseServer.Configure(t, env)
 	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1"))
 	env.SetAuthenticator(ta)
 
@@ -436,7 +443,7 @@ func TestGetExecutionTimeline(t *testing.T) {
 
 	ctx := context.Background()
 	env := testenv.GetTestEnv(t)
-	testclickhouse.Configure(t, env)
+	clickhouseServer.Configure(t, env)
 	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1", "US2", "GR2"))
 	env.SetAuthenticator(ta)
 
@@ -581,7 +588,7 @@ func TestGetExecutionTimeline(t *testing.T) {
 func TestGetExecutionTimeline_RequiresTarget(t *testing.T) {
 	ctx := context.Background()
 	env := testenv.GetTestEnv(t)
-	testclickhouse.Configure(t, env)
+	clickhouseServer.Configure(t, env)
 	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1"))
 	env.SetAuthenticator(ta)
 
@@ -598,7 +605,7 @@ func TestGetExecutionTimeline_RequiresTarget(t *testing.T) {
 func TestGetExecutionTimeline_RequiresAuth(t *testing.T) {
 	ctx := context.Background()
 	env := testenv.GetTestEnv(t)
-	testclickhouse.Configure(t, env)
+	clickhouseServer.Configure(t, env)
 	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1"))
 	env.SetAuthenticator(ta)
 
@@ -611,7 +618,7 @@ func TestGetExecutionTimeline_RequiresAuth(t *testing.T) {
 func TestSearchExecutions_RequiresAuth(t *testing.T) {
 	ctx := context.Background()
 	env := testenv.GetTestEnv(t)
-	testclickhouse.Configure(t, env)
+	clickhouseServer.Configure(t, env)
 	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1"))
 	env.SetAuthenticator(ta)
 
