@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -315,4 +317,106 @@ func BenchmarkSampleGenerator(b *testing.B) {
 		for range e.samples {
 		}
 	})
+}
+
+// Observe when the wait reaches its final select, after registering its channel.
+type sweepRegisteredContext struct {
+	context.Context
+	once       sync.Once
+	registered chan struct{}
+}
+
+func (c *sweepRegisteredContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.registered) })
+	return c.Context.Done()
+}
+
+type gatedSamplerDB struct {
+	pebble.IPebbleDB
+	ctx       context.Context
+	started   chan chan struct{}
+	gatesLeft int
+}
+
+func (db *gatedSamplerDB) NewIter(opts *pebble.IterOptions) (pebble.Iterator, error) {
+	if db.gatesLeft > 0 {
+		db.gatesLeft--
+		release := make(chan struct{})
+		select {
+		case db.started <- release:
+		case <-db.ctx.Done():
+			return nil, db.ctx.Err()
+		}
+		select {
+		case <-release:
+		case <-db.ctx.Done():
+			return nil, db.ctx.Err()
+		}
+	}
+	return db.IPebbleDB.NewIter(opts)
+}
+
+func TestSamplingSweepWaitIgnoresRunningBatch(t *testing.T) {
+	db := newMemDB(t)
+	store := filestore.New()
+	// A maximal digest makes every random SeekGE land on this valid row.
+	md := fileMetadata(0, false)
+	md.FileRecord.Digest.Hash = strings.Repeat("f", 64)
+	writeFileMetadata(t, db, store, md)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	gated := &gatedSamplerDB{IPebbleDB: db, ctx: ctx, started: make(chan chan struct{}, 2)}
+	e := newTestEvictor(t, store, gated)
+	gated.gatesLeft = 2 // Gate sampler iterators, after constructor size accounting.
+	e.sizeBytes = 1000  // No low-size sleep; test controls iterator creation instead.
+	e.samplesPerBatch = 1
+	pc := &PebbleCache{statusMu: &sync.Mutex{}, evictors: []*partitionEvictor{e}}
+	quit := make(chan struct{})
+	samplerDone := make(chan error, 1)
+	go func() { samplerDone <- e.generateSamplesForEviction(quit) }()
+	t.Cleanup(func() {
+		cancel()
+		close(quit)
+		select {
+		case <-samplerDone:
+		case <-time.After(10 * time.Second):
+			t.Error("sampler failed to stop")
+		}
+	})
+	nextGate := func() chan struct{} {
+		select {
+		case gate := <-gated.started:
+			return gate
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+			return nil
+		}
+	}
+	first := nextGate() // The first batch has captured its observer before NewIter.
+	registered := &sweepRegisteredContext{Context: ctx, registered: make(chan struct{})}
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- pc.TestingWaitForEvictionSweep(registered, benchPartitionID, 1000, true) }()
+	select {
+	case <-registered.registered:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	e.mu.Lock()
+	observation := e.testingSampleSweepDone
+	e.mu.Unlock()
+	require.NotNil(t, observation)
+	close(first)
+	second := nextGate() // The old batch finished; the new batch is still blocked.
+	select {
+	case <-observation:
+		t.Fatal("already-running batch satisfied newly registered wait")
+	default:
+	}
+	close(second)
+	select {
+	case err := <-waitDone:
+		require.NoError(t, err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
 }

@@ -405,19 +405,13 @@ func (l *LRU[T]) LastEvicted() *Sample[T] {
 	return l.lastEvicted
 }
 
-// TestingWaitForSweep waits for a janitor sweep started after this call.
-// This includes sweeps that find the cache below its eviction threshold.
-func (l *LRU[T]) TestingWaitForSweep(ctx context.Context) error {
+// TestingSweepDone returns a signal for completion of a janitor sweep started
+// after this call, including sweeps that find the cache below its threshold.
+func (l *LRU[T]) TestingSweepDone() <-chan struct{} {
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.testingSweepDone == nil {
 		l.testingSweepDone = make(chan struct{})
 	}
-	done := l.testingSweepDone
-	l.mu.Unlock()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return l.testingSweepDone
 }

@@ -1536,6 +1536,107 @@ func TestNoEarlyEviction(t *testing.T) {
 	}
 }
 
+// Keep waking the sampler until the observed batch completes. A fixed number
+// of advances can all happen before a delayed sampler registers its sleep.
+func waitForSamplingSweep(ctx context.Context, pc *pebble_cache.PebbleCache, clock *clockwork.FakeClock, minSizeBytes int64) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- pc.TestingWaitForEvictionSweep(ctx, pebble_cache.DefaultPartitionID, minSizeBytes, true)
+	}()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-done:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			clock.Advance(pebble_cache.SamplerSleepDuration)
+		}
+	}
+}
+
+// Delay the sampler between deciding to sleep and registering its fake timer.
+// No other cache worker uses Clock.After.
+type delayedSamplerClock struct {
+	clockwork.Clock
+	once        sync.Once
+	releaseOnce sync.Once
+	entered     chan struct{}
+	release     chan struct{}
+	registered  chan struct{}
+}
+
+func (c *delayedSamplerClock) After(d time.Duration) <-chan time.Time {
+	var result <-chan time.Time
+	c.once.Do(func() {
+		close(c.entered)
+		<-c.release
+		result = c.Clock.After(d)
+		close(c.registered)
+	})
+	if result != nil {
+		return result
+	}
+	return c.Clock.After(d)
+}
+
+func (c *delayedSamplerClock) unblock() { c.releaseOnce.Do(func() { close(c.release) }) }
+
+func TestPartitionMinEvictionAgeDelayedSampler(t *testing.T) {
+	flags.Set(t, "cache.pebble.presence_cache.max_entries", int64(0))
+	te := testenv.GetTestEnv(t)
+	te.SetAuthenticator(testauth.NewTestAuthenticator(t, emptyUserMap))
+	ctx, cancel := context.WithTimeout(getAnonContext(t, te), 30*time.Second)
+	defer cancel()
+	clock := clockwork.NewFakeClock()
+	delayed := &delayedSamplerClock{Clock: clock, entered: make(chan struct{}), release: make(chan struct{}), registered: make(chan struct{})}
+	maxSizeBytes := int64(10_000)
+	minAge := time.Hour
+	pc, err := pebble_cache.NewPebbleCache(te, &pebble_cache.Options{
+		RootDirectory: testfs.MakeTempDir(t), MaxSizeBytes: maxSizeBytes,
+		MinEvictionAge:              &minAge,
+		MinBytesAutoZstdCompression: new(int64(math.MaxInt64)),
+		AtimeUpdateThreshold:        new(time.Duration(math.MaxInt64)),
+		Clock:                       delayed, SamplesPerBatch: new(50), SampleBufferSize: new(10),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { delayed.unblock(); pc.Stop() })
+	require.NoError(t, pc.Start())
+	select {
+	case <-delayed.entered:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	// Force all five old wake attempts to precede the sampler's sleep timer.
+	for range 5 {
+		clock.Advance(pebble_cache.SamplerSleepDuration)
+	}
+	writtenAt := clock.Now()
+	var keys []*rspb.ResourceName
+	for range 30 {
+		rn, buf := testdigest.RandomCASResourceBuf(t, 1000)
+		require.NoError(t, pc.Set(ctx, rn, buf))
+		keys = append(keys, rn)
+	}
+	delayed.unblock()
+	select {
+	case <-delayed.registered:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	// The sampler is now asleep despite all five advances and completed writes.
+	// This must wake it and observe a fresh completed batch, not time out.
+	require.NoError(t, waitForSamplingSweep(ctx, pc, clock, 3*maxSizeBytes))
+	require.Less(t, clock.Since(writtenAt), minAge)
+	for _, rn := range keys {
+		exists, err := pc.Contains(ctx, rn)
+		require.NoError(t, err)
+		require.True(t, exists)
+	}
+}
+
 func TestPartitionMinEvictionAge(t *testing.T) {
 	te := testenv.GetTestEnv(t)
 	te.SetAuthenticator(testauth.NewTestAuthenticator(t, emptyUserMap))
@@ -1568,6 +1669,7 @@ func TestPartitionMinEvictionAge(t *testing.T) {
 	defer pc.Stop()
 
 	// Write 3x the partition capacity.
+	resourceWrittenAt := clock.Now()
 	var resourceKeys []*rspb.ResourceName
 	for i := 0; i < int(maxSizeBytes)/1000*3; i++ {
 		rn, buf := testdigest.RandomCASResourceBuf(t, 1000)
@@ -1575,20 +1677,13 @@ func TestPartitionMinEvictionAge(t *testing.T) {
 		resourceKeys = append(resourceKeys, rn)
 	}
 
-	// Wake the sample generator, which goes to sleep while the cache is
-	// empty. Advance repeatedly in case it wasn't sleeping yet on the first
-	// advance.
-	for range 5 {
-		clock.Advance(pebble_cache.SamplerSleepDuration)
-		time.Sleep(100 * time.Millisecond)
-	}
-
 	// Nothing has been idle for the partition's min eviction age, so nothing
 	// should be evicted even though the partition is over capacity. Wait for
 	// the sampler to complete a fresh batch before verifying retention.
 	sweepCtx, cancelSweep := context.WithTimeout(ctx, 30*time.Second)
 	defer cancelSweep()
-	require.NoError(t, pc.TestingWaitForEvictionSweep(sweepCtx, pebble_cache.DefaultPartitionID, 3*maxSizeBytes, true))
+	require.NoError(t, waitForSamplingSweep(sweepCtx, pc, clock, 3*maxSizeBytes))
+	require.Less(t, clock.Since(resourceWrittenAt), partitionMinEvictionAge)
 	for _, r := range resourceKeys {
 		exists, err := pc.Contains(ctx, r)
 		require.NoError(t, err)

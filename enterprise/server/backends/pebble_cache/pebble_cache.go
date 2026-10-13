@@ -3010,15 +3010,17 @@ func (p *PebbleCache) TestingWaitForEvictionSweep(ctx context.Context, partition
 		case <-time.After(time.Millisecond):
 		}
 	}
+	var done <-chan struct{}
 	if !sampling {
-		return evictor.lru.TestingWaitForSweep(ctx)
+		done = evictor.lru.TestingSweepDone()
+	} else {
+		evictor.mu.Lock()
+		if evictor.testingSampleSweepDone == nil {
+			evictor.testingSampleSweepDone = make(chan struct{})
+		}
+		done = evictor.testingSampleSweepDone
+		evictor.mu.Unlock()
 	}
-	evictor.mu.Lock()
-	if evictor.testingSampleSweepDone == nil {
-		evictor.testingSampleSweepDone = make(chan struct{})
-	}
-	done := evictor.testingSampleSweepDone
-	evictor.mu.Unlock()
 	select {
 	case <-done:
 		return nil
