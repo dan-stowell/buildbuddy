@@ -5,6 +5,7 @@ package(default_visibility = ["//enterprise:__subpackages__"])
 go_test(
     name = "stream_run_logs_test",
     srcs = ["stream_run_logs_test.go"],
+    shard_count = 5,
     exec_properties = {
         # TODO: remove network dependency.
         "test.dockerNetwork": "bridge",
