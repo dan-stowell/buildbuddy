@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,8 +14,6 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/priority_queue"
-	"golang.org/x/exp/constraints"
-	"golang.org/x/exp/slices"
 )
 
 var (
@@ -70,9 +69,14 @@ func toCPUInfos(processors []int, numaNode int) []CPUInfo {
 	return infos
 }
 
+type integer interface {
+	~int | ~int8 | ~int16 | ~int32 | ~int64 |
+		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr
+}
+
 // Format formats a set of CPUs as a cpuset list-format compatible string.
 // See https://man7.org/linux/man-pages/man7/cpuset.7.html for list-format.
-func Format[I constraints.Integer](cpus ...I) string {
+func Format[I integer](cpus ...I) string {
 	slices.Sort(cpus)
 	cpuStrings := make([]string, len(cpus))
 	for i, cpu := range cpus {
