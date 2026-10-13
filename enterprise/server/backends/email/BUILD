@@ -10,9 +10,6 @@ go_library(
         "//server/http/httpclient",
         "//server/util/flag",
         "//server/util/status",
-        "@com_github_sendgrid_rest//:rest",
-        "@com_github_sendgrid_sendgrid_go//:sendgrid-go",
-        "@com_github_sendgrid_sendgrid_go//helpers/mail",
     ],
 )
 
