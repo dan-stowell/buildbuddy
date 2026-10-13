@@ -157,6 +157,7 @@ func (ht *testHitTracker) casDownloadExpectation(key string, expectation int64) 
 }
 
 func setup(t testing.TB) (interfaces.Authenticator, *HitTrackerFactory, *testHitTracker) {
+	flags.Set(t, "cache_proxy.remote_hit_tracker.update_interval", 10*time.Millisecond)
 	return setupWithClock(t, nil)
 }
 
@@ -235,7 +236,7 @@ func TestACHitTracker_SkipRemote(t *testing.T) {
 	hitTracker.TrackUpload(cDigest).CloseWithBytesTransferred(3000, 4000, repb.Compressor_IDENTITY, "test")
 
 	expectation := hitTrackerService.acDownloadExpectation(anonKey, 1)
-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond)
+	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond)
 	require.Equal(t, int64(2000), hitTrackerService.acBytesDownloaded[anonKey].Load())
 	require.Equal(t, int64(1), hitTrackerService.acUploads[anonKey].Load())
 	require.Equal(t, int64(4000), hitTrackerService.acBytesUploaded[anonKey].Load())
@@ -252,7 +253,7 @@ func TestCASHitTracker(t *testing.T) {
 	hitTracker.TrackUpload(cDigest).CloseWithBytesTransferred(3000, 4000, repb.Compressor_IDENTITY, "test")
 
 	expectation := hitTrackerService.casDownloadExpectation(anonKey, 1)
-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond)
+	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond)
 	require.Equal(t, int64(2000), hitTrackerService.casBytesDownloaded[anonKey].Load())
 	// By default, we don't expect CAS upload tracking
 	require.Equal(t, int64(0), hitTrackerService.casUploads[anonKey].Load())
@@ -267,7 +268,7 @@ func TestCASHitTracker_SkipRemote(t *testing.T) {
 	hitTracker.TrackUpload(cDigest).CloseWithBytesTransferred(3000, 4000, repb.Compressor_IDENTITY, "test")
 
 	expectation := hitTrackerService.casDownloadExpectation(anonKey, 1)
-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond)
+	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond)
 	require.Equal(t, int64(2000), hitTrackerService.casBytesDownloaded[anonKey].Load())
 	require.Equal(t, int64(1), hitTrackerService.casUploads[anonKey].Load(), "Expected 1 HitTracker.Track upload")
 	require.Equal(t, int64(4000), hitTrackerService.casBytesUploaded[anonKey].Load())
@@ -281,7 +282,7 @@ func TestCASHitTracker_NoDeduplication(t *testing.T) {
 	hitTracker.TrackDownload(aDigest).CloseWithBytesTransferred(1000, 2000, repb.Compressor_IDENTITY, "test")
 
 	expectation := hitTrackerService.casDownloadExpectation(anonKey, 2)
-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond)
+	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond)
 	require.Equal(t, int64(4000), hitTrackerService.casBytesDownloaded[anonKey].Load())
 }
 
@@ -322,22 +323,22 @@ func TestCASHitTracker_SplitsUpdates(t *testing.T) {
 
 	// Expect 10x [A, B, C, D, E] for ANON.
 	expectation := hitTrackerService.casDownloadExpectation(anonKey, 50)
-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond, "Expected 50 updates for group ANON")
+	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond, "Expected 50 updates for group ANON")
 	require.Equal(t, int64(222_220), hitTrackerService.casBytesDownloaded[anonKey].Load())
 
 	// Group 1's update shouldn't be affected by ANON's batching
 	expectation = hitTrackerService.casDownloadExpectation(group1Key, 2)
-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond, "Expected 2 external cache hits for group 1")
+	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond, "Expected 2 external cache hits for group 1")
 	require.Equal(t, int64(4_000_000), hitTrackerService.casBytesDownloaded[group1Key].Load())
 
 	// Group 1's update that claims to be 'internal' should be separate from its non-internal update.
 	expectation = hitTrackerService.casDownloadExpectation(group1InternalKey, 2)
-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond, "Expected 2 internal cache hits for group 1")
+	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond, "Expected 2 internal cache hits for group 1")
 	require.Equal(t, int64(2_000_002), hitTrackerService.casBytesDownloaded[group1InternalKey].Load())
 
 	// Same for Group 1's update that claims to be 'bazel' and 'internal'.
 	expectation = hitTrackerService.casDownloadExpectation(group1InternalBazelKey, 1)
-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond, "Expected 1 internal bazel cache hit for group 1")
+	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond, "Expected 1 internal bazel cache hit for group 1")
 	require.Equal(t, int64(2_030_000), hitTrackerService.casBytesDownloaded[group1InternalBazelKey].Load())
 }
 
@@ -370,12 +371,12 @@ func TestCASHitTracker_DropsUpdates(t *testing.T) {
 
 	// Expect A, B, C, D, E, A, B, C, D, E to be sent for ANON.
 	expectation := hitTrackerService.casDownloadExpectation(anonKey, 10)
-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond, "Expected 10 updates for group ANON")
+	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond, "Expected 10 updates for group ANON")
 	require.Equal(t, int64(44_444), hitTrackerService.casBytesDownloaded[anonKey].Load())
 
 	// Even though group 1's second update came at the end, it should still be sent.
 	expectation = hitTrackerService.casDownloadExpectation(group1Key, 2)
-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond, "Expected 2 cache hits for group 1")
+	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond, "Expected 2 cache hits for group 1")
 	require.Equal(t, int64(4_000_000), hitTrackerService.casBytesDownloaded[group1Key].Load())
 }
 
@@ -427,8 +428,8 @@ func TestCASHitTracker_AcceptsHitsWhileSplitOverflowIsPending(t *testing.T) {
 	require.True(t, pendingHitsExpectation(hitTrackerFactory, anonKey, 20)(), "hits enqueued while the split overflow was pending were dropped")
 
 	resume()
-	require.Eventually(t, hitTrackerService.casDownloadExpectation(anonKey, 30), 10*time.Second, 100*time.Millisecond, "Expected 30 updates for group ANON")
-	require.Eventually(t, hitTrackerService.casDownloadExpectation(group1Key, 1), 10*time.Second, 100*time.Millisecond, "Expected 1 update for group 1")
+	require.Eventually(t, hitTrackerService.casDownloadExpectation(anonKey, 30), 10*time.Second, 10*time.Millisecond, "Expected 30 updates for group ANON")
+	require.Eventually(t, hitTrackerService.casDownloadExpectation(group1Key, 1), 10*time.Second, 10*time.Millisecond, "Expected 1 update for group 1")
 }
 
 // TestBatchAndSendAreSerialized exists for the race detector, which CI runs.
