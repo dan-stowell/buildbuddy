@@ -1061,7 +1061,7 @@ func (r *Env) waitForExecutorRegistration() {
 		if reflect.DeepEqual(expectedNodesByID, nodesByID) {
 			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	require.Equal(r.t, expectedNodesByID, nodesByID, "set of registered executors should converge")
