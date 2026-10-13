@@ -24,6 +24,7 @@ go_test(
     embed = [":dsingleflight"],
     deps = [
         "//enterprise/server/testutil/testredis",
+        "@com_github_go_redis_redis_v8//:redis",
         "//server/util/status",
         "@com_github_stretchr_testify//require",
         "@org_golang_x_sync//errgroup",
