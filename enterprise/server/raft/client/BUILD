@@ -40,6 +40,7 @@ go_library(
 go_test(
     name = "client_test",
     srcs = ["client_test.go"],
+    shard_count = 4,
     deps = [
         ":client",
         "//enterprise/server/raft/constants",
