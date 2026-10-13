@@ -18,6 +18,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/operation"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/test/integration/remote_execution/rbetest"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/enterprise_testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/cache/dirtools"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
@@ -33,6 +34,7 @@ import (
 	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -41,6 +43,7 @@ import (
 	espb "github.com/buildbuddy-io/buildbuddy/proto/execution_stats"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 	scpb "github.com/buildbuddy-io/buildbuddy/proto/scheduler"
+	bspb "google.golang.org/genproto/googleapis/bytestream"
 	gstatus "google.golang.org/grpc/status"
 )
 
@@ -122,6 +125,21 @@ func (p *mockPublisher) SetState(state repb.ExecutionProgress_ExecutionState) er
 
 func (p *mockPublisher) CloseAndRecv() (*repb.PublishOperationResponse, error) {
 	return &repb.PublishOperationResponse{}, nil
+}
+
+// recordingByteStreamClient observes download requests while delegating all RPCs
+// to the real cache client, including the timeout behavior under test.
+type recordingByteStreamClient struct {
+	bspb.ByteStreamClient
+	readRequests chan *bspb.ReadRequest
+}
+
+func (c *recordingByteStreamClient) Read(ctx context.Context, req *bspb.ReadRequest, opts ...grpc.CallOption) (bspb.ByteStream_ReadClient, error) {
+	select {
+	case c.readRequests <- req:
+	default:
+	}
+	return c.ByteStreamClient.Read(ctx, req, opts...)
 }
 
 type counters struct {
@@ -565,10 +583,12 @@ func TestExecuteTaskAndStreamResults_PublishFailures(t *testing.T) {
 			flags.Set(t, "executor.task_progress_publish_interval", 1*time.Millisecond)
 
 			ctx := context.Background()
+			runStopped := make(chan struct{})
 			runOverride := func(ctx context.Context, original rbetest.RunFunc) *interfaces.CommandResult {
-				// Block the run call to give the executor time to ping the publisher
-				time.Sleep(5 * time.Minute)
-				return &interfaces.CommandResult{}
+				defer close(runStopped)
+				// Keep execution in progress until the failed ping cancels it.
+				<-ctx.Done()
+				return &interfaces.CommandResult{Error: ctx.Err()}
 			}
 			exec, _, _, _, mockCounter := getExecutor(t, runOverride)
 			task := getTask()
@@ -584,6 +604,11 @@ func TestExecuteTaskAndStreamResults_PublishFailures(t *testing.T) {
 				// Skip if there's a send failure, because we exit early
 				// before creating the runner
 				require.Equal(t, 1, mockCounter.countRecycled)
+				select {
+				case <-runStopped:
+				case <-time.After(10 * time.Second):
+					t.Fatal("run did not stop after publisher failure")
+				}
 			}
 		})
 	}
@@ -596,11 +621,17 @@ func TestExecuteTaskAndStreamResults_InternalInputDownloadTimeout(t *testing.T) 
 	// Prepare an input root with a large input that requires a bytestream
 	// download.
 	inputRoot := testfs.MakeTempDir(t)
-	err := os.WriteFile(filepath.Join(inputRoot, "input.txt"), make([]byte, 128*1024*1024), 0644)
+	err := os.WriteFile(filepath.Join(inputRoot, "input.txt"), make([]byte, dirtools.BatchReadLimitBytes+1), 0644)
 	require.NoError(t, err)
 	ird, _, err := cachetools.UploadDirectoryToCAS(ctx, env, "", repb.DigestFunction_SHA256, inputRoot)
 	require.NoError(t, err)
 	task.ExecutionTask.Action.InputRootDigest = ird
+
+	bsClient := &recordingByteStreamClient{
+		ByteStreamClient: env.GetByteStreamClient(),
+		readRequests:     make(chan *bspb.ReadRequest, 1),
+	}
+	env.SetByteStreamClient(bsClient)
 
 	// Set CAS RPC timeout so low that it's guaranteed to timeout.
 	flags.Set(t, "cache.client.cas_rpc_timeout", 1*time.Nanosecond)
@@ -616,6 +647,14 @@ func TestExecuteTaskAndStreamResults_InternalInputDownloadTimeout(t *testing.T) 
 		err,
 	)
 	require.False(t, retry, "bazel will retry Unavailable errors, so we should not retry internally")
+	select {
+	case req := <-bsClient.readRequests:
+		rn, err := digest.ParseDownloadResourceName(req.GetResourceName())
+		require.NoError(t, err)
+		require.EqualValues(t, dirtools.BatchReadLimitBytes+1, rn.GetDigest().GetSizeBytes(), "input must be downloaded via ByteStream Read")
+	default:
+		t.Fatal("expected a ByteStream Read request for the input")
+	}
 
 	<-mockServer.finished
 	// We should still recycle the runner if we timed out downloading inputs -
