@@ -1,6 +1,7 @@
 package email_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -113,6 +114,28 @@ func TestSend(t *testing.T) {
 			wantRequests: []capturedRequest{validRequest},
 		},
 		{
+			name:         "accepts HTTP 200",
+			message:      validMessage,
+			statusCode:   http.StatusOK,
+			wantRequests: []capturedRequest{validRequest},
+		},
+		{
+			name:         "rejects HTTP 300",
+			message:      validMessage,
+			statusCode:   http.StatusMultipleChoices,
+			responseBody: "unexpected redirect",
+			wantErr:      "SendGrid returned HTTP 300: unexpected redirect",
+			wantRequests: []capturedRequest{validRequest},
+		},
+		{
+			name:         "returns authentication failure",
+			message:      validMessage,
+			statusCode:   http.StatusUnauthorized,
+			responseBody: "invalid key",
+			wantErr:      "SendGrid returned HTTP 401: invalid key",
+			wantRequests: []capturedRequest{validRequest},
+		},
+		{
 			name:       "requires message",
 			statusCode: http.StatusAccepted,
 			wantErr:    "message is required",
@@ -199,6 +222,23 @@ func TestSend(t *testing.T) {
 	}
 }
 
+func TestSendCanceledContext(t *testing.T) {
+	flags.Set(t, "notifications.email.sendgrid.api_key", "test-api-key")
+	server := runFakeSendgridServer(t, http.StatusAccepted, "")
+	client := email.NewClient(email.ClientConfig{HTTPClient: server.httpClient, SendGridHost: server.url})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := client.Send(ctx, &email.Message{
+		From:        email.Address{Email: "sender@example.com"},
+		ToAddresses: []email.Address{{Email: "recipient@example.com"}},
+		Subject:     "Build complete",
+		Body:        "<p>Done</p>",
+	})
+	require.ErrorContains(t, err, "send email through SendGrid:")
+	require.ErrorContains(t, err, "context canceled")
+	require.Empty(t, server.capturedRequests)
+}
+
 type capturedRequest struct {
 	request     string
 	auth        string
@@ -257,7 +297,9 @@ func (s *fakeSendgridServer) ServeHTTP(w http.ResponseWriter, req *http.Request)
 	body, err := io.ReadAll(req.Body)
 	require.NoError(s.t, err)
 	var payload sendgridPayload
-	require.NoError(s.t, json.Unmarshal(body, &payload))
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	require.NoError(s.t, decoder.Decode(&payload))
 	s.capturedRequests = append(s.capturedRequests, capturedRequest{
 		request:     req.Method + " " + req.URL.Path,
 		auth:        req.Header.Get("Authorization"),

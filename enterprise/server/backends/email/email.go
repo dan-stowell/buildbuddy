@@ -1,16 +1,15 @@
 package email
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 
 	"github.com/buildbuddy-io/buildbuddy/server/http/httpclient"
 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
-
-	sendgridrest "github.com/sendgrid/rest"
-	sendgrid "github.com/sendgrid/sendgrid-go"
-	sendgridmail "github.com/sendgrid/sendgrid-go/helpers/mail"
 )
 
 var (
@@ -50,7 +49,7 @@ type Message struct {
 
 // Client sends email notifications.
 type Client struct {
-	client       *sendgridrest.Client
+	client       *http.Client
 	sendgridHost string
 }
 
@@ -71,7 +70,7 @@ func NewClient(config ClientConfig) *Client {
 		httpClient = httpclient.New(nil, "sendgrid")
 	}
 	return &Client{
-		client:       &sendgridrest.Client{HTTPClient: httpClient},
+		client:       httpClient,
 		sendgridHost: config.SendGridHost,
 	}
 }
@@ -86,31 +85,61 @@ func (c *Client) Send(ctx context.Context, msg *Message) error {
 	if err != nil {
 		return err
 	}
-	return sendWithClient(ctx, c.client, newRequest(email, c.sendgridHost))
-}
-
-func newRequest(email *sendgridmail.SGMailV3, host string) sendgridrest.Request {
-	request := sendgrid.GetRequest(*sendgridAPIKey, "/v3/mail/send", host)
-	request.Method = sendgridrest.Post
-	request.Body = sendgridmail.GetRequestBody(email)
-	return request
-}
-
-func sendWithClient(ctx context.Context, client *sendgridrest.Client, request sendgridrest.Request) error {
-	resp, err := client.SendWithContext(ctx, request)
+	body, err := json.Marshal(email)
 	if err != nil {
 		return status.UnavailableErrorf("send email through SendGrid: %s", err)
 	}
-	if resp == nil {
-		return status.UnavailableError("send email through SendGrid: empty response")
+	host := c.sendgridHost
+	if host == "" {
+		host = "https://api.sendgrid.com"
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, host+"/v3/mail/send", bytes.NewReader(body))
+	if err != nil {
+		return status.UnavailableErrorf("send email through SendGrid: %s", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+*sendgridAPIKey)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("User-Agent", "sendgrid/3.16.1;go")
+	resp, err := c.client.Do(request)
+	if err != nil {
+		return status.UnavailableErrorf("send email through SendGrid: %s", err)
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return status.UnavailableErrorf("send email through SendGrid: %s", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return status.UnavailableErrorf("SendGrid returned HTTP %d: %s", resp.StatusCode, resp.Body)
+		return status.UnavailableErrorf("SendGrid returned HTTP %d: %s", resp.StatusCode, responseBody)
 	}
 	return nil
 }
 
-func buildEmail(msg *Message) (*sendgridmail.SGMailV3, error) {
+// These types describe the subset of the SendGrid mail API used here.
+// Names are omitted when empty, matching the previous SDK encoding.
+type mailAddress struct {
+	Name  string `json:"name,omitempty"`
+	Email string `json:"email,omitempty"`
+}
+
+type personalization struct {
+	To []mailAddress `json:"to"`
+}
+
+type content struct {
+	Type  string `json:"type"`
+	Value string `json:"value"`
+}
+
+type mailRequest struct {
+	From             mailAddress       `json:"from"`
+	Subject          string            `json:"subject"`
+	Personalizations []personalization `json:"personalizations"`
+	Content          []content         `json:"content"`
+}
+
+func buildEmail(msg *Message) (*mailRequest, error) {
 	if msg == nil {
 		return nil, status.InvalidArgumentError("message is required")
 	}
@@ -137,15 +166,14 @@ func buildEmail(msg *Message) (*sendgridmail.SGMailV3, error) {
 		return nil, status.InvalidArgumentError("body is required")
 	}
 
-	email := sendgridmail.NewV3Mail()
-	email.SetFrom(toSendGridAddress(from))
-	email.Subject = msg.Subject
-	email.AddContent(sendgridmail.NewContent("text/html", msg.Body))
-
+	email := &mailRequest{
+		From:    toMailAddress(from),
+		Subject: msg.Subject,
+		Content: []content{{Type: "text/html", Value: msg.Body}},
+	}
 	for _, recipient := range recipients {
-		personalization := sendgridmail.NewPersonalization()
-		personalization.AddTos(toSendGridAddress(recipient))
-		email.AddPersonalizations(personalization)
+		// Separate personalizations keep recipients private from one another.
+		email.Personalizations = append(email.Personalizations, personalization{To: []mailAddress{toMailAddress(recipient)}})
 	}
 
 	return email, nil
@@ -155,6 +183,6 @@ func defaultFrom() Address {
 	return *defaultFromAddress
 }
 
-func toSendGridAddress(address Address) *sendgridmail.Email {
-	return sendgridmail.NewEmail(address.Name, address.Email)
+func toMailAddress(address Address) mailAddress {
+	return mailAddress(address)
 }
