@@ -9,16 +9,18 @@ go_library(
     deps = [
         "//proto:remote_execution_go_proto",
         "//server/util/lib/set",
-        "@com_github_mitchellh_go_ps//:go-ps",
         "@com_github_shirou_gopsutil_v3//process",
     ],
 )
 
 go_test(
     name = "procstats_test",
-    srcs = ["procstats_test.go"],
+    srcs = [
+        "enumeration_linux_test.go",
+        "procstats_test.go",
+    ],
+    embed = [":procstats"],
     deps = [
-        ":procstats",
         "//proto:remote_execution_go_proto",
         "@com_github_stretchr_testify//require",
     ],
