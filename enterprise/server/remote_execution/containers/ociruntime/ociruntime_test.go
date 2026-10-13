@@ -1128,7 +1128,54 @@ func TestSignal(t *testing.T) {
 	assert.Empty(t, string(res.Stderr))
 }
 
-func TestNetworking(t *testing.T) {
+type networkingTestParams struct {
+	defaultNetworkFlag         string
+	dockerNetworkProp          string
+	userspaceNetworking        bool
+	expectExternalConnectivity bool
+}
+
+func TestNetworkingDefaultEnabled(t *testing.T) {
+	testNetworking(t, networkingTestParams{expectExternalConnectivity: true})
+}
+
+func TestNetworkingEnabledExplicitlyViaProp(t *testing.T) {
+	testNetworking(t, networkingTestParams{
+		dockerNetworkProp:          "bridge",
+		expectExternalConnectivity: true,
+	})
+}
+
+func TestNetworkingDisabledViaFlag(t *testing.T) {
+	testNetworking(t, networkingTestParams{defaultNetworkFlag: "off"})
+}
+
+func TestNetworkingDisabledViaFlagButOverriddenViaProp(t *testing.T) {
+	testNetworking(t, networkingTestParams{
+		defaultNetworkFlag:         "off",
+		dockerNetworkProp:          "bridge",
+		expectExternalConnectivity: true,
+	})
+}
+
+func TestNetworkingUserspaceNetworking(t *testing.T) {
+	testNetworking(t, networkingTestParams{
+		userspaceNetworking:        true,
+		expectExternalConnectivity: true,
+	})
+}
+
+func TestNetworkingUserspaceNetworkingDisabledViaFlag(t *testing.T) {
+	testNetworking(t, networkingTestParams{
+		defaultNetworkFlag:  "off",
+		userspaceNetworking: true,
+	})
+}
+
+// Keep each scenario's flags, registry, directories, and container scoped to its
+// top-level test so Bazel can run the scenarios in separate shards.
+func testNetworking(t *testing.T, tc networkingTestParams) {
+	t.Helper()
 	setupNetworking(t)
 
 	// Note: busybox has ping, but it fails with 'permission denied (are you
@@ -1139,108 +1186,66 @@ func TestNetworking(t *testing.T) {
 	// (Note that podman has this same issue.)
 	image := netToolsImage(t)
 
-	for _, tc := range []struct {
-		name                       string
-		defaultNetworkFlag         string
-		dockerNetworkProp          string
-		userspaceNetworking        bool
-		expectExternalConnectivity bool
-	}{
-		{
-			name:                       "default enabled",
-			expectExternalConnectivity: true,
-		},
-		{
-			name:                       "enabled explicitly via prop",
-			dockerNetworkProp:          "bridge",
-			expectExternalConnectivity: true,
-		},
-		{
-			name:                       "disabled via flag",
-			defaultNetworkFlag:         "off",
-			expectExternalConnectivity: false,
-		},
-		{
-			name:                       "disabled via flag but overridden via prop",
-			defaultNetworkFlag:         "off",
-			dockerNetworkProp:          "bridge",
-			expectExternalConnectivity: true,
-		},
-		{
-			name:                       "userspace networking",
-			userspaceNetworking:        true,
-			expectExternalConnectivity: true,
-		},
-		{
-			name:                       "userspace networking disabled via flag",
-			defaultNetworkFlag:         "off",
-			userspaceNetworking:        true,
-			expectExternalConnectivity: false,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			env := testenv.GetTestEnv(t)
-			installLeaserInEnv(t, env)
-			installFileCacheInEnv(t, env)
+	ctx := context.Background()
+	env := testenv.GetTestEnv(t)
+	installLeaserInEnv(t, env)
+	installFileCacheInEnv(t, env)
 
-			runtimeRoot := testfs.MakeTempDir(t)
-			flags.Set(t, "executor.network_stats_enabled", true)
-			flags.Set(t, "executor.oci.runtime_root", runtimeRoot)
-			if tc.defaultNetworkFlag != "" {
-				flags.Set(t, "executor.oci.default_network_mode", tc.defaultNetworkFlag)
-			}
-			flags.Set(t, "executor.userspace_networking", tc.userspaceNetworking)
+	runtimeRoot := testfs.MakeTempDir(t)
+	flags.Set(t, "executor.network_stats_enabled", true)
+	flags.Set(t, "executor.oci.runtime_root", runtimeRoot)
+	if tc.defaultNetworkFlag != "" {
+		flags.Set(t, "executor.oci.default_network_mode", tc.defaultNetworkFlag)
+	}
+	flags.Set(t, "executor.userspace_networking", tc.userspaceNetworking)
 
-			buildRoot := testfs.MakeTempDir(t)
-			cacheRoot := testfs.MakeTempDir(t)
+	buildRoot := testfs.MakeTempDir(t)
+	cacheRoot := testfs.MakeTempDir(t)
 
-			provider, err := ociruntime.NewProvider(env, buildRoot, cacheRoot)
-			require.NoError(t, err)
-			wd := testfs.MakeDirAll(t, buildRoot, "work")
+	provider, err := ociruntime.NewProvider(env, buildRoot, cacheRoot)
+	require.NoError(t, err)
+	wd := testfs.MakeDirAll(t, buildRoot, "work")
 
-			c, err := provider.New(ctx, &container.Init{
-				Props: &platform.Properties{
-					ContainerImage: image,
-					DockerNetwork:  tc.dockerNetworkProp,
-				},
-				Task: &repb.ScheduledTask{ExecutionTask: &repb.ExecutionTask{}},
-			})
-			require.NoError(t, err)
-			t.Cleanup(func() {
-				err := c.Remove(ctx)
-				require.NoError(t, err)
-			})
+	c, err := provider.New(ctx, &container.Init{
+		Props: &platform.Properties{
+			ContainerImage: image,
+			DockerNetwork:  tc.dockerNetworkProp,
+		},
+		Task: &repb.ScheduledTask{ExecutionTask: &repb.ExecutionTask{}},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		err := c.Remove(ctx)
+		require.NoError(t, err)
+	})
 
-			// Run
-			cmd := &repb.Command{
-				Arguments: []string{"sh", "-c", `
-					# Should still have a loopback device available.
-					if ping -c1 -W1 $(hostname) >&2 ; then
-						echo PING_LOOPBACK_OK=true
-					else
-						echo PING_LOOPBACK_OK=false
-					fi
-					if ping -c1 -W2 8.8.8.8 >&2 ; then
-						echo PING_EXTERNAL_OK=true
-					else
-						echo PING_EXTERNAL_OK=false
-					fi
-				`},
-			}
-			res := c.Run(ctx, cmd, wd, oci.Credentials{})
-			require.NoError(t, res.Error)
-			t.Logf("stderr: %s", string(res.Stderr))
-			if tc.expectExternalConnectivity {
-				assert.Equal(t, "PING_LOOPBACK_OK=true\nPING_EXTERNAL_OK=true\n", string(res.Stdout))
-				assert.GreaterOrEqual(t, res.UsageStats.GetNetworkStats().GetBytesSent(), int64(100))
-				assert.GreaterOrEqual(t, res.UsageStats.GetNetworkStats().GetBytesReceived(), int64(100))
-			} else {
-				assert.Equal(t, "PING_LOOPBACK_OK=true\nPING_EXTERNAL_OK=false\n", string(res.Stdout))
-				assert.Equal(t, int64(0), res.UsageStats.GetNetworkStats().GetBytesSent())
-				assert.Equal(t, int64(0), res.UsageStats.GetNetworkStats().GetBytesReceived())
-			}
-		})
+	// Run
+	cmd := &repb.Command{
+		Arguments: []string{"sh", "-c", `
+			# Should still have a loopback device available.
+			if ping -c1 -W1 $(hostname) >&2 ; then
+				echo PING_LOOPBACK_OK=true
+			else
+				echo PING_LOOPBACK_OK=false
+			fi
+			if ping -c1 -W2 8.8.8.8 >&2 ; then
+				echo PING_EXTERNAL_OK=true
+			else
+				echo PING_EXTERNAL_OK=false
+			fi
+		`},
+	}
+	res := c.Run(ctx, cmd, wd, oci.Credentials{})
+	require.NoError(t, res.Error)
+	t.Logf("stderr: %s", string(res.Stderr))
+	if tc.expectExternalConnectivity {
+		assert.Equal(t, "PING_LOOPBACK_OK=true\nPING_EXTERNAL_OK=true\n", string(res.Stdout))
+		assert.GreaterOrEqual(t, res.UsageStats.GetNetworkStats().GetBytesSent(), int64(100))
+		assert.GreaterOrEqual(t, res.UsageStats.GetNetworkStats().GetBytesReceived(), int64(100))
+	} else {
+		assert.Equal(t, "PING_LOOPBACK_OK=true\nPING_EXTERNAL_OK=false\n", string(res.Stdout))
+		assert.Equal(t, int64(0), res.UsageStats.GetNetworkStats().GetBytesSent())
+		assert.Equal(t, int64(0), res.UsageStats.GetNetworkStats().GetBytesReceived())
 	}
 }
 
