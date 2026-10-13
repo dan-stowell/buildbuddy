@@ -83,9 +83,14 @@ f=
 set -e
 `
 
+// Preserve the old backoff's total wait budget: 50 ms doubled through 51.2 s.
+// Limit polling intervals so readiness does not go unnoticed for tens of seconds.
+const invocationPollTimeout = 102350 * time.Millisecond
+const maxInvocationPollDelay = 100 * time.Millisecond
+
 // Returns the invocation ID of the outer invocation.
 func waitForInvocationCreated(t *testing.T, ctx context.Context, bb bbspb.BuildBuddyServiceClient, reqCtx *ctxpb.RequestContext) string {
-	for delay := 50 * time.Millisecond; delay < 1*time.Minute; delay *= 2 {
+	for deadline, delay := time.Now().Add(invocationPollTimeout), 50*time.Millisecond; time.Now().Before(deadline); delay = min(2*delay, maxInvocationPollDelay) {
 		searchResp, err := bb.SearchInvocation(ctx, &inpb.SearchInvocationRequest{
 			RequestContext: reqCtx,
 			Query:          &inpb.InvocationQuery{GroupId: reqCtx.GetGroupId()},
@@ -98,7 +103,7 @@ func waitForInvocationCreated(t *testing.T, ctx context.Context, bb bbspb.BuildB
 				return in.GetInvocationId()
 			}
 		}
-		time.Sleep(delay)
+		time.Sleep(min(delay, max(0, time.Until(deadline))))
 	}
 
 	require.FailNowf(t, "timeout", "Timed out waiting for workflow invocation to be created")
@@ -107,7 +112,7 @@ func waitForInvocationCreated(t *testing.T, ctx context.Context, bb bbspb.BuildB
 
 func waitForLogLine(t *testing.T, ctx context.Context, bb bbspb.BuildBuddyServiceClient, invocationID string, s string) {
 	chunkID := ""
-	for delay := 50 * time.Millisecond; delay < 1*time.Minute; delay *= 2 {
+	for deadline, delay := time.Now().Add(invocationPollTimeout), 50*time.Millisecond; time.Now().Before(deadline); delay = min(2*delay, maxInvocationPollDelay) {
 		logResp, err := bb.GetEventLogChunk(ctx, &elpb.GetEventLogChunkRequest{
 			InvocationId: invocationID,
 			ChunkId:      chunkID,
@@ -121,13 +126,13 @@ func waitForLogLine(t *testing.T, ctx context.Context, bb bbspb.BuildBuddyServic
 				chunkID = logResp.GetNextChunkId()
 			}
 		}
-		time.Sleep(delay)
+		time.Sleep(min(delay, max(0, time.Until(deadline))))
 	}
 	require.FailNowf(t, "timeout", "Timed out waiting for %s in invocation logs", s)
 }
 
 func waitForInvocationStatus(t *testing.T, ctx context.Context, bb bbspb.BuildBuddyServiceClient, reqCtx *ctxpb.RequestContext, invocationID string, expectedStatus inspb.InvocationStatus) {
-	for delay := 50 * time.Millisecond; delay < 1*time.Minute; delay *= 2 {
+	for deadline, delay := time.Now().Add(invocationPollTimeout), 50*time.Millisecond; time.Now().Before(deadline); delay = min(2*delay, maxInvocationPollDelay) {
 		invResp, err := bb.GetInvocation(ctx, &inpb.GetInvocationRequest{
 			RequestContext: reqCtx,
 			Lookup:         &inpb.InvocationLookup{InvocationId: invocationID},
@@ -141,7 +146,7 @@ func waitForInvocationStatus(t *testing.T, ctx context.Context, bb bbspb.BuildBu
 			return
 		}
 
-		time.Sleep(delay)
+		time.Sleep(min(delay, max(0, time.Until(deadline))))
 	}
 
 	require.FailNowf(t, "timeout", "Timed out waiting for invocation to reach expected status %v", expectedStatus)
