@@ -6,7 +6,9 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"testing"
 	"time"
 
@@ -24,16 +26,20 @@ var (
 	bazel6Runfilepath string
 	bazel7Runfilepath string
 	bazel8Runfilepath string
+
+	// Pre-extracted installations for the active versions, injected via x_defs.
+	bazel6InstallRunfilepath string
+	bazel7InstallRunfilepath string
 )
 
 func TestBazelRBEProber_Bazel6(t *testing.T) {
-	runProberTest(t, bazel6Runfilepath, "bazel6", "")
+	runProberTest(t, bazel6Runfilepath, bazel6InstallRunfilepath, "bazel6", "")
 }
 
 func TestBazelRBEProber_Bazel7(t *testing.T) {
 	// Bazel 7+ has bzlmod enabled by default, which requires network access to
 	// fetch from the Bazel Central Registry. Disable it for network-isolated tests.
-	runProberTest(t, bazel7Runfilepath, "bazel7", "--enable_bzlmod=false")
+	runProberTest(t, bazel7Runfilepath, bazel7InstallRunfilepath, "bazel7", "--enable_bzlmod=false")
 }
 
 func TestBazelRBEProber_Bazel8(t *testing.T) {
@@ -52,7 +58,7 @@ func TestBazelRBEProber_Bazel8(t *testing.T) {
 	t.Skip("Bazel 8 requires network access to download implicit rules_cc dependency")
 }
 
-func runProberTest(t *testing.T, bazelRunfilepath, proberName, extraBazelArgs string) {
+func runProberTest(t *testing.T, bazelRunfilepath, installRunfilepath, proberName, extraBazelArgs string) {
 	// Set up RBE test environment with a BuildBuddy server and executor
 	env := rbetest.NewRBETestEnv(t)
 	env.AddBuildBuddyServer()
@@ -65,6 +71,8 @@ func runProberTest(t *testing.T, bazelRunfilepath, proberName, extraBazelArgs st
 
 	bazelBinary, err := runfiles.Rlocation(bazelRunfilepath)
 	require.NoError(t, err, "failed to locate bazel binary for %s", proberName)
+
+	installBase := initInstallBase(t, installRunfilepath)
 
 	// Run the prober
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -83,6 +91,7 @@ func runProberTest(t *testing.T, bazelRunfilepath, proberName, extraBazelArgs st
 
 	args := []string{
 		"--bazel_binary=" + bazelBinary,
+		"--bazel_startup_options=" + strconv.Quote("--install_base="+installBase),
 		"--prober_name=" + proberName,
 		"--num_targets=2",
 		"--num_inputs_per_target=2",
@@ -100,4 +109,32 @@ func runProberTest(t *testing.T, bazelRunfilepath, proberName, extraBazelArgs st
 
 	// Ensure server processes complete
 	env.ShutdownBuildBuddyServers()
+}
+
+// initInstallBase follows testbazel's runfile handling: sandboxed files may
+// need a physical copy, and Bazel requires future mtimes for a pristine install.
+func initInstallBase(t *testing.T, installRunfilepath string) string {
+	t.Helper()
+	outdir, err := runfiles.Rlocation(installRunfilepath)
+	require.NoError(t, err, "failed to locate pre-extracted bazel installation")
+	installBase := filepath.Join(outdir, "install_base")
+	if target, err := os.Readlink(filepath.Join(installBase, "build-label.txt")); err == nil {
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(installBase, target)
+		}
+		copyPath := filepath.Join(t.TempDir(), "install_base")
+		b, err := exec.Command("cp", "-R", filepath.Dir(target), copyPath).CombinedOutput()
+		require.NoError(t, err, "failed to copy bazel installation: %s", b)
+		// Build outputs can be read-only; the private copy must be removable
+		// by t.TempDir cleanup. Preserve executable bits and future mtimes.
+		b, err = exec.Command("chmod", "-R", "u+w", copyPath).CombinedOutput()
+		require.NoError(t, err, "failed to make bazel installation writable: %s", b)
+		installBase = copyPath
+	}
+	mtime := time.Now().Add(10 * 365 * 24 * time.Hour).Format("2006-01-02T00:00:00")
+	cmd := exec.Command("find", ".", "-type", "f", "-exec", "touch", "-d", mtime, "{}", "+")
+	cmd.Dir = installBase
+	b, err := cmd.CombinedOutput()
+	require.NoError(t, err, "failed to touch bazel installation: %s", b)
+	return installBase
 }
