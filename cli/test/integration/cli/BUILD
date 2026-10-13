@@ -5,7 +5,7 @@ package(default_visibility = ["//cli:__subpackages__"])
 go_test(
     name = "cli_test",
     srcs = ["cli_test.go"],
-    shard_count = 4,
+    shard_count = 8,
     deps = [
         "//cli/log",
         "//cli/parser",
