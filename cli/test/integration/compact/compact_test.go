@@ -16,13 +16,16 @@ func TestPrintCompactExec(t *testing.T) {
 	files, err := filepath.Glob("testdata/*.binpb.zst")
 	require.NoError(t, err)
 
-	ws := testcli.NewWorkspace(t)
+	// Initialize the shared CLI environment with the parent test so its HOME
+	// directory stays alive until all parallel subtests have finished.
+	testcli.Command(t, "")
 	for _, f := range files {
 		absPath, err := filepath.Abs(f)
 		require.NoError(t, err)
 
 		for _, isSorted := range []bool{true, false} {
 			t.Run(fmt.Sprintf("%s/isSorted_%t", f, isSorted), func(t *testing.T) {
+				t.Parallel()
 				expectedSuffix := ".json"
 				if isSorted {
 					expectedSuffix = ".sorted.json"
@@ -33,6 +36,8 @@ func TestPrintCompactExec(t *testing.T) {
 
 				for i := range 3 {
 					t.Run(fmt.Sprintf("run_%d", i), func(t *testing.T) {
+						t.Parallel()
+						ws := testcli.NewWorkspace(t)
 						out, err := testcli.CombinedOutput(testcli.Command(t, ws, "print", "--compact_execution_log", absPath, fmt.Sprintf("--sort=%t", isSorted)))
 						assert.NoError(t, err)
 						assert.Equal(t, string(b), string(out))
