@@ -111,28 +111,6 @@ proto_library(
 )
 
 proto_library(
-    name = "buck_data_proto",
-    srcs = ["buck_data.proto"],
-    deps = [
-        ":buck_error_proto",
-        ":buck_host_sharing_proto",
-        "@com_google_protobuf//:duration_proto",
-        "@com_google_protobuf//:empty_proto",
-        "@com_google_protobuf//:timestamp_proto",
-    ],
-)
-
-proto_library(
-    name = "buck_error_proto",
-    srcs = ["buck_error.proto"],
-)
-
-proto_library(
-    name = "buck_host_sharing_proto",
-    srcs = ["buck_host_sharing.proto"],
-)
-
-proto_library(
     name = "build_status_proto",
     srcs = [
         "build_status.proto",
@@ -153,11 +131,6 @@ proto_library(
         "@com_google_protobuf//:any_proto",
         "@com_google_protobuf//:timestamp_proto",
     ],
-)
-
-proto_library(
-    name = "bytestream_proto",
-    srcs = ["bytestream.proto"],
 )
 
 proto_library(
@@ -998,22 +971,6 @@ ts_proto_library(
 )
 
 proto_library(
-    name = "kythe_service_proto",
-    srcs = ["kythe_service.proto"],
-    deps = [
-        "@io_kythe//kythe/proto:analysis_proto",
-        "@io_kythe//kythe/proto:explore_proto",
-        "@io_kythe//kythe/proto:filetree_proto",
-        "@io_kythe//kythe/proto:graph_proto",
-        "@io_kythe//kythe/proto:identifier_proto",
-        "@io_kythe//kythe/proto:link_proto",
-        "@io_kythe//kythe/proto:status_service_proto",
-        "@io_kythe//kythe/proto:storage_proto",
-        "@io_kythe//kythe/proto:xref_proto",
-    ],
-)
-
-proto_library(
     name = "ociregistry_proto",
     srcs = ["ociregistry.proto"],
 )
@@ -1118,28 +1075,6 @@ go_proto_library(
 )
 
 go_proto_library(
-    name = "buck_data_go_proto",
-    importpath = "github.com/buildbuddy-io/buildbuddy/proto/buckdata",
-    proto = ":buck_data_proto",
-    deps = [
-        ":buck_error_go_proto",
-        ":buck_host_sharing_go_proto",
-    ],
-)
-
-go_proto_library(
-    name = "buck_error_go_proto",
-    importpath = "github.com/buildbuddy-io/buildbuddy/proto/buckerror",
-    proto = ":buck_error_proto",
-)
-
-go_proto_library(
-    name = "buck_host_sharing_go_proto",
-    importpath = "github.com/buildbuddy-io/buildbuddy/proto/buckhostsharing",
-    proto = ":buck_host_sharing_proto",
-)
-
-go_proto_library(
     name = "build_status_go_proto",
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/build_status",
     proto = ":build_status_proto",
@@ -1152,13 +1087,6 @@ go_proto_library(
     deps = [
         ":build_status_go_proto",
     ],
-)
-
-go_proto_library(
-    name = "bytestream_go_proto",
-    importpath = "github.com/buildbuddy-io/buildbuddy/proto/bytestream",
-    mode = "messages_and_services",
-    proto = ":bytestream_proto",
 )
 
 go_proto_library(
@@ -1949,24 +1877,6 @@ go_proto_library(
     deps = [
         ":index_go_proto",
         ":search_go_proto",
-    ],
-)
-
-go_proto_library(
-    name = "kythe_service_go_proto",
-    importpath = "github.com/buildbuddy-io/buildbuddy/proto/kythe_service",
-    mode = "services_only",
-    proto = ":kythe_service_proto",
-    deps = [
-        "@io_kythe//kythe/proto:analysis_go_proto",
-        "@io_kythe//kythe/proto:explore_go_proto",
-        "@io_kythe//kythe/proto:filetree_go_proto",
-        "@io_kythe//kythe/proto:graph_go_proto",
-        "@io_kythe//kythe/proto:identifier_go_proto",
-        "@io_kythe//kythe/proto:link_go_proto",
-        "@io_kythe//kythe/proto:status_service_go_proto",
-        "@io_kythe//kythe/proto:storage_go_proto",
-        "@io_kythe//kythe/proto:xref_go_proto",
     ],
 )
 
