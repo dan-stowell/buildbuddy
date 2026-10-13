@@ -5,7 +5,8 @@ package(default_visibility = ["//enterprise:__subpackages__"])
 go_test(
     name = "remote_bazel_test",
     srcs = ["remote_bazel_test.go"],
-    shard_count = 7,
+    # Each top-level test gets its own shard, including the runfiles scenarios.
+    shard_count = 13,
     tags = ["block-network"],
     deps = [
         "//cli/remotebazel",
