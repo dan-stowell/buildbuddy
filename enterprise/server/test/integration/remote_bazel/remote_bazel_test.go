@@ -90,7 +90,10 @@ const maxInvocationPollDelay = 100 * time.Millisecond
 
 // Returns the invocation ID of the outer invocation.
 func waitForInvocationCreated(t *testing.T, ctx context.Context, bb bbspb.BuildBuddyServiceClient, reqCtx *ctxpb.RequestContext) string {
-	for deadline, delay := time.Now().Add(invocationPollTimeout), 50*time.Millisecond; time.Now().Before(deadline); delay = min(2*delay, maxInvocationPollDelay) {
+	deadline := time.Now().Add(invocationPollTimeout)
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	for delay := 50 * time.Millisecond; time.Now().Before(deadline); delay = min(2*delay, maxInvocationPollDelay) {
 		searchResp, err := bb.SearchInvocation(ctx, &inpb.SearchInvocationRequest{
 			RequestContext: reqCtx,
 			Query:          &inpb.InvocationQuery{GroupId: reqCtx.GetGroupId()},
@@ -112,7 +115,10 @@ func waitForInvocationCreated(t *testing.T, ctx context.Context, bb bbspb.BuildB
 
 func waitForLogLine(t *testing.T, ctx context.Context, bb bbspb.BuildBuddyServiceClient, invocationID string, s string) {
 	chunkID := ""
-	for deadline, delay := time.Now().Add(invocationPollTimeout), 50*time.Millisecond; time.Now().Before(deadline); delay = min(2*delay, maxInvocationPollDelay) {
+	deadline := time.Now().Add(invocationPollTimeout)
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	for delay := 50 * time.Millisecond; time.Now().Before(deadline); delay = min(2*delay, maxInvocationPollDelay) {
 		logResp, err := bb.GetEventLogChunk(ctx, &elpb.GetEventLogChunkRequest{
 			InvocationId: invocationID,
 			ChunkId:      chunkID,
@@ -132,7 +138,10 @@ func waitForLogLine(t *testing.T, ctx context.Context, bb bbspb.BuildBuddyServic
 }
 
 func waitForInvocationStatus(t *testing.T, ctx context.Context, bb bbspb.BuildBuddyServiceClient, reqCtx *ctxpb.RequestContext, invocationID string, expectedStatus inspb.InvocationStatus) {
-	for deadline, delay := time.Now().Add(invocationPollTimeout), 50*time.Millisecond; time.Now().Before(deadline); delay = min(2*delay, maxInvocationPollDelay) {
+	deadline := time.Now().Add(invocationPollTimeout)
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	for delay := 50 * time.Millisecond; time.Now().Before(deadline); delay = min(2*delay, maxInvocationPollDelay) {
 		invResp, err := bb.GetInvocation(ctx, &inpb.GetInvocationRequest{
 			RequestContext: reqCtx,
 			Lookup:         &inpb.InvocationLookup{InvocationId: invocationID},
