@@ -21,11 +21,14 @@ func TestPubSub(t *testing.T) {
 	ch1 := app1.Subscribe(&snpb.InvalidateIPRulesCache{})
 	ch2 := app2.Subscribe(&snpb.InvalidateIPRulesCache{})
 
-	// Gross, but the PubSub subscription in New is async and must happen
-	// before any published messages can be dispatched.
-	time.Sleep(3 * time.Second)
-
 	ctx := context.Background()
+	// New subscribes asynchronously. Wait until Redis has registered both
+	// subscribers so the published message can reach both services.
+	rdb := h.Client()
+	require.Eventually(t, func() bool {
+		counts, err := rdb.PubSubNumSub(ctx, "serverNotifications/app").Result()
+		return err == nil && counts["serverNotifications/app"] == 2
+	}, 10*time.Second, 5*time.Millisecond, "notification channel should have two subscribers")
 
 	// Publish a message.
 	msg := &snpb.InvalidateIPRulesCache{GroupId: "123"}
