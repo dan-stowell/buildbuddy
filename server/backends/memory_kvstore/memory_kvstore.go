@@ -3,9 +3,8 @@ package memory_kvstore
 import (
 	"context"
 
+	"github.com/buildbuddy-io/buildbuddy/server/util/lru"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
-
-	lru "github.com/hashicorp/golang-lru"
 )
 
 const (
@@ -15,11 +14,16 @@ const (
 )
 
 type MemoryKeyValStore struct {
-	l *lru.Cache
+	l lru.LRU[any]
 }
 
 func NewMemoryKeyValStore() (*MemoryKeyValStore, error) {
-	l, err := lru.New(maxNumEntries)
+	l, err := lru.New(&lru.Config[any]{
+		MaxSize:       maxNumEntries,
+		SizeFn:        func(any) int64 { return 1 },
+		UpdateInPlace: true,
+		ThreadSafe:    true,
+	})
 	if err != nil {
 		return nil, err
 	}
