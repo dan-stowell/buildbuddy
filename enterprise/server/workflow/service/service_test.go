@@ -1764,13 +1764,11 @@ actions:
     bazel_commands: ["test //..."]
 `)
 
-	time.Sleep(1 * time.Second)
-
 	var runs []*tables.ScheduledRun
 	require.Eventually(t, func() bool {
 		runs = listScheduledRuns(t, te, gid, repoURL)
 		return len(runs) == 1
-	}, 1*time.Second, 100*time.Millisecond)
+	}, 1*time.Second, 10*time.Millisecond)
 	require.Equal(t, "Hourly", runs[0].ActionName)
 	require.Equal(t, "0 * * * *", runs[0].CronExpr)
 	require.Equal(t, threePM.Add(1*time.Hour).UnixMicro(), runs[0].NextRunUsec)
@@ -1807,7 +1805,7 @@ actions:
 	require.Eventually(t, func() bool {
 		runs = listScheduledRuns(t, te, gid, repoURL)
 		return len(runs) == 4
-	}, 1*time.Second, 100*time.Millisecond)
+	}, 1*time.Second, 10*time.Millisecond)
 
 	// Should be triggered daily at 4PM.
 	run1 := runs[0]
@@ -1896,7 +1894,7 @@ actions:
 	require.Eventually(t, func() bool {
 		runs = listScheduledRuns(t, te, gid, repoURL)
 		return len(runs) == 1
-	}, 1*time.Second, 100*time.Millisecond)
+	}, 1*time.Second, 10*time.Millisecond)
 	require.Equal(t, "Nightly", runs[0].ActionName)
 	require.Equal(t, "0 0 * * *", runs[0].CronExpr)
 }
@@ -1961,7 +1959,7 @@ actions:
 	require.Eventually(t, func() bool {
 		runs = listScheduledRuns(t, te, gid, repoURL)
 		return len(runs) == 2
-	}, 1*time.Second, 100*time.Millisecond)
+	}, 1*time.Second, 10*time.Millisecond)
 
 	// Based on the most recent config push, there should be a scheduled run at 4PM.
 	run1 := runs[0]
@@ -2029,7 +2027,7 @@ actions:
 	require.Eventually(t, func() bool {
 		runs = listScheduledRuns(t, te, gid, repoURL)
 		return len(runs) == 1
-	}, 1*time.Second, 100*time.Millisecond)
+	}, 1*time.Second, 10*time.Millisecond)
 
 	run := runs[0]
 	require.Equal(t, "Schedule", run.ActionName)
@@ -2091,7 +2089,7 @@ actions:
 	require.Eventually(t, func() bool {
 		runs = listScheduledRuns(t, te, gid, repoURL)
 		return len(runs) == 1
-	}, 1*time.Second, 100*time.Millisecond)
+	}, 1*time.Second, 10*time.Millisecond)
 
 	run := runs[0]
 	require.Equal(t, "Schedule", run.ActionName)
@@ -2121,7 +2119,7 @@ actions:
 	// Wait for scheduled runs to be created.
 	require.Eventually(t, func() bool {
 		return len(listScheduledRuns(t, te, gid, repoURL)) == 1
-	}, 1*time.Second, 100*time.Millisecond)
+	}, 1*time.Second, 10*time.Millisecond)
 
 	// Simulate the user deleting their buildbuddy.yaml file.
 	provider.FileContents = map[string]string{}
@@ -2142,7 +2140,7 @@ actions:
 	// The previously created scheduled run should be deleted.
 	require.Eventually(t, func() bool {
 		return len(listScheduledRuns(t, te, gid, repoURL)) == 0
-	}, 1*time.Second, 100*time.Millisecond)
+	}, 1*time.Second, 10*time.Millisecond)
 }
 func TestScheduledWorkflows_ConfigValidation_InvalidCron(t *testing.T) {
 	ctx := context.Background()
