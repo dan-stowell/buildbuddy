@@ -1,14 +1,11 @@
 package schema
 
 import (
-	"encoding/hex"
 	"reflect"
 	"slices"
-	"strings"
 	"testing"
 
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
-	"github.com/go-faker/faker/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -106,9 +103,53 @@ var NonStandardInvocationCopyFields = []string{
 }
 
 func TestToInvocationFromPrimaryDB(t *testing.T) {
-	src := &tables.Invocation{}
-	err := faker.FakeData(src)
-	require.NoError(t, err)
+	src := &tables.Invocation{
+		CreatedAtUsec:                     101,
+		UpdatedAtUsec:                     102,
+		InvocationUUID:                    []byte{0x00, 0x01, 0xab, 0xff},
+		Tags:                              "linux,ci",
+		GroupID:                           "GroupID-value",
+		Role:                              "Role-value",
+		User:                              "User-value",
+		UserID:                            "UserID-value",
+		Host:                              "Host-value",
+		CommitSHA:                         "CommitSHA-value",
+		BranchName:                        "BranchName-value",
+		Command:                           "Command-value",
+		BazelExitCode:                     "BazelExitCode-value",
+		Pattern:                           "Pattern-value",
+		Attempt:                           213,
+		ActionCount:                       214,
+		InvocationStatus:                  215,
+		RepoURL:                           "RepoURL-value",
+		DurationUsec:                      217,
+		Success:                           true,
+		ActionCacheHits:                   219,
+		ActionCacheMisses:                 220,
+		ActionCacheUploads:                221,
+		CasCacheHits:                      222,
+		CasCacheMisses:                    223,
+		CasCacheUploads:                   224,
+		TotalDownloadSizeBytes:            225,
+		TotalUploadSizeBytes:              226,
+		TotalDownloadUsec:                 227,
+		TotalUploadUsec:                   228,
+		TotalDownloadTransferredSizeBytes: 229,
+		TotalUploadTransferredSizeBytes:   230,
+		TotalCachedActionExecUsec:         231,
+		TotalUncachedActionExecUsec:       232,
+		DownloadThroughputBytesPerSecond:  233,
+		UploadThroughputBytesPerSecond:    234,
+		DownloadOutputsOption:             235,
+		UploadLocalResultsEnabled:         true,
+		RemoteExecutionEnabled:            true,
+		RunID:                             "RunID-value",
+		ParentRunID:                       "ParentRunID-value",
+		RunStatus:                         240,
+		GitFetchTotalBytes:                241,
+		GitFetchDurationUsec:              242,
+		GitFetchRetryCount:                243,
+	}
 	dest := ToInvocationFromPrimaryDB(src)
 
 	primaryInvType := reflect.TypeOf(*src)
@@ -117,10 +158,10 @@ func TestToInvocationFromPrimaryDB(t *testing.T) {
 	destValue := reflect.ValueOf(*dest)
 	excludedFields := (&Invocation{}).ExcludedFields()
 
-	expectedUUID := hex.EncodeToString(src.InvocationUUID)
-	assert.Equal(t, dest.InvocationUUID, expectedUUID, "src and dest have different values for field 'InvocationUUID'. src = %v, dest = %v", src.InvocationUUID, expectedUUID)
-	// faker might pick a string with commas in it, so we unfortunately have to split here, too.
-	assert.Equal(t, dest.Tags, strings.Split(src.Tags, ","))
+	expectedUUID := "0001abff"
+	assert.Equal(t, expectedUUID, dest.InvocationUUID, "src and dest have different values for field 'InvocationUUID'. src = %v, dest = %v", src.InvocationUUID, expectedUUID)
+	// Tags are stored as a comma-separated string in the primary DB.
+	assert.Equal(t, []string{"linux", "ci"}, dest.Tags)
 
 	for _, primaryField := range primaryInvFields {
 		if slices.Contains(excludedFields, primaryField.Name) || primaryField.Anonymous || slices.Contains(NonStandardInvocationCopyFields, primaryField.Name) {
@@ -130,6 +171,8 @@ func TestToInvocationFromPrimaryDB(t *testing.T) {
 		srcFieldValue := srcValue.FieldByName(primaryField.Name)
 		destFieldValue := destValue.FieldByName(primaryField.Name)
 		require.True(t, srcFieldValue.IsValid())
+		// A newly added field must receive a nonzero fixture value to catch omitted copies.
+		require.False(t, srcFieldValue.IsZero(), "fixture omits %s", primaryField.Name)
 		if destFieldValue.IsValid() {
 			assert.Equal(t, srcFieldValue.Interface(), destFieldValue.Interface(), "src and dest have different values for field %q. src = %v, dest = %v", primaryField.Name, srcFieldValue, destFieldValue)
 		} else {
