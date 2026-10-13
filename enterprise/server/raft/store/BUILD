@@ -68,7 +68,7 @@ go_test(
         "test.EstimatedComputeUnits": "10",
         "test.workload-isolation-type": "firecracker",
     },
-    shard_count = 8,
+    shard_count = 16,
     tags = ["block-network"],
     deps = [
         "//enterprise/server/filestore",

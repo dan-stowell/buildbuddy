@@ -34,6 +34,7 @@ go_library(
 go_test(
     name = "sender_test",
     srcs = ["sender_test.go"],
+    shard_count = 4,
     exec_properties = {
         "test.EstimatedComputeUnits": "8",
         "test.EstimatedMemory": "8GB",
