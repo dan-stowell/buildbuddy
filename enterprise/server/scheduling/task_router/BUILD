@@ -41,6 +41,5 @@ go_test(
         "@com_github_open_feature_go_sdk//openfeature/testing",
         "@com_github_open_feature_go_sdk_contrib_providers_flagd//pkg",
         "@com_github_stretchr_testify//require",
-        "@org_golang_x_exp//slices",
     ],
 )

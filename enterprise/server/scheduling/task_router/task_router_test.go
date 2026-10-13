@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"slices"
 	"testing"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/experiments"
@@ -20,7 +21,6 @@ import (
 	"github.com/open-feature/go-sdk/openfeature"
 	"github.com/open-feature/go-sdk/openfeature/memprovider"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/slices"
 
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 	flagd "github.com/open-feature/go-sdk-contrib/providers/flagd/pkg"
