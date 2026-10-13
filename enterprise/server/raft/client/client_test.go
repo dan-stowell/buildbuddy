@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/raft/client"
@@ -230,16 +231,19 @@ func TestRunNodehostFn_ErrorCodes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			err := client.RunNodehostFn(ctx, time.Second, func(ctx context.Context) error {
-				return tt.err
+			// Advance retry timers and deadlines using fake time.
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				err := client.RunNodehostFn(ctx, time.Second, func(ctx context.Context) error {
+					return tt.err
+				})
+				require.Error(t, err)
+				require.Equal(t, tt.expectedCode, gstatus.Code(err))
+				if tt.checkErrorIs {
+					require.True(t, errors.Is(err, tt.expectedErrIs))
+				}
 			})
-			require.Error(t, err)
-			require.Equal(t, tt.expectedCode, gstatus.Code(err))
-			if tt.checkErrorIs {
-				require.True(t, errors.Is(err, tt.expectedErrIs))
-			}
 		})
 	}
 }
