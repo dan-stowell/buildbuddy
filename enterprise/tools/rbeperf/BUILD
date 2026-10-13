@@ -1,6 +1,6 @@
 load("@io_bazel_rules_docker//container:container.bzl", "container_push")
 load("@io_bazel_rules_docker//go:image.bzl", "go_image")
-load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 load("@rules_oci//oci:defs.bzl", "oci_image", "oci_push")
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 
@@ -80,4 +80,14 @@ oci_push(
     # Set the image tag with the bazel run flag "--//deployment:image_tag=TAG"
     remote_tags = "//deployment:oci_tag_file",
     repository = "gcr.io/flame-build/rbeperf-oci",
+)
+
+# Compare parsers before changing command-line tokenization.
+go_test(
+    name = "rbeperf_test",
+    srcs = ["rbeperf_test.go"],
+    deps = [
+        "//server/util/shlex",
+        "@com_github_mattn_go_shellwords//:go-shellwords",
+    ],
 )
