@@ -1,0 +1,399 @@
+diff --git a/server/util/clickhouse/schema/BUILD b/server/util/clickhouse/schema/BUILD
+index 4677efe3b..a3c90cf10 100644
+--- a/server/util/clickhouse/schema/BUILD
++++ b/server/util/clickhouse/schema/BUILD
+@@ -22,7 +22,6 @@ go_test(
+     embed = [":schema"],
+     deps = [
+         "//server/tables",
+-        "@com_github_go_faker_faker_v4//:faker",
+         "@com_github_stretchr_testify//assert",
+         "@com_github_stretchr_testify//require",
+     ],
+diff --git a/server/util/clickhouse/schema/schema_test.go b/server/util/clickhouse/schema/schema_test.go
+index 83e390d1b..839161fd8 100644
+--- a/server/util/clickhouse/schema/schema_test.go
++++ b/server/util/clickhouse/schema/schema_test.go
+@@ -1,14 +1,11 @@
+ package schema
+ 
+ import (
+-	"encoding/hex"
+ 	"reflect"
+ 	"slices"
+-	"strings"
+ 	"testing"
+ 
+ 	"github.com/buildbuddy-io/buildbuddy/server/tables"
+-	"github.com/go-faker/faker/v4"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+ )
+@@ -106,9 +103,53 @@ var NonStandardInvocationCopyFields = []string{
+ }
+ 
+ func TestToInvocationFromPrimaryDB(t *testing.T) {
+-	src := &tables.Invocation{}
+-	err := faker.FakeData(src)
+-	require.NoError(t, err)
++	src := &tables.Invocation{
++		CreatedAtUsec:                     101,
++		UpdatedAtUsec:                     102,
++		InvocationUUID:                    []byte{0x00, 0x01, 0xab, 0xff},
++		Tags:                              "linux,ci",
++		GroupID:                           "GroupID-value",
++		Role:                              "Role-value",
++		User:                              "User-value",
++		UserID:                            "UserID-value",
++		Host:                              "Host-value",
++		CommitSHA:                         "CommitSHA-value",
++		BranchName:                        "BranchName-value",
++		Command:                           "Command-value",
++		BazelExitCode:                     "BazelExitCode-value",
++		Pattern:                           "Pattern-value",
++		Attempt:                           213,
++		ActionCount:                       214,
++		InvocationStatus:                  215,
++		RepoURL:                           "RepoURL-value",
++		DurationUsec:                      217,
++		Success:                           true,
++		ActionCacheHits:                   219,
++		ActionCacheMisses:                 220,
++		ActionCacheUploads:                221,
++		CasCacheHits:                      222,
++		CasCacheMisses:                    223,
++		CasCacheUploads:                   224,
++		TotalDownloadSizeBytes:            225,
++		TotalUploadSizeBytes:              226,
++		TotalDownloadUsec:                 227,
++		TotalUploadUsec:                   228,
++		TotalDownloadTransferredSizeBytes: 229,
++		TotalUploadTransferredSizeBytes:   230,
++		TotalCachedActionExecUsec:         231,
++		TotalUncachedActionExecUsec:       232,
++		DownloadThroughputBytesPerSecond:  233,
++		UploadThroughputBytesPerSecond:    234,
++		DownloadOutputsOption:             235,
++		UploadLocalResultsEnabled:         true,
++		RemoteExecutionEnabled:            true,
++		RunID:                             "RunID-value",
++		ParentRunID:                       "ParentRunID-value",
++		RunStatus:                         240,
++		GitFetchTotalBytes:                241,
++		GitFetchDurationUsec:              242,
++		GitFetchRetryCount:                243,
++	}
+ 	dest := ToInvocationFromPrimaryDB(src)
+ 
+ 	primaryInvType := reflect.TypeOf(*src)
+@@ -117,10 +158,10 @@ func TestToInvocationFromPrimaryDB(t *testing.T) {
+ 	destValue := reflect.ValueOf(*dest)
+ 	excludedFields := (&Invocation{}).ExcludedFields()
+ 
+-	expectedUUID := hex.EncodeToString(src.InvocationUUID)
+-	assert.Equal(t, dest.InvocationUUID, expectedUUID, "src and dest have different values for field 'InvocationUUID'. src = %v, dest = %v", src.InvocationUUID, expectedUUID)
+-	// faker might pick a string with commas in it, so we unfortunately have to split here, too.
+-	assert.Equal(t, dest.Tags, strings.Split(src.Tags, ","))
++	expectedUUID := "0001abff"
++	assert.Equal(t, expectedUUID, dest.InvocationUUID, "src and dest have different values for field 'InvocationUUID'. src = %v, dest = %v", src.InvocationUUID, expectedUUID)
++	// Tags are stored as a comma-separated string in the primary DB.
++	assert.Equal(t, []string{"linux", "ci"}, dest.Tags)
+ 
+ 	for _, primaryField := range primaryInvFields {
+ 		if slices.Contains(excludedFields, primaryField.Name) || primaryField.Anonymous || slices.Contains(NonStandardInvocationCopyFields, primaryField.Name) {
+@@ -130,6 +171,8 @@ func TestToInvocationFromPrimaryDB(t *testing.T) {
+ 		srcFieldValue := srcValue.FieldByName(primaryField.Name)
+ 		destFieldValue := destValue.FieldByName(primaryField.Name)
+ 		require.True(t, srcFieldValue.IsValid())
++		// A newly added field must receive a nonzero fixture value to catch omitted copies.
++		require.False(t, srcFieldValue.IsZero(), "fixture omits %s", primaryField.Name)
+ 		if destFieldValue.IsValid() {
+ 			assert.Equal(t, srcFieldValue.Interface(), destFieldValue.Interface(), "src and dest have different values for field %q. src = %v, dest = %v", primaryField.Name, srcFieldValue, destFieldValue)
+ 		} else {
+diff --git a/server/util/proto/BUILD b/server/util/proto/BUILD
+index cbf90f9e6..8abeecde7 100644
+--- a/server/util/proto/BUILD
++++ b/server/util/proto/BUILD
+@@ -16,10 +16,11 @@ go_test(
+         "//proto:cache_go_proto",
+         "//proto:distributed_cache_go_proto",
+         "//proto:storage_go_proto",
+-        "@com_github_go_faker_faker_v4//:faker",
+         "@com_github_stretchr_testify//require",
+         "@org_golang_google_genproto_googleapis_rpc//status",
++        "@org_golang_google_protobuf//encoding/prototext",
+         "@org_golang_google_protobuf//proto",
++        "@org_golang_google_protobuf//reflect/protoreflect",
+         "@org_golang_google_protobuf//types/known/anypb",
+         "@org_golang_google_protobuf//types/known/wrapperspb",
+     ],
+diff --git a/server/util/proto/proto_test.go b/server/util/proto/proto_test.go
+index 0dadd1d7b..752f42b98 100644
+--- a/server/util/proto/proto_test.go
++++ b/server/util/proto/proto_test.go
+@@ -2,24 +2,60 @@ package proto_test
+ 
+ import (
+ 	"fmt"
+-	"math/rand"
+ 	"testing"
+ 
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
+-	"github.com/go-faker/faker/v4"
+ 	"github.com/stretchr/testify/require"
+ 
+ 	capb "github.com/buildbuddy-io/buildbuddy/proto/cache"
+ 	dspb "github.com/buildbuddy-io/buildbuddy/proto/distributed_cache"
+ 	sgpb "github.com/buildbuddy-io/buildbuddy/proto/storage"
+ 	statuspb "google.golang.org/genproto/googleapis/rpc/status"
++	"google.golang.org/protobuf/encoding/prototext"
+ 	gproto "google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/reflect/protoreflect"
+ 	"google.golang.org/protobuf/types/known/anypb"
+ 	"google.golang.org/protobuf/types/known/wrapperspb"
+ )
+ 
+ const (
+-	numSamples = 30
++	fileMetadataFixture = `
++ file_record: {
++   isolation: { cache_type: CAS remote_instance_name: "instance" partition_id: "partition" group_id: "group" }
++   digest: { hash: "abc123" size_bytes: 123 }
++   compressor: ZSTD encryption: { key_id: "key" } digest_function: SHA256
++ }
++ storage_metadata: {
++   file_metadata: { filename: "cache/file" }
++   inline_metadata: { data: "\000\001payload" created_at_nsec: 123456789 }
++   gcs_metadata: { blob_name: "blob" last_custom_time_usec: 234567 shared: true }
++ }
++ encryption_metadata: { encryption_key_id: "encryption-key" version: 2 }
++ stored_size_bytes: 456 last_access_usec: 345678 last_modify_usec: 456789
++ `
++	scoreCardResultFixture = `
++ action_mnemonic: "GoCompile" target_id: "//foo:bar" action_id: "action"
++ request_type: READ status: { code: 5 message: "missing" details: { type_url: "type.example/detail" value: "detail" } }
++ digest: { hash: "def456" size_bytes: 789 }
++ start_time: { seconds: 123 nanos: 456 } duration: { seconds: 2 nanos: 345 }
++ compressor: ZSTD transferred_size_bytes: 678 name: "file.a" path_prefix: "bazel-out"
++ cache_type: CAS execution_start_timestamp: { seconds: 100 nanos: 200 }
++ execution_completed_timestamp: { seconds: 110 nanos: 300 } origin_invocation_id: "origin"
++ `
++	resourceFixture       = `digest: { hash: "abcdef" size_bytes: 321 } instance_name: "tree-instance" compressor: ZSTD cache_type: CAS digest_function: SHA256`
++	nodePropertiesFixture = `properties: { name: "owner" value: "builder" } mtime: { seconds: 123 nanos: 456 } unix_mode: { value: 493 }`
++	treeCacheFixture      = `
++ children: {
++   directory: {
++     files: { name: "tool" digest: { hash: "123abc" size_bytes: 42 } is_executable: true node_properties: { ` + nodePropertiesFixture + ` } }
++     directories: { name: "subdir" digest: { hash: "456def" size_bytes: 43 } }
++     symlinks: { name: "link" target: "tool" node_properties: { ` + nodePropertiesFixture + ` } }
++     node_properties: { ` + nodePropertiesFixture + ` }
++   }
++   resource_name: { ` + resourceFixture + ` }
++ }
++ tree_cache_children: { ` + resourceFixture + ` }
++ `
+ )
+ 
+ var (
+@@ -27,26 +63,31 @@ var (
+ 
+ 	testProtoTypes = map[string]testProtoType{
+ 		"FileMetadata": testProtoType{
++			fixture: fileMetadataFixture,
+ 			providerFn: func() protoMessage {
+ 				return &sgpb.FileMetadata{}
+ 			},
+ 		},
+ 		"ScoreCard": testProtoType{
++			fixture: `misses: { ` + scoreCardResultFixture + ` } results: { ` + scoreCardResultFixture + ` }`,
+ 			providerFn: func() protoMessage {
+ 				return &capb.ScoreCard{}
+ 			},
+ 		},
+ 		"ScoreCardResult": testProtoType{
++			fixture: scoreCardResultFixture,
+ 			providerFn: func() protoMessage {
+ 				return &capb.ScoreCard_Result{}
+ 			},
+ 		},
+ 		"TreeCache": testProtoType{
++			fixture: treeCacheFixture,
+ 			providerFn: func() protoMessage {
+ 				return &capb.TreeCache{}
+ 			},
+ 		},
+ 		"ReadResponse": testProtoType{
++			fixture: `data: "payload" reference: { metadata: { ` + fileMetadataFixture + ` } }`,
+ 			providerFn: func() protoMessage {
+ 				return &dspb.ReadResponse{}
+ 			},
+@@ -68,22 +109,45 @@ type providerFunc func() protoMessage
+ type providerWithPoolFunc func() protoMessageWithPoolEnabled
+ 
+ type testProtoType struct {
++	fixture            string
+ 	providerFn         providerFunc
+ 	providerFnWithPool providerWithPoolFunc
+ }
+ 
+-func generateProtos(t testing.TB, providerFn providerFunc) []protoMessage {
+-	// Reset Faker for each proto type so benchmark fixtures do not depend on
+-	// randomized map iteration order.
+-	faker.SetRandomSource(rand.NewSource(0))
+-	res := make([]protoMessage, 0, numSamples)
+-	for range numSamples {
+-		pb := providerFn()
+-		err := faker.FakeData(pb)
+-		require.NoError(t, err, "unable to fake data")
+-		res = append(res, pb)
++// Require every field to be populated, including nested messages, so new proto
++// fields require an explicit fixture update instead of silently losing coverage.
++func requireAllFieldsPopulated(t testing.TB, msg protoreflect.Message) {
++	t.Helper()
++	fields := msg.Descriptor().Fields()
++	for i := 0; i < fields.Len(); i++ {
++		field := fields.Get(i)
++		require.True(t, msg.Has(field), "fixture omits %s", field.FullName())
++		if field.Message() == nil {
++			continue
++		}
++		if field.IsList() {
++			list := msg.Get(field).List()
++			for j := 0; j < list.Len(); j++ {
++				requireAllFieldsPopulated(t, list.Get(j).Message())
++			}
++		} else {
++			requireAllFieldsPopulated(t, msg.Get(field).Message())
++		}
+ 	}
+-	return res
++}
++
++func generateProtos(t testing.TB, pbType testProtoType) []protoMessage {
++	t.Helper()
++	populated := pbType.providerFn()
++	require.NoError(t, prototext.Unmarshal([]byte(pbType.fixture), populated))
++	requireAllFieldsPopulated(t, populated.ProtoReflect())
++	// Exercise both empty/default fields and fully populated messages.
++	return []protoMessage{pbType.providerFn(), populated}
++}
++
++func fileMetadata(t testing.TB) *sgpb.FileMetadata {
++	t.Helper()
++	return generateProtos(t, testProtoTypes["FileMetadata"])[1].(*sgpb.FileMetadata)
+ }
+ 
+ func generateBytes(t testing.TB, protos []protoMessage) [][]byte {
+@@ -102,9 +166,7 @@ type cloneFunc func(v proto.Message) proto.Message
+ type sizeFunc func(v proto.Message) int
+ 
+ func TestMarshal(t *testing.T) {
+-	md := &sgpb.FileMetadata{}
+-	err := faker.FakeData(md)
+-	require.NoError(t, err, "unable to fake data")
++	md := fileMetadata(t)
+ 
+ 	actual, err := proto.Marshal(md)
+ 	require.NoError(t, err)
+@@ -159,9 +221,7 @@ func TestMarshalWithExternalVTMessage(t *testing.T) {
+ }
+ 
+ func TestUnmarshal(t *testing.T) {
+-	md := &sgpb.FileMetadata{}
+-	err := faker.FakeData(md)
+-	require.NoError(t, err, "unable to fake data")
++	md := fileMetadata(t)
+ 
+ 	data, err := gproto.Marshal(md)
+ 	require.NoError(t, err)
+@@ -174,22 +234,19 @@ func TestUnmarshal(t *testing.T) {
+ }
+ 
+ func TestClone(t *testing.T) {
+-	md := &sgpb.FileMetadata{}
+-	err := faker.FakeData(md)
+-	require.NoError(t, err, "unable to fake data")
++	md := fileMetadata(t)
+ 
+ 	actual := proto.Clone(md)
+-	require.NoError(t, err)
+ 	require.True(t, proto.Equal(md, actual))
+ }
+ 
+ func TestSizeVT(t *testing.T) {
+ 	for name, pbType := range testProtoTypes {
+ 		t.Run(name, func(t *testing.T) {
+-			msg := pbType.providerFn()
+-			require.Implements(t, (*proto.VTProtoMessage)(nil), msg)
+-			require.NoError(t, faker.FakeData(msg), "unable to fake data")
+-			require.Equal(t, gproto.Size(msg), proto.Size(msg))
++			for _, msg := range generateProtos(t, pbType) {
++				require.Implements(t, (*proto.VTProtoMessage)(nil), msg)
++				require.Equal(t, gproto.Size(msg), proto.Size(msg))
++			}
+ 		})
+ 	}
+ 
+@@ -232,7 +289,7 @@ func benchmarkUnmarshal(b *testing.B, unmarshalFn unmarshalFunc, providerFn prov
+ 	b.ResetTimer()
+ 
+ 	for i := 0; i < b.N; i++ {
+-		buf := data[rand.Intn(len(data))]
++		buf := data[i%len(data)]
+ 		b.SetBytes(int64(len(buf)))
+ 		v := providerFn()
+ 		err := unmarshalFn(buf, v)
+@@ -254,7 +311,7 @@ func BenchmarkMarshal(b *testing.B) {
+ 	}
+ 
+ 	for pbName, pbType := range testProtoTypes {
+-		protos := generateProtos(b, pbType.providerFn)
++		protos := generateProtos(b, pbType)
+ 		for name, fn := range marshalFns {
+ 			b.Run(fmt.Sprintf("name=%s/pbName=%s", name, pbName), func(b *testing.B) {
+ 				benchmarkMarshal(b, fn, protos)
+@@ -274,7 +331,7 @@ func BenchmarkUnmarshal(b *testing.B) {
+ 	}
+ 
+ 	for pbName, pbType := range testProtoTypes {
+-		protos := generateProtos(b, pbType.providerFn)
++		protos := generateProtos(b, pbType)
+ 		data := generateBytes(b, protos)
+ 		for name, fn := range unmarshalFns {
+ 			b.Run(fmt.Sprintf("name=%s/pbName=%s", name, pbName), func(b *testing.B) {
+@@ -289,7 +346,7 @@ func BenchmarkUnmarshal(b *testing.B) {
+ 				b.ResetTimer()
+ 
+ 				for i := 0; i < b.N; i++ {
+-					buf := data[rand.Intn(len(data))]
++					buf := data[i%len(data)]
+ 					b.SetBytes(int64(len(buf)))
+ 					v := pbType.providerFnWithPool()
+ 					err := proto.Unmarshal(buf, v)
+@@ -308,7 +365,7 @@ func benchmarkClone(b *testing.B, cloneFn cloneFunc, data []protoMessage) {
+ 	b.ResetTimer()
+ 
+ 	for i := 0; i < b.N; i++ {
+-		pb := data[rand.Intn(len(data))]
++		pb := data[i%len(data)]
+ 		b.SetBytes(int64(pb.SizeVT()))
+ 		_ = cloneFn(pb)
+ 	}
+@@ -326,7 +383,7 @@ func BenchmarkClone(b *testing.B) {
+ 	}
+ 
+ 	for pbName, pbType := range testProtoTypes {
+-		protos := generateProtos(b, pbType.providerFn)
++		protos := generateProtos(b, pbType)
+ 		for name, fn := range cloneFns {
+ 			b.Run(fmt.Sprintf("name=%s/pbName=%s", name, pbName), func(b *testing.B) {
+ 				benchmarkClone(b, fn, protos)
+@@ -346,7 +403,7 @@ func BenchmarkSize(b *testing.B) {
+ 	}
+ 
+ 	for pbName, pbType := range testProtoTypes {
+-		protos := generateProtos(b, pbType.providerFn)
++		protos := generateProtos(b, pbType)
+ 		for name, fn := range sizeFns {
+ 			b.Run(fmt.Sprintf("name=%s/pbName=%s", name, pbName), func(b *testing.B) {
+ 				b.ReportAllocs()

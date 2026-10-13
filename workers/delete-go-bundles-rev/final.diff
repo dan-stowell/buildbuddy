@@ -1,0 +1,241 @@
+diff --git a/config/BUILD b/config/BUILD
+index b86ce7ff6..c83a501d0 100644
+--- a/config/BUILD
++++ b/config/BUILD
+@@ -1,5 +1,3 @@
+-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+-
+ # gazelle:default_visibility //visibility:public
+ package(default_visibility = ["//visibility:public"])
+ 
+@@ -12,13 +10,3 @@ filegroup(
+         "//conditions:default": glob(["**"]),
+     }),
+ )
+-
+-go_library(
+-    name = "bundle",
+-    srcs = ["bundle.go"],
+-    embedsrcs = [":config_files"],  # keep
+-    importpath = "github.com/buildbuddy-io/buildbuddy/config",
+-    deps = [
+-        "//server/util/fileresolver",
+-    ],
+-)
+diff --git a/config/bundle.go b/config/bundle.go
+deleted file mode 100644
+index 7c73e12d6..000000000
+--- a/config/bundle.go
++++ /dev/null
+@@ -1,17 +0,0 @@
+-package config
+-
+-import (
+-	"embed"
+-	"io/fs"
+-
+-	"github.com/buildbuddy-io/buildbuddy/server/util/fileresolver"
+-)
+-
+-// NB: Include everything in bazel `embedsrcs` with `*`.
+-//
+-//go:embed *
+-var all embed.FS
+-
+-func Get() fs.FS {
+-	return fileresolver.New(all, "enterprise/config")
+-}
+diff --git a/enterprise/BUILD b/enterprise/BUILD
+index 375914ba3..7b8df964f 100644
+--- a/enterprise/BUILD
++++ b/enterprise/BUILD
+@@ -1,5 +1,3 @@
+-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+-
+ # gazelle:default_visibility //enterprise:__subpackages__
+ package(default_visibility = ["//enterprise:__subpackages__"])
+ 
+@@ -10,13 +8,3 @@ filegroup(
+     ],
+     visibility = ["//visibility:public"],
+ )
+-
+-go_library(
+-    name = "bundle",
+-    srcs = ["bundle.go"],
+-    embedsrcs = [":licenses"],
+-    importpath = "github.com/buildbuddy-io/buildbuddy/enterprise",
+-    deps = [
+-        "//server/util/fileresolver",
+-    ],
+-)
+diff --git a/enterprise/bundle.go b/enterprise/bundle.go
+deleted file mode 100644
+index fd1a7e45f..000000000
+--- a/enterprise/bundle.go
++++ /dev/null
+@@ -1,15 +0,0 @@
+-package enterprise
+-
+-import (
+-	"embed"
+-	"io/fs"
+-
+-	"github.com/buildbuddy-io/buildbuddy/server/util/fileresolver"
+-)
+-
+-//go:embed LICENSE
+-var all embed.FS
+-
+-func Get() fs.FS {
+-	return fileresolver.New(all, "enterprise")
+-}
+diff --git a/enterprise/config/BUILD b/enterprise/config/BUILD
+index 9ec48fbb7..f5a497d70 100644
+--- a/enterprise/config/BUILD
++++ b/enterprise/config/BUILD
+@@ -1,5 +1,3 @@
+-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+-
+ # gazelle:default_visibility //enterprise:__subpackages__
+ package(default_visibility = ["//enterprise:__subpackages__"])
+ 
+@@ -13,13 +11,3 @@ filegroup(
+         "//conditions:default": glob(["*.yaml"]),
+     }),
+ )
+-
+-go_library(
+-    name = "bundle",
+-    srcs = ["bundle.go"],
+-    embedsrcs = [":config_files"],  # keep
+-    importpath = "github.com/buildbuddy-io/buildbuddy/enterprise/config",
+-    deps = [
+-        "//server/util/fileresolver",
+-    ],
+-)
+diff --git a/enterprise/config/bundle.go b/enterprise/config/bundle.go
+deleted file mode 100644
+index 7c73e12d6..000000000
+--- a/enterprise/config/bundle.go
++++ /dev/null
+@@ -1,17 +0,0 @@
+-package config
+-
+-import (
+-	"embed"
+-	"io/fs"
+-
+-	"github.com/buildbuddy-io/buildbuddy/server/util/fileresolver"
+-)
+-
+-// NB: Include everything in bazel `embedsrcs` with `*`.
+-//
+-//go:embed *
+-var all embed.FS
+-
+-func Get() fs.FS {
+-	return fileresolver.New(all, "enterprise/config")
+-}
+diff --git a/result.md b/result.md
+new file mode 100644
+index 000000000..7a9a51f7d
+--- /dev/null
++++ b/result.md
+@@ -0,0 +1,96 @@
++# Obsolete Go resource bundles
++
++Removed `//config:bundle`, `//enterprise/config:bundle`, and `//enterprise:bundle`, their three `bundle.go` wrappers, and each BUILD file's now-unused `go_library` load. Every filegroup and `exports_files` declaration is preserved verbatim. Config and license contents are unchanged.
++
++One commit per bundle: `897fb5740` (config), `b28ba10af` (enterprise config), and the final enterprise license commit (which also contains this report). No push or PR.
++
++## Premise verification
++
++Before editing, searched all Go and BUILD files for imports/references to the three packages/targets: no users. Ran:
++
++```sh
++bazel query 'rdeps(//..., set(//config:bundle //enterprise/config:bundle //enterprise:bundle)) except set(//config:bundle //enterprise/config:bundle //enterprise:bundle)'
++```
++
++The unrestricted query failed (exit 7): the repository-defined `default_execution_image` Docker build timed out after 600 seconds. Retried the reverse-dependency and depth-1 queries with `--keep_going --nofetch`: both returned no users, but exit 3 and missing-external-repository warnings mean those results alone are incomplete.
++
++To independently verify all first-party inputs without fetching the external transitive closure, ran `bazel query --bes_backend= --output=xml //...` successfully (exit 0), then checked every `<rule-input>` against the three labels. All 5,043 first-party rules were included; none referenced any bundle. With no direct first-party users there can be no transitive first-party users. This establishes the premise before deletion. The identical XML export succeeded after deletion (exit 0); its rule set differs only by the three requested labels.
++
++## Before/after measurements
++
++Used the same expressions and counting code before and after:
++
++```sh
++B='filter("^//(config|enterprise/config|enterprise):bundle$", kind("go_library", //config:* + //enterprise/config:* + //enterprise:*))'
++bazel query "$B"
++bazel query "deps($B)"
++bazel query --keep_going --nofetch "rdeps(//..., $B) except $B"
++bazel query --keep_going --nofetch "rdeps(//..., $B, 1) except $B"
++```
++
++The filtered seed permits the same command after the named rules have been deleted. Count output lines; external labels start with `@`. Count existing `bundle.go` files and their `splitlines()` in the three directories, and `splitlines()` for their BUILD files.
++
++| Measurement | Before | After | Change |
++| --- | ---: | ---: | ---: |
++| All first-party rules (`query --output=xml //...`) | 5,043 | 5,040 | -3 |
++| All first-party `go_library` rules (same XML) | 693 | 690 | -3 |
++| Unique first-party rule-input labels (same XML) | 6,605 | 6,602 | -3 |
++| External rule-input labels (same XML) | 1,121 | 1,121 | 0 |
++| Bundle targets | 3 | 0 | -3 |
++| Go wrapper packages | 3 | 0 | -3 |
++| Wrapper Go LOC | 49 | 0 | -49 |
++| Three BUILD files LOC | 71 | 35 | -36 |
++| Labels in bundle dependency closure | 1,146 | 0 | -1,146 |
++| External labels in that closure | 1,086 | 0 | -1,086 |
++| First-party reverse dependencies | 0 | 0 | 0 |
++
++Dependency-closure counts describe the selected obsolete roots, **not** removal of shared dependencies or external modules from the repository. These packages were already absent from the binaries' dependency graphs, so no binary-size reduction is claimed. The realized gain is three fewer rules/packages and 85 fewer source/BUILD lines.
++
++## Build and resource validation
++
++Used the repository-pinned Bazel 9.3.0rc2 executable directly after the BuildBuddy CLI initialized it. Long commands ran under `nohup`, with logs in `/tmp`, and were polled. No remote execution:
++
++```sh
++bazel build --jobs=2 --remote_executor= --bes_backend= \
++  //server/cmd/buildbuddy:buildbuddy \
++  //enterprise/server/cmd/server:buildbuddy \
++  //enterprise/server/cmd/executor:executor \
++  //enterprise/server/cmd/server:config_files_tar \
++  //enterprise/server/cmd/server:licenses
++```
++
++Binary build result: **blocked by VM disk capacity; none of the three binaries is claimed to have built successfully**. The initial uncached invocation was interrupted (exit 8) after 2,074.951 seconds and 4,884 processes to resume the same targets with anonymous remote-cache reads. The resumed command added `--remote_cache=grpcs://remote.buildbuddy.io --noremote_upload_local_results`; execution remained local with two jobs. It reached approximately 11,922 of 19,736 actions before a `GoCompilePkg` action for `//server/remote_cache/cachetools:cachetools` failed and Bazel reported `I/O error while writing action log: No space left on device`. The 25 GB filesystem was full. Even the exit-code file could not be written, so no numeric exit code is asserted for that attempt. No source/static-check failure was reported before the capacity failure.
++
++Clearing completed sandbox temporary files recovered enough space for the remaining lightweight checks. Building the three binaries still requires a larger disk; this remains outstanding. Logs: `/tmp/bundle-build.log` and `/tmp/bundle-build-cache.log`.
++
++The enterprise config tar action completed successfully. `tar -tf` confirms all ten enterprise YAML configs in `app/config/`, including `buildbuddy.release.yaml`, `executor.local.yaml`, and `executor.release.yaml`.
++
++The OSS server retains `//config:config_files` in `data`; the enterprise server retains its config filegroup in `data` and its licenses filegroup in packaging; the executor retains both `//enterprise:licenses` and `//enterprise/config:config_files` in `data`. Configured runfiles were verified successfully (exit 0) using:
++
++```sh
++bazel cquery --jobs=2 --remote_executor= --bes_backend= \
++  --remote_cache=grpcs://remote.buildbuddy.io --noremote_upload_local_results \
++  'set(//server/cmd/buildbuddy:buildbuddy //enterprise/server/cmd/server:buildbuddy //enterprise/server/cmd/executor:executor //enterprise/server/cmd/server:licenses)' \
++  --output=starlark --starlark:file=/tmp/bundle-runfiles.bzl
++```
++
++The formatter inspects `providers(target)["DefaultInfo"].default_runfiles.files.to_list()` and prints config/license paths. Results (`/tmp/bundle-runfiles.txt`): OSS server has all five OSS YAML configs; enterprise server and executor each have all ten enterprise YAML configs; executor and enterprise server's packaging licenses filegroup each have `enterprise/LICENSE`. These are configured runfiles sets, not completed binary runfiles trees.
++
++Also ran a separate resource-only build (exit 0, 12 total actions):
++
++```sh
++bazel build --jobs=2 --remote_executor= --bes_backend= \
++  //config:config_files //enterprise/config:config_files //enterprise:licenses \
++  //enterprise/server/cmd/server:config_files_tar \
++  //enterprise/server/cmd/server:licenses
++```
++
++`tar -tf bazel-bin/enterprise/server/cmd/server/config_files_tar.tar` confirms all ten enterprise YAML configs are packaged. The unchanged `exports_files(["buildbuddy.local.yaml"])` remains present.
++
++Checked each remaining BUILD file against the original with only the `go_library` load and bundle rule removed: exact match. Checked representative local/release YAML files and `enterprise/LICENSE` against the original commit: byte-for-byte match. `git diff --check` passes.
++
++## External modules and scope
++
++No external module becomes unused. Each wrapper imported only Go standard-library `embed`/`io/fs` and first-party `server/util/fileresolver`. The successful first-party XML query shows ten direct users of `//server/util/fileresolver:fileresolver` before deletion, seven of which remain (including app/static bundles and its test). After deletion, `rg -l 'github.com/buildbuddy-io/buildbuddy/server/util/fileresolver' --glob '*.go' | wc -l` returns 7. Shared dependency and lockfiles were not edited.
++
++Only the six scoped files and this explicitly requested `result.md` were changed. No new tests were added for removal of unused code. Full-repository builds/tests and container-image builds were not requested or deliberately selected; the unrestricted baseline query triggered Docker repository setup automatically. Cleared regenerable Bazel downloaded archives and the completed Gazelle setup compiler cache to make space, and cleared completed sandbox temporary files after the failure; preserved extracted sources and persistent build outputs. No shared dependency files or VM disk settings were changed.

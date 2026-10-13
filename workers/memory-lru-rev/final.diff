@@ -1,0 +1,422 @@
+diff --git a/result.md b/result.md
+new file mode 100644
+index 000000000..4be5c7f3a
+--- /dev/null
++++ b/result.md
+@@ -0,0 +1,107 @@
++# Memory backends: use the repo LRU
++
++Migrated `memory_kvstore` and `memory_metrics_collector` from HashiCorp's LRU to `server/util/lru`, with `SizeFn` returning 1 per entry and `UpdateInPlace: true`. Limits remain 5,000 and 50,000 entries, respectively. Reads and updates retain their LRU recency behavior. The KV store uses `ThreadSafe: true`; metrics operations retain their existing mutex, including compound updates. Expiration and flush behavior are unchanged.
++
++The premise was verified before migration: the two packages were the only first-party Go imports and BUILD edges to `github.com/hashicorp/golang-lru`. The original implementation's Add/Get behavior was inspected, and the new capacity/eviction and concurrency tests passed against it under the race detector before the migration. Both packages also passed those tests after migration.
++
++Tests cover full capacity, variable-size/empty KV values, mixed metrics value types sharing one capacity, read/update recency, eviction, deletion freeing capacity, and concurrent reads/writes/deletes. The metrics concurrency test verifies exact counter totals, set membership, and list length.
++
++## Measurements
++
++| Measurement | Before | After |
++| --- | ---: | ---: |
++| Backend BUILD targets | 4 | 4 |
++| Direct backend library dependency edges | 4 | 4 |
++| Direct HashiCorp LRU edges | 2 | 0 |
++| Production Go LOC | 365 | 373 |
++| Transitive dependency labels (including source files) | 1,641 | 1,996 |
++| External dependency labels (including source files) | 1,604 | 1,953 |
++| External repositories in backend closure | 21 | 31 |
++| HashiCorp LRU labels in backend closure | 11 | 0 |
++
++The transitive graph increases because the repo LRU imports metrics packages. The gain is removing the two external LRU edges and using one first-party implementation, not shrinking standalone backend dependency closures or deleting targets. Binary size was not measured.
++
++Same BUILD/source counting command before and after:
++
++```sh
++python3 - <<'PYCODE'
++from pathlib import Path
++import re, json
++paths = [Path('server/backends/memory_kvstore/BUILD'), Path('server/backends/memory_metrics_collector/BUILD')]
++print(json.dumps({
++    'targets': sum(len(re.findall(r'^go_(?:library|test)\(', p.read_text(), re.M)) for p in paths),
++    'direct_library_deps': sum(len(re.findall(r'^        "', p.read_text().split('go_test(')[0], re.M)) for p in paths),
++    'external_lru_edges': sum(p.read_text().count('@com_github_hashicorp_golang_lru//:golang-lru') for p in paths),
++    'production_go_loc': sum(len(p.with_name(p.parent.name + '.go').read_text().splitlines()) for p in paths),
++}, indent=2))
++PYCODE
++```
++
++Same graph query before and after:
++
++```sh
++bazel query 'deps(set(//server/backends/memory_kvstore:memory_kvstore //server/backends/memory_metrics_collector:memory_metrics_collector))'
++```
++
++Both queries passed. Counts use unique output lines beginning with `//` or `@`; external counts use `@`, and repository counts use the prefix before `//`. Logs: `/tmp/memory-deps-before.log` and `/tmp/memory-deps-after.log`.
++
++## Validation
++
++- Before: `go test -mod=readonly -race ./server/backends/memory_kvstore ./server/backends/memory_metrics_collector` — PASS (both packages).
++- After: same command — PASS (both packages).
++- `git diff --check` — PASS.
++- `bazel test --jobs=2 --local_test_jobs=2 --remote_executor= --bes_backend= --test_output=errors //server/backends/memory_kvstore:memory_kvstore_test //server/backends/memory_metrics_collector:memory_metrics_collector_test` — PASS, 2/2 tests and static analysis; 2,953 actions, 1,650.923 seconds. Log: `/tmp/memory-bazel-backends.log`.
++- `bazel test --jobs=2 --local_test_jobs=2 --remote_executor= --bes_backend= --test_output=errors --target_pattern_file=/tmp/memory-targets.txt` — all 14 targets analyzed; **9 tests passed**, including both backend tests and all 7 non-integration dependent tests. Both integration test binaries failed linking with `mapping output file failed: no space left on device`. The run took 4,349.246 seconds; log: `/tmp/memory-bazel-direct.log`. The three libraries, including `server/libmain`, compiled without reported errors.
++- After reclaiming already-tested binary outputs, `bazel test --jobs=1 --local_test_jobs=1 --remote_executor= --bes_backend= --test_output=errors //enterprise/server/test/integration/remote_bazel:remote_bazel_test //enterprise/server/test/integration/workflow:workflow_test` — remote Bazel binary linked, but workflow's external linker failed with `clang++: error: unable to execute command: Bus error` while disk space remained low. Tests did not run in this invocation. Log: `/tmp/memory-bazel-integration-retry.log`.
++- `bazel test --jobs=1 --local_test_jobs=1 --remote_executor= --bes_backend= --test_output=errors //enterprise/server/test/integration/remote_bazel:remote_bazel_test` — built and executed; **FAIL** due to executor capacity. Reported errors include `no registered executors ... can fit a task with milli_cpu=3000, memory_bytes=7500000000`; this VM has 2 CPUs. Log: `/tmp/memory-bazel-remote-only.log` and the target's sharded `bazel-testlogs` logs. These integration results do not validate integration behavior; no backend assertion or data-race failures were observed.
++
++Bazel commands ran in the background using `nohup ... > /tmp/...log 2>&1 &`, with the parent shell waiting so the tool session retained the background job, and logs polled for completion. No remote execution was used.
++
++The requested query was attempted:
++
++```sh
++bazel query 'rdeps(//..., set(//server/backends/memory_kvstore:memory_kvstore //server/backends/memory_metrics_collector:memory_metrics_collector), 1)'
++```
++
++It failed during transitive preloading because the unrelated `+dockerfile_image+default_execution_image` repository rule timed out running `docker build --no-cache`. Log: `/tmp/memory-rdeps.log`. A BUILD-attribute query avoids loading unrelated transitive repositories and returns the direct dependency edges; the embedded metrics test and changed targets are included explicitly:
++
++```sh
++bazel query 'attr("deps", "//server/backends/memory_(kvstore|metrics_collector)(:|\\])", //...) union set(//server/backends/memory_kvstore:memory_kvstore //server/backends/memory_kvstore:memory_kvstore_test //server/backends/memory_metrics_collector:memory_metrics_collector //server/backends/memory_metrics_collector:memory_metrics_collector_test)'
++```
++
++This query passed and returned these 14 targets (also cross-checked by searching BUILD files):
++
++```text
++//enterprise/server/hit_tracker_service:hit_tracker_service_test
++//enterprise/server/test/integration/remote_bazel:remote_bazel_test
++//enterprise/server/test/integration/workflow:workflow_test
++//server/backends/memory_kvstore:memory_kvstore
++//server/backends/memory_kvstore:memory_kvstore_test
++//server/backends/memory_metrics_collector:memory_metrics_collector
++//server/backends/memory_metrics_collector:memory_metrics_collector_test
++//server/buildbuddy_server:buildbuddy_server_test
++//server/eventlog:eventlog_test
++//server/libmain:libmain
++//server/remote_cache/action_cache_server:action_cache_server_test
++//server/remote_cache/byte_stream_server:byte_stream_server_test
++//server/remote_cache/content_addressable_storage_server:content_addressable_storage_server_test
++//server/remote_cache/hit_tracker:hit_tracker_test
++```
++
++Log: `/tmp/memory-direct.log`; target list: `/tmp/memory-targets.txt`.
++
++To keep validation running on the 25 GB disk, cache cleanup reclaimed the failed Docker build's 4.48 GB (`docker builder prune -f`), 2,269,535,857 bytes of older downloaded Bazel archive files, the completed Go test/module caches (`go clean -cache -testcache -modcache`), unused macOS/Windows LLVM toolchain repositories downloaded by the broad query, 576,743,184 bytes of already-passed test executables, and 247,289,216 bytes of optimized static intermediate archives after binaries linked. Test logs and source files were retained. Cleanup logs are `/tmp/memory-*-prune.log`. The integration linking still exceeded available disk space on the first attempt; the serial retry subsequently failed in the workflow linker.
++
++## Scope and exclusions
++
++Only the two backend packages and this explicitly requested report are changed in the repository. Cache cleanup outside the repository was needed for validation, as detailed above. Shared dependency files are untouched. I did not change integration tests, scheduler resource limits, shared toolchains, or dependency declarations to force these VM-limited integration checks through. No targets were deleted, and no binary-size reduction is claimed. The repo LRU brings metrics dependencies into the standalone backends' transitive graphs; the measured benefit is eliminating two first-party external LRU edges and consolidating implementations.
++
++`github.com/hashicorp/golang-lru` now has no first-party Go imports or BUILD references. The module remains needed transitively: the fetched `github.com/hashicorp/go-immutable-radix` repository imports `github.com/hashicorp/golang-lru/simplelru` in `iradix.go:7`, and its `BUILD.bazel:15` depends on `@com_github_hashicorp_golang_lru//simplelru`. No external module became wholly unused. Leave module removal or demotion to the separate serialized dependency PR; `go.mod` and all other shared dependency files remain unchanged.
++
++The same search found four matching lines before (two Go imports, two BUILD edges), and no matches after (exit 1):
++
++```sh
++rg -n 'hashicorp/golang-lru|@com_github_hashicorp_golang_lru' --glob '*.go' --glob BUILD --glob BUILD.bazel
++```
++
++The successful before/after dependency queries above independently show 11 HashiCorp LRU labels reduced to zero in the two backends' combined closure.
+diff --git a/server/backends/memory_kvstore/BUILD b/server/backends/memory_kvstore/BUILD
+index 141497624..03d4705fd 100644
+--- a/server/backends/memory_kvstore/BUILD
++++ b/server/backends/memory_kvstore/BUILD
+@@ -6,8 +6,8 @@ go_library(
+     importpath = "github.com/buildbuddy-io/buildbuddy/server/backends/memory_kvstore",
+     visibility = ["//visibility:public"],
+     deps = [
++        "//server/util/lru",
+         "//server/util/status",
+-        "@com_github_hashicorp_golang_lru//:golang-lru",
+     ],
+ )
+ 
+diff --git a/server/backends/memory_kvstore/memory_kvstore.go b/server/backends/memory_kvstore/memory_kvstore.go
+index 0f8388575..214ad472c 100644
+--- a/server/backends/memory_kvstore/memory_kvstore.go
++++ b/server/backends/memory_kvstore/memory_kvstore.go
+@@ -3,9 +3,8 @@ package memory_kvstore
+ import (
+ 	"context"
+ 
++	"github.com/buildbuddy-io/buildbuddy/server/util/lru"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+-
+-	lru "github.com/hashicorp/golang-lru"
+ )
+ 
+ const (
+@@ -15,11 +14,16 @@ const (
+ )
+ 
+ type MemoryKeyValStore struct {
+-	l *lru.Cache
++	l lru.LRU[any]
+ }
+ 
+ func NewMemoryKeyValStore() (*MemoryKeyValStore, error) {
+-	l, err := lru.New(maxNumEntries)
++	l, err := lru.New(&lru.Config[any]{
++		MaxSize:       maxNumEntries,
++		SizeFn:        func(any) int64 { return 1 },
++		UpdateInPlace: true,
++		ThreadSafe:    true,
++	})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/server/backends/memory_kvstore/memory_kvstore_test.go b/server/backends/memory_kvstore/memory_kvstore_test.go
+index 47b4dff79..77f5dc6f3 100644
+--- a/server/backends/memory_kvstore/memory_kvstore_test.go
++++ b/server/backends/memory_kvstore/memory_kvstore_test.go
+@@ -1,6 +1,8 @@
+ package memory_kvstore_test
+ 
+ import (
++	"fmt"
++	"sync"
+ 	"testing"
+ 
+ 	"github.com/buildbuddy-io/buildbuddy/server/backends/memory_kvstore"
+@@ -66,3 +68,82 @@ func TestReplaceSuffix_MissingKey(t *testing.T) {
+ 	_, err = store.Get(ctx, "missing")
+ 	require.True(t, status.IsNotFoundError(err), "expected NotFound, got %v", err)
+ }
++
++func TestCapacityAndEviction(t *testing.T) {
++	ctx := t.Context()
++	store, err := memory_kvstore.NewMemoryKeyValStore()
++	require.NoError(t, err)
++	// Values of different lengths, including empty slices, each count as one entry.
++	for i := range 5000 {
++		require.NoError(t, store.Set(ctx, fmt.Sprint(i), make([]byte, i%100)))
++	}
++	for i := range 5000 {
++		val, err := store.Get(ctx, fmt.Sprint(i))
++		require.NoError(t, err)
++		require.Len(t, val, i%100)
++	}
++	// Reads and updates both refresh recency; updating does not use another slot.
++	_, err = store.Get(ctx, "0")
++	require.NoError(t, err)
++	require.NoError(t, store.Set(ctx, "1", []byte("updated")))
++	require.NoError(t, store.Set(ctx, "overflow", []byte{}))
++	_, err = store.Get(ctx, "2")
++	require.True(t, status.IsNotFoundError(err))
++	for _, key := range []string{"0", "1", "3", "overflow"} {
++		_, err = store.Get(ctx, key)
++		require.NoError(t, err)
++	}
++	// Deleting frees a slot without evicting another entry.
++	require.NoError(t, store.Set(ctx, "overflow", nil))
++	_, err = store.Get(ctx, "overflow")
++	require.True(t, status.IsNotFoundError(err))
++	require.NoError(t, store.Set(ctx, "replacement", []byte{}))
++	_, err = store.Get(ctx, "4")
++	require.NoError(t, err)
++}
++
++func TestConcurrentAccess(t *testing.T) {
++	ctx := t.Context()
++	store, err := memory_kvstore.NewMemoryKeyValStore()
++	require.NoError(t, err)
++	var wg sync.WaitGroup
++	for worker := range 16 {
++		wg.Go(func() {
++			// Each worker owns its values; shared keys exercise LRU locking without
++			// mutating slices returned to other callers.
++			key := fmt.Sprintf("worker-%d", worker)
++			for range 100 {
++				if err := store.Set(ctx, key, []byte("a")); err != nil {
++					t.Error(err)
++					return
++				}
++				if err := store.ReplaceSuffix(ctx, key, 1, 1, []byte("b")); err != nil {
++					t.Error(err)
++					return
++				}
++				val, err := store.Get(ctx, key)
++				if err != nil || string(val) != "ab" {
++					t.Errorf("Get = %q, %v", val, err)
++					return
++				}
++				if err := store.Set(ctx, key, nil); err != nil {
++					t.Error(err)
++					return
++				}
++				if err := store.Set(ctx, "shared", []byte("value")); err != nil {
++					t.Error(err)
++					return
++				}
++				if _, err := store.Get(ctx, "shared"); err != nil && !status.IsNotFoundError(err) {
++					t.Error(err)
++					return
++				}
++				if err := store.Set(ctx, "shared", nil); err != nil {
++					t.Error(err)
++					return
++				}
++			}
++		})
++	}
++	wg.Wait()
++}
+diff --git a/server/backends/memory_metrics_collector/BUILD b/server/backends/memory_metrics_collector/BUILD
+index 08e8d7e5f..322b93f7a 100644
+--- a/server/backends/memory_metrics_collector/BUILD
++++ b/server/backends/memory_metrics_collector/BUILD
+@@ -6,8 +6,8 @@ go_library(
+     importpath = "github.com/buildbuddy-io/buildbuddy/server/backends/memory_metrics_collector",
+     visibility = ["//visibility:public"],
+     deps = [
++        "//server/util/lru",
+         "//server/util/status",
+-        "@com_github_hashicorp_golang_lru//:golang-lru",
+     ],
+ )
+ 
+@@ -16,5 +16,8 @@ go_test(
+     size = "small",
+     srcs = ["memory_metrics_collector_test.go"],
+     embed = [":memory_metrics_collector"],
+-    deps = ["@com_github_stretchr_testify//require"],
++    deps = [
++        "//server/util/status",
++        "@com_github_stretchr_testify//require",
++    ],
+ )
+diff --git a/server/backends/memory_metrics_collector/memory_metrics_collector.go b/server/backends/memory_metrics_collector/memory_metrics_collector.go
+index d48092389..eae0c2cb9 100644
+--- a/server/backends/memory_metrics_collector/memory_metrics_collector.go
++++ b/server/backends/memory_metrics_collector/memory_metrics_collector.go
+@@ -6,9 +6,8 @@ import (
+ 	"sync"
+ 	"time"
+ 
++	"github.com/buildbuddy-io/buildbuddy/server/util/lru"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+-
+-	lru "github.com/hashicorp/golang-lru"
+ )
+ 
+ const (
+@@ -22,12 +21,17 @@ const (
+ )
+ 
+ type MemoryMetricsCollector struct {
+-	l  *lru.Cache
++	// mu protects the LRU and compound operations on its values.
++	l  lru.LRU[any]
+ 	mu sync.Mutex
+ }
+ 
+ func NewMemoryMetricsCollector() (*MemoryMetricsCollector, error) {
+-	l, err := lru.New(maxNumEntries)
++	l, err := lru.New(&lru.Config[any]{
++		MaxSize:       maxNumEntries,
++		SizeFn:        func(any) int64 { return 1 },
++		UpdateInPlace: true,
++	})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/server/backends/memory_metrics_collector/memory_metrics_collector_test.go b/server/backends/memory_metrics_collector/memory_metrics_collector_test.go
+index 6a658b9ad..6fc0b7a6a 100644
+--- a/server/backends/memory_metrics_collector/memory_metrics_collector_test.go
++++ b/server/backends/memory_metrics_collector/memory_metrics_collector_test.go
+@@ -3,6 +3,8 @@ package memory_metrics_collector
+ import (
+ 	"context"
+ 	"fmt"
++	"github.com/buildbuddy-io/buildbuddy/server/util/status"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -144,3 +146,92 @@ func TestListAppendAndTruncate(t *testing.T) {
+ 	// The list read before the truncation should be unchanged.
+ 	require.Equal(t, []string{"1", "2", "3"}, list)
+ }
++
++func TestCapacityAndEviction(t *testing.T) {
++	ctx := t.Context()
++	mc, err := NewMemoryMetricsCollector()
++	require.NoError(t, err)
++	// Different value types all share the same entry-count capacity.
++	require.NoError(t, mc.IncrementCount(ctx, "counts", "field", 1))
++	require.NoError(t, mc.SetAdd(ctx, "set", "member"))
++	require.NoError(t, mc.ListAppend(ctx, "list", "value"))
++	for i := range maxNumEntries - 3 {
++		require.NoError(t, mc.Set(ctx, fmt.Sprint(i), "value", noExpiration))
++	}
++	require.Equal(t, maxNumEntries, mc.l.Len())
++	// Reads and updates refresh recency without increasing entry count.
++	_, err = mc.ReadCounts(ctx, "counts")
++	require.NoError(t, err)
++	require.NoError(t, mc.SetAdd(ctx, "set", "another"))
++	require.NoError(t, mc.Set(ctx, "overflow", "", noExpiration))
++	list, err := mc.ListRange(ctx, "list", 0, -1)
++	require.NoError(t, err)
++	require.Empty(t, list)
++	require.Equal(t, maxNumEntries, mc.l.Len())
++	require.NoError(t, mc.Set(ctx, "overflow2", "value", noExpiration))
++	_, err = mc.GetAll(ctx, "0")
++	require.True(t, status.IsNotFoundError(err))
++	counts, err := mc.ReadCounts(ctx, "counts")
++	require.NoError(t, err)
++	require.Equal(t, map[string]int64{"field": 1}, counts)
++	members, err := mc.SetGetMembers(ctx, "set")
++	require.NoError(t, err)
++	require.ElementsMatch(t, []string{"member", "another"}, members)
++	require.NoError(t, mc.Delete(ctx, "overflow"))
++	require.NoError(t, mc.Set(ctx, "replacement", "value", noExpiration))
++	_, err = mc.GetAll(ctx, "1")
++	require.NoError(t, err)
++	require.Equal(t, maxNumEntries, mc.l.Len())
++}
++
++func TestConcurrentAccess(t *testing.T) {
++	ctx := t.Context()
++	mc, err := NewMemoryMetricsCollector()
++	require.NoError(t, err)
++	var wg sync.WaitGroup
++	for worker := range 16 {
++		wg.Go(func() {
++			key := fmt.Sprintf("worker-%d", worker)
++			for range 100 {
++				for _, err := range []error{
++					mc.IncrementCount(ctx, "counts", "single", 1),
++					mc.IncrementCounts(ctx, "counts", map[string]int64{"multiple": 1}),
++					mc.SetAdd(ctx, "set", key),
++					mc.Set(ctx, key, "value", noExpiration),
++					mc.ListAppend(ctx, "list", key),
++				} {
++					if err != nil {
++						t.Error(err)
++						return
++					}
++				}
++				if _, err := mc.ReadCounts(ctx, "counts"); err != nil {
++					t.Error(err)
++					return
++				}
++				if _, err := mc.SetGetMembers(ctx, "set"); err != nil {
++					t.Error(err)
++					return
++				}
++				if _, err := mc.GetAll(ctx, key); err != nil {
++					t.Error(err)
++					return
++				}
++				if err := mc.Delete(ctx, key); err != nil {
++					t.Error(err)
++					return
++				}
++			}
++		})
++	}
++	wg.Wait()
++	counts, err := mc.ReadCounts(ctx, "counts")
++	require.NoError(t, err)
++	require.Equal(t, map[string]int64{"single": 1600, "multiple": 1600}, counts)
++	members, err := mc.SetGetMembers(ctx, "set")
++	require.NoError(t, err)
++	require.Len(t, members, 16)
++	list, err := mc.ListRange(ctx, "list", 0, -1)
++	require.NoError(t, err)
++	require.Len(t, list, 1600)
++}

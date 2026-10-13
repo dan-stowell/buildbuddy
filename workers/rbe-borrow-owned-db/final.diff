@@ -1,0 +1,205 @@
+diff --git a/enterprise/server/test/integration/remote_execution/rbetest/rbetest.go b/enterprise/server/test/integration/remote_execution/rbetest/rbetest.go
+index 52b402b23..cc33d95e9 100644
+--- a/enterprise/server/test/integration/remote_execution/rbetest/rbetest.go
++++ b/enterprise/server/test/integration/remote_execution/rbetest/rbetest.go
+@@ -801,10 +801,13 @@ func (r *Env) AddBuildBuddyServers(n int) {
+ }
+ 
+ func (r *Env) AddBuildBuddyServerWithOptions(opts *BuildBuddyServerOptions) *BuildBuddyServer {
+-	envOpts := &enterprise_testenv.Options{RedisClient: r.redisClient}
++	// Apps borrow the harness database; the harness owns its lifetime.
++	envOpts := &enterprise_testenv.Options{
++		RedisClient:    r.redisClient,
++		TestEnvOptions: []testenv.TestEnvOption{testenv.WithBorrowedDBHandle(r.testEnv.GetDBHandle())},
++	}
+ 	env := &buildBuddyServerEnv{TestEnv: enterprise_testenv.GetCustomTestEnv(r.t, envOpts), rbeEnv: r}
+ 	// We're using an in-memory SQLite database so we need to make sure all servers share the same handle.
+-	env.SetDBHandle(r.testEnv.GetDBHandle())
+ 	env.SetAuthDB(r.testEnv.GetAuthDB())
+ 	env.SetUserDB(r.testEnv.GetUserDB())
+ 	env.SetInvocationDB(r.testEnv.GetInvocationDB())
+diff --git a/enterprise/server/testutil/enterprise_testenv/enterprise_testenv.go b/enterprise/server/testutil/enterprise_testenv/enterprise_testenv.go
+index bdce16764..fd894e3e8 100644
+--- a/enterprise/server/testutil/enterprise_testenv/enterprise_testenv.go
++++ b/enterprise/server/testutil/enterprise_testenv/enterprise_testenv.go
+@@ -22,6 +22,8 @@ import (
+ type Options struct {
+ 	RedisTarget string
+ 	RedisClient redis.UniversalClient
++	// TestEnvOptions are forwarded to testenv.GetTestEnv, including DB ownership options.
++	TestEnvOptions []testenv.TestEnvOption
+ }
+ 
+ func New(t *testing.T) *testenv.TestEnv {
+@@ -29,7 +31,7 @@ func New(t *testing.T) *testenv.TestEnv {
+ }
+ 
+ func GetCustomTestEnv(t *testing.T, opts *Options) *testenv.TestEnv {
+-	env := testenv.GetTestEnv(t)
++	env := testenv.GetTestEnv(t, opts.TestEnvOptions...)
+ 
+ 	redisClient := opts.RedisClient
+ 	if redisClient == nil && opts.RedisTarget != "" {
+diff --git a/server/testutil/testenv/BUILD b/server/testutil/testenv/BUILD
+index bdd07c1a4..a2f290435 100644
+--- a/server/testutil/testenv/BUILD
++++ b/server/testutil/testenv/BUILD
+@@ -1,4 +1,4 @@
+-load("@io_bazel_rules_go//go:def.bzl", "go_library")
++load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+ 
+ go_library(
+     name = "testenv",
+@@ -31,3 +31,13 @@ go_library(
+         "@org_golang_google_grpc//test/bufconn",
+     ],
+ )
++
++go_test(
++    name = "testenv_test",
++    srcs = ["testenv_test.go"],
++    deps = [
++        ":testenv",
++        "//server/interfaces",
++        "@com_github_stretchr_testify//require",
++    ],
++)
+diff --git a/server/testutil/testenv/testenv.go b/server/testutil/testenv/testenv.go
+index b318b6d4d..14c45dc7c 100644
+--- a/server/testutil/testenv/testenv.go
++++ b/server/testutil/testenv/testenv.go
+@@ -168,19 +168,31 @@ type TestEnvOption interface {
+ }
+ 
+ type dbHandleOption struct {
+-	dbh interfaces.DBHandle
++	dbh      interfaces.DBHandle
++	borrowed bool
+ }
+ 
+ func (o *dbHandleOption) accumulate(opt TestEnvOption) {
+ 	if opt, ok := opt.(*dbHandleOption); ok {
+ 		o.dbh = opt.dbh
++		o.borrowed = opt.borrowed
+ 	}
+ }
+ 
++// WithDBHandle transfers ownership of dbh to the test environment, whose cleanup
++// closes it. If dbh is nil, the environment creates and owns a new database.
+ func WithDBHandle(dbh interfaces.DBHandle) TestEnvOption {
+ 	return &dbHandleOption{dbh: dbh}
+ }
+ 
++// WithBorrowedDBHandle uses an existing database without creating or migrating
++// one. The caller retains ownership and must keep the handle open until all
++// borrowers have finished. The environment does not close the borrowed handle.
++// A nil borrowed handle is invalid.
++func WithBorrowedDBHandle(dbh interfaces.DBHandle) TestEnvOption {
++	return &dbHandleOption{dbh: dbh, borrowed: true}
++}
++
+ func GetTestEnv(t testing.TB, opts ...TestEnvOption) *real_environment.RealEnv {
+ 	dbHandleOpt := &dbHandleOption{}
+ 	for _, opt := range opts {
+@@ -191,6 +203,9 @@ func GetTestEnv(t testing.TB, opts ...TestEnvOption) *real_environment.RealEnv {
+ 			t.Fatalf("Unhandled TestEnvOption type: %T", opt)
+ 		}
+ 	}
++	if dbHandleOpt.borrowed && dbHandleOpt.dbh == nil {
++		t.Fatal("WithBorrowedDBHandle requires a non-nil database handle")
++	}
+ 	flags.PopulateFlagsFromData(t, testConfigData)
+ 	testRootDir := testfs.MakeTempDir(t)
+ 	if flag.Lookup("storage.disk.root_directory") != nil {
+@@ -228,11 +243,13 @@ func GetTestEnv(t testing.TB, opts ...TestEnvOption) *real_environment.RealEnv {
+ 		}
+ 	}
+ 	te.SetDBHandle(dbHandle)
+-	t.Cleanup(func() {
+-		if err := dbHandle.Close(); err != nil {
+-			t.Fatalf("Error closing database handle: %s", err)
+-		}
+-	})
++	if !dbHandleOpt.borrowed {
++		t.Cleanup(func() {
++			if err := dbHandle.Close(); err != nil {
++				t.Fatalf("Error closing database handle: %s", err)
++			}
++		})
++	}
+ 	te.SetInvocationDB(invocationdb.NewInvocationDB(te, dbHandle))
+ 
+ 	if err := blobstore.Register(te); err != nil {
+diff --git a/server/testutil/testenv/testenv_test.go b/server/testutil/testenv/testenv_test.go
+new file mode 100644
+index 000000000..a83c33f7c
+--- /dev/null
++++ b/server/testutil/testenv/testenv_test.go
+@@ -0,0 +1,67 @@
++package testenv_test
++
++import (
++	"context"
++	"testing"
++
++	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
++	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
++	"github.com/stretchr/testify/require"
++)
++
++type trackedHandle struct {
++	interfaces.DBHandle
++	closes int
++}
++
++func (h *trackedHandle) Close() error {
++	h.closes++
++	return h.DBHandle.Close()
++}
++
++func TestDBHandleOwnership(t *testing.T) {
++	for _, borrowed := range []bool{false, true} {
++		name := "owned"
++		if borrowed {
++			name = "borrowed"
++		}
++		t.Run(name, func(t *testing.T) {
++			owner := testenv.GetTestEnv(t)
++			handle := &trackedHandle{DBHandle: owner.GetDBHandle()}
++			t.Run("cleanup", func(t *testing.T) {
++				opt := testenv.WithDBHandle(handle)
++				if borrowed {
++					opt = testenv.WithBorrowedDBHandle(handle)
++				}
++				env := testenv.GetTestEnv(t, opt)
++				require.Same(t, handle, env.GetDBHandle())
++			})
++			if borrowed {
++				require.Zero(t, handle.closes)
++				// The shared database must remain usable after borrower cleanup.
++				var value int
++				err := handle.NewQuery(context.Background(), "borrowed_handle_test").Raw("SELECT 1").Take(&value)
++				require.NoError(t, err)
++				require.Equal(t, 1, value)
++			} else {
++				require.Equal(t, 1, handle.closes)
++			}
++		})
++	}
++}
++
++// BenchmarkDBHandleSetup compares the old discarded-DB setup path with borrowing.
++// Use a fixed iteration count to bound resources retained until benchmark cleanup.
++func BenchmarkDBHandleSetup(b *testing.B) {
++	owner := testenv.GetTestEnv(b)
++	b.Run("create_and_migrate", func(b *testing.B) {
++		for i := 0; i < b.N; i++ {
++			testenv.GetTestEnv(b)
++		}
++	})
++	b.Run("borrow", func(b *testing.B) {
++		for i := 0; i < b.N; i++ {
++			testenv.GetTestEnv(b, testenv.WithBorrowedDBHandle(owner.GetDBHandle()))
++		}
++	})
++}

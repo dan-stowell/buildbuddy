@@ -1,0 +1,153 @@
+diff --git a/enterprise/server/raft/txn/txn_test.go b/enterprise/server/raft/txn/txn_test.go
+index 9d7bd7d32..0b961427d 100644
+--- a/enterprise/server/raft/txn/txn_test.go
++++ b/enterprise/server/raft/txn/txn_test.go
+@@ -574,65 +574,92 @@ func verifyDirectReadNotFound(t *testing.T, ctx context.Context, s *sender.Sende
+ 	require.True(t, status.IsNotFoundError(err))
+ }
+ 
+-func TestSplitTxnRetryMatrix(t *testing.T) {
+-	testCases := []struct {
+-		name    string
+-		rangeID uint64
+-		op      rfpb.FinalizeOperation
+-		timing  faultTiming
+-	}{
+-		{name: "prepare_left_before_apply", rangeID: 2, op: rfpb.FinalizeOperation_UNKNOWN_OPERATION, timing: faultBeforeApply},
+-		{name: "prepare_left_after_apply", rangeID: 2, op: rfpb.FinalizeOperation_UNKNOWN_OPERATION, timing: faultAfterApply},
+-		{name: "prepare_right_before_apply", rangeID: 3, op: rfpb.FinalizeOperation_UNKNOWN_OPERATION, timing: faultBeforeApply},
+-		{name: "prepare_right_after_apply", rangeID: 3, op: rfpb.FinalizeOperation_UNKNOWN_OPERATION, timing: faultAfterApply},
+-		{name: "prepare_meta_before_apply", rangeID: 1, op: rfpb.FinalizeOperation_UNKNOWN_OPERATION, timing: faultBeforeApply},
+-		{name: "prepare_meta_after_apply", rangeID: 1, op: rfpb.FinalizeOperation_UNKNOWN_OPERATION, timing: faultAfterApply},
+-		{name: "commit_left_before_apply", rangeID: 2, op: rfpb.FinalizeOperation_COMMIT, timing: faultBeforeApply},
+-		{name: "commit_left_after_apply", rangeID: 2, op: rfpb.FinalizeOperation_COMMIT, timing: faultAfterApply},
+-		{name: "commit_right_before_apply", rangeID: 3, op: rfpb.FinalizeOperation_COMMIT, timing: faultBeforeApply},
+-		{name: "commit_right_after_apply", rangeID: 3, op: rfpb.FinalizeOperation_COMMIT, timing: faultAfterApply},
+-		{name: "commit_meta_before_apply", rangeID: 1, op: rfpb.FinalizeOperation_COMMIT, timing: faultBeforeApply},
+-		{name: "commit_meta_after_apply", rangeID: 1, op: rfpb.FinalizeOperation_COMMIT, timing: faultAfterApply},
+-	}
+-	for _, tc := range testCases {
+-		t.Run(tc.name, func(t *testing.T) {
+-			harness := newTxnFaultHarness(txnFaultRule{
+-				rangeID:   tc.rangeID,
+-				op:        tc.op,
+-				timing:    tc.timing,
+-				remaining: 1,
+-			})
+-			sf, grpcConfig := newFaultInjectedStoreFactory(t, harness)
+-			s1 := sf.NewStoreWithGRPCServerConfig(t, grpcConfig)
+-			s2 := sf.NewStoreWithGRPCServerConfig(t, grpcConfig)
+-			s3 := sf.NewStoreWithGRPCServerConfig(t, grpcConfig)
+-			stores := []*testutil.TestingStore{s1, s2, s3}
+-			ctx := context.Background()
+-
+-			sf.StartShard(t, ctx, stores...)
+-			s := testutil.GetStoreWithRangeLease(t, ctx, stores, 2)
+-			rd := s.GetRange(2)
+-
+-			splitRangeTxn, err := s.BuildTxnForRangeSplit(rd, 3, []byte("a"), []uint64{1, 2, 3})
+-			require.NoError(t, err)
+-			txnProto, err := splitRangeTxn.TxnBuilder.ToProto()
+-			require.NoError(t, err)
+-			harness.setTxnID(txnProto.GetTransactionId())
++// Keep each scenario top-level so Bazel can distribute the matrix across shards.
++func TestSplitTxnRetryMatrixPrepareLeftBeforeApply(t *testing.T) {
++	testSplitTxnRetry(t, 2, rfpb.FinalizeOperation_UNKNOWN_OPERATION, faultBeforeApply)
++}
+ 
+-			tc := txn.NewCoordinator(s, s.APIClient(), clockwork.NewFakeClock())
+-			require.NoError(t, tc.RunTxnWithProto(ctx, txnProto))
++func TestSplitTxnRetryMatrixPrepareLeftAfterApply(t *testing.T) {
++	testSplitTxnRetry(t, 2, rfpb.FinalizeOperation_UNKNOWN_OPERATION, faultAfterApply)
++}
+ 
+-			verifyTxnRecordNotExist(t, ctx, s.Sender(), txnProto.GetTransactionId())
+-			verifyRangeDescriptorInMetaRangeEquals(t, ctx, s.Sender(), splitRangeTxn.UpdatedLeftRange)
+-			verifyRangeDescriptorInMetaRangeEquals(t, ctx, s.Sender(), splitRangeTxn.NewRightRange)
++func TestSplitTxnRetryMatrixPrepareRightBeforeApply(t *testing.T) {
++	testSplitTxnRetry(t, 3, rfpb.FinalizeOperation_UNKNOWN_OPERATION, faultBeforeApply)
++}
+ 
+-			leftStore := testutil.GetStoreWithRangeLease(t, ctx, stores, 2)
+-			require.True(t, proto.Equal(splitRangeTxn.UpdatedLeftRange, leftStore.GetRange(2)))
+-			rightStore := testutil.GetStoreWithRangeLease(t, ctx, stores, 3)
+-			require.True(t, proto.Equal(splitRangeTxn.NewRightRange, rightStore.GetRange(3)))
+-			harness.assertFired(t)
+-		})
+-	}
++func TestSplitTxnRetryMatrixPrepareRightAfterApply(t *testing.T) {
++	testSplitTxnRetry(t, 3, rfpb.FinalizeOperation_UNKNOWN_OPERATION, faultAfterApply)
++}
++
++func TestSplitTxnRetryMatrixPrepareMetaBeforeApply(t *testing.T) {
++	testSplitTxnRetry(t, 1, rfpb.FinalizeOperation_UNKNOWN_OPERATION, faultBeforeApply)
++}
++
++func TestSplitTxnRetryMatrixPrepareMetaAfterApply(t *testing.T) {
++	testSplitTxnRetry(t, 1, rfpb.FinalizeOperation_UNKNOWN_OPERATION, faultAfterApply)
++}
++
++func TestSplitTxnRetryMatrixCommitLeftBeforeApply(t *testing.T) {
++	testSplitTxnRetry(t, 2, rfpb.FinalizeOperation_COMMIT, faultBeforeApply)
++}
++
++func TestSplitTxnRetryMatrixCommitLeftAfterApply(t *testing.T) {
++	testSplitTxnRetry(t, 2, rfpb.FinalizeOperation_COMMIT, faultAfterApply)
++}
++
++func TestSplitTxnRetryMatrixCommitRightBeforeApply(t *testing.T) {
++	testSplitTxnRetry(t, 3, rfpb.FinalizeOperation_COMMIT, faultBeforeApply)
++}
++
++func TestSplitTxnRetryMatrixCommitRightAfterApply(t *testing.T) {
++	testSplitTxnRetry(t, 3, rfpb.FinalizeOperation_COMMIT, faultAfterApply)
++}
++
++func TestSplitTxnRetryMatrixCommitMetaBeforeApply(t *testing.T) {
++	testSplitTxnRetry(t, 1, rfpb.FinalizeOperation_COMMIT, faultBeforeApply)
++}
++
++func TestSplitTxnRetryMatrixCommitMetaAfterApply(t *testing.T) {
++	testSplitTxnRetry(t, 1, rfpb.FinalizeOperation_COMMIT, faultAfterApply)
++}
++
++func testSplitTxnRetry(t *testing.T, rangeID uint64, op rfpb.FinalizeOperation, timing faultTiming) {
++	t.Helper()
++	harness := newTxnFaultHarness(txnFaultRule{
++		rangeID:   rangeID,
++		op:        op,
++		timing:    timing,
++		remaining: 1,
++	})
++	sf, grpcConfig := newFaultInjectedStoreFactory(t, harness)
++	s1 := sf.NewStoreWithGRPCServerConfig(t, grpcConfig)
++	s2 := sf.NewStoreWithGRPCServerConfig(t, grpcConfig)
++	s3 := sf.NewStoreWithGRPCServerConfig(t, grpcConfig)
++	stores := []*testutil.TestingStore{s1, s2, s3}
++	ctx := context.Background()
++
++	sf.StartShard(t, ctx, stores...)
++	s := testutil.GetStoreWithRangeLease(t, ctx, stores, 2)
++	rd := s.GetRange(2)
++
++	splitRangeTxn, err := s.BuildTxnForRangeSplit(rd, 3, []byte("a"), []uint64{1, 2, 3})
++	require.NoError(t, err)
++	txnProto, err := splitRangeTxn.TxnBuilder.ToProto()
++	require.NoError(t, err)
++	harness.setTxnID(txnProto.GetTransactionId())
++
++	tc := txn.NewCoordinator(s, s.APIClient(), clockwork.NewFakeClock())
++	require.NoError(t, tc.RunTxnWithProto(ctx, txnProto))
++
++	verifyTxnRecordNotExist(t, ctx, s.Sender(), txnProto.GetTransactionId())
++	verifyRangeDescriptorInMetaRangeEquals(t, ctx, s.Sender(), splitRangeTxn.UpdatedLeftRange)
++	verifyRangeDescriptorInMetaRangeEquals(t, ctx, s.Sender(), splitRangeTxn.NewRightRange)
++
++	leftStore := testutil.GetStoreWithRangeLease(t, ctx, stores, 2)
++	require.True(t, proto.Equal(splitRangeTxn.UpdatedLeftRange, leftStore.GetRange(2)))
++	rightStore := testutil.GetStoreWithRangeLease(t, ctx, stores, 3)
++	require.True(t, proto.Equal(splitRangeTxn.NewRightRange, rightStore.GetRange(3)))
++	harness.assertFired(t)
+ }
+ 
+ func TestTxnRollbackRetryIsIdempotent(t *testing.T) {

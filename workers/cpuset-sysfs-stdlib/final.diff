@@ -1,0 +1,352 @@
+diff --git a/enterprise/server/util/cpuset/BUILD b/enterprise/server/util/cpuset/BUILD
+index 8ef0dc5bc..3b6610e6c 100644
+--- a/enterprise/server/util/cpuset/BUILD
++++ b/enterprise/server/util/cpuset/BUILD
+@@ -18,16 +18,10 @@ go_library(
+         "//server/util/flag",
+         "//server/util/log",
+         "//server/util/priority_queue",
+-        "@org_golang_x_exp//constraints",
+-        "@org_golang_x_exp//slices",
+     ] + select({
+         "@io_bazel_rules_go//go/platform:darwin": [
+             "@com_github_elastic_gosigar//:gosigar",
+         ],
+-        "@io_bazel_rules_go//go/platform:linux": [
+-            "@com_github_google_cadvisor//utils/sysfs",
+-            "@com_github_google_cadvisor//utils/sysinfo",
+-        ],
+         "@io_bazel_rules_go//go/platform:windows": [
+             "@com_github_elastic_gosigar//:gosigar",
+         ],
+@@ -37,9 +31,12 @@ go_library(
+ 
+ go_test(
+     name = "cpuset_test",
+-    srcs = ["cpuset_test.go"],
++    srcs = [
++        "cpuset_test.go",
++        "numcpu_linux_test.go",
++    ],
++    embed = [":cpuset"],
+     deps = [
+-        ":cpuset",
+         "//server/util/testing/flags",
+         "//server/util/uuid",
+         "@com_github_stretchr_testify//assert",
+diff --git a/enterprise/server/util/cpuset/cpuset.go b/enterprise/server/util/cpuset/cpuset.go
+index 24d2d647e..f254b4585 100644
+--- a/enterprise/server/util/cpuset/cpuset.go
++++ b/enterprise/server/util/cpuset/cpuset.go
+@@ -4,6 +4,7 @@ import (
+ 	"fmt"
+ 	"math"
+ 	"runtime"
++	"slices"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+@@ -13,8 +14,6 @@ import (
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/priority_queue"
+-	"golang.org/x/exp/constraints"
+-	"golang.org/x/exp/slices"
+ )
+ 
+ var (
+@@ -70,9 +69,14 @@ func toCPUInfos(processors []int, numaNode int) []CPUInfo {
+ 	return infos
+ }
+ 
++type integer interface {
++	~int | ~int8 | ~int16 | ~int32 | ~int64 |
++		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr
++}
++
+ // Format formats a set of CPUs as a cpuset list-format compatible string.
+ // See https://man7.org/linux/man-pages/man7/cpuset.7.html for list-format.
+-func Format[I constraints.Integer](cpus ...I) string {
++func Format[I integer](cpus ...I) string {
+ 	slices.Sort(cpus)
+ 	cpuStrings := make([]string, len(cpus))
+ 	for i, cpu := range cpus {
+diff --git a/enterprise/server/util/cpuset/numcpu_linux.go b/enterprise/server/util/cpuset/numcpu_linux.go
+index 66cde845c..823e9acbd 100644
+--- a/enterprise/server/util/cpuset/numcpu_linux.go
++++ b/enterprise/server/util/cpuset/numcpu_linux.go
+@@ -3,28 +3,150 @@
+ package cpuset
+ 
+ import (
+-	"github.com/google/cadvisor/utils/sysfs"
+-	"github.com/google/cadvisor/utils/sysinfo"
++	"fmt"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strconv"
++	"strings"
+ )
+ 
+ func GetCPUs() ([]CPUInfo, error) {
+-	sys := sysfs.NewRealSysFs()
+-	nodeInfos, _, err := sysinfo.GetNodesInfo(sys)
++	return getCPUs("/sys/devices/system")
++}
++
++func getCPUs(root string) ([]CPUInfo, error) {
++	nodes, err := filepath.Glob(filepath.Join(root, "node", "node*[0-9]"))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-
+ 	cpus := make([]CPUInfo, 0)
+-	for _, nodeInfo := range nodeInfos {
+-		for _, coreInfo := range nodeInfo.Cores {
+-			for _, thread := range coreInfo.Threads {
+-				c := CPUInfo{
+-					Processor: int(thread),
+-					NumaNode:  int(nodeInfo.Id),
+-				}
+-				cpus = append(cpus, c)
++	for _, node := range nodes {
++		id, err := strconv.Atoi(strings.TrimPrefix(filepath.Base(node), "node"))
++		if err != nil {
++			return nil, err
++		}
++		data, err := os.ReadFile(filepath.Join(node, "cpulist"))
++		if err != nil {
++			return nil, err
++		}
++		list := strings.TrimSpace(string(data))
++		if list == "" {
++			continue // Memory-only NUMA node.
++		}
++		infos, err := parseCPUs(list)
++		if err != nil {
++			return nil, fmt.Errorf("parse %s/cpulist: %w", node, err)
++		}
++		for _, info := range infos {
++			ok, err := cpuAvailable(root, filepath.Join(root, "cpu", fmt.Sprintf("cpu%d", info.Processor)), info.Processor)
++			if err != nil {
++				return nil, err
++			}
++			if !ok {
++				continue
+ 			}
++			info.NumaNode = id
++			cpus = append(cpus, info)
++		}
++	}
++	if len(nodes) > 0 {
++		return cpus, nil
++	}
++
++	// Without NUMA topology, cAdvisor grouped CPUs by physical package ID.
++	paths, err := filepath.Glob(filepath.Join(root, "cpu", "cpu*[0-9]"))
++	if err != nil {
++		return nil, err
++	}
++	if len(paths) == 0 {
++		return nil, fmt.Errorf("no CPU is available, cpusPath: %s", filepath.Join(root, "cpu"))
++	}
++	for _, path := range paths {
++		data, err := os.ReadFile(filepath.Join(path, "topology", "physical_package_id"))
++		if os.IsNotExist(err) {
++			continue
++		}
++		if err != nil {
++			return nil, err
++		}
++		id, err := strconv.Atoi(strings.TrimSpace(string(data)))
++		if err != nil {
++			return nil, err
++		}
++		processor, err := strconv.Atoi(strings.TrimPrefix(filepath.Base(path), "cpu"))
++		if err != nil {
++			return nil, err
++		}
++		ok, err := cpuAvailable(root, path, processor)
++		if err != nil {
++			return nil, err
+ 		}
++		if !ok {
++			continue
++		}
++		cpus = append(cpus, CPUInfo{Processor: processor, NumaNode: id})
+ 	}
+ 	return cpus, nil
+ }
++
++// Read the online list for each CPU, as cAdvisor did, so hotplug changes are
++// observed during discovery. Kernels without CPU hotplug omit this file.
++func cpuAvailable(root, path string, processor int) (bool, error) {
++	onlinePath := filepath.Join(root, "cpu", "online")
++	if _, err := os.Stat(onlinePath); !os.IsNotExist(err) {
++		data, err := os.ReadFile(onlinePath)
++		if err != nil || !cpuInOnlineList(string(data), uint16(processor)) {
++			return false, nil
++		}
++	}
++	for _, name := range []string{"core_id", "physical_package_id"} {
++		data, err := os.ReadFile(filepath.Join(path, "topology", name))
++		if os.IsNotExist(err) {
++			return false, nil
++		}
++		if err != nil {
++			return false, err
++		}
++		if _, err := strconv.Atoi(strings.TrimSpace(string(data))); err != nil {
++			return false, err
++		}
++	}
++	if runtime.GOARCH == "s390x" {
++		for _, name := range []string{"book_id", "drawer_id"} {
++			if _, err := os.ReadFile(filepath.Join(path, "topology", name)); err != nil {
++				if os.IsNotExist(err) {
++					return false, nil
++				}
++				return false, err
++			}
++		}
++	}
++	return true, nil
++}
++
++// Match cAdvisor's online-list parsing, including stopping at the first match
++// and treating unreadable or malformed entries as offline.
++func cpuInOnlineList(list string, cpu uint16) bool {
++	for entry := range strings.SplitSeq(strings.TrimSpace(list), ",") {
++		bounds := strings.Split(entry, "-")
++		if len(bounds) > 2 {
++			return false
++		}
++		low, err := strconv.ParseUint(bounds[0], 10, 16)
++		if err != nil {
++			return false
++		}
++		high := low
++		if len(bounds) == 2 {
++			high, err = strconv.ParseUint(bounds[1], 10, 16)
++			if err != nil || low > high {
++				return false
++			}
++		}
++		if uint64(cpu) >= low && uint64(cpu) <= high {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/enterprise/server/util/cpuset/numcpu_linux_test.go b/enterprise/server/util/cpuset/numcpu_linux_test.go
+new file mode 100644
+index 000000000..d490f508d
+--- /dev/null
++++ b/enterprise/server/util/cpuset/numcpu_linux_test.go
+@@ -0,0 +1,105 @@
++//go:build linux && !android
++
++package cpuset
++
++import (
++	"fmt"
++	"maps"
++	"os"
++	"path/filepath"
++	"reflect"
++	"strings"
++	"testing"
++)
++
++func TestGetCPUsFromSysfs(t *testing.T) {
++	for _, tc := range []struct {
++		name            string
++		missingTopology string
++		files           map[string]string
++		want            []CPUInfo
++		wantError       bool
++	}{
++		{name: "ranges and commas", files: map[string]string{"node/node0/cpulist": "0-2,4,6-7\n"}, want: []CPUInfo{{0, 0}, {1, 0}, {2, 0}, {4, 0}, {6, 0}, {7, 0}}},
++		{name: "multiple noncontiguous nodes", files: map[string]string{"node/node0/cpulist": "0,2\n", "node/node3/cpulist": "1,3\n", "node/node4/cpulist": "\n"}, want: []CPUInfo{{0, 0}, {2, 0}, {1, 3}, {3, 3}}},
++		{name: "missing node directory", files: map[string]string{"cpu/cpu0/topology/physical_package_id": "2\n", "cpu/cpu1/topology/physical_package_id": "5\n", "cpu/cpu2/unrelated": ""}, want: []CPUInfo{{0, 2}, {1, 5}}},
++		{name: "missing package IDs", files: map[string]string{"cpu/cpu0/unrelated": ""}, want: []CPUInfo{}},
++		{name: "offline fallback CPU", files: map[string]string{"cpu/cpu0/topology/physical_package_id": "0", "cpu/cpu1/topology/physical_package_id": "0", "cpu/online": "0"}, want: []CPUInfo{{0, 0}}},
++		{name: "absent online file", files: map[string]string{"cpu/cpu0/topology/physical_package_id": "0", "cpu/cpu1/topology/physical_package_id": "0"}, want: []CPUInfo{{0, 0}, {1, 0}}},
++		{name: "offline NUMA CPU", files: map[string]string{"node/node0/cpulist": "0-1", "cpu/online": "0"}, want: []CPUInfo{{0, 0}}},
++		{name: "missing NUMA core ID", files: map[string]string{"node/node0/cpulist": "0"}, missingTopology: "core_id", want: []CPUInfo{}},
++		{name: "missing NUMA package ID", files: map[string]string{"node/node0/cpulist": "0"}, missingTopology: "physical_package_id", want: []CPUInfo{}},
++		{name: "missing fallback core ID", files: map[string]string{"cpu/cpu0/topology/physical_package_id": "0"}, missingTopology: "core_id", want: []CPUInfo{}},
++		{name: "malformed online list", files: map[string]string{"node/node0/cpulist": "0", "cpu/online": "bad"}, want: []CPUInfo{}},
++		{name: "invalid core ID", files: map[string]string{"cpu/cpu0/topology/physical_package_id": "0", "cpu/cpu0/topology/core_id": "bad"}, wantError: true},
++		{name: "no CPUs", wantError: true},
++		{name: "missing cpulist", files: map[string]string{"node/node0/unrelated": ""}, wantError: true},
++		{name: "invalid range", files: map[string]string{"node/node0/cpulist": "3-1\n"}, wantError: true},
++		{name: "invalid CPU", files: map[string]string{"node/node0/cpulist": "x\n"}, wantError: true},
++		{name: "invalid package ID", files: map[string]string{"cpu/cpu0/topology/physical_package_id": "x\n"}, wantError: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			root := t.TempDir()
++			// Supply normal topology for CPUs in node lists and fallback fixtures.
++			defaults := map[string]string{}
++			for name, data := range tc.files {
++				if filepath.Base(name) == "cpulist" {
++					infos, err := parseCPUs(strings.TrimSpace(data))
++					if err == nil {
++						for _, info := range infos {
++							for _, field := range []string{"core_id", "physical_package_id", "book_id", "drawer_id"} {
++								defaults[fmt.Sprintf("cpu/cpu%d/topology/%s", info.Processor, field)] = "0"
++							}
++						}
++					}
++				}
++				if filepath.Base(name) == "physical_package_id" {
++					for _, field := range []string{"core_id", "book_id", "drawer_id"} {
++						defaults[filepath.Join(filepath.Dir(name), field)] = "0"
++					}
++				}
++			}
++			maps.Copy(defaults, tc.files)
++			if tc.missingTopology != "" {
++				delete(defaults, "cpu/cpu0/topology/"+tc.missingTopology)
++			}
++			for name, data := range defaults {
++				path := filepath.Join(root, name)
++				if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
++					t.Fatal(err)
++				}
++				if err := os.WriteFile(path, []byte(data), 0644); err != nil {
++					t.Fatal(err)
++				}
++			}
++			got, err := getCPUs(root)
++			if (err != nil) != tc.wantError {
++				t.Fatalf("getCPUs() error = %v, wantError %v", err, tc.wantError)
++			}
++			if !tc.wantError && !reflect.DeepEqual(got, tc.want) {
++				t.Fatalf("getCPUs() = %v, want %v", got, tc.want)
++			}
++		})
++	}
++}
++
++func TestCPUInOnlineList(t *testing.T) {
++	for _, tc := range []struct {
++		list string
++		cpu  uint16
++		want bool
++	}{
++		{"0,2-4,7\n", 3, true},
++		{"0,2-4,7", 1, false},
++		{"", 0, false},
++		{"4-2", 3, false},
++		{"0,bad", 0, true},
++		{"bad,0", 0, false},
++		{"0-1-2", 0, false},
++		{"65536", 0, false},
++	} {
++		if got := cpuInOnlineList(tc.list, tc.cpu); got != tc.want {
++			t.Errorf("cpuInOnlineList(%q, %d) = %v, want %v", tc.list, tc.cpu, got, tc.want)
++		}
++	}
++}

@@ -1,0 +1,25 @@
+diff --git a/cli/test/integration/cli/BUILD b/cli/test/integration/cli/BUILD
+index 255a418ba..250430fa6 100644
+--- a/cli/test/integration/cli/BUILD
++++ b/cli/test/integration/cli/BUILD
+@@ -5,7 +5,7 @@ package(default_visibility = ["//cli:__subpackages__"])
+ go_test(
+     name = "cli_test",
+     srcs = ["cli_test.go"],
+-    shard_count = 4,
++    shard_count = 8,
+     deps = [
+         "//cli/log",
+         "//cli/parser",
+diff --git a/enterprise/server/test/integration/cli/stream_run_logs/BUILD b/enterprise/server/test/integration/cli/stream_run_logs/BUILD
+index 8a0148e14..dd165e123 100644
+--- a/enterprise/server/test/integration/cli/stream_run_logs/BUILD
++++ b/enterprise/server/test/integration/cli/stream_run_logs/BUILD
+@@ -5,6 +5,7 @@ package(default_visibility = ["//enterprise:__subpackages__"])
+ go_test(
+     name = "stream_run_logs_test",
+     srcs = ["stream_run_logs_test.go"],
++    shard_count = 5,
+     exec_properties = {
+         # TODO: remove network dependency.
+         "test.dockerNetwork": "bridge",

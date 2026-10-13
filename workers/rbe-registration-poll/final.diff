@@ -1,0 +1,13 @@
+diff --git a/enterprise/server/test/integration/remote_execution/rbetest/rbetest.go b/enterprise/server/test/integration/remote_execution/rbetest/rbetest.go
+index 52b402b23..0dbe43686 100644
+--- a/enterprise/server/test/integration/remote_execution/rbetest/rbetest.go
++++ b/enterprise/server/test/integration/remote_execution/rbetest/rbetest.go
+@@ -1061,7 +1061,7 @@ func (r *Env) waitForExecutorRegistration() {
+ 		if reflect.DeepEqual(expectedNodesByID, nodesByID) {
+ 			return
+ 		}
+-		time.Sleep(100 * time.Millisecond)
++		time.Sleep(10 * time.Millisecond)
+ 	}
+ 
+ 	require.Equal(r.t, expectedNodesByID, nodesByID, "set of registered executors should converge")

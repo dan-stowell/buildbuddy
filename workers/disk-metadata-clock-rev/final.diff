@@ -1,0 +1,56 @@
+diff --git a/server/backends/disk_cache/disk_cache_test.go b/server/backends/disk_cache/disk_cache_test.go
+index 781d6a8a1..29877374f 100644
+--- a/server/backends/disk_cache/disk_cache_test.go
++++ b/server/backends/disk_cache/disk_cache_test.go
+@@ -91,6 +91,29 @@ func TestGetSet(t *testing.T) {
+ 	}
+ }
+ 
++// Wait for a probe's filesystem timestamps, as observed by the cache, to move
++// past both reference values. Wall-clock time alone does not account for the
++// filesystem's timestamp precision (or a cached filesystem clock).
++func waitForTimestampAdvance(t *testing.T, ctx context.Context, dc *disk_cache.DiskCache, accessUsec, modifyUsec int64) {
++	t.Helper()
++	// Use a separate instance so even a matching digest cannot touch test data.
++	probe, buf := testdigest.NewRandomResourceAndBuf(t, 1, rspb.CacheType_AC, "timestamp-probe")
++	defer func() {
++		require.NoError(t, dc.Delete(ctx, probe))
++	}()
++	deadline := time.Now().Add(5 * time.Second)
++	for time.Now().Before(deadline) {
++		require.NoError(t, dc.Set(ctx, probe, buf))
++		md, err := dc.Metadata(ctx, probe)
++		require.NoError(t, err)
++		if md.LastAccessTimeUsec > accessUsec && md.LastModifyTimeUsec > modifyUsec {
++			return
++		}
++		time.Sleep(time.Millisecond)
++	}
++	require.FailNow(t, "filesystem timestamps did not advance")
++}
++
+ func TestMetadata(t *testing.T) {
+ 	maxSizeBytes := int64(1_000_000_000) // 1GB
+ 	rootDir := testfs.MakeTempDir(t)
+@@ -132,7 +155,7 @@ func TestMetadata(t *testing.T) {
+ 		require.Equal(t, lastModifyTime1, lastModifyTime2)
+ 
+ 		// After updating data, last access and modify time should update
+-		time.Sleep(1 * time.Second) // Sleep to guarantee timestamps change
++		waitForTimestampAdvance(t, ctx, dc, lastAccessTime1, lastModifyTime1)
+ 		err = dc.Set(ctx, rn, buf)
+ 		require.NoError(t, err)
+ 		md, err = dc.Metadata(ctx, rn)
+@@ -660,8 +683,10 @@ func TestJanitorThread(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	// GC runs after 100ms, so give it a little time to delete the files.
+-	time.Sleep(500 * time.Millisecond)
++	// Wait for the restart scan before checking size: an unmapped cache may
++	// appear to be within its target size even though GC has not run yet.
++	dc.WaitUntilMapped()
++	waitForEviction(t, dc)
+ 	for i, r := range resources {
+ 		if i > 500 {
+ 			break

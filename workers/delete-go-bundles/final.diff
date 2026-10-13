@@ -1,0 +1,139 @@
+diff --git a/config/BUILD b/config/BUILD
+index b86ce7ff6..c83a501d0 100644
+--- a/config/BUILD
++++ b/config/BUILD
+@@ -1,5 +1,3 @@
+-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+-
+ # gazelle:default_visibility //visibility:public
+ package(default_visibility = ["//visibility:public"])
+ 
+@@ -12,13 +10,3 @@ filegroup(
+         "//conditions:default": glob(["**"]),
+     }),
+ )
+-
+-go_library(
+-    name = "bundle",
+-    srcs = ["bundle.go"],
+-    embedsrcs = [":config_files"],  # keep
+-    importpath = "github.com/buildbuddy-io/buildbuddy/config",
+-    deps = [
+-        "//server/util/fileresolver",
+-    ],
+-)
+diff --git a/config/bundle.go b/config/bundle.go
+deleted file mode 100644
+index 7c73e12d6..000000000
+--- a/config/bundle.go
++++ /dev/null
+@@ -1,17 +0,0 @@
+-package config
+-
+-import (
+-	"embed"
+-	"io/fs"
+-
+-	"github.com/buildbuddy-io/buildbuddy/server/util/fileresolver"
+-)
+-
+-// NB: Include everything in bazel `embedsrcs` with `*`.
+-//
+-//go:embed *
+-var all embed.FS
+-
+-func Get() fs.FS {
+-	return fileresolver.New(all, "enterprise/config")
+-}
+diff --git a/enterprise/BUILD b/enterprise/BUILD
+index 375914ba3..7b8df964f 100644
+--- a/enterprise/BUILD
++++ b/enterprise/BUILD
+@@ -1,5 +1,3 @@
+-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+-
+ # gazelle:default_visibility //enterprise:__subpackages__
+ package(default_visibility = ["//enterprise:__subpackages__"])
+ 
+@@ -10,13 +8,3 @@ filegroup(
+     ],
+     visibility = ["//visibility:public"],
+ )
+-
+-go_library(
+-    name = "bundle",
+-    srcs = ["bundle.go"],
+-    embedsrcs = [":licenses"],
+-    importpath = "github.com/buildbuddy-io/buildbuddy/enterprise",
+-    deps = [
+-        "//server/util/fileresolver",
+-    ],
+-)
+diff --git a/enterprise/bundle.go b/enterprise/bundle.go
+deleted file mode 100644
+index fd1a7e45f..000000000
+--- a/enterprise/bundle.go
++++ /dev/null
+@@ -1,15 +0,0 @@
+-package enterprise
+-
+-import (
+-	"embed"
+-	"io/fs"
+-
+-	"github.com/buildbuddy-io/buildbuddy/server/util/fileresolver"
+-)
+-
+-//go:embed LICENSE
+-var all embed.FS
+-
+-func Get() fs.FS {
+-	return fileresolver.New(all, "enterprise")
+-}
+diff --git a/enterprise/config/BUILD b/enterprise/config/BUILD
+index 9ec48fbb7..f5a497d70 100644
+--- a/enterprise/config/BUILD
++++ b/enterprise/config/BUILD
+@@ -1,5 +1,3 @@
+-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+-
+ # gazelle:default_visibility //enterprise:__subpackages__
+ package(default_visibility = ["//enterprise:__subpackages__"])
+ 
+@@ -13,13 +11,3 @@ filegroup(
+         "//conditions:default": glob(["*.yaml"]),
+     }),
+ )
+-
+-go_library(
+-    name = "bundle",
+-    srcs = ["bundle.go"],
+-    embedsrcs = [":config_files"],  # keep
+-    importpath = "github.com/buildbuddy-io/buildbuddy/enterprise/config",
+-    deps = [
+-        "//server/util/fileresolver",
+-    ],
+-)
+diff --git a/enterprise/config/bundle.go b/enterprise/config/bundle.go
+deleted file mode 100644
+index 7c73e12d6..000000000
+--- a/enterprise/config/bundle.go
++++ /dev/null
+@@ -1,17 +0,0 @@
+-package config
+-
+-import (
+-	"embed"
+-	"io/fs"
+-
+-	"github.com/buildbuddy-io/buildbuddy/server/util/fileresolver"
+-)
+-
+-// NB: Include everything in bazel `embedsrcs` with `*`.
+-//
+-//go:embed *
+-var all embed.FS
+-
+-func Get() fs.FS {
+-	return fileresolver.New(all, "enterprise/config")
+-}

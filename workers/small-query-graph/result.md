@@ -1,0 +1,3 @@
+Fixed in `2dcac7749`: unchanged graph content now preserves zoom/pan across parent rerenders. Added a renderer lifecycle regression test covering rerenders, content changes, and resize fitting.
+
+`bb remote` tests, type checks, and bundle build passed. Verified code/BUILD-only diff and no `result.md` in branch history. Restored origin and updated [result.md](/home/exedev/repo/result.md), kept untracked. Nothing pushed.

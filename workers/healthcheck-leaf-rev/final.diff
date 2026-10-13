@@ -1,0 +1,301 @@
+diff --git a/result.md b/result.md
+new file mode 100644
+index 000000000..8a4ba57dd
+--- /dev/null
++++ b/result.md
+@@ -0,0 +1,135 @@
++# Health-check type extraction
++
++Moved `Checker`, `CheckerFunc`, and the unchanged `CheckerFunc.Check` method to
++`server/util/healthcheck/checker`, a leaf Go library importing only `context`.
++`server/interfaces` retains type aliases, preserving Go type identity and existing
++call sites. Healthcheck now imports the leaf directly. Updated both existing BUILD
++files and added the leaf BUILD file by hand.
++
++## Premise and measurements
++
++Before editing, source inspection confirmed healthcheck used interfaces only for
++these two types. Querying the closure of its other nine library dependencies showed
++that interfaces uniquely contributed 246 first-party labels and 1,299 external
++labels. The reduction is substantial, so the extraction proceeded.
++
++Identical queries were used before and after:
++
++```sh
++bazel query 'deps(//server/util/healthcheck)' | wc -l
++bazel query 'kind("rule", deps(//server/util/healthcheck))'
++```
++
++The query output was saved and counted by `//` (first-party) and `@` (external)
++prefix; external labels include source files, not just rules.
++
++| Metric | Before | After | Change |
++| --- | ---: | ---: | ---: |
++| All dependency labels (`deps` / `wc -l`) | 4,602 | 3,061 | -1,541 |
++| First-party dependency labels | 302 | 60 | -242 |
++| External dependency labels | 4,300 | 3,001 | -1,299 |
++| All dependency rules | 1,403 | 1,044 | -359 |
++| First-party dependency rules | 198 | 49 | -149 |
++| External dependency rules | 1,205 | 995 | -210 |
++| Go + BUILD LOC in interfaces, healthcheck, and new leaf | 2,587 | 2,603 | +16 |
++
++The survey's ~152 first-party rule reduction was close; its ~70 external label
++estimate understated the actual reduction. No binary size claim is made.
++
++## Validation
++
++`gofmt` and `git diff --check` passed. The 31-target build passed (exit 0,
++5,761.562 seconds / about 96 minutes). The healthcheck test passed (exit 0,
++17.762 seconds; both shutdown/signal test cases in the single Bazel test target).
++
++The requested full-repository query
++`bazel query 'rdeps(//..., //server/util/healthcheck, 1)'` failed during repository
++fetch: `default_execution_image`'s `docker build --no-cache` exceeded its timeout.
++The query was interrupted after that error when it started another unrelated
++Docker image fetch. A package-wildcard fallback was also narrowed to avoid image
++targets. No repository/dependency configuration was modified to bypass the error.
++
++Consumer packages were selected with
++`rg -l -F '"//server/util/healthcheck"' --glob BUILD --glob BUILD.bazel .`, then Bazel
++queried their rules with `attr("deps", "//server/util/healthcheck:healthcheck(,| |\\]|$)", set(<consumer package wildcards> //server/util/healthcheck:*))`.
++This succeeded and found 26 direct consumers, including the local healthcheck test.
++The equivalent interfaces query succeeded and found 283 direct consumers; the
++requested three binary proxies were used for interfaces validation.
++
++A depth-one `rdeps` query restricted to the selected healthcheck consumers then
++passed (exit 0, 27 labels: healthcheck itself plus the same 26 consumers).
++`rdeps(set(//server/cmd/buildbuddy:buildbuddy_lib
++//enterprise/server/cmd/server:server_lib
++//enterprise/server/cmd/executor:executor_lib //server/interfaces),
++//server/interfaces, 1)` also passed. Bazel includes the universe's transitive
++closure, so this returned interfaces and its direct dependents reachable through
++those proxies (136 labels: interfaces plus 135 direct dependents).
++
++Background validation (local execution, two jobs):
++
++```sh
++bazel build --jobs=2 --keep_going --target_pattern_file=/tmp/healthcheck-build.targets
++bazel test --jobs=2 //server/util/healthcheck:healthcheck_test
++```
++
++The target-pattern file contains the 26 healthcheck consumers plus interfaces, the
++new leaf, and `//server/cmd/buildbuddy:buildbuddy`,
++`//enterprise/server/cmd/server:buildbuddy`, and
++`//enterprise/server/cmd/executor:executor` (31 unique targets). Logs are in
++`/tmp/healthcheck-build.log` and `/tmp/healthcheck-test.log`.
++
++## Dependencies and scope
++
++No shared dependency files were edited. Interfaces retains all its existing
++external dependencies; this changes only which closure healthcheck reaches.
++No external module became unused. Evidence: saved output from
++`bazel query 'deps(//server/interfaces)'` contains all 1,299 external labels in
++`before_healthcheck_deps - after_healthcheck_deps` (set comparison: 1,299 retained,
++0 missing). `git diff -- server/interfaces/BUILD` also confirms every old dependency
++entry remains; only the new leaf was added.
++
++Only the requested `result.md` is outside the listed implementation scope. No
++other call sites were migrated, and no runtime health/shutdown logic was changed.
++The existing shutdown and signal tests passed; no additional behavior tests
++are needed for moving the unchanged definitions and adding type aliases.
++
++Unused Docker build cache and the image generated by the failed repository query
++were reclaimed to free disk space during the build. No source configuration changed.
++
++## Built targets
++
++Contents of `/tmp/healthcheck-build.targets`:
++
++```text
++//cli/cmd/sidecar:sidecar
++//codesearch/cmd/server:server_lib
++//enterprise/atlas/cmd/atlas:atlas_lib
++//enterprise/atlas/server/web:web_test
++//enterprise/dns/cmd/density:density_lib
++//enterprise/gateway/cmd/gateway:gateway_lib
++//enterprise/gateway/cmd/relaygateway:relaygateway_lib
++//enterprise/server/certgenerator:certgenerator_lib
++//enterprise/server/cmd/cache:cache_lib
++//enterprise/server/cmd/cache_proxy:cache_proxy_lib
++//enterprise/server/cmd/ci_runner:ci_runner_lib
++//enterprise/server/cmd/executor:executor
++//enterprise/server/cmd/executor:executor_lib
++//enterprise/server/cmd/metadata_server:metadata_server_lib
++//enterprise/server/cmd/server:buildbuddy
++//enterprise/server/cmd/server:server_lib
++//enterprise/server/usagealert:usagealert_lib
++//enterprise/server/vmexec:vmexec
++//enterprise/tools/metronome_exporter:metronome_exporter_lib
++//enterprise/tools/mount_vfs:mount_vfs_lib
++//enterprise/tools/replay_action:replay_action_lib
++//enterprise/tools/vmstart:vmstart_lib
++//server/cmd/buildbuddy:buildbuddy
++//server/cmd/buildbuddy:buildbuddy_lib
++//server/http/interceptors:interceptors_test
++//server/interfaces
++//server/libmain:libmain
++//server/testutil/testenv:testenv
++//server/util/healthcheck/checker
++//server/util/healthcheck:healthcheck_test
++//tools/replay_invocation:replay_invocation_lib
++```
+diff --git a/server/interfaces/BUILD b/server/interfaces/BUILD
+index d10225fb7..a1befc19d 100644
+--- a/server/interfaces/BUILD
++++ b/server/interfaces/BUILD
+@@ -47,6 +47,7 @@ go_library(
+         "//server/tables",
+         "//server/usage/sku",
+         "//server/util/clickhouse/schema",
++        "//server/util/healthcheck/checker",
+         "//server/util/platform",
+         "//server/util/proto",
+         "@com_github_golang_jwt_jwt_v4//:jwt",
+diff --git a/server/interfaces/interfaces.go b/server/interfaces/interfaces.go
+index aaad550bc..763ae83c8 100644
+--- a/server/interfaces/interfaces.go
++++ b/server/interfaces/interfaces.go
+@@ -15,6 +15,7 @@ import (
+ 	"github.com/buildbuddy-io/buildbuddy/server/tables"
+ 	"github.com/buildbuddy-io/buildbuddy/server/usage/sku"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/clickhouse/schema"
++	"github.com/buildbuddy-io/buildbuddy/server/util/healthcheck/checker"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
+ 	"github.com/golang-jwt/jwt/v4"
+@@ -1470,17 +1471,8 @@ type RepoDownloader interface {
+ 	TestRepoAccess(ctx context.Context, repoURL, username, accessToken string) error
+ }
+ 
+-type Checker interface {
+-	// Returns nil on success, error on failure. Returning an error will
+-	// indicate to the health checker that this service is unhealthy and
+-	// that the server is not ready to serve.
+-	Check(ctx context.Context) error
+-}
+-type CheckerFunc func(ctx context.Context) error
+-
+-func (f CheckerFunc) Check(ctx context.Context) error {
+-	return f(ctx)
+-}
++type Checker = checker.Checker
++type CheckerFunc = checker.CheckerFunc
+ 
+ type HealthChecker interface {
+ 	// AddHealthCheck adds a healthcheck -- the server's readiness is dependent on all
+diff --git a/server/util/healthcheck/BUILD b/server/util/healthcheck/BUILD
+index 6c3b6dcd8..cdee969d7 100644
+--- a/server/util/healthcheck/BUILD
++++ b/server/util/healthcheck/BUILD
+@@ -6,8 +6,8 @@ go_library(
+     importpath = "github.com/buildbuddy-io/buildbuddy/server/util/healthcheck",
+     visibility = ["//visibility:public"],
+     deps = [
+-        "//server/interfaces",
+         "//server/metrics",
++        "//server/util/healthcheck/checker",
+         "//server/util/log",
+         "//server/util/status",
+         "//server/util/statusz",
+diff --git a/server/util/healthcheck/checker/BUILD b/server/util/healthcheck/checker/BUILD
+new file mode 100644
+index 000000000..548e12565
+--- /dev/null
++++ b/server/util/healthcheck/checker/BUILD
+@@ -0,0 +1,8 @@
++load("@io_bazel_rules_go//go:def.bzl", "go_library")
++
++go_library(
++    name = "checker",
++    srcs = ["checker.go"],
++    importpath = "github.com/buildbuddy-io/buildbuddy/server/util/healthcheck/checker",
++    visibility = ["//visibility:public"],
++)
+diff --git a/server/util/healthcheck/checker/checker.go b/server/util/healthcheck/checker/checker.go
+new file mode 100644
+index 000000000..a6fb48d2c
+--- /dev/null
++++ b/server/util/healthcheck/checker/checker.go
+@@ -0,0 +1,15 @@
++package checker
++
++import "context"
++
++type Checker interface {
++	// Returns nil on success, error on failure. Returning an error will
++	// indicate to the health checker that this service is unhealthy and
++	// that the server is not ready to serve.
++	Check(ctx context.Context) error
++}
++type CheckerFunc func(ctx context.Context) error
++
++func (f CheckerFunc) Check(ctx context.Context) error {
++	return f(ctx)
++}
+diff --git a/server/util/healthcheck/healthcheck.go b/server/util/healthcheck/healthcheck.go
+index ca91cdec7..4df5fbc4b 100644
+--- a/server/util/healthcheck/healthcheck.go
++++ b/server/util/healthcheck/healthcheck.go
+@@ -15,8 +15,8 @@ import (
+ 	"syscall"
+ 	"time"
+ 
+-	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+ 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
++	"github.com/buildbuddy-io/buildbuddy/server/util/healthcheck/checker"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/statusz"
+@@ -50,12 +50,12 @@ type HealthChecker struct {
+ 	done          chan bool
+ 	quit          chan struct{}
+ 	checkersMu    sync.Mutex
+-	checkers      map[string]interfaces.Checker
++	checkers      map[string]checker.Checker
+ 	lastStatus    []*serviceStatus
+ 	serverType    string
+ 	shutdownOnce  sync.Once
+ 	mu            sync.RWMutex // protects: shutdownFuncs, readyToServe, shuttingDown
+-	shutdownFuncs []interfaces.CheckerFunc
++	shutdownFuncs []checker.CheckerFunc
+ 	readyToServe  bool
+ 	shuttingDown  bool
+ 	watchdogTimer *watchdog.Timer
+@@ -66,10 +66,10 @@ func NewHealthChecker(serverType string) *HealthChecker {
+ 		serverType:    serverType,
+ 		done:          make(chan bool),
+ 		quit:          make(chan struct{}),
+-		shutdownFuncs: make([]interfaces.CheckerFunc, 0),
++		shutdownFuncs: make([]checker.CheckerFunc, 0),
+ 		readyToServe:  true,
+ 		checkersMu:    sync.Mutex{},
+-		checkers:      make(map[string]interfaces.Checker, 0),
++		checkers:      make(map[string]checker.Checker, 0),
+ 		lastStatus:    make([]*serviceStatus, 0),
+ 		watchdogTimer: watchdog.New(*maxUnreadyDuration),
+ 	}
+@@ -201,13 +201,13 @@ func (h *HealthChecker) handleShutdownFuncs() {
+ 	close(h.done)
+ }
+ 
+-func (h *HealthChecker) RegisterShutdownFunction(f interfaces.CheckerFunc) {
++func (h *HealthChecker) RegisterShutdownFunction(f checker.CheckerFunc) {
+ 	h.mu.Lock()
+ 	h.shutdownFuncs = append(h.shutdownFuncs, f)
+ 	h.mu.Unlock()
+ }
+ 
+-func (h *HealthChecker) AddHealthCheck(name string, f interfaces.Checker) {
++func (h *HealthChecker) AddHealthCheck(name string, f checker.Checker) {
+ 	h.checkersMu.Lock()
+ 	h.checkers[name] = f
+ 	h.checkersMu.Unlock()
+@@ -238,7 +238,7 @@ func (h *HealthChecker) runHealthChecks(ctx context.Context) {
+ 	statusDataMu := sync.Mutex{}
+ 
+ 	h.checkersMu.Lock()
+-	checkers := make(map[string]interfaces.Checker, len(h.checkers))
++	checkers := make(map[string]checker.Checker, len(h.checkers))
+ 	maps.Copy(checkers, h.checkers)
+ 	h.checkersMu.Unlock()
+ 

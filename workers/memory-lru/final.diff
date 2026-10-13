@@ -1,0 +1,309 @@
+diff --git a/server/backends/memory_kvstore/BUILD b/server/backends/memory_kvstore/BUILD
+index 141497624..03d4705fd 100644
+--- a/server/backends/memory_kvstore/BUILD
++++ b/server/backends/memory_kvstore/BUILD
+@@ -6,8 +6,8 @@ go_library(
+     importpath = "github.com/buildbuddy-io/buildbuddy/server/backends/memory_kvstore",
+     visibility = ["//visibility:public"],
+     deps = [
++        "//server/util/lru",
+         "//server/util/status",
+-        "@com_github_hashicorp_golang_lru//:golang-lru",
+     ],
+ )
+ 
+diff --git a/server/backends/memory_kvstore/memory_kvstore.go b/server/backends/memory_kvstore/memory_kvstore.go
+index 0f8388575..214ad472c 100644
+--- a/server/backends/memory_kvstore/memory_kvstore.go
++++ b/server/backends/memory_kvstore/memory_kvstore.go
+@@ -3,9 +3,8 @@ package memory_kvstore
+ import (
+ 	"context"
+ 
++	"github.com/buildbuddy-io/buildbuddy/server/util/lru"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+-
+-	lru "github.com/hashicorp/golang-lru"
+ )
+ 
+ const (
+@@ -15,11 +14,16 @@ const (
+ )
+ 
+ type MemoryKeyValStore struct {
+-	l *lru.Cache
++	l lru.LRU[any]
+ }
+ 
+ func NewMemoryKeyValStore() (*MemoryKeyValStore, error) {
+-	l, err := lru.New(maxNumEntries)
++	l, err := lru.New(&lru.Config[any]{
++		MaxSize:       maxNumEntries,
++		SizeFn:        func(any) int64 { return 1 },
++		UpdateInPlace: true,
++		ThreadSafe:    true,
++	})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/server/backends/memory_kvstore/memory_kvstore_test.go b/server/backends/memory_kvstore/memory_kvstore_test.go
+index 47b4dff79..77f5dc6f3 100644
+--- a/server/backends/memory_kvstore/memory_kvstore_test.go
++++ b/server/backends/memory_kvstore/memory_kvstore_test.go
+@@ -1,6 +1,8 @@
+ package memory_kvstore_test
+ 
+ import (
++	"fmt"
++	"sync"
+ 	"testing"
+ 
+ 	"github.com/buildbuddy-io/buildbuddy/server/backends/memory_kvstore"
+@@ -66,3 +68,82 @@ func TestReplaceSuffix_MissingKey(t *testing.T) {
+ 	_, err = store.Get(ctx, "missing")
+ 	require.True(t, status.IsNotFoundError(err), "expected NotFound, got %v", err)
+ }
++
++func TestCapacityAndEviction(t *testing.T) {
++	ctx := t.Context()
++	store, err := memory_kvstore.NewMemoryKeyValStore()
++	require.NoError(t, err)
++	// Values of different lengths, including empty slices, each count as one entry.
++	for i := range 5000 {
++		require.NoError(t, store.Set(ctx, fmt.Sprint(i), make([]byte, i%100)))
++	}
++	for i := range 5000 {
++		val, err := store.Get(ctx, fmt.Sprint(i))
++		require.NoError(t, err)
++		require.Len(t, val, i%100)
++	}
++	// Reads and updates both refresh recency; updating does not use another slot.
++	_, err = store.Get(ctx, "0")
++	require.NoError(t, err)
++	require.NoError(t, store.Set(ctx, "1", []byte("updated")))
++	require.NoError(t, store.Set(ctx, "overflow", []byte{}))
++	_, err = store.Get(ctx, "2")
++	require.True(t, status.IsNotFoundError(err))
++	for _, key := range []string{"0", "1", "3", "overflow"} {
++		_, err = store.Get(ctx, key)
++		require.NoError(t, err)
++	}
++	// Deleting frees a slot without evicting another entry.
++	require.NoError(t, store.Set(ctx, "overflow", nil))
++	_, err = store.Get(ctx, "overflow")
++	require.True(t, status.IsNotFoundError(err))
++	require.NoError(t, store.Set(ctx, "replacement", []byte{}))
++	_, err = store.Get(ctx, "4")
++	require.NoError(t, err)
++}
++
++func TestConcurrentAccess(t *testing.T) {
++	ctx := t.Context()
++	store, err := memory_kvstore.NewMemoryKeyValStore()
++	require.NoError(t, err)
++	var wg sync.WaitGroup
++	for worker := range 16 {
++		wg.Go(func() {
++			// Each worker owns its values; shared keys exercise LRU locking without
++			// mutating slices returned to other callers.
++			key := fmt.Sprintf("worker-%d", worker)
++			for range 100 {
++				if err := store.Set(ctx, key, []byte("a")); err != nil {
++					t.Error(err)
++					return
++				}
++				if err := store.ReplaceSuffix(ctx, key, 1, 1, []byte("b")); err != nil {
++					t.Error(err)
++					return
++				}
++				val, err := store.Get(ctx, key)
++				if err != nil || string(val) != "ab" {
++					t.Errorf("Get = %q, %v", val, err)
++					return
++				}
++				if err := store.Set(ctx, key, nil); err != nil {
++					t.Error(err)
++					return
++				}
++				if err := store.Set(ctx, "shared", []byte("value")); err != nil {
++					t.Error(err)
++					return
++				}
++				if _, err := store.Get(ctx, "shared"); err != nil && !status.IsNotFoundError(err) {
++					t.Error(err)
++					return
++				}
++				if err := store.Set(ctx, "shared", nil); err != nil {
++					t.Error(err)
++					return
++				}
++			}
++		})
++	}
++	wg.Wait()
++}
+diff --git a/server/backends/memory_metrics_collector/BUILD b/server/backends/memory_metrics_collector/BUILD
+index 08e8d7e5f..322b93f7a 100644
+--- a/server/backends/memory_metrics_collector/BUILD
++++ b/server/backends/memory_metrics_collector/BUILD
+@@ -6,8 +6,8 @@ go_library(
+     importpath = "github.com/buildbuddy-io/buildbuddy/server/backends/memory_metrics_collector",
+     visibility = ["//visibility:public"],
+     deps = [
++        "//server/util/lru",
+         "//server/util/status",
+-        "@com_github_hashicorp_golang_lru//:golang-lru",
+     ],
+ )
+ 
+@@ -16,5 +16,8 @@ go_test(
+     size = "small",
+     srcs = ["memory_metrics_collector_test.go"],
+     embed = [":memory_metrics_collector"],
+-    deps = ["@com_github_stretchr_testify//require"],
++    deps = [
++        "//server/util/status",
++        "@com_github_stretchr_testify//require",
++    ],
+ )
+diff --git a/server/backends/memory_metrics_collector/memory_metrics_collector.go b/server/backends/memory_metrics_collector/memory_metrics_collector.go
+index d48092389..eae0c2cb9 100644
+--- a/server/backends/memory_metrics_collector/memory_metrics_collector.go
++++ b/server/backends/memory_metrics_collector/memory_metrics_collector.go
+@@ -6,9 +6,8 @@ import (
+ 	"sync"
+ 	"time"
+ 
++	"github.com/buildbuddy-io/buildbuddy/server/util/lru"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+-
+-	lru "github.com/hashicorp/golang-lru"
+ )
+ 
+ const (
+@@ -22,12 +21,17 @@ const (
+ )
+ 
+ type MemoryMetricsCollector struct {
+-	l  *lru.Cache
++	// mu protects the LRU and compound operations on its values.
++	l  lru.LRU[any]
+ 	mu sync.Mutex
+ }
+ 
+ func NewMemoryMetricsCollector() (*MemoryMetricsCollector, error) {
+-	l, err := lru.New(maxNumEntries)
++	l, err := lru.New(&lru.Config[any]{
++		MaxSize:       maxNumEntries,
++		SizeFn:        func(any) int64 { return 1 },
++		UpdateInPlace: true,
++	})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/server/backends/memory_metrics_collector/memory_metrics_collector_test.go b/server/backends/memory_metrics_collector/memory_metrics_collector_test.go
+index 6a658b9ad..6fc0b7a6a 100644
+--- a/server/backends/memory_metrics_collector/memory_metrics_collector_test.go
++++ b/server/backends/memory_metrics_collector/memory_metrics_collector_test.go
+@@ -3,6 +3,8 @@ package memory_metrics_collector
+ import (
+ 	"context"
+ 	"fmt"
++	"github.com/buildbuddy-io/buildbuddy/server/util/status"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -144,3 +146,92 @@ func TestListAppendAndTruncate(t *testing.T) {
+ 	// The list read before the truncation should be unchanged.
+ 	require.Equal(t, []string{"1", "2", "3"}, list)
+ }
++
++func TestCapacityAndEviction(t *testing.T) {
++	ctx := t.Context()
++	mc, err := NewMemoryMetricsCollector()
++	require.NoError(t, err)
++	// Different value types all share the same entry-count capacity.
++	require.NoError(t, mc.IncrementCount(ctx, "counts", "field", 1))
++	require.NoError(t, mc.SetAdd(ctx, "set", "member"))
++	require.NoError(t, mc.ListAppend(ctx, "list", "value"))
++	for i := range maxNumEntries - 3 {
++		require.NoError(t, mc.Set(ctx, fmt.Sprint(i), "value", noExpiration))
++	}
++	require.Equal(t, maxNumEntries, mc.l.Len())
++	// Reads and updates refresh recency without increasing entry count.
++	_, err = mc.ReadCounts(ctx, "counts")
++	require.NoError(t, err)
++	require.NoError(t, mc.SetAdd(ctx, "set", "another"))
++	require.NoError(t, mc.Set(ctx, "overflow", "", noExpiration))
++	list, err := mc.ListRange(ctx, "list", 0, -1)
++	require.NoError(t, err)
++	require.Empty(t, list)
++	require.Equal(t, maxNumEntries, mc.l.Len())
++	require.NoError(t, mc.Set(ctx, "overflow2", "value", noExpiration))
++	_, err = mc.GetAll(ctx, "0")
++	require.True(t, status.IsNotFoundError(err))
++	counts, err := mc.ReadCounts(ctx, "counts")
++	require.NoError(t, err)
++	require.Equal(t, map[string]int64{"field": 1}, counts)
++	members, err := mc.SetGetMembers(ctx, "set")
++	require.NoError(t, err)
++	require.ElementsMatch(t, []string{"member", "another"}, members)
++	require.NoError(t, mc.Delete(ctx, "overflow"))
++	require.NoError(t, mc.Set(ctx, "replacement", "value", noExpiration))
++	_, err = mc.GetAll(ctx, "1")
++	require.NoError(t, err)
++	require.Equal(t, maxNumEntries, mc.l.Len())
++}
++
++func TestConcurrentAccess(t *testing.T) {
++	ctx := t.Context()
++	mc, err := NewMemoryMetricsCollector()
++	require.NoError(t, err)
++	var wg sync.WaitGroup
++	for worker := range 16 {
++		wg.Go(func() {
++			key := fmt.Sprintf("worker-%d", worker)
++			for range 100 {
++				for _, err := range []error{
++					mc.IncrementCount(ctx, "counts", "single", 1),
++					mc.IncrementCounts(ctx, "counts", map[string]int64{"multiple": 1}),
++					mc.SetAdd(ctx, "set", key),
++					mc.Set(ctx, key, "value", noExpiration),
++					mc.ListAppend(ctx, "list", key),
++				} {
++					if err != nil {
++						t.Error(err)
++						return
++					}
++				}
++				if _, err := mc.ReadCounts(ctx, "counts"); err != nil {
++					t.Error(err)
++					return
++				}
++				if _, err := mc.SetGetMembers(ctx, "set"); err != nil {
++					t.Error(err)
++					return
++				}
++				if _, err := mc.GetAll(ctx, key); err != nil {
++					t.Error(err)
++					return
++				}
++				if err := mc.Delete(ctx, key); err != nil {
++					t.Error(err)
++					return
++				}
++			}
++		})
++	}
++	wg.Wait()
++	counts, err := mc.ReadCounts(ctx, "counts")
++	require.NoError(t, err)
++	require.Equal(t, map[string]int64{"single": 1600, "multiple": 1600}, counts)
++	members, err := mc.SetGetMembers(ctx, "set")
++	require.NoError(t, err)
++	require.Len(t, members, 16)
++	list, err := mc.ListRange(ctx, "list", 0, -1)
++	require.NoError(t, err)
++	require.Len(t, list, 1600)
++}

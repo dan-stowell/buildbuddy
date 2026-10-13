@@ -1,0 +1,81 @@
+diff --git a/enterprise/server/test/integration/remote_execution/remote_execution_test.go b/enterprise/server/test/integration/remote_execution/remote_execution_test.go
+index 5fa828b26..24df8f859 100644
+--- a/enterprise/server/test/integration/remote_execution/remote_execution_test.go
++++ b/enterprise/server/test/integration/remote_execution/remote_execution_test.go
+@@ -1761,17 +1761,21 @@ func TestCommandWithMissingInputRootDigest(t *testing.T) {
+ }
+ 
+ func TestRedisRestart(t *testing.T) {
++	// The local executor can access this gate outside the action workspace.
++	gateDir := t.TempDir()
++	started := filepath.Join(gateDir, "started")
++	gate := filepath.Join(gateDir, "release")
+ 	workspaceContents := map[string]string{
+ 		"BUILD": fmt.Sprintf(`genrule(
+   name = "hello_txt",
+   outs = ["hello.txt"],
+-  cmd_bash = "sleep 5 && echo 'Hello world' > $@",
++  cmd_bash = "touch %s && while [ ! -f %s ]; do sleep 0.01; done; echo 'Hello world' > $@",
+   exec_properties = {
+     "OSFamily": "%s",
+     "Arch": "%s",
+   },
+   tags = ["no-remote-cache"],
+-)`, runtime.GOOS, runtime.GOARCH),
++)`, started, gate, runtime.GOOS, runtime.GOARCH),
+ 	}
+ 
+ 	var redisShards []*testredis.Handle
+@@ -1818,9 +1822,16 @@ func TestRedisRestart(t *testing.T) {
+ 	}
+ 	require.NotNil(t, victimShard, "could not find victim shard")
+ 
++	// Ensure the action is running and blocked at the gate before restarting Redis.
++	require.Eventually(t, func() bool {
++		_, err := os.Stat(started)
++		return err == nil
++	}, 30*time.Second, time.Millisecond, "action did not reach the gate")
++
+ 	// Restart the shard containing task information and verify that the Bazel
+ 	// invocation can still finish successfully.
+ 	victimShard.Restart()
++	require.NoError(t, os.WriteFile(gate, nil, 0600))
+ 
+ 	result := <-resultCh
+ 
+@@ -1989,12 +2000,21 @@ func TestActionMerging_CancellationDoesntAffectMergedActions(t *testing.T) {
+ 			{Name: "Arch", Value: runtime.GOARCH},
+ 		},
+ 	}
++	// Keep the action running until both invocations have merged and the first
++	// invocation has been canceled. The local executor shares the test filesystem.
++	gateDir := t.TempDir()
++	started := filepath.Join(gateDir, "started")
++	gate := filepath.Join(gateDir, "release")
+ 	cmd := &repb.Command{
+-		Arguments: []string{"sh", "-c", "sleep 5"},
++		Arguments: []string{"sh", "-c", fmt.Sprintf("touch %q && while [ ! -f %q ]; do sleep 0.01; done", started, gate)},
+ 		Platform:  platform,
+ 	}
+ 	cmd1 := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "invocation1"})
+ 	op1 := cmd1.WaitAccepted()
++	require.Eventually(t, func() bool {
++		_, err := os.Stat(started)
++		return err == nil
++	}, 30*time.Second, time.Millisecond, "action did not reach the gate")
+ 
+ 	cmd2 := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "invocation2"})
+ 	op2 := cmd2.WaitAccepted()
+@@ -2012,7 +2032,11 @@ func TestActionMerging_CancellationDoesntAffectMergedActions(t *testing.T) {
+ 	})
+ 	require.NoError(t, err)
+ 
+-	// Verify that the action can run to completion.
++	// Wait for the server to process cancellation before releasing the action.
++	require.NoError(t, bep.Finish())
++
++	// Release the action and verify that it can run to completion.
++	require.NoError(t, os.WriteFile(gate, nil, 0600))
+ 
+ 	res := cmd1.Wait()
+ 	require.Equal(t, 0, res.ExitCode)

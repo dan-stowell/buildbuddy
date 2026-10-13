@@ -1,0 +1,1395 @@
+From a95f1519b2b643f090ff4ef2d29b64b7404a82bd Mon Sep 17 00:00:00 2001
+From: codex worker <codex-worker@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 23:00:54 +0000
+Subject: [PATCH] Add observe-only ext4 conversion metrics and phase accounting
+ tests
+
+---
+ enterprise/server/oci/ociconv/BUILD           |  29 +-
+ enterprise/server/oci/ociconv/metrics.go      | 138 ++++++
+ enterprise/server/oci/ociconv/metrics_test.go | 398 ++++++++++++++++++
+ enterprise/server/oci/ociconv/ociconv.go      |  36 +-
+ .../containers/firecracker/firecracker.go     |   2 +
+ enterprise/server/util/ext4/BUILD             |  18 +-
+ enterprise/server/util/ext4/ext4.go           |   5 +
+ enterprise/server/util/ext4/metrics.go        | 174 ++++++++
+ enterprise/server/util/ext4/metrics_test.go   | 217 ++++++++++
+ result.md                                     |  38 ++
+ server/metrics/metrics.go                     | 104 +++++
+ 11 files changed, 1151 insertions(+), 8 deletions(-)
+ create mode 100644 enterprise/server/oci/ociconv/metrics.go
+ create mode 100644 enterprise/server/oci/ociconv/metrics_test.go
+ create mode 100644 enterprise/server/util/ext4/metrics.go
+ create mode 100644 enterprise/server/util/ext4/metrics_test.go
+ create mode 100644 result.md
+
+diff --git a/enterprise/server/oci/ociconv/BUILD b/enterprise/server/oci/ociconv/BUILD
+index ac9f57d51..61d215257 100644
+--- a/enterprise/server/oci/ociconv/BUILD
++++ b/enterprise/server/oci/ociconv/BUILD
+@@ -4,7 +4,10 @@ package(default_visibility = ["//enterprise:__subpackages__"])
+ 
+ go_library(
+     name = "ociconv",
+-    srcs = ["ociconv.go"],
++    srcs = [
++        "metrics.go",
++        "ociconv.go",
++    ],
+     importpath = "github.com/buildbuddy-io/buildbuddy/enterprise/server/oci/ociconv",
+     target_compatible_with = ["@platforms//os:linux"],
+     deps = [
+@@ -12,6 +15,7 @@ go_library(
+         "//enterprise/server/util/oci",
+         "//proto:remote_execution_go_proto",
+         "//server/interfaces",
++        "//server/metrics",
+         "//server/util/disk",
+         "//server/util/flag",
+         "//server/util/hash",
+@@ -47,3 +51,26 @@ go_test(
+         "@com_github_stretchr_testify//require",
+     ],
+ )
++
++go_test(
++    name = "metrics_test",
++    srcs = ["metrics_test.go"],
++    embed = [":ociconv"],
++    target_compatible_with = ["@platforms//os:linux"],
++    deps = [
++        "//enterprise/server/remote_execution/filecache",
++        "//enterprise/server/testutil/testregistry",
++        "//enterprise/server/util/ext4",
++        "//enterprise/server/util/oci",
++        "//server/interfaces",
++        "//server/testutil/testenv",
++        "//server/metrics",
++        "//server/util/hash",
++        "//server/util/testing/flags",
++        "@com_github_google_go_containerregistry//pkg/v1/empty",
++        "@com_github_google_go_containerregistry//pkg/v1/mutate",
++        "@com_github_prometheus_client_golang//prometheus",
++        "@com_github_prometheus_client_model//io/prometheus/client:go",
++        "@com_github_stretchr_testify//require",
++    ],
++)
+diff --git a/enterprise/server/oci/ociconv/metrics.go b/enterprise/server/oci/ociconv/metrics.go
+new file mode 100644
+index 000000000..b57dcccbe
+--- /dev/null
++++ b/enterprise/server/oci/ociconv/metrics.go
+@@ -0,0 +1,138 @@
++package ociconv
++
++import (
++	"container/list"
++	"context"
++	"sync"
++	"sync/atomic"
++
++	"github.com/buildbuddy-io/buildbuddy/server/metrics"
++	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
++	"github.com/buildbuddy-io/buildbuddy/server/util/hash"
++)
++
++var trackConversionKeys = flag.Bool("executor.ext4_conversion_track_keys", false, "Track recently converted filecache keys and concurrent credential overlap for metrics. Default off: adds request-path bookkeeping; history and active flight hashes are each bounded to 4096 entries. History loss and active overflow can undercount.")
++
++const trackedKeyLimit = 4096
++
++type keyTracker struct {
++	mu            sync.Mutex
++	limit         int
++	recent        map[string]*list.Element
++	order         list.List
++	active        map[string]map[string]int
++	activeEntries int
++}
++
++var conversionKeys = keyTracker{limit: trackedKeyLimit}
++
++// begin is called only inside singleflight after a cache miss. Active
++// flights with distinct credential hashes identify credential overlap.
++// Hashes are retained only while active; raw credentials are never retained.
++func (t *keyTracker) begin(key, flight string) (bool, bool, func()) {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	if t.recent == nil {
++		t.recent = make(map[string]*list.Element)
++	}
++	if t.active == nil {
++		t.active = make(map[string]map[string]int)
++	}
++	e, recent := t.recent[key]
++	if recent {
++		t.order.MoveToFront(e)
++	}
++	flights := t.active[key]
++	n := flights[flight]
++	overlap := len(flights) > 0 && (n == 0 || len(flights) > 1)
++	if n == 0 && t.activeEntries >= t.limit {
++		return recent, overlap, func() {}
++	}
++	if flights == nil {
++		flights = make(map[string]int)
++		t.active[key] = flights
++	}
++	if n == 0 {
++		t.activeEntries++
++	}
++	flights[flight]++
++	return recent, overlap, func() {
++		t.mu.Lock()
++		defer t.mu.Unlock()
++		flights[flight]--
++		if flights[flight] == 0 {
++			delete(flights, flight)
++			t.activeEntries--
++		}
++		if len(flights) == 0 {
++			delete(t.active, key)
++		}
++	}
++}
++
++func (t *keyTracker) converted(key string) {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	if t.recent == nil {
++		t.recent = make(map[string]*list.Element)
++	}
++	if e := t.recent[key]; e != nil {
++		t.order.MoveToFront(e)
++		return
++	}
++	t.recent[key] = t.order.PushFront(key)
++	if t.order.Len() > t.limit {
++		e := t.order.Back()
++		delete(t.recent, e.Value.(string))
++		t.order.Remove(e)
++	}
++}
++
++func observeConversion(keyParts []string, flight string, filecache bool) func(bool) {
++	metrics.Ext4ImageConversions.Inc()
++	if !*trackConversionKeys {
++		return func(bool) {}
++	}
++	key := hash.Strings(keyParts...)
++	recent, overlap, done := conversionKeys.begin(key, flight)
++	label := "false"
++	if recent {
++		label = "true"
++	}
++	if filecache {
++		metrics.Ext4ImageReConversions.WithLabelValues(label).Inc()
++	}
++	if overlap {
++		metrics.Ext4ImageCredentialOverlap.WithLabelValues("bounded").Inc()
++	}
++	return func(success bool) {
++		if success && filecache {
++			conversionKeys.converted(key)
++		}
++		done()
++	}
++}
++
++func observeLookup(method string, hit bool, err error) {
++	label := "miss"
++	if err != nil {
++		label = "error"
++	} else if hit {
++		label = "hit"
++	}
++	metrics.Ext4ImageCacheLookups.WithLabelValues(method, label).Inc()
++}
++
++// doConversionFlight counts completed deduplicated callers, excluding the
++// executing caller and callers whose contexts were canceled while waiting.
++func doConversionFlight(ctx context.Context, key string, fn func(context.Context) (string, error)) (string, error) {
++	var executed atomic.Bool
++	out, shared, err := conversionGroup.Do(ctx, key, func(ctx context.Context) (string, error) {
++		executed.Store(true)
++		return fn(ctx)
++	})
++	if shared && !executed.Load() && ctx.Err() == nil {
++		metrics.Ext4ImageDedupedWaiters.Inc()
++	}
++	return out, err
++}
+diff --git a/enterprise/server/oci/ociconv/metrics_test.go b/enterprise/server/oci/ociconv/metrics_test.go
+new file mode 100644
+index 000000000..6f68d0325
+--- /dev/null
++++ b/enterprise/server/oci/ociconv/metrics_test.go
+@@ -0,0 +1,398 @@
++package ociconv
++
++import (
++	"archive/tar"
++	"bytes"
++	"context"
++	"fmt"
++	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/filecache"
++	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testregistry"
++	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/oci"
++	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
++	"github.com/buildbuddy-io/buildbuddy/server/metrics"
++	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
++	"github.com/buildbuddy-io/buildbuddy/server/util/hash"
++	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
++	"github.com/google/go-containerregistry/pkg/v1/empty"
++	"github.com/google/go-containerregistry/pkg/v1/mutate"
++	"github.com/prometheus/client_golang/prometheus"
++	dto "github.com/prometheus/client_model/go"
++	"github.com/stretchr/testify/require"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestKeyTrackerHistoryAndOverlap(t *testing.T) {
++	tr := keyTracker{limit: 2}
++	recent, overlap, end := tr.begin("a", "creds1")
++	if recent || overlap {
++		t.Fatal("new key reported as recent or overlapping")
++	}
++	_, overlap, end2 := tr.begin("a", "creds2")
++	if !overlap {
++		t.Fatal("missing credential overlap")
++	}
++	end2()
++	end()
++	tr.converted("a")
++	tr.converted("b")
++	recent, overlap, end = tr.begin("a", "creds1")
++	if !recent || overlap {
++		t.Fatal("completed key tracking incorrect")
++	}
++	end()
++	tr.converted("c")
++	recent, _, end = tr.begin("b", "creds1")
++	if recent {
++		t.Fatal("LRU key was not evicted")
++	}
++	end()
++	if len(tr.recent) != 2 || len(tr.active) != 0 {
++		t.Fatal("tracker exceeded bound or leaked active keys")
++	}
++}
++
++func TestKeyTrackerActiveBound(t *testing.T) {
++	tr := keyTracker{limit: 1}
++	_, _, end := tr.begin("a", "creds1")
++	_, overlap, overflowEnd := tr.begin("b", "creds1")
++	if overlap || len(tr.active) != 1 {
++		t.Fatal("overflow tracking is unbounded")
++	}
++	overflowEnd()
++	end()
++	if len(tr.active) != 0 {
++		t.Fatal("overflow cleanup corrupted active set")
++	}
++}
++
++func TestKeyTrackerConcurrent(t *testing.T) {
++	tr := keyTracker{limit: 2}
++	var wg sync.WaitGroup
++	for range 100 {
++		wg.Go(func() {
++			_, _, end := tr.begin("a", "creds1")
++			tr.converted("a")
++			end()
++		})
++	}
++	wg.Wait()
++	if len(tr.active) != 0 || len(tr.recent) != 1 {
++		t.Fatal("concurrent bookkeeping incorrect")
++	}
++}
++
++func TestKeyTrackerSameCredentialsNotOverlap(t *testing.T) {
++	tr := keyTracker{limit: 2}
++	_, _, end := tr.begin("a", "creds1")
++	_, overlap, end2 := tr.begin("a", "creds1")
++	if overlap {
++		t.Fatal("same credentials counted as credential overlap")
++	}
++	end()
++	end2()
++	if tr.activeEntries != 0 {
++		t.Fatal("active flight leaked")
++	}
++}
++
++func TestKeyTrackerBoundsCredentialsForOneImage(t *testing.T) {
++	tr := keyTracker{limit: 2}
++	var ends []func()
++	for _, flight := range []string{"creds1", "creds2", "creds3", "creds4"} {
++		_, _, end := tr.begin("a", flight)
++		ends = append(ends, end)
++	}
++	if tr.activeEntries != 2 || len(tr.active["a"]) != 2 {
++		t.Fatal("credential hashes exceeded active bound")
++	}
++	for _, end := range ends {
++		end()
++	}
++	if tr.activeEntries != 0 || len(tr.active) != 0 {
++		t.Fatal("bounded flights leaked")
++	}
++}
++
++func counterValue(t *testing.T, counter prometheus.Counter) float64 {
++	t.Helper()
++	m := &dto.Metric{}
++	require.NoError(t, counter.Write(m))
++	return m.GetCounter().GetValue()
++}
++
++// Done is evaluated by singleflight's select after the caller has joined the
++// flight. This barrier makes waiter tests deterministic without scheduling sleeps.
++type joiningContext struct {
++	context.Context
++	joined chan struct{}
++	once   sync.Once
++}
++
++func (c *joiningContext) Done() <-chan struct{} {
++	c.once.Do(func() { close(c.joined) })
++	return c.Context.Done()
++}
++func waitFor(t *testing.T, ch <-chan struct{}) {
++	t.Helper()
++	select {
++	case <-ch:
++	case <-time.After(10 * time.Second):
++		t.Fatal("timed out waiting for flight")
++	}
++}
++
++func TestSingleflightMetricsLeaderWaitersAndCancellation(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	before := counterValue(t, metrics.Ext4ImageDedupedWaiters)
++	started := make(chan struct{})
++	release := make(chan struct{})
++	leaderResult := make(chan error, 1)
++	var executions atomic.Int32
++	fn := func(ctx context.Context) (string, error) {
++		executions.Add(1)
++		close(started)
++		select {
++		case <-release:
++			return "image", nil
++		case <-ctx.Done():
++			return "", ctx.Err()
++		}
++	}
++	go func() { _, err := doConversionFlight(ctx, t.Name(), fn); leaderResult <- err }()
++	waitFor(t, started)
++	results := make(chan error, 3)
++	for range 3 {
++		waiter := &joiningContext{Context: ctx, joined: make(chan struct{})}
++		go func() { _, err := doConversionFlight(waiter, t.Name(), fn); results <- err }()
++		waitFor(t, waiter.joined)
++	}
++	canceled, cancelWaiter := context.WithCancel(ctx)
++	waiter := &joiningContext{Context: canceled, joined: make(chan struct{})}
++	canceledResult := make(chan error, 1)
++	go func() { _, err := doConversionFlight(waiter, t.Name(), fn); canceledResult <- err }()
++	waitFor(t, waiter.joined)
++	cancelWaiter()
++	require.ErrorIs(t, <-canceledResult, context.Canceled)
++	require.Equal(t, before, counterValue(t, metrics.Ext4ImageDedupedWaiters))
++	close(release)
++	require.NoError(t, <-leaderResult)
++	for range 3 {
++		require.NoError(t, <-results)
++	}
++	require.Equal(t, int32(1), executions.Load())
++	require.Equal(t, before+3, counterValue(t, metrics.Ext4ImageDedupedWaiters))
++	// An unshared leader must not count either.
++	_, err := doConversionFlight(ctx, t.Name()+"-solo", func(context.Context) (string, error) { return "image", nil })
++	require.NoError(t, err)
++	require.Equal(t, before+3, counterValue(t, metrics.Ext4ImageDedupedWaiters))
++}
++
++func TestSingleflightMetricsCanceledLeaderWithLiveWaiter(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	leaderCtx, cancelLeader := context.WithCancel(ctx)
++	before := counterValue(t, metrics.Ext4ImageDedupedWaiters)
++	started := make(chan struct{})
++	release := make(chan struct{})
++	fn := func(ctx context.Context) (string, error) {
++		close(started)
++		select {
++		case <-release:
++			return "image", ctx.Err()
++		case <-ctx.Done():
++			return "", ctx.Err()
++		}
++	}
++	leader := make(chan error, 1)
++	go func() { _, err := doConversionFlight(leaderCtx, t.Name(), fn); leader <- err }()
++	waitFor(t, started)
++	waiter := &joiningContext{Context: ctx, joined: make(chan struct{})}
++	result := make(chan error, 1)
++	go func() { _, err := doConversionFlight(waiter, t.Name(), fn); result <- err }()
++	waitFor(t, waiter.joined)
++	cancelLeader()
++	require.ErrorIs(t, <-leader, context.Canceled)
++	require.Equal(t, before, counterValue(t, metrics.Ext4ImageDedupedWaiters))
++	close(release)
++	require.NoError(t, <-result)
++	require.Equal(t, before+1, counterValue(t, metrics.Ext4ImageDedupedWaiters))
++}
++
++func TestSingleflightMetricsDistinctCredentials(t *testing.T) {
++	flags.Set(t, "executor.ext4_conversion_track_keys", true)
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	parts := []string{t.Name(), "image"}
++	started := make(chan struct{}, 2)
++	release := make(chan struct{})
++	results := make(chan error, 2)
++	overlap := metrics.Ext4ImageCredentialOverlap.WithLabelValues("bounded")
++	before := counterValue(t, overlap)
++	beforeDedup := counterValue(t, metrics.Ext4ImageDedupedWaiters)
++	for _, credential := range []string{"first", "second"} {
++		flight := hash.Strings(append(parts, credential)...)
++		go func() {
++			_, err := doConversionFlight(ctx, flight, func(ctx context.Context) (string, error) {
++				finish := observeConversion(parts, flight, true)
++				defer finish(false)
++				started <- struct{}{}
++				select {
++				case <-release:
++					return "image", nil
++				case <-ctx.Done():
++					return "", ctx.Err()
++				}
++			})
++			results <- err
++		}()
++	}
++	for range 2 {
++		waitFor(t, started)
++	}
++	require.Equal(t, before+1, counterValue(t, overlap))
++	close(release)
++	for range 2 {
++		require.NoError(t, <-results)
++	}
++	require.Equal(t, beforeDedup, counterValue(t, metrics.Ext4ImageDedupedWaiters))
++}
++
++type conversionFixture struct {
++	ctx       context.Context
++	resolver  *oci.Resolver
++	cache     interfaces.FileCache
++	root, ref string
++}
++
++func newConversionFixture(t *testing.T) *conversionFixture {
++	t.Helper()
++	flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
++	flags.Set(t, "executor.local_cache_store_ext4_images", true)
++	flags.Set(t, "executor.reproducible_ext4_images", false)
++	root := t.TempDir()
++	fc, err := filecache.NewFileCache(filepath.Join(root, "filecache"), 1_000_000_000, false)
++	require.NoError(t, err)
++	te := testenv.GetTestEnv(t)
++	te.SetFileCache(fc)
++	reg := testregistry.Run(t, testregistry.Opts{})
++	t.Cleanup(func() { require.NoError(t, reg.Shutdown()) })
++	ref, _ := reg.PushNamedImageWithFiles(t, "metrics-image:latest", map[string][]byte{"/data": []byte("conversion metrics")}, nil)
++	resolver, err := oci.NewResolver(te)
++	require.NoError(t, err)
++	return &conversionFixture{ctx: context.Background(), resolver: resolver, cache: fc, root: root, ref: ref}
++}
++func (f *conversionFixture) convert(output string) error {
++	return CreateDiskImage(f.ctx, f.resolver, f.cache, f.root, f.ref, oci.Credentials{}, false, filepath.Join(f.root, output))
++}
++
++func TestConversionPhaseAccountingEndToEnd(t *testing.T) {
++	flags.Set(t, "executor.ext4_conversion_sample_process_io", true)
++	flags.Set(t, "executor.ext4_conversion_sample_image_size", true)
++	fixture := newConversionFixture(t)
++	phases := []string{"extract", "size", "mke2fs", "filecache_add", "cleanup"}
++	counts := func() map[string]uint64 {
++		out := make(map[string]uint64)
++		for _, phase := range phases {
++			m := &dto.Metric{}
++			require.NoError(t, metrics.Ext4ImagePhaseDurationUsec.WithLabelValues(phase).(prometheus.Metric).Write(m))
++			out[phase] = m.GetHistogram().GetSampleCount()
++			for _, direction := range []string{"read", "write"} {
++				require.NoError(t, metrics.Ext4ImagePhaseIOBytes.WithLabelValues(phase, "process", direction).(prometheus.Metric).Write(m))
++				out[phase+direction] = m.GetHistogram().GetSampleCount()
++			}
++		}
++		for _, kind := range []string{"apparent", "allocated"} {
++			m := &dto.Metric{}
++			require.NoError(t, metrics.Ext4ImageSizeBytes.WithLabelValues(kind).(prometheus.Metric).Write(m))
++			out[kind] = m.GetHistogram().GetSampleCount()
++		}
++		return out
++	}
++	before := counts()
++	for n := range 2 {
++		require.NoError(t, fixture.convert(fmt.Sprintf("image-%d.ext4", n)))
++		after := counts()
++		for key, count := range before {
++			require.Equal(t, count+uint64(n+1), after[key], "accounting for %s", key)
++		}
++		// Explicit removal simulates eviction from the real filecache. Each new
++		// conversion executes both the unpack-dir and temp-image cleanup defers.
++		require.True(t, fixture.cache.DeleteFile(sharedFileCacheContext(fixture.ctx, fixture.cache), diskImageFileNode(fixture.ref)))
++	}
++	require.Empty(t, mustGlob(t, filepath.Join(fixture.root, "unpack-*")))
++	require.Empty(t, mustGlob(t, filepath.Join(fixture.root, "containerfs-*.ext4")))
++}
++func mustGlob(t *testing.T, pattern string) []string {
++	t.Helper()
++	matches, err := filepath.Glob(pattern)
++	require.NoError(t, err)
++	return matches
++}
++
++func TestReconversionAfterEvictionMetrics(t *testing.T) {
++	for _, enabled := range []bool{true, false} {
++		t.Run(fmt.Sprint(enabled), func(t *testing.T) {
++			flags.Set(t, "executor.ext4_conversion_track_keys", enabled)
++			fixture := newConversionFixture(t)
++			recent := metrics.Ext4ImageReConversions.WithLabelValues("true")
++			unseen := metrics.Ext4ImageReConversions.WithLabelValues("false")
++			beforeRecent, beforeUnseen := counterValue(t, recent), counterValue(t, unseen)
++			require.NoError(t, fixture.convert("first.ext4"))
++			require.True(t, fixture.cache.DeleteFile(sharedFileCacheContext(fixture.ctx, fixture.cache), diskImageFileNode(fixture.ref)))
++			require.NoError(t, fixture.convert("second.ext4"))
++			require.True(t, fixture.cache.DeleteFile(sharedFileCacheContext(fixture.ctx, fixture.cache), diskImageFileNode(fixture.ref)))
++			// An existing non-directory workspace makes extraction fail after the
++			// miss/attempt has been observed. Failed attempts must not seed history.
++			failedRoot := filepath.Join(fixture.root, "not-a-directory")
++			require.NoError(t, os.WriteFile(failedRoot, []byte("x"), 0600))
++			originalRoot := fixture.root
++			fixture.root = failedRoot
++			require.Error(t, fixture.convert("failed.ext4"))
++			require.Error(t, fixture.convert("failed-again.ext4"))
++			fixture.root = originalRoot
++			require.NoError(t, fixture.convert("third.ext4"))
++			if enabled {
++				require.Equal(t, beforeRecent+2, counterValue(t, recent))
++				require.Equal(t, beforeUnseen+3, counterValue(t, unseen))
++			} else {
++				require.Equal(t, beforeRecent, counterValue(t, recent))
++				require.Equal(t, beforeUnseen, counterValue(t, unseen))
++			}
++		})
++	}
++}
++
++func TestRootConversionPhaseAccountingWithDeviceNode(t *testing.T) {
++	if os.Geteuid() != 0 {
++		t.Skip("device-node conversion requires root")
++	}
++	fixture := newConversionFixture(t)
++	flags.Set(t, "executor.exclude_root_device_nodes", false)
++	var buf bytes.Buffer
++	tw := tar.NewWriter(&buf)
++	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "dev", Typeflag: tar.TypeDir, Mode: 0755}))
++	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "dev/null", Typeflag: tar.TypeChar, Mode: 0666, Devmajor: 1, Devminor: 3}))
++	require.NoError(t, tw.Close())
++	image, err := mutate.AppendLayers(empty.Image, testregistry.NewBytesLayer(t, buf.Bytes()))
++	require.NoError(t, err)
++	reg := testregistry.Run(t, testregistry.Opts{})
++	t.Cleanup(func() { require.NoError(t, reg.Shutdown()) })
++	fixture.ref = reg.Push(t, image, "device-image", nil)
++	before := &dto.Metric{}
++	cleanup := metrics.Ext4ImagePhaseDurationUsec.WithLabelValues("cleanup").(prometheus.Metric)
++	require.NoError(t, cleanup.Write(before))
++	require.NoError(t, fixture.convert("device.ext4"))
++	after := &dto.Metric{}
++	require.NoError(t, cleanup.Write(after))
++	require.Equal(t, before.GetHistogram().GetSampleCount()+1, after.GetHistogram().GetSampleCount())
++	out, err := exec.Command("/sbin/debugfs", "-R", "stat /dev/null", filepath.Join(fixture.root, "device.ext4")).CombinedOutput()
++	require.NoError(t, err)
++	require.Contains(t, string(out), "Type: character special")
++}
+diff --git a/enterprise/server/oci/ociconv/ociconv.go b/enterprise/server/oci/ociconv/ociconv.go
+index 4c82d45da..6c5d05518 100644
+--- a/enterprise/server/oci/ociconv/ociconv.go
++++ b/enterprise/server/oci/ociconv/ociconv.go
+@@ -203,7 +203,8 @@ func MigrateImagesToFileCache(ctx context.Context, fileCache interfaces.FileCach
+ // If outputPath is non-empty, the cached image is hardlinked there.
+ //
+ // IMPORTANT: Callers are responsible for authorizing access to the image.
+-func LinkCachedImage(ctx context.Context, fileCache interfaces.FileCache, cacheRoot, containerImage, outputPath string) error {
++func LinkCachedImage(ctx context.Context, fileCache interfaces.FileCache, cacheRoot, containerImage, outputPath string) (err error) {
++	defer func() { observeLookup("link", err == nil, nil) }()
+ 	if *localCacheStoreExt4Images {
+ 		sharedCtx := sharedFileCacheContext(ctx, fileCache)
+ 		node := diskImageFileNode(containerImage)
+@@ -232,7 +233,8 @@ func LinkCachedImage(ctx context.Context, fileCache interfaces.FileCache, cacheR
+ 
+ // IsImageCached checks whether an ext4 image is present in filecache (if
+ // enabled) or the legacy ext4 cache dir (if filecache is not enabled).
+-func IsImageCached(ctx context.Context, fileCache interfaces.FileCache, cacheRoot, containerImage string) (bool, error) {
++func IsImageCached(ctx context.Context, fileCache interfaces.FileCache, cacheRoot, containerImage string) (hit bool, err error) {
++	defer func() { observeLookup("contains", hit, err) }()
+ 	if *localCacheStoreExt4Images {
+ 		sharedCtx := sharedFileCacheContext(ctx, fileCache)
+ 		node := diskImageFileNode(containerImage)
+@@ -266,7 +268,8 @@ func CreateDiskImage(ctx context.Context, resolver *oci.Resolver, fileCache inte
+ 	} else {
+ 		conversionOpKeyParts = append([]string{"legacy"}, conversionOpKeyParts...)
+ 	}
+-	_, _, err := conversionGroup.Do(ctx, hash.Strings(conversionOpKeyParts...), func(ctx context.Context) (string, error) {
++	flightKey := hash.Strings(conversionOpKeyParts...)
++	_, err := doConversionFlight(ctx, flightKey, func(ctx context.Context) (string, error) {
+ 		ctx, cancel := context.WithTimeout(ctx, imageConversionTimeout)
+ 		defer cancel()
+ 
+@@ -282,10 +285,14 @@ func CreateDiskImage(ctx context.Context, resolver *oci.Resolver, fileCache inte
+ 
+ 		// NOTE: If more params are added to this func, be sure to update
+ 		// conversionOpKeyParts above (if applicable).
++		finish := observeConversion(conversionOpKeyParts[:len(conversionOpKeyParts)-2], flightKey, *localCacheStoreExt4Images)
++		success := false
++		defer func() { finish(success) }()
+ 		out, err := createExt4Image(ctx, resolver, fileCache, cacheRoot, containerImage, creds, useOCIFetcher)
+ 		if err != nil {
+ 			return "", status.WrapErrorf(err, "convert %q from OCI to EXT4 format", containerImage)
+ 		}
++		success = true
+ 		return out, nil
+ 	})
+ 	if err != nil {
+@@ -305,12 +312,16 @@ func CreateDiskImage(ctx context.Context, resolver *oci.Resolver, fileCache inte
+ func createExt4Image(ctx context.Context, resolver *oci.Resolver, fileCache interfaces.FileCache, cacheRoot, containerImage string, creds oci.Credentials, useOCIFetcher bool) (string, error) {
+ 	ctx, span := tracing.StartSpan(ctx)
+ 	defer span.End()
++	ctx, finishMetrics := ext4.StartConversionMetrics(ctx)
++	defer finishMetrics()
+ 	tmpImage, err := os.CreateTemp(cacheRoot, "containerfs-*.ext4")
+ 	if err != nil {
+ 		return "", err
+ 	}
+ 	tmpImagePath := tmpImage.Name()
+ 	defer func() {
++		observe := ext4.ObservePhase(ctx, "cleanup")
++		defer observe(nil)
+ 		if err := os.Remove(tmpImagePath); err != nil && !os.IsNotExist(err) {
+ 			log.CtxWarningf(ctx, "Delete temp disk image %q: %s", tmpImagePath, err)
+ 		}
+@@ -341,7 +352,10 @@ func createExt4Image(ctx context.Context, resolver *oci.Resolver, fileCache inte
+ 		log.CtxDebugf(ctx, "generated rootfs at %q", containerImagePath)
+ 		return containerImagePath, nil
+ 	}
+-	if err := AddDiskImageToFileCache(ctx, fileCache, containerImage, tmpImagePath); err != nil {
++	observeAdd := ext4.ObservePhase(ctx, "filecache_add")
++	err = AddDiskImageToFileCache(ctx, fileCache, containerImage, tmpImagePath)
++	observeAdd(nil)
++	if err != nil {
+ 		return "", fmt.Errorf("add disk image to filecache: %w", err)
+ 	}
+ 	return "", nil
+@@ -350,6 +364,8 @@ func createExt4Image(ctx context.Context, resolver *oci.Resolver, fileCache inte
+ // ConvertContainerToExt4FS writes a resolved OCI image's root filesystem to an
+ // ext4 image at outputPath. containerImage identifies the image in log messages.
+ func ConvertContainerToExt4FS(ctx context.Context, img ctr.Image, workspaceDir, containerImage, outputPath string) error {
++	ctx, finishMetrics := ext4.StartConversionMetrics(ctx)
++	defer finishMetrics()
+ 	log.CtxInfof(ctx, "Downloading image %s and converting to ext4 format", containerImage)
+ 	start := time.Now()
+ 
+@@ -360,7 +376,11 @@ func ConvertContainerToExt4FS(ctx context.Context, img ctr.Image, workspaceDir,
+ 	if err != nil {
+ 		return status.UnavailableErrorf("error creating temp unpack dir: %s", err)
+ 	}
+-	defer os.RemoveAll(tempUnpackDir)
++	defer func() {
++		observe := ext4.ObservePhase(ctx, "cleanup")
++		defer observe(nil)
++		os.RemoveAll(tempUnpackDir)
++	}()
+ 
+ 	tarArgs := []string{
+ 		"--extract",
+@@ -381,7 +401,10 @@ func ConvertContainerToExt4FS(ctx context.Context, img ctr.Image, workspaceDir,
+ 	cmd.Stdin = rc
+ 	cmd.Stderr = &stderr
+ 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+-	if err := cmd.Run(); err != nil {
++	observeExtract := ext4.ObservePhase(ctx, "extract")
++	err = cmd.Run()
++	observeExtract(cmd)
++	if err != nil {
+ 		return status.UnavailableErrorf("download and extract layer tarball: %s: %q", err, stderr.String())
+ 	}
+ 
+@@ -389,6 +412,7 @@ func ConvertContainerToExt4FS(ctx context.Context, img ctr.Image, workspaceDir,
+ 	if err := ext4.DirectoryToImageAutoSize(ctx, tempUnpackDir, outputPath); err != nil {
+ 		return err
+ 	}
++	ext4.ObserveImageSize(outputPath)
+ 	log.CtxInfof(ctx, "Converted %s to ext4 format in %s", containerImage, time.Since(start))
+ 	return nil
+ }
+diff --git a/enterprise/server/remote_execution/containers/firecracker/firecracker.go b/enterprise/server/remote_execution/containers/firecracker/firecracker.go
+index ce8005e03..3a7f9288c 100644
+--- a/enterprise/server/remote_execution/containers/firecracker/firecracker.go
++++ b/enterprise/server/remote_execution/containers/firecracker/firecracker.go
+@@ -3011,7 +3011,9 @@ func (c *FirecrackerContainer) PullImage(ctx context.Context, creds oci.Credenti
+ 	if err := os.MkdirAll(c.getChroot(), 0755); err != nil {
+ 		return status.UnavailableErrorf("create chroot dir: %s", err)
+ 	}
++	conversionStart := time.Now()
+ 	err = ociconv.CreateDiskImage(ctx, c.resolver, c.env.GetFileCache(), c.executorConfig.CacheRoot, c.containerImage, creds, c.useOCIFetcher, containerFSPath)
++	c.observeStageDuration("image_conversion", time.Since(conversionStart))
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/enterprise/server/util/ext4/BUILD b/enterprise/server/util/ext4/BUILD
+index caee572c8..d283003b8 100644
+--- a/enterprise/server/util/ext4/BUILD
++++ b/enterprise/server/util/ext4/BUILD
+@@ -4,7 +4,10 @@ package(default_visibility = ["//enterprise:__subpackages__"])
+ 
+ go_library(
+     name = "ext4",
+-    srcs = ["ext4.go"],
++    srcs = [
++        "ext4.go",
++        "metrics.go",
++    ],
+     importpath = "github.com/buildbuddy-io/buildbuddy/enterprise/server/util/ext4",
+     target_compatible_with = ["@platforms//os:linux"],
+     deps = select({
+@@ -44,3 +47,16 @@ go_test(
+         "//conditions:default": [],
+     }),
+ )
++
++go_test(
++    name = "metrics_test",
++    srcs = ["metrics_test.go"],
++    embed = [":ext4"],
++    target_compatible_with = ["@platforms//os:linux"],
++    deps = [
++        "//server/metrics",
++        "//server/util/testing/flags",
++        "@com_github_prometheus_client_golang//prometheus",
++        "@com_github_prometheus_client_model//io/prometheus/client:go",
++    ],
++)
+diff --git a/enterprise/server/util/ext4/ext4.go b/enterprise/server/util/ext4/ext4.go
+index 90108717c..4e624a2e4 100644
+--- a/enterprise/server/util/ext4/ext4.go
++++ b/enterprise/server/util/ext4/ext4.go
+@@ -58,6 +58,7 @@ var (
+ // EnsureDependencies verifies that all external binaries required for ext4
+ // image operations are present and executable.
+ func EnsureDependencies() error {
++	defer observeVersion()
+ 	requiredBinaries := []string{mke2fsPath, debugfsPath}
+ 
+ 	for _, binary := range requiredBinaries {
+@@ -108,6 +109,8 @@ func DirectoryToImage(ctx context.Context, inputDir, outputFile string, sizeByte
+ 	args = append(args, outputFile, fmt.Sprintf("%dK", sizeBytes/iecKilobyte))
+ 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+ 	cmd.Env = env
++	observe := ObservePhase(ctx, "mke2fs")
++	defer observe(cmd)
+ 	if out, err := cmd.CombinedOutput(); err != nil {
+ 		log.Errorf("Error running %q: %s %s", cmd.String(), err, out)
+ 		return status.InternalErrorf("%s: %s", err, out)
+@@ -216,7 +219,9 @@ func DiskSizeBytes(ctx context.Context, inputDir string) (int64, error) {
+ // DirectoryToImageAutoSize is like DirectoryToImage, but it will attempt to
+ // automatically pick a file size that is "big enough".
+ func DirectoryToImageAutoSize(ctx context.Context, inputDir, outputFile string) error {
++	observe := ObservePhase(ctx, "size")
+ 	dirSizeBytes, err := DiskSizeBytes(ctx, inputDir)
++	observe(nil)
+ 	if err != nil {
+ 		return status.WrapError(err, "estimate disk usage")
+ 	}
+diff --git a/enterprise/server/util/ext4/metrics.go b/enterprise/server/util/ext4/metrics.go
+new file mode 100644
+index 000000000..a3435bdb4
+--- /dev/null
++++ b/enterprise/server/util/ext4/metrics.go
+@@ -0,0 +1,174 @@
++//go:build linux && !android
++
++package ext4
++
++import (
++	"context"
++	"os"
++	"os/exec"
++	"strconv"
++	"strings"
++	"sync"
++	"syscall"
++	"time"
++
++	"github.com/buildbuddy-io/buildbuddy/server/metrics"
++	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
++)
++
++var sampleProcessIO = flag.Bool("executor.ext4_conversion_sample_process_io", false, "Sample /proc/self/io before and after ext4 conversion phases. Default off: adds local reads on the request path; deltas include unrelated concurrent executor IO.")
++var sampleImageSize = flag.Bool("executor.ext4_conversion_sample_image_size", false, "Record apparent and allocated ext4 image sizes. Default off: adds one local stat lookup per successful conversion on the request path.")
++var mke2fsVersion versionRecorder
++
++type versionRecorder struct{ once sync.Once }
++
++type conversionMetricsKey struct{}
++
++var conversionPhases = [...]string{"extract", "size", "mke2fs", "filecache_add", "cleanup"}
++
++type phaseAccounting struct {
++	duration       time.Duration
++	bytes          [2][2]int64 // source (child/process), direction (read/write)
++	valid          [2]bool
++	processInvalid bool
++}
++
++type conversionAccounting struct {
++	phases [len(conversionPhases)]phaseAccounting
++	once   sync.Once
++}
++
++// StartConversionMetrics owns one conversion's observations. Nested calls reuse
++// the accounting object and return a no-op finish. The owner must defer finish
++// before registering cleanup defers, so all cleanup scopes are included.
++// Unreached phases have zero duration; unavailable IO observations are omitted.
++func StartConversionMetrics(ctx context.Context) (context.Context, func()) {
++	if _, ok := ctx.Value(conversionMetricsKey{}).(*conversionAccounting); ok {
++		return ctx, func() {}
++	}
++	accounting := &conversionAccounting{}
++	return context.WithValue(ctx, conversionMetricsKey{}, accounting), func() {
++		accounting.once.Do(func() {
++			for i, phase := range conversionPhases {
++				p := &accounting.phases[i]
++				metrics.Ext4ImagePhaseDurationUsec.WithLabelValues(phase).Observe(float64(p.duration.Microseconds()))
++				for source, label := range []string{"child_rusage", "process"} {
++					if !p.valid[source] || (source == 1 && p.processInvalid) {
++						continue
++					}
++					for direction, labelDirection := range []string{"read", "write"} {
++						metrics.Ext4ImagePhaseIOBytes.WithLabelValues(phase, label, labelDirection).Observe(float64(p.bytes[source][direction]))
++					}
++				}
++			}
++		})
++	}
++}
++
++func processIO() (map[string]int64, bool) {
++	b, err := os.ReadFile("/proc/self/io")
++	if err != nil {
++		return nil, false
++	}
++	return parseProcessIO(string(b))
++}
++
++func parseProcessIO(contents string) (map[string]int64, bool) {
++	m := make(map[string]int64)
++	for line := range strings.SplitSeq(contents, "\n") {
++		f := strings.Fields(line)
++		if len(f) != 2 {
++			continue
++		}
++		v, err := strconv.ParseInt(f[1], 10, 64)
++		if err == nil {
++			m[strings.TrimSuffix(f[0], ":")] = v
++		}
++	}
++	_, r := m["read_bytes"]
++	_, w := m["write_bytes"]
++	return m, r && w
++}
++
++// ObservePhase records elapsed time and child physical IO even on failure.
++// Optional process deltas must not be added to child IO: /proc/self/io may
++// include reaped children, and other goroutines can do IO during the phase.
++func ObservePhase(ctx context.Context, phase string) func(*exec.Cmd) {
++	accounting, ok := ctx.Value(conversionMetricsKey{}).(*conversionAccounting)
++	if !ok {
++		return func(*exec.Cmd) {}
++	}
++	var p *phaseAccounting
++	for i, name := range conversionPhases {
++		if name == phase {
++			p = &accounting.phases[i]
++			break
++		}
++	}
++	if p == nil {
++		return func(*exec.Cmd) {}
++	}
++	start := time.Now()
++	var before map[string]int64
++	var validBefore bool
++	sample := *sampleProcessIO
++	if sample {
++		before, validBefore = processIO()
++	}
++	return func(cmd *exec.Cmd) {
++		p.duration += time.Since(start)
++		if cmd != nil && cmd.ProcessState != nil {
++			if r, _ := cmd.ProcessState.SysUsage().(*syscall.Rusage); r != nil {
++				p.valid[0] = true
++				p.bytes[0][0] += r.Inblock * 512
++				p.bytes[0][1] += r.Oublock * 512
++			}
++		}
++		if sample {
++			after, validAfter := processIO()
++			if !validBefore || !validAfter || after["read_bytes"] < before["read_bytes"] || after["write_bytes"] < before["write_bytes"] {
++				p.processInvalid = true
++			} else {
++				p.valid[1] = true
++				p.bytes[1][0] += after["read_bytes"] - before["read_bytes"]
++				p.bytes[1][1] += after["write_bytes"] - before["write_bytes"]
++			}
++		}
++	}
++}
++
++func observeVersion() {
++	mke2fsVersion.record(func(ctx context.Context) ([]byte, error) {
++		return exec.CommandContext(ctx, mke2fsPath, "-V").CombinedOutput()
++	})
++}
++
++func (r *versionRecorder) record(run func(context.Context) ([]byte, error)) {
++	r.once.Do(func() {
++		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++		defer cancel()
++		out, err := run(ctx)
++		if err != nil {
++			return
++		}
++		fields := strings.Fields(string(out))
++		if len(fields) >= 2 && fields[0] == "mke2fs" {
++			metrics.Ext4Mke2fsVersion.WithLabelValues(fields[1]).Set(1)
++		}
++	})
++}
++
++// ObserveImageSize records apparent and allocated bytes without affecting errors.
++func ObserveImageSize(path string) {
++	if !*sampleImageSize {
++		return
++	}
++	info, err := os.Stat(path)
++	if err != nil {
++		return
++	}
++	metrics.Ext4ImageSizeBytes.WithLabelValues("apparent").Observe(float64(info.Size()))
++	if st, ok := info.Sys().(*syscall.Stat_t); ok {
++		metrics.Ext4ImageSizeBytes.WithLabelValues("allocated").Observe(float64(st.Blocks) * 512)
++	}
++}
+diff --git a/enterprise/server/util/ext4/metrics_test.go b/enterprise/server/util/ext4/metrics_test.go
+new file mode 100644
+index 000000000..73e7fb5b9
+--- /dev/null
++++ b/enterprise/server/util/ext4/metrics_test.go
+@@ -0,0 +1,217 @@
++//go:build linux && !android
++
++package ext4
++
++import (
++	"context"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"syscall"
++	"testing"
++
++	"github.com/buildbuddy-io/buildbuddy/server/metrics"
++	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
++	"github.com/prometheus/client_golang/prometheus"
++	dto "github.com/prometheus/client_model/go"
++)
++
++func TestParseProcessIO(t *testing.T) {
++	for _, tc := range []struct {
++		input string
++		valid bool
++	}{
++		{"read_bytes: 512\nwrite_bytes: 1024\nrchar: 999\n", true},
++		{"read_bytes: 0\nwrite_bytes: 0\n", true},
++		{"read_bytes: invalid\nwrite_bytes: 12\n", false},
++		{"rchar: 512\nwchar: 1024\n", false},
++		{"", false},
++	} {
++		_, valid := parseProcessIO(tc.input)
++		if valid != tc.valid {
++			t.Errorf("parseProcessIO(%q): valid=%v", tc.input, valid)
++		}
++	}
++	values, _ := parseProcessIO("read_bytes: 512\nwrite_bytes: 1024\n")
++	if values["read_bytes"] != 512 || values["write_bytes"] != 1024 {
++		t.Fatal("incorrect byte counters")
++	}
++}
++
++func histogramCount(t *testing.T, metric prometheus.Observer) uint64 {
++	t.Helper()
++	m := &dto.Metric{}
++	if err := metric.(prometheus.Metric).Write(m); err != nil {
++		t.Fatal(err)
++	}
++	return m.GetHistogram().GetSampleCount()
++}
++
++func TestObservePhaseScopedAndFailedChild(t *testing.T) {
++	flags.Set(t, "executor.ext4_conversion_sample_process_io", false)
++	phase := "extract"
++	duration := metrics.Ext4ImagePhaseDurationUsec.WithLabelValues(phase)
++	before := histogramCount(t, duration)
++	ObservePhase(context.Background(), phase)(nil)
++	if histogramCount(t, duration) != before {
++		t.Fatal("unscoped operation recorded as conversion")
++	}
++	ctx, finish := StartConversionMetrics(context.Background())
++	cmd := exec.Command("/bin/sh", "-c", "exit 1")
++	observe := ObservePhase(ctx, phase)
++	if err := cmd.Run(); err == nil {
++		t.Fatal("expected child failure")
++	}
++	io := metrics.Ext4ImagePhaseIOBytes.WithLabelValues(phase, "child_rusage", "read")
++	beforeIO := histogramCount(t, io)
++	observe(cmd)
++	finish()
++	if histogramCount(t, duration) != before+1 || histogramCount(t, io) != beforeIO+1 {
++		t.Fatal("failed child phase was not recorded")
++	}
++}
++
++func histogramSnapshot(t *testing.T, metric prometheus.Observer) *dto.Histogram {
++	t.Helper()
++	m := &dto.Metric{}
++	if err := metric.(prometheus.Metric).Write(m); err != nil {
++		t.Fatal(err)
++	}
++	return m.GetHistogram()
++}
++
++func TestConversionAccountingAggregatesScopesAndFlushesOnce(t *testing.T) {
++	flags.Set(t, "executor.ext4_conversion_sample_process_io", true)
++	before := make(map[string]uint64)
++	beforeIO := make(map[string]uint64)
++	for _, phase := range conversionPhases {
++		before[phase] = histogramCount(t, metrics.Ext4ImagePhaseDurationUsec.WithLabelValues(phase))
++		beforeIO[phase] = histogramCount(t, metrics.Ext4ImagePhaseIOBytes.WithLabelValues(phase, "process", "write"))
++	}
++	ctx, finish := StartConversionMetrics(context.Background())
++	nested, nestedFinish := StartConversionMetrics(ctx)
++	for _, phase := range conversionPhases {
++		ObservePhase(nested, phase)(nil)
++	}
++	// The two independent cleanup sites share the same accounting record.
++	ObservePhase(ctx, "cleanup")(nil)
++	nestedFinish()
++	if histogramCount(t, metrics.Ext4ImagePhaseDurationUsec.WithLabelValues("cleanup")) != before["cleanup"] {
++		t.Fatal("nested scope flushed prematurely")
++	}
++	finish()
++	finish()
++	for _, phase := range conversionPhases {
++		if histogramCount(t, metrics.Ext4ImagePhaseDurationUsec.WithLabelValues(phase)) != before[phase]+1 {
++			t.Fatalf("phase %s was not recorded exactly once", phase)
++		}
++		if histogramCount(t, metrics.Ext4ImagePhaseIOBytes.WithLabelValues(phase, "process", "write")) != beforeIO[phase]+1 {
++			t.Fatalf("process IO for %s was not recorded exactly once", phase)
++		}
++	}
++}
++
++func TestEnabledProcessIOAndImageSizes(t *testing.T) {
++	flags.Set(t, "executor.ext4_conversion_sample_process_io", true)
++	flags.Set(t, "executor.ext4_conversion_sample_image_size", true)
++	ctx, finish := StartConversionMetrics(context.Background())
++	read := metrics.Ext4ImagePhaseIOBytes.WithLabelValues("extract", "process", "read")
++	write := metrics.Ext4ImagePhaseIOBytes.WithLabelValues("extract", "process", "write")
++	readBefore := histogramSnapshot(t, read)
++	writeBefore := histogramSnapshot(t, write)
++	observe := ObservePhase(ctx, "extract")
++	path := filepath.Join(t.TempDir(), "sparse-image")
++	f, err := os.Create(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := f.Truncate(1 << 20); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := f.WriteAt([]byte("ext4"), 0); err != nil {
++		t.Fatal(err)
++	}
++	if err := f.Sync(); err != nil {
++		t.Fatal(err)
++	}
++	if err := f.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.ReadFile(path); err != nil {
++		t.Fatal(err)
++	}
++	observe(nil)
++	finish()
++	for _, pair := range []struct {
++		metric prometheus.Observer
++		before *dto.Histogram
++	}{{read, readBefore}, {write, writeBefore}} {
++		after := histogramSnapshot(t, pair.metric)
++		if after.GetSampleCount() != pair.before.GetSampleCount()+1 || after.GetSampleSum() < pair.before.GetSampleSum() {
++			t.Fatal("enabled IO sampling did not report a nonnegative delta")
++		}
++	}
++	info, err := os.Stat(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	expectedSizes := map[string]int64{"apparent": info.Size(), "allocated": info.Sys().(*syscall.Stat_t).Blocks * 512}
++	beforeSizes := make(map[string]*dto.Histogram)
++	for kind := range expectedSizes {
++		beforeSizes[kind] = histogramSnapshot(t, metrics.Ext4ImageSizeBytes.WithLabelValues(kind))
++	}
++	ObserveImageSize(path)
++	for kind, expected := range expectedSizes {
++		after := histogramSnapshot(t, metrics.Ext4ImageSizeBytes.WithLabelValues(kind))
++		before := beforeSizes[kind]
++		if after.GetSampleSum()-before.GetSampleSum() != float64(expected) || after.GetSampleCount() != before.GetSampleCount()+1 {
++			t.Fatalf("incorrect %s image size", kind)
++		}
++	}
++	flags.Set(t, "executor.ext4_conversion_sample_image_size", false)
++	h := metrics.Ext4ImageSizeBytes.WithLabelValues("apparent")
++	before := histogramCount(t, h)
++	ObserveImageSize(path)
++	if histogramCount(t, h) != before {
++		t.Fatal("disabled size sampling emitted an observation")
++	}
++}
++
++func TestVersionGaugeReportedOnce(t *testing.T) {
++	var recorder versionRecorder
++	calls := 0
++	run := func(context.Context) ([]byte, error) {
++		calls++
++		return []byte("mke2fs test-once (date)\nUsing EXT2FS Library version test-once\n"), nil
++	}
++	recorder.record(run)
++	gauge := metrics.Ext4Mke2fsVersion.WithLabelValues("test-once")
++	m := &dto.Metric{}
++	if err := gauge.Write(m); err != nil {
++		t.Fatal(err)
++	}
++	if m.GetGauge().GetValue() != 1 {
++		t.Fatal("version gauge missing")
++	}
++	gauge.Set(0)
++	recorder.record(run)
++	if err := gauge.Write(m); err != nil {
++		t.Fatal(err)
++	}
++	if calls != 1 || m.GetGauge().GetValue() != 0 {
++		t.Fatal("version command or gauge was recorded more than once")
++	}
++	observeVersion()
++	out, err := exec.Command(mke2fsPath, "-V").CombinedOutput()
++	if err != nil {
++		t.Fatal(err)
++	}
++	version := strings.Fields(string(out))[1]
++	if err := metrics.Ext4Mke2fsVersion.WithLabelValues(version).Write(m); err != nil {
++		t.Fatal(err)
++	}
++	if m.GetGauge().GetValue() != 1 {
++		t.Fatal("installed e2fsprogs version not reported")
++	}
++}
+diff --git a/result.md b/result.md
+new file mode 100644
+index 000000000..dd20d253e
+--- /dev/null
++++ b/result.md
+@@ -0,0 +1,38 @@
++Measure OCI-to-ext4 conversion IO before selecting optimizations. Adds observe-only counters and histograms with fixed labels, preserves conversion/cache/singleflight behavior, and keeps ociconv changes localized to instrumentation calls. Existing filecache metrics are aggregate across all artifacts: FastLinkFile records hit/miss, but ContainsFile does not. Existing workspace write operations include directory-to-image mke2fs calls but lack reads, phase distributions, and OCI isolation. Existing image-fetch latency includes the outer per-image pull mutex wait and registry/authentication work, so it answers total task image-fetch wait but cannot count actual ext4 conversions.
++
++Optional measurement flags (all default off):
++
++- `executor.ext4_conversion_track_keys`: 4096-key LRU of successful conversions plus at most 4096 active flight hashes. Tracks cache-miss reconversion attempts and overlapping flights without retaining credentials. A recently successful key missing from filecache is evidence of eviction/removal, not proof of eviction. Restart, history eviction, and active overflow undercount; simultaneous first conversions are not classified as reconversions.
++- `executor.ext4_conversion_sample_process_io`: adds two `/proc/self/io` reads per measured scope (cleanup has two scopes). These physical IO deltas include concurrent executor work and potentially reaped children; do not sum process and child sources. Child rusage is physical IO in 512-byte units, not logical bytes copied; cached reads may be zero. Process-only phases have no IO samples while this flag is disabled. Missing observations are omitted rather than reported as zero.
++- `executor.ext4_conversion_sample_image_size`: adds one stat per successful generated image for apparent and allocated sizes.
++
++Lookup counters count operations, not unique pulls; contains includes singleflight cache rechecks. Conversion counts are attempts after that recheck. Deduped waiter counts exclude canceled callers and the executing caller (the shared return value alone also counts the leader). Credential overlap counts each starting conversion which overlaps another flight for the same storage/image key. Each conversion emits exactly one duration sample for each of the five phases. Cleanup sums unpack-directory and temporary-image removal; repeated scopes are aggregated before flushing. Failed operations are included, and unreached phases emit zero duration. Available IO is likewise aggregated into one sample per phase/source/direction; unavailable IO is omitted. The conversion wait stage includes cache recheck, conversion, singleflight wait, and final link; existing pull timing includes authentication and other pull work. Scrape target `instance` identifies the executor, without adding an executor label.
++
++| Metric | Question answered | Type and labels | New/existing | Example PromQL |
++| --- | --- | --- | --- | --- |
++| `buildbuddy_remote_execution_ext4_image_conversions` | How many conversion attempts per executor? | Counter, none | New | `sum by (instance) (increase(buildbuddy_remote_execution_ext4_image_conversions[1h]))` |
++| `buildbuddy_remote_execution_ext4_image_cache_lookups` | How often do contains/link lookups hit? | Counter, method=contains/link; status=hit/miss/error (link failures are misses) | New | `sum by (instance, method, status) (rate(buildbuddy_remote_execution_ext4_image_cache_lookups[5m]))` |
++| `buildbuddy_remote_execution_ext4_image_reconversions` | How often is a recently converted filecache key converted after a miss? | Counter, recent=true/false; opt-in | New | `sum by (instance) (increase(buildbuddy_remote_execution_ext4_image_reconversions{recent="true"}[1h]))` |
++| `buildbuddy_remote_execution_ext4_image_credential_overlap` | How often do different credentials cause concurrent conversions of the same image? | Counter, tracking=bounded; opt-in | New | `sum by (instance) (increase(buildbuddy_remote_execution_ext4_image_credential_overlap[1h]))` |
++| `buildbuddy_remote_execution_ext4_image_deduped_waiters` | How many completed callers did singleflight dedupe? | Counter, none | New | `sum by (instance) (increase(buildbuddy_remote_execution_ext4_image_deduped_waiters[1h]))` |
++| `buildbuddy_remote_execution_ext4_image_phase_duration_usec` | Which phases take time? | Histogram, phase=extract/size/mke2fs/filecache_add/cleanup | New | `histogram_quantile(0.95, sum by (phase, le) (rate(buildbuddy_remote_execution_ext4_image_phase_duration_usec_bucket[1h])))` |
++| `buildbuddy_remote_execution_ext4_image_phase_io_bytes` | What physical read/write IO occurs per phase? | Histogram, phase; source=child_rusage/process; direction=read/write | New | `sum by (phase, source, direction) (rate(buildbuddy_remote_execution_ext4_image_phase_io_bytes_sum[1h])) / sum by (phase, source, direction) (rate(buildbuddy_remote_execution_ext4_image_phase_io_bytes_count[1h]))` |
++| `buildbuddy_remote_execution_ext4_image_size_bytes` | How large/sparse are generated images? | Histogram, kind=apparent/allocated; opt-in | New | `histogram_quantile(0.95, sum by (kind, le) (rate(buildbuddy_remote_execution_ext4_image_size_bytes_bucket[1h])))` |
++| `buildbuddy_remote_execution_ext4_mke2fs_version` | Which e2fsprogs version is installed? | Info gauge, version | New | `count by (version) (buildbuddy_remote_execution_ext4_mke2fs_version == 1)` |
++| `buildbuddy_firecracker_stage_duration_usec` | How long do tasks wait for image conversion within pull/init? | Histogram, stage; reuse pull_image, add image_conversion | Existing, new stage | `histogram_quantile(0.95, sum by (stage, le) (rate(buildbuddy_firecracker_stage_duration_usec_bucket{stage=~"pull_image\|image_conversion"}[1h])))` |
++| `buildbuddy_remote_execution_file_cache_requests` | What is overall executor filecache hit/miss pressure? | Counter, status | Existing | `sum by (instance, status) (rate(buildbuddy_remote_execution_file_cache_requests[5m]))` |
++| `buildbuddy_remote_execution_file_cache_op_latency_usec` | How slow are filecache operations across artifacts? | Histogram, op | Existing | `histogram_quantile(0.95, sum by (op, le) (rate(buildbuddy_remote_execution_file_cache_op_latency_usec_bucket[1h])))` |
++| `buildbuddy_remote_execution_file_cache_last_eviction_age_usec` | Are entries evicted soon after being added? | Gauge, none | Existing | `buildbuddy_remote_execution_file_cache_last_eviction_age_usec / 1e6` |
++| `buildbuddy_remote_execution_file_cache_added_file_size_bytes` | What sizes enter filecache overall? | Histogram, none | Existing | `histogram_quantile(0.95, sum by (le) (rate(buildbuddy_remote_execution_file_cache_added_file_size_bytes_bucket[1h])))` |
++| `buildbuddy_remote_execution_file_cache_added_file_bytes_count` | How many bytes of artifacts are admitted (not physical IO)? | Counter, group_id (pre-existing label only) | Existing | `sum by (instance) (rate(buildbuddy_remote_execution_file_cache_added_file_bytes_count[5m]))` |
++| `buildbuddy_firecracker_workspace_conversion_disk_write_ops` | What mke2fs/debugfs write operations are already recorded? | Counter, command | Existing | `sum by (command) (rate(buildbuddy_firecracker_workspace_conversion_disk_write_ops[5m]))` |
++| `buildbuddy_remote_execution_image_fetch_duration_usec` | How long do tasks wait for the whole image fetch, including the outer per-image lock? | Histogram, isolation, registry, status, on_disk, has_creds, trigger, use_oci_fetcher | Existing | `histogram_quantile(0.95, sum by (le) (rate(buildbuddy_remote_execution_image_fetch_duration_usec_bucket{isolation="firecracker"}[1h])))` |
++
++Validation covers bounded LRU history and active-flight tracking, end-to-end phase and IO sample counts across two real conversions, successful reconversion after filecache removal, failed conversions and disabled tracking, singleflight leaders/waiters/cancellation/distinct credentials, enabled process IO, sparse image apparent/allocated sizes, and once-only version reporting. The device-node conversion test skips cleanly without root and checks the resulting ext4 inode when run as root.
++
++Validation results:
++
++- Uncached non-root package run: ociconv (both test targets), ext4 metrics, and filecache passed; `//server/metrics:all` built with repository nogo checks. The root-only device-node case skipped. The existing ext4 `TestDirectoryToImageAutoSize_Reproducible` failed with its known image hash mismatch on e2fsprogs 1.47.0 (the reproducibility flag requires at least 1.47.2). This pre-existing failure is out of scope. [Invocation](https://app.buildbuddy.io/invocation/781a977d-ebf5-4a90-ab22-6066c1cff78b).
++- Uncached root run: all four targets (ociconv tests, ext4 metrics, and filecache) passed, including `TestRootConversionPhaseAccountingWithDeviceNode`, which executed and verified a character-device inode. Tests ran through a sudo wrapper with standalone execution; the wrapper restored output ownership so Bazel could collect results. [Invocation](https://app.buildbuddy.io/invocation/9819742e-792b-4bae-b4b5-c46bccb7be78).
++- The earlier Firecracker test attempt could not build its generated image prerequisites: `docker_enabled_x86_64_build` requires a root builder or `--config=remote`. Firecracker tests remain unverified. [Invocation](https://app.buildbuddy.io/invocation/d708cd9c-dc7d-4b26-a941-e29c7d6ed985).
++- All Bazel test runs used `--nocache_test_results`; compilation used the public CI cache with uploads disabled. `git diff --check` passed.
+diff --git a/server/metrics/metrics.go b/server/metrics/metrics.go
+index 7c414775d..6d9df8664 100644
+--- a/server/metrics/metrics.go
++++ b/server/metrics/metrics.go
+@@ -437,6 +437,27 @@ const (
+ 	// Label name for whether the OCI fetcher service was used for the image fetch.
+ 	ImageFetchUseOCIFetcherLabel = "use_oci_fetcher"
+ 
++	// Ext4 image cache operation: contains or link.
++	Ext4ImageCacheMethodLabel = "method"
++
++	// Whether a missed ext4 filecache key was recently successfully converted.
++	Ext4ImageRecentLabel = "recent"
++
++	// Ext4 conversion overlap tracking mode: bounded.
++	Ext4ImageTrackingLabel = "tracking"
++
++	// Ext4 conversion phase: extract, size, mke2fs, filecache_add, or cleanup.
++	Ext4ImagePhaseLabel = "phase"
++
++	// Physical IO accounting source: child_rusage or process.
++	Ext4ImageIOSourceLabel = "source"
++
++	// Physical IO direction: read or write.
++	Ext4ImageIODirectionLabel = "direction"
++
++	// Ext4 image size accounting: apparent or allocated.
++	Ext4ImageSizeKindLabel = "kind"
++
+ 	ManifestPrefixLabel = "prefix"
+ 
+ 	// Signing algorithm used (JWT alg), such as "HS256" or "ES256".
+@@ -2192,6 +2213,89 @@ var (
+ 		Help:      "Total disk usage of pooled command runners, in **bytes**.",
+ 	})
+ 
++	Ext4ImageConversions = promauto.NewCounter(prometheus.CounterOpts{
++		Namespace: bbNamespace,
++		Subsystem: "remote_execution",
++		Name:      "ext4_image_conversions",
++		Help:      "Number of OCI to ext4 conversion attempts.",
++	})
++
++	Ext4ImageCacheLookups = promauto.NewCounterVec(prometheus.CounterOpts{
++		Namespace: bbNamespace,
++		Subsystem: "remote_execution",
++		Name:      "ext4_image_cache_lookups",
++		Help:      "Number of ext4 image cache lookups; link misses include link failures.",
++	}, []string{
++		Ext4ImageCacheMethodLabel,
++		StatusLabel,
++	})
++
++	Ext4ImageReConversions = promauto.NewCounterVec(prometheus.CounterOpts{
++		Namespace: bbNamespace,
++		Subsystem: "remote_execution",
++		Name:      "ext4_image_reconversions",
++		Help:      "Number of filecache-miss conversion attempts by whether the key was recently successfully converted; bounded history can undercount repeat conversions.",
++	}, []string{
++		Ext4ImageRecentLabel,
++	})
++
++	Ext4ImageCredentialOverlap = promauto.NewCounterVec(prometheus.CounterOpts{
++		Namespace: bbNamespace,
++		Subsystem: "remote_execution",
++		Name:      "ext4_image_credential_overlap",
++		Help:      "Number of conversions starting while the same cache key is being converted under different credentials.",
++	}, []string{
++		Ext4ImageTrackingLabel,
++	})
++
++	Ext4ImageDedupedWaiters = promauto.NewCounter(prometheus.CounterOpts{
++		Namespace: bbNamespace,
++		Subsystem: "remote_execution",
++		Name:      "ext4_image_deduped_waiters",
++		Help:      "Number of completed callers deduplicated by image conversion singleflight.",
++	})
++
++	Ext4ImagePhaseDurationUsec = promauto.NewHistogramVec(prometheus.HistogramOpts{
++		Namespace: bbNamespace,
++		Subsystem: "remote_execution",
++		Name:      "ext4_image_phase_duration_usec",
++		Help:      "Total duration per ext4 image conversion phase, including failed phases, in **microseconds**; one sample per conversion, zero for unreached phases.",
++		Buckets:   durationUsecBuckets(1*time.Microsecond, 1*time.Hour, 2),
++	}, []string{
++		Ext4ImagePhaseLabel,
++	})
++
++	Ext4ImagePhaseIOBytes = promauto.NewHistogramVec(prometheus.HistogramOpts{
++		Namespace: bbNamespace,
++		Subsystem: "remote_execution",
++		Name:      "ext4_image_phase_io_bytes",
++		Help:      "Total available IO per ext4 conversion phase in **bytes**, aggregated once per conversion. Child rusage counts physical IO in 512-byte units; process deltas include unrelated concurrent work and are opt-in.",
++		Buckets:   prometheus.ExponentialBuckets(512, 4, 16),
++	}, []string{
++		Ext4ImagePhaseLabel,
++		Ext4ImageIOSourceLabel,
++		Ext4ImageIODirectionLabel,
++	})
++
++	Ext4ImageSizeBytes = promauto.NewHistogramVec(prometheus.HistogramOpts{
++		Namespace: bbNamespace,
++		Subsystem: "remote_execution",
++		Name:      "ext4_image_size_bytes",
++		Help:      "Final successfully generated ext4 image size, in **bytes**.",
++		Buckets:   prometheus.ExponentialBuckets(512, 4, 16),
++	}, []string{
++		Ext4ImageSizeKindLabel,
++	})
++
++	Ext4Mke2fsVersion = promauto.NewGaugeVec(prometheus.GaugeOpts{
++		Namespace: bbNamespace,
++		Subsystem: "remote_execution",
++		Name:      "ext4_mke2fs_version",
++		Help:      "Installed e2fsprogs version; value is 1, recorded once during dependency checks.",
++	}, []string{
++		VersionLabel,
++	})
++
+ 	FileCacheRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+ 		Namespace: bbNamespace,
+ 		Subsystem: "remote_execution",
+-- 
+2.43.0
+
+

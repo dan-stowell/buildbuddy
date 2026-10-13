@@ -1,0 +1,143 @@
+diff --git a/server/util/ioutil/BUILD b/server/util/ioutil/BUILD
+index e94b9af3e..fc37b9502 100644
+--- a/server/util/ioutil/BUILD
++++ b/server/util/ioutil/BUILD
+@@ -6,7 +6,6 @@ go_library(
+     importpath = "github.com/buildbuddy-io/buildbuddy/server/util/ioutil",
+     visibility = ["//visibility:public"],
+     deps = [
+-        "//server/interfaces",
+         "//server/util/bytebufferpool",
+         "//server/util/status",
+     ],
+diff --git a/server/util/ioutil/ioutil.go b/server/util/ioutil/ioutil.go
+index 6cd09350f..1b3f89c38 100644
+--- a/server/util/ioutil/ioutil.go
++++ b/server/util/ioutil/ioutil.go
+@@ -7,7 +7,6 @@ import (
+ 	"io"
+ 	"os"
+ 
+-	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/bytebufferpool"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+ )
+@@ -71,8 +70,20 @@ func LimitReadCloser(reader io.ReadCloser, limit int64) io.ReadCloser {
+ type CloseFunc func() error
+ type CommitFunc func(int64) error
+ 
++// Committer finalizes a write.
++type Committer interface {
++	Commit() error
++}
++
++// CommittedWriteCloser is a writer that can finalize a write and release resources.
++type CommittedWriteCloser interface {
++	io.Writer
++	io.Closer
++	Committer
++}
++
+ type CustomCommitWriteCloser interface {
+-	interfaces.CommittedWriteCloser
++	CommittedWriteCloser
+ 
+ 	SetCloseFn(CloseFunc)
+ 	SetCommitFn(CommitFunc)
+@@ -109,7 +120,7 @@ func (c *customCommitWriteCloser) Commit() error {
+ 		c.committed = true
+ 	}()
+ 
+-	if committer, ok := c.w.(interfaces.Committer); ok {
++	if committer, ok := c.w.(Committer); ok {
+ 		if err := committer.Commit(); err != nil {
+ 			return err
+ 		}
+@@ -153,9 +164,9 @@ type customCommitWriteSeekCloser struct {
+ 	io.Seeker
+ }
+ 
+-// NewCustomCommitWriteCloser wraps an io.Writer/interfaces.CommittedWriteCloser
++// NewCustomCommitWriteCloser wraps an io.Writer or CommittedWriteCloser
+ // and returns a customCommitWriteCloser, which implements
+-// interfaces.CommittedWriteCloser but allows adding on custom logic that will
++// CommittedWriteCloser but allows adding on custom logic that will
+ // be called when Commit or Close methods are called. If the wrapped writer
+ // implements io.Seeker, the returned value will also implement io.Seeker.
+ func NewCustomCommitWriteCloser(w io.Writer) CustomCommitWriteCloser {
+diff --git a/server/util/ioutil/ioutil_test.go b/server/util/ioutil/ioutil_test.go
+index 9e9324145..05dcabd88 100644
+--- a/server/util/ioutil/ioutil_test.go
++++ b/server/util/ioutil/ioutil_test.go
+@@ -3,6 +3,7 @@ package ioutil_test
+ import (
+ 	"bytes"
+ 	"errors"
++	"fmt"
+ 	"io"
+ 	"os"
+ 	"path/filepath"
+@@ -34,6 +35,63 @@ func TestCustomCommitWriteCloser_SecondCommitFails(t *testing.T) {
+ 	require.NoError(t, err)
+ }
+ 
++type committingWriter struct {
++	bytes.Buffer
++	commitFn func() error
++	closeFn  func() error
++}
++
++func (w *committingWriter) Commit() error { return w.commitFn() }
++func (w *committingWriter) Close() error  { return w.closeFn() }
++
++func TestCustomCommitWriteCloser_UnderlyingCommitter(t *testing.T) {
++	for _, failCommit := range []bool{false, true} {
++		t.Run(fmt.Sprintf("failCommit=%t", failCommit), func(t *testing.T) {
++			var calls []string
++			commitErr := errors.New("underlying commit failed")
++			w := &committingWriter{
++				commitFn: func() error {
++					calls = append(calls, "underlying commit")
++					if failCommit {
++						return commitErr
++					}
++					return nil
++				},
++				closeFn: func() error {
++					calls = append(calls, "underlying close")
++					return nil
++				},
++			}
++			var underlying ioutil.CommittedWriteCloser = w
++			cwc := ioutil.NewCustomCommitWriteCloser(underlying)
++			cwc.SetCommitFn(func(n int64) error {
++				require.Equal(t, int64(3), n)
++				calls = append(calls, "custom commit")
++				return nil
++			})
++			cwc.SetCloseFn(func() error {
++				calls = append(calls, "custom close")
++				return nil
++			})
++			_, err := cwc.Write([]byte("abc"))
++			require.NoError(t, err)
++			if failCommit {
++				require.ErrorIs(t, cwc.Commit(), commitErr)
++			} else {
++				require.NoError(t, cwc.Commit())
++			}
++			require.Error(t, cwc.Commit())
++			require.NoError(t, cwc.Close())
++			want := []string{"underlying commit"}
++			if !failCommit {
++				want = append(want, "custom commit")
++			}
++			want = append(want, "underlying close", "custom close")
++			require.Equal(t, want, calls)
++		})
++	}
++}
++
+ func TestReadAllLimited(t *testing.T) {
+ 	for _, testCase := range []struct {
+ 		name      string

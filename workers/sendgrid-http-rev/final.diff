@@ -1,0 +1,308 @@
+diff --git a/enterprise/server/backends/email/BUILD b/enterprise/server/backends/email/BUILD
+index b760bebfd..0c01d9a26 100644
+--- a/enterprise/server/backends/email/BUILD
++++ b/enterprise/server/backends/email/BUILD
+@@ -10,9 +10,6 @@ go_library(
+         "//server/http/httpclient",
+         "//server/util/flag",
+         "//server/util/status",
+-        "@com_github_sendgrid_rest//:rest",
+-        "@com_github_sendgrid_sendgrid_go//:sendgrid-go",
+-        "@com_github_sendgrid_sendgrid_go//helpers/mail",
+     ],
+ )
+ 
+diff --git a/enterprise/server/backends/email/email.go b/enterprise/server/backends/email/email.go
+index 9b9054ae0..ec00d9244 100644
+--- a/enterprise/server/backends/email/email.go
++++ b/enterprise/server/backends/email/email.go
+@@ -1,16 +1,15 @@
+ package email
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
++	"io"
+ 	"net/http"
+ 
+ 	"github.com/buildbuddy-io/buildbuddy/server/http/httpclient"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+-
+-	sendgridrest "github.com/sendgrid/rest"
+-	sendgrid "github.com/sendgrid/sendgrid-go"
+-	sendgridmail "github.com/sendgrid/sendgrid-go/helpers/mail"
+ )
+ 
+ var (
+@@ -50,7 +49,7 @@ type Message struct {
+ 
+ // Client sends email notifications.
+ type Client struct {
+-	client       *sendgridrest.Client
++	client       *http.Client
+ 	sendgridHost string
+ }
+ 
+@@ -71,7 +70,7 @@ func NewClient(config ClientConfig) *Client {
+ 		httpClient = httpclient.New(nil, "sendgrid")
+ 	}
+ 	return &Client{
+-		client:       &sendgridrest.Client{HTTPClient: httpClient},
++		client:       httpClient,
+ 		sendgridHost: config.SendGridHost,
+ 	}
+ }
+@@ -86,31 +85,61 @@ func (c *Client) Send(ctx context.Context, msg *Message) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	return sendWithClient(ctx, c.client, newRequest(email, c.sendgridHost))
+-}
+-
+-func newRequest(email *sendgridmail.SGMailV3, host string) sendgridrest.Request {
+-	request := sendgrid.GetRequest(*sendgridAPIKey, "/v3/mail/send", host)
+-	request.Method = sendgridrest.Post
+-	request.Body = sendgridmail.GetRequestBody(email)
+-	return request
+-}
+-
+-func sendWithClient(ctx context.Context, client *sendgridrest.Client, request sendgridrest.Request) error {
+-	resp, err := client.SendWithContext(ctx, request)
++	body, err := json.Marshal(email)
++	if err != nil {
++		return status.UnavailableErrorf("send email through SendGrid: %s", err)
++	}
++	host := c.sendgridHost
++	if host == "" {
++		host = "https://api.sendgrid.com"
++	}
++	request, err := http.NewRequestWithContext(ctx, http.MethodPost, host+"/v3/mail/send", bytes.NewReader(body))
++	if err != nil {
++		return status.UnavailableErrorf("send email through SendGrid: %s", err)
++	}
++	request.Header.Set("Authorization", "Bearer "+*sendgridAPIKey)
++	request.Header.Set("Content-Type", "application/json")
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("User-Agent", "sendgrid/3.16.1;go")
++	resp, err := c.client.Do(request)
+ 	if err != nil {
+ 		return status.UnavailableErrorf("send email through SendGrid: %s", err)
+ 	}
+-	if resp == nil {
+-		return status.UnavailableError("send email through SendGrid: empty response")
++	defer resp.Body.Close()
++	responseBody, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return status.UnavailableErrorf("send email through SendGrid: %s", err)
+ 	}
+ 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+-		return status.UnavailableErrorf("SendGrid returned HTTP %d: %s", resp.StatusCode, resp.Body)
++		return status.UnavailableErrorf("SendGrid returned HTTP %d: %s", resp.StatusCode, responseBody)
+ 	}
+ 	return nil
+ }
+ 
+-func buildEmail(msg *Message) (*sendgridmail.SGMailV3, error) {
++// These types describe the subset of the SendGrid mail API used here.
++// Names are omitted when empty, matching the previous SDK encoding.
++type mailAddress struct {
++	Name  string `json:"name,omitempty"`
++	Email string `json:"email,omitempty"`
++}
++
++type personalization struct {
++	To []mailAddress `json:"to"`
++}
++
++type content struct {
++	Type  string `json:"type"`
++	Value string `json:"value"`
++}
++
++type mailRequest struct {
++	From             mailAddress       `json:"from"`
++	Subject          string            `json:"subject"`
++	Personalizations []personalization `json:"personalizations"`
++	Content          []content         `json:"content"`
++}
++
++func buildEmail(msg *Message) (*mailRequest, error) {
+ 	if msg == nil {
+ 		return nil, status.InvalidArgumentError("message is required")
+ 	}
+@@ -137,15 +166,14 @@ func buildEmail(msg *Message) (*sendgridmail.SGMailV3, error) {
+ 		return nil, status.InvalidArgumentError("body is required")
+ 	}
+ 
+-	email := sendgridmail.NewV3Mail()
+-	email.SetFrom(toSendGridAddress(from))
+-	email.Subject = msg.Subject
+-	email.AddContent(sendgridmail.NewContent("text/html", msg.Body))
+-
++	email := &mailRequest{
++		From:    toMailAddress(from),
++		Subject: msg.Subject,
++		Content: []content{{Type: "text/html", Value: msg.Body}},
++	}
+ 	for _, recipient := range recipients {
+-		personalization := sendgridmail.NewPersonalization()
+-		personalization.AddTos(toSendGridAddress(recipient))
+-		email.AddPersonalizations(personalization)
++		// Separate personalizations keep recipients private from one another.
++		email.Personalizations = append(email.Personalizations, personalization{To: []mailAddress{toMailAddress(recipient)}})
+ 	}
+ 
+ 	return email, nil
+@@ -155,6 +183,6 @@ func defaultFrom() Address {
+ 	return *defaultFromAddress
+ }
+ 
+-func toSendGridAddress(address Address) *sendgridmail.Email {
+-	return sendgridmail.NewEmail(address.Name, address.Email)
++func toMailAddress(address Address) mailAddress {
++	return mailAddress(address)
+ }
+diff --git a/enterprise/server/backends/email/email_test.go b/enterprise/server/backends/email/email_test.go
+index 606b418fa..a6a498914 100644
+--- a/enterprise/server/backends/email/email_test.go
++++ b/enterprise/server/backends/email/email_test.go
+@@ -1,6 +1,7 @@
+ package email_test
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"encoding/json"
+ 	"io"
+@@ -112,6 +113,28 @@ func TestSend(t *testing.T) {
+ 			wantErr:      "SendGrid returned HTTP 500: nope",
+ 			wantRequests: []capturedRequest{validRequest},
+ 		},
++		{
++			name:         "accepts HTTP 200",
++			message:      validMessage,
++			statusCode:   http.StatusOK,
++			wantRequests: []capturedRequest{validRequest},
++		},
++		{
++			name:         "rejects HTTP 300",
++			message:      validMessage,
++			statusCode:   http.StatusMultipleChoices,
++			responseBody: "unexpected redirect",
++			wantErr:      "SendGrid returned HTTP 300: unexpected redirect",
++			wantRequests: []capturedRequest{validRequest},
++		},
++		{
++			name:         "returns authentication failure",
++			message:      validMessage,
++			statusCode:   http.StatusUnauthorized,
++			responseBody: "invalid key",
++			wantErr:      "SendGrid returned HTTP 401: invalid key",
++			wantRequests: []capturedRequest{validRequest},
++		},
+ 		{
+ 			name:       "requires message",
+ 			statusCode: http.StatusAccepted,
+@@ -199,6 +222,23 @@ func TestSend(t *testing.T) {
+ 	}
+ }
+ 
++func TestSendCanceledContext(t *testing.T) {
++	flags.Set(t, "notifications.email.sendgrid.api_key", "test-api-key")
++	server := runFakeSendgridServer(t, http.StatusAccepted, "")
++	client := email.NewClient(email.ClientConfig{HTTPClient: server.httpClient, SendGridHost: server.url})
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	err := client.Send(ctx, &email.Message{
++		From:        email.Address{Email: "sender@example.com"},
++		ToAddresses: []email.Address{{Email: "recipient@example.com"}},
++		Subject:     "Build complete",
++		Body:        "<p>Done</p>",
++	})
++	require.ErrorContains(t, err, "send email through SendGrid:")
++	require.ErrorContains(t, err, "context canceled")
++	require.Empty(t, server.capturedRequests)
++}
++
+ type capturedRequest struct {
+ 	request     string
+ 	auth        string
+@@ -257,7 +297,9 @@ func (s *fakeSendgridServer) ServeHTTP(w http.ResponseWriter, req *http.Request)
+ 	body, err := io.ReadAll(req.Body)
+ 	require.NoError(s.t, err)
+ 	var payload sendgridPayload
+-	require.NoError(s.t, json.Unmarshal(body, &payload))
++	decoder := json.NewDecoder(bytes.NewReader(body))
++	decoder.DisallowUnknownFields()
++	require.NoError(s.t, decoder.Decode(&payload))
+ 	s.capturedRequests = append(s.capturedRequests, capturedRequest{
+ 		request:     req.Method + " " + req.URL.Path,
+ 		auth:        req.Header.Get("Authorization"),
+diff --git a/enterprise/server/backends/email/result.md b/enterprise/server/backends/email/result.md
+new file mode 100644
+index 000000000..552447be3
+--- /dev/null
++++ b/enterprise/server/backends/email/result.md
+@@ -0,0 +1,60 @@
++# Replace SendGrid SDKs with direct HTTP
++
++Verified the premise before editing: repository searches found SendGrid imports only in `email.go` and first-party Bazel dependency labels only in this directory's BUILD. Checked the pinned SDK implementations (`sendgrid-go` v3.16.1 and `rest` v2.6.9) for JSON encoding, default host, headers, context propagation, and response-body handling.
++
++The client now marshals a small private SendGrid request type and posts using the existing injected `http.Client` (defaulting to `httpclient.New`). Preserved validation, sender fallback, one personalization per recipient, omitted empty display names, HTML content, default/override host, headers, context cancellation, successful 2xx statuses, and Unavailable errors including non-2xx response bodies. Response bodies are read and closed on success and failure. The SDK's unreachable nil-response guard is unnecessary because `http.Client.Do` guarantees a non-nil response/body when its error is nil.
++
++Updated BUILD by removing three SDK labels. Existing httptest cases verify authorization, content type, JSON fields, sender fallback/override, recipient privacy, validation and HTTP 500 errors. Added HTTP 200, 300 and 401 cases, canceled-context coverage, and rejection of unknown JSON fields in the fake.
++
++## Measurements
++
++Same script run against original files copied from HEAD into `/tmp/email-before` and the edited directory:
++
++```python
++from pathlib import Path
++import re
++for directory in ['/tmp/email-before', 'enterprise/server/backends/email']:
++    p = Path(directory)
++    b = (p / 'BUILD').read_text()
++    g = (p / 'email.go').read_text()
++    print(directory,
++          'targets', len(re.findall(r'^    name =', b, re.M)),
++          'deps', len(re.findall(r'^        "', b, re.M)),
++          'external labels', len(re.findall(r'^        "@', b, re.M)),
++          'SDK modules', len(set(re.findall(r'github.com/sendgrid/([^/"\s]+)', g))),
++          'LOC', [len((p / f).read_text().splitlines())
++                  for f in ['email.go', 'email_test.go', 'BUILD']])
++```
++
++| Metric (email package only) | Before | After |
++| --- | ---: | ---: |
++| Bazel targets | 2 | 2 |
++| Direct BUILD dependency labels | 9 | 6 |
++| External BUILD dependency labels | 4 | 1 |
++| Direct SendGrid modules used | 2 | 0 |
++| Source LOC | 160 | 188 |
++| Test LOC | 270 | 312 |
++| BUILD LOC | 28 | 25 |
++
++This removes two module usages, not declarations from go.mod. Local source grows by 28 lines to replace the SDK payload and transport helpers; binary size and transitive dependency savings were not measured.
++
++## Verification
++
++- `gofmt -w enterprise/server/backends/email/{email.go,email_test.go}` and `git diff --check`: clean.
++- `bazel query 'rdeps(//..., //enterprise/server/backends/email:all, 1)'`: failed (exit 7) after loading 3,421 packages because unrelated `+dockerfile_image+default_execution_image` hit its Docker build timeout. Did not stop the scoped code checks because of this repository setup failure.
++- `bazel query 'rdeps(set(//enterprise/server/backends/email:all //enterprise/server/backends/email/sendmail:all //enterprise/server/notification:all //enterprise/server/usagealert:all), //enterprise/server/backends/email:all, 1)'`: passed (exit 0). The universe was selected using `rg '"//enterprise/server/backends/email"' --glob BUILD`, which identifies every first-party direct user. Returned:
++  - `//enterprise/server/backends/email:email`
++  - `//enterprise/server/backends/email:email_test`
++  - `//enterprise/server/backends/email/sendmail:sendmail_lib`
++  - `//enterprise/server/notification:notification`
++  - `//enterprise/server/notification:notification_test`
++  - `//enterprise/server/usagealert:usagealert_lib`
++  - `//enterprise/server/usagealert:usagealert_test`
++- `bazel test //enterprise/server/backends/email:email_test --jobs=2`: initially failed build-time static analysis S1016 (use direct struct conversion); applied the suggested conversion and reran the same command: passed (exit 0), one test target passed.
++- `bazel test //enterprise/server/backends/email:email //enterprise/server/backends/email:email_test //enterprise/server/backends/email/sendmail:sendmail_lib //enterprise/server/notification:notification //enterprise/server/notification:notification_test //enterprise/server/usagealert:usagealert_lib //enterprise/server/usagealert:usagealert_test --jobs=2`: initially failed (exit 36), unable to create a sandbox because the 25 GB disk was full. `docker builder prune -f` removed unused build cache and restored about 3.4 GB of free disk space. Reran the identical command: passed (exit 0), all four library targets built and all three test targets passed (email cached; notification and usagealert executed). Final retry log: `/tmp/email-rdeps-test-retry.log`.
++
++Long Bazel tests and the scoped query ran under `nohup sh -c '... > /tmp/email-*.log 2>&1; echo $? > /tmp/email-*.exit'` with the launcher waiting in a tool session, and logs were polled. The full query ran in a persistent tool session.
++
++## External dependencies and scope
++
++After editing, `rg 'github.com/sendgrid/|@com_github_sendgrid_' --glob '*.go' --glob BUILD .` returns no matches (exit 1). Both `github.com/sendgrid/sendgrid-go` and `github.com/sendgrid/rest` therefore have no remaining first-party Go or BUILD users. The module declarations and repository registrations remain for the separate serialized dependency-removal PR. No shared dependency files were edited. All changes, including this report, are within `enterprise/server/backends/email/`. No push or PR.

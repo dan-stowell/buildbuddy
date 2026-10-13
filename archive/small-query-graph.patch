@@ -1,0 +1,786 @@
+From 2dcac77498a5ffd7ce7789867682fd200ae55437 Mon Sep 17 00:00:00 2001
+From: codex worker <codex-worker@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 00:45:46 +0000
+Subject: [PATCH] Replace invocation query graph with native SVG renderer
+
+---
+ app/invocation/BUILD                          |  33 ++-
+ .../invocation_query_graph_card.tsx           |  20 +-
+ .../invocation_query_graph_card_test.ts       | 191 ++++++++++++++++++
+ app/invocation/query_graph.tsx                | 164 +++++++++++++++
+ app/invocation/query_graph_layout.ts          | 128 ++++++++++++
+ app/invocation/query_graph_layout_test.ts     | 168 +++++++++++++++
+ 6 files changed, 683 insertions(+), 21 deletions(-)
+ create mode 100644 app/invocation/invocation_query_graph_card_test.ts
+ create mode 100644 app/invocation/query_graph.tsx
+ create mode 100644 app/invocation/query_graph_layout.ts
+ create mode 100644 app/invocation/query_graph_layout_test.ts
+
+diff --git a/app/invocation/BUILD b/app/invocation/BUILD
+index bbf25e794..ad7bca2d4 100644
+--- a/app/invocation/BUILD
++++ b/app/invocation/BUILD
+@@ -578,17 +578,44 @@ ts_library(
+ 
+ ts_library(
+     name = "invocation_query_graph_card",
+-    srcs = ["invocation_query_graph_card.tsx"],
++    srcs = [
++        "invocation_query_graph_card.tsx",
++        "query_graph.tsx",
++    ],
+     deps = [
+-        "//:node_modules/@types/dagre-d3",  # keep
++        ":query_graph_layout",
+         "//:node_modules/@types/react",
+-        "//:node_modules/dagre-d3-react",
+         "//:node_modules/lucide-react",
+         "//:node_modules/react",
+         "//:node_modules/tslib",
+     ],
+ )
+ 
++ts_library(
++    name = "query_graph_layout",
++    srcs = ["query_graph_layout.ts"],
++)
++
++ts_jasmine_node_test(
++    name = "query_graph_layout_test",
++    srcs = ["query_graph_layout_test.ts"],
++    deps = [
++        ":query_graph_layout",
++        "//:node_modules/tslib",
++    ],
++)
++
++ts_jasmine_node_test(
++    name = "invocation_query_graph_card_test",
++    srcs = ["invocation_query_graph_card_test.ts"],
++    deps = [
++        ":invocation_query_graph_card",
++        "//:node_modules/@types/react",
++        "//:node_modules/react",
++        "//:node_modules/tslib",
++    ],
++)
++
+ ts_library(
+     name = "invocation_raw_logs_card",
+     srcs = ["invocation_raw_logs_card.tsx"],
+diff --git a/app/invocation/invocation_query_graph_card.tsx b/app/invocation/invocation_query_graph_card.tsx
+index a74ac7dba..7b73692d9 100644
+--- a/app/invocation/invocation_query_graph_card.tsx
++++ b/app/invocation/invocation_query_graph_card.tsx
+@@ -1,6 +1,6 @@
+-import DagreGraph from "dagre-d3-react";
+ import { AlertCircle, List } from "lucide-react";
+ import React from "react";
++import QueryGraph from "./query_graph";
+ 
+ interface Props {
+   buildLogs: string;
+@@ -61,23 +61,7 @@ export default class QueryGraphCardComponent extends React.Component<Props, Stat
+       <>
+         {!fullGraphHidden && (
+           <div className="card invocation-query-graph-card">
+-            <DagreGraph
+-              className="invocation-query-graph"
+-              nodes={Array.from(nodes).map((node) => {
+-                return { id: node, label: node };
+-              })}
+-              links={edges}
+-              config={{
+-                rankdir: "LR",
+-                align: "UL",
+-                ranker: "tight-tree",
+-              }}
+-              width={`${width}px`}
+-              height={`60vh`}
+-              shape="rect"
+-              fitBoundaries
+-              zoomable
+-            />
++            <QueryGraph nodes={Array.from(nodes)} edges={edges} width={width} />
+           </div>
+         )}
+         {fullGraphHidden && (
+diff --git a/app/invocation/invocation_query_graph_card_test.ts b/app/invocation/invocation_query_graph_card_test.ts
+new file mode 100644
+index 000000000..8254ffbc0
+--- /dev/null
++++ b/app/invocation/invocation_query_graph_card_test.ts
+@@ -0,0 +1,191 @@
++import React from "react";
++import QueryGraphCard from "./invocation_query_graph_card";
++import QueryGraph, { zoomView } from "./query_graph";
++
++function elements(node: React.ReactNode): React.ReactElement<any>[] {
++  if (Array.isArray(node)) return node.flatMap(elements);
++  if (!React.isValidElement<{ children?: React.ReactNode }>(node)) return [];
++  return [node, ...elements(node.props.children)];
++}
++
++function text(node: React.ReactNode): string {
++  if (Array.isArray(node)) return node.map(text).join(" ");
++  if (React.isValidElement<{ children?: React.ReactNode }>(node)) return text(node.props.children);
++  return typeof node === "string" || typeof node === "number" ? String(node) : "";
++}
++
++describe("query graph card", () => {
++  beforeAll(() => {
++    globalThis.window = { innerWidth: 1024 } as Window & typeof globalThis;
++  });
++  afterAll(() => {
++    Reflect.deleteProperty(globalThis, "window");
++  });
++
++  it("only displays graphs for query graph output", () => {
++    const card = new QueryGraphCard({ buildLogs: "ordinary build output" });
++    expect(elements(card.render()).some((element) => element.type === QueryGraph)).toBeFalse();
++    expect(text(card.render())).toBe("");
++  });
++
++  it("passes target labels and dependency links to the renderer and preserves size summaries", () => {
++    const card = new QueryGraphCard({
++      buildLogs: 'digraph mygraph {\n"//app:a\\nlabel"\n"//app:b"\n"//app:a\\nlabel" -> "//app:b"\n}',
++    });
++    const rendered = card.render();
++    const graph = elements(rendered).find((element) => element.type === QueryGraph)!;
++    expect(graph.props.nodes).toEqual(["//app:a\\nlabel", "//app:b"]);
++    expect(graph.props.edges).toEqual([{ source: "//app:a\\nlabel", target: "//app:b" }]);
++    expect(text(rendered)).toContain("2 Targets 1 Dependency links");
++  });
++
++  it("guards graphs above 1000 edges and renders them after Show anyway", () => {
++    const edges = Array.from({ length: 1001 }, (_, i) => `"a" -> "node${i}"`).join("\n");
++    const card = new QueryGraphCard({ buildLogs: `digraph mygraph {\n"a"\n${edges}\n}` });
++    expect(elements(card.render()).some((element) => element.type === QueryGraph)).toBeFalse();
++    expect(text(card.render())).toContain("Show anyway");
++    expect(text(card.render())).toContain("1001 Dependency links");
++    // Exercise the actual click handler without mounting the SVG in the Node test runner.
++    spyOn(card, "setState").and.callFake((state: any) => {
++      card.state = { ...card.state, ...state };
++    });
++    card.onClickShowAnyway();
++    expect(elements(card.render()).some((element) => element.type === QueryGraph)).toBeTrue();
++    const atLimit = new QueryGraphCard({
++      buildLogs: `digraph mygraph {\n${edges.split("\n").slice(0, 1000).join("\n")}\n}`,
++    });
++    expect(elements(atLimit.render()).some((element) => element.type === QueryGraph)).toBeTrue();
++  });
++
++  it("preserves the graph insight sections and their counts", () => {
++    const edges = Array.from({ length: 10 }, (_, i) => `"root" -> "node${i}"`).join("\n");
++    const card = new QueryGraphCard({ buildLogs: `digraph mygraph {\n${edges}\n}` });
++    expect(text(card.render())).toContain("Targets most often used as a direct dependency");
++    expect(text(card.render())).toContain("Targets with the most direct dependencies 10 root");
++  });
++});
++
++describe("query graph zoom", () => {
++  it("keeps the cursor over the same graph coordinate when zooming in and out", () => {
++    const initial = { x: 30, y: -40, scale: 0.5 };
++    for (const factor of [2, 0.5, 1e10, 1e-10]) {
++      const next = zoomView(initial, 200, 300, factor);
++      expect((200 - next.x) / next.scale).toBeCloseTo((200 - initial.x) / initial.scale, 5);
++      expect((300 - next.y) / next.scale).toBeCloseTo((300 - initial.y) / initial.scale, 5);
++      expect(next.scale).toBeGreaterThan(0);
++      expect(Number.isFinite(next.scale)).toBeTrue();
++    }
++  });
++});
++
++describe("query graph viewport lifecycle", () => {
++  it("preserves zoom and pan across parent rerenders with fresh unchanged graph arrays", () => {
++    // Run the component's hooks/effects and SVG handlers in the Node harness.
++    // Only browser APIs and React's hook storage are replaced; layout, fitting,
++    // memo dependencies, wheel zoom, and pointer pan are the production code.
++    const slots: any[] = [];
++    let cursor = 0;
++    let pending: (() => void)[] = [];
++    const cleanups: (() => void)[] = [];
++    const same = (a: any[], b: any[]) => a && b && a.length === b.length && a.every((v, i) => Object.is(v, b[i]));
++    spyOn(React, "useState").and.callFake(((initial: any) => {
++      const index = cursor++;
++      if (!(index in slots)) slots[index] = typeof initial === "function" ? initial() : initial;
++      return [
++        slots[index],
++        (next: any) => {
++          slots[index] = next;
++        },
++      ];
++    }) as any);
++    spyOn(React, "useRef").and.callFake(((initial: any) => {
++      const index = cursor++;
++      return (slots[index] ||= { current: initial });
++    }) as any);
++    spyOn(React, "useMemo").and.callFake(((compute: () => any, deps: any[]) => {
++      const index = cursor++;
++      if (!slots[index] || !same(slots[index].deps, deps)) slots[index] = { deps, value: compute() };
++      return slots[index].value;
++    }) as any);
++    const effect = (callback: () => any, deps: any[]) => {
++      const index = cursor++;
++      if (slots[index] && same(slots[index].deps, deps)) return;
++      slots[index]?.cleanup?.();
++      const slot = (slots[index] = { deps, cleanup: undefined });
++      pending.push(() => {
++        slot.cleanup = callback();
++        if (slot.cleanup) cleanups.push(slot.cleanup);
++      });
++    };
++    spyOn(React, "useLayoutEffect").and.callFake(effect);
++    spyOn(React, "useEffect").and.callFake(effect);
++    let wheel!: (event: any) => void;
++    let resized!: () => void;
++    let bounds = { width: 800, height: 600, left: 0, top: 0 };
++    const svg = {
++      getBoundingClientRect: () => bounds,
++      addEventListener: (_: string, callback: any) => {
++        wheel = callback;
++      },
++      removeEventListener: () => {},
++      setPointerCapture: () => {},
++    };
++    const originals = new Map<string, PropertyDescriptor | undefined>();
++    const install = (name: string, value: any) => {
++      originals.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
++      Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
++    };
++    install("document", {
++      createElement: () => ({ getContext: () => ({ measureText: (s: string) => ({ width: s.length * 8 }) }) }),
++    });
++    install("getComputedStyle", () => ({ fontFamily: "sans-serif" }));
++    install(
++      "ResizeObserver",
++      class {
++        constructor(callback: () => void) {
++          resized = callback;
++        }
++        observe() {}
++        disconnect() {}
++      }
++    );
++    const render = (target = "b") => {
++      cursor = 0;
++      const output = QueryGraph({ nodes: ["a", target], edges: [{ source: "a", target }], width: 800 });
++      (output as any).ref.current = svg;
++      const effects = pending;
++      pending = [];
++      effects.forEach((run) => run());
++      return output;
++    };
++    const transform = (output: React.ReactElement<any>) =>
++      elements(output).find((element) => element.type === "g")!.props.transform;
++    try {
++      render();
++      render(); // Apply the initial font measurement and fit.
++      const initial = transform(render());
++      wheel({ preventDefault() {}, deltaY: -120, deltaMode: 0, clientX: 200, clientY: 150 });
++      let output = render();
++      output.props.onPointerDown({ button: 0, currentTarget: svg, pointerId: 1, clientX: 10, clientY: 20 });
++      output.props.onPointerMove({ pointerId: 1, clientX: 60, clientY: 90 });
++      output.props.onPointerUp({ pointerId: 1 });
++      const interacted = transform(render());
++      expect(interacted).not.toBe(initial);
++      expect(transform(render())).toBe(interacted);
++      resized(); // Initial observer notification with unchanged dimensions.
++      expect(transform(render())).toBe(interacted);
++      render("changed target");
++      const changed = transform(render("changed target"));
++      expect(changed).not.toBe(interacted);
++      bounds = { ...bounds, width: 1000 };
++      resized();
++      expect(transform(render("changed target"))).not.toBe(changed);
++    } finally {
++      cleanups.forEach((cleanup) => cleanup());
++      for (const [name, descriptor] of originals) {
++        if (descriptor) Object.defineProperty(globalThis, name, descriptor);
++        else Reflect.deleteProperty(globalThis, name);
++      }
++    }
++  });
++});
+diff --git a/app/invocation/query_graph.tsx b/app/invocation/query_graph.tsx
+new file mode 100644
+index 000000000..550c3fd8a
+--- /dev/null
++++ b/app/invocation/query_graph.tsx
+@@ -0,0 +1,164 @@
++import React from "react";
++import { GraphEdge, LABEL_LINE_HEIGHT, layoutGraph } from "./query_graph_layout";
++
++interface Props {
++  nodes: string[];
++  edges: GraphEdge[];
++  width: number;
++}
++
++interface View {
++  x: number;
++  y: number;
++  scale: number;
++}
++
++let nextGraphId = 0;
++
++/** SVG rendering and viewport interaction only; graph placement is independent of the DOM. */
++export default function QueryGraph({ nodes, edges, width }: Props) {
++  const svg = React.useRef<SVGSVGElement>(null);
++  const [markerId] = React.useState(() => `query-graph-arrow-${nextGraphId++}`);
++  const [font, setFont] = React.useState("14.4px sans-serif");
++  const [view, setView] = React.useState<View>({ x: 0, y: 0, scale: 1 });
++  const viewRef = React.useRef(view);
++  const pointers = React.useRef(new Map<number, { x: number; y: number }>());
++  const updateView = (next: View) => {
++    viewRef.current = next;
++    setView(next);
++  };
++  React.useLayoutEffect(() => {
++    setFont(`14.4px ${getComputedStyle(svg.current!).fontFamily}`);
++  }, []);
++  // Parent log/model updates recreate the arrays without changing the graph.
++  const contentKey = JSON.stringify([nodes, edges.map(({ source, target }) => [source, target])]);
++  const graph = React.useMemo(() => {
++    const context = document.createElement("canvas").getContext("2d")!;
++    context.font = font;
++    return layoutGraph(nodes, edges, (text) => context.measureText(text).width);
++  }, [contentKey, font]);
++
++  React.useLayoutEffect(() => {
++    const element = svg.current!;
++    let previousWidth = 0;
++    let previousHeight = 0;
++    const fit = () => {
++      const bounds = element.getBoundingClientRect();
++      if (!bounds.width || !bounds.height) return;
++      if (bounds.width === previousWidth && bounds.height === previousHeight) return;
++      previousWidth = bounds.width;
++      previousHeight = bounds.height;
++      const scale = 0.9 * Math.min(bounds.width / graph.width, bounds.height / graph.height);
++      updateView({ x: (bounds.width - graph.width * scale) / 2, y: (bounds.height - graph.height * scale) / 2, scale });
++    };
++    fit();
++    const observer = new ResizeObserver(fit);
++    observer.observe(element);
++    return () => observer.disconnect();
++  }, [graph]);
++
++  const zoom = (x: number, y: number, factor: number) => {
++    updateView(zoomView(viewRef.current, x, y, factor));
++  };
++  React.useEffect(() => {
++    const element = svg.current!;
++    const wheel = (event: WheelEvent) => {
++      event.preventDefault();
++      const bounds = element.getBoundingClientRect();
++      const delta = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? bounds.height : 1);
++      zoom(event.clientX - bounds.left, event.clientY - bounds.top, Math.exp(-delta * 0.002));
++    };
++    // React's delegated wheel listener is passive, so attach this listener directly.
++    element.addEventListener("wheel", wheel, { passive: false });
++    return () => element.removeEventListener("wheel", wheel);
++  }, []);
++
++  const pointerMove = (event: React.PointerEvent<SVGSVGElement>) => {
++    const previous = pointers.current.get(event.pointerId);
++    if (!previous) return;
++    const next = { x: event.clientX, y: event.clientY };
++    const other = [...pointers.current.entries()].find(([id]) => id !== event.pointerId)?.[1];
++    if (other) {
++      const oldDistance = Math.hypot(previous.x - other.x, previous.y - other.y);
++      const newDistance = Math.hypot(next.x - other.x, next.y - other.y);
++      const bounds = svg.current!.getBoundingClientRect();
++      if (oldDistance > 0) {
++        zoom(
++          (previous.x + other.x) / 2 - bounds.left,
++          (previous.y + other.y) / 2 - bounds.top,
++          newDistance / oldDistance
++        );
++      }
++    }
++    const current = viewRef.current;
++    const divisor = other ? 2 : 1;
++    updateView({
++      ...current,
++      x: current.x + (next.x - previous.x) / divisor,
++      y: current.y + (next.y - previous.y) / divisor,
++    });
++    pointers.current.set(event.pointerId, next);
++  };
++  const pointerEnd = (event: React.PointerEvent<SVGSVGElement>) => pointers.current.delete(event.pointerId);
++
++  return (
++    <svg
++      ref={svg}
++      className="invocation-query-graph"
++      width={`${width}px`}
++      height="60vh"
++      aria-label="Query dependency graph"
++      style={{ touchAction: "none", userSelect: "none" }}
++      onPointerDown={(event) => {
++        if (event.button !== 0) return;
++        event.currentTarget.setPointerCapture(event.pointerId);
++        pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
++      }}
++      onPointerMove={pointerMove}
++      onPointerUp={pointerEnd}
++      onPointerCancel={pointerEnd}
++      onLostPointerCapture={pointerEnd}
++      onDoubleClick={(event) => {
++        const bounds = event.currentTarget.getBoundingClientRect();
++        zoom(event.clientX - bounds.left, event.clientY - bounds.top, event.shiftKey ? 0.5 : 2);
++      }}>
++      <defs>
++        <marker id={markerId} viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto">
++          <path d="M 0 0 L 10 5 L 0 10 Z" />
++        </marker>
++      </defs>
++      <g transform={`translate(${view.x} ${view.y}) scale(${view.scale})`}>
++        <g>
++          {graph.edges.map((edge, index) => (
++            <path key={index} d={edge.path} style={{ fill: "none" }} markerEnd={`url(#${markerId})`} />
++          ))}
++        </g>
++        <g className="nodes">
++          {graph.nodes.map((node) => (
++            <g key={node.id} transform={`translate(${node.x} ${node.y})`}>
++              <title>{node.lines.join("\n")}</title>
++              <rect width={node.width} height={node.height} />
++              <text textAnchor="middle" style={{ font }}>
++                {node.lines.map((line, index) => (
++                  <tspan key={index} x={node.width / 2} y={12 + LABEL_LINE_HEIGHT * (index + 0.8)}>
++                    {line}
++                  </tspan>
++                ))}
++              </text>
++            </g>
++          ))}
++        </g>
++      </g>
++    </svg>
++  );
++}
++
++/** Keep the graph coordinate under the cursor fixed, including at zoom limits. */
++export function zoomView(current: View, x: number, y: number, factor: number): View {
++  const scale = Math.max(0.00001, Math.min(100, current.scale * factor));
++  return {
++    x: x - ((x - current.x) * scale) / current.scale,
++    y: y - ((y - current.y) * scale) / current.scale,
++    scale,
++  };
++}
+diff --git a/app/invocation/query_graph_layout.ts b/app/invocation/query_graph_layout.ts
+new file mode 100644
+index 000000000..27b24a7e4
+--- /dev/null
++++ b/app/invocation/query_graph_layout.ts
+@@ -0,0 +1,128 @@
++export interface GraphEdge {
++  source: string;
++  target: string;
++}
++
++export interface GraphNode {
++  id: string;
++  lines: string[];
++  x: number;
++  y: number;
++  width: number;
++  height: number;
++}
++
++export const LABEL_LINE_HEIGHT = 18;
++const MARGIN = 40;
++const RANK_GAP = 80;
++const NODE_GAP = 40;
++
++/** A deterministic left-to-right layout. DFS back edges are retained for rendering,
++ * but excluded from ranking, so even cyclic graphs terminate. All traversals are
++ * iterative to support long dependency chains when the user selects Show anyway.
++ */
++export function layoutGraph(ids: Iterable<string>, edges: GraphEdge[], measureText: (text: string) => number) {
++  const nodes = new Map<string, GraphNode>();
++  const addNode = (id: string) => {
++    if (nodes.has(id)) return;
++    const lines = id.replaceAll("\\n", "\n").split("\n");
++    nodes.set(id, {
++      id,
++      lines,
++      x: 0,
++      y: 0,
++      width: lines.reduce((width, line) => Math.max(width, measureText(line)), 40) + 24,
++      height: lines.length * LABEL_LINE_HEIGHT + 24,
++    });
++  };
++  for (const id of ids) addNode(id);
++  const outgoing = new Map<string, Set<string>>();
++  for (const edge of edges) {
++    addNode(edge.source);
++    addNode(edge.target);
++    if (!outgoing.has(edge.source)) outgoing.set(edge.source, new Set());
++    outgoing.get(edge.source)!.add(edge.target);
++  }
++
++  const visited = new Set<string>();
++  const active = new Set<string>();
++  const forward = new Map<string, string[]>();
++  const order: string[] = [];
++  for (const id of nodes.keys()) {
++    if (visited.has(id)) continue;
++    visited.add(id);
++    active.add(id);
++    const stack = [{ id, children: (outgoing.get(id) || new Set<string>()).values() }];
++    while (stack.length) {
++      const current = stack[stack.length - 1];
++      const next = current.children.next();
++      if (next.done) {
++        active.delete(current.id);
++        order.push(current.id);
++        stack.pop();
++        continue;
++      }
++      if (active.has(next.value)) continue;
++      if (!forward.has(current.id)) forward.set(current.id, []);
++      forward.get(current.id)!.push(next.value);
++      if (visited.has(next.value)) continue;
++      visited.add(next.value);
++      active.add(next.value);
++      stack.push({ id: next.value, children: (outgoing.get(next.value) || new Set<string>()).values() });
++    }
++  }
++  const ranks = new Map<string, number>();
++  for (const id of order.reverse()) {
++    const rank = ranks.get(id) || 0;
++    ranks.set(id, rank);
++    for (const target of forward.get(id) || []) {
++      ranks.set(target, Math.max(ranks.get(target) || 0, rank + 1));
++    }
++  }
++  const layers: GraphNode[][] = [];
++  for (const node of nodes.values()) {
++    const rank = ranks.get(node.id)!;
++    (layers[rank] ||= []).push(node);
++  }
++  const layerRight: number[] = [];
++  let x = MARGIN;
++  let height = 2 * MARGIN;
++  for (const layer of layers) {
++    let y = MARGIN;
++    let width = 0;
++    for (const node of layer) {
++      node.x = x;
++      node.y = y;
++      y += node.height + NODE_GAP;
++      width = Math.max(width, node.width);
++    }
++    height = Math.max(height, y - NODE_GAP + MARGIN);
++    layerRight.push(x + width);
++    x += width + RANK_GAP;
++  }
++  const links = [...outgoing].flatMap(([source, targets]) =>
++    [...targets].map((target) => ({
++      source,
++      target,
++      path: edgePath(nodes.get(source)!, nodes.get(target)!, layerRight[ranks.get(source)!] + RANK_GAP / 2),
++    }))
++  );
++  return { nodes: [...nodes.values()], edges: links, width: Math.max(2 * MARGIN, x - RANK_GAP + MARGIN), height };
++}
++
++/** Turn only in column gutters: horizontal endpoint segments stay in their own
++ * rows, and the top lane clears every column, regardless of node dimensions.
++ * Adjacent columns share a gutter and need no trip through the top lane.
++ */
++function edgePath(source: GraphNode, target: GraphNode, exitX: number): string {
++  const sx = source.x + source.width;
++  const sy = source.y + source.height / 2;
++  const tx = target.x;
++  const ty = target.y + target.height / 2;
++  const entryX = tx - RANK_GAP / 2;
++  if (exitX === entryX) {
++    return `M ${sx} ${sy} L ${exitX} ${sy} L ${entryX} ${ty} L ${tx} ${ty}`;
++  }
++  const top = MARGIN / 2;
++  return `M ${sx} ${sy} L ${exitX} ${sy} L ${exitX} ${top} L ${entryX} ${top} L ${entryX} ${ty} L ${tx} ${ty}`;
++}
+diff --git a/app/invocation/query_graph_layout_test.ts b/app/invocation/query_graph_layout_test.ts
+new file mode 100644
+index 000000000..96620e6d6
+--- /dev/null
++++ b/app/invocation/query_graph_layout_test.ts
+@@ -0,0 +1,168 @@
++import { GraphEdge, layoutGraph } from "./query_graph_layout";
++
++const measure = (text: string) => text.length * 8;
++const edge = (source: string, target: string): GraphEdge => ({ source, target });
++
++// Orthogonal segments allow exact rectangle intersection checks, without
++// sampling curves and potentially missing a crossing between samples.
++function assertClearPaths(graph: ReturnType<typeof layoutGraph>, context: string) {
++  for (const link of graph.edges) {
++    const tokens = link.path.match(/[ML]|-?\d+(?:\.\d+)?/g)!;
++    const points = [];
++    for (let i = 0; i < tokens.length; i += 3) {
++      expect(["M", "L"]).toContain(tokens[i]);
++      points.push({ x: Number(tokens[i + 1]), y: Number(tokens[i + 2]) });
++    }
++    for (const point of points) {
++      expect(point.x).toBeGreaterThanOrEqual(0);
++      expect(point.x).toBeLessThanOrEqual(graph.width);
++      expect(point.y).toBeGreaterThanOrEqual(0);
++      expect(point.y).toBeLessThanOrEqual(graph.height);
++    }
++    for (let i = 1; i < points.length; i++) {
++      const start = points[i - 1];
++      const end = points[i];
++      expect(start.x === end.x || start.y === end.y)
++        .withContext(context)
++        .toBeTrue();
++      for (const node of graph.nodes) {
++        if (node.id === link.source || node.id === link.target) continue;
++        const intersects =
++          Math.max(start.x, end.x) >= node.x &&
++          Math.min(start.x, end.x) <= node.x + node.width &&
++          Math.max(start.y, end.y) >= node.y &&
++          Math.min(start.y, end.y) <= node.y + node.height;
++        expect(intersects).withContext(`${context}: ${link.source}->${link.target} intersects ${node.id}`).toBeFalse();
++      }
++    }
++  }
++}
++
++describe("query graph layout", () => {
++  it("has finite bounds for an empty graph", () => {
++    const graph = layoutGraph([], [], measure);
++    expect(graph.nodes).toEqual([]);
++    expect(graph.edges).toEqual([]);
++    expect(graph.width).toBeGreaterThan(0);
++    expect(graph.height).toBeGreaterThan(0);
++  });
++
++  it("places dependencies to the right even when declarations are reversed", () => {
++    const graph = layoutGraph(["leaf", "middle", "root"], [edge("root", "middle"), edge("middle", "leaf")], measure);
++    const [leaf, middle, root] = graph.nodes;
++    expect(root.x + root.width).toBeLessThan(middle.x);
++    expect(middle.x + middle.width).toBeLessThan(leaf.x);
++  });
++
++  it("ranks a shared dependency after all of its parents", () => {
++    const graph = layoutGraph(
++      ["a", "b", "c", "d"],
++      [edge("a", "b"), edge("a", "c"), edge("b", "d"), edge("c", "d")],
++      measure
++    );
++    const [a, b, c, d] = graph.nodes;
++    expect(a.x + a.width).toBeLessThan(b.x);
++    expect(b.x).toBe(c.x);
++    expect(b.y + b.height).toBeLessThan(c.y);
++    expect(d.x).toBeGreaterThan(b.x + b.width);
++    expect(d.x).toBeGreaterThan(c.x + c.width);
++  });
++
++  it("includes isolated nodes and undeclared edge endpoints, and deduplicates links", () => {
++    const graph = layoutGraph(["isolated", "isolated"], [edge("a", "b"), edge("a", "b")], measure);
++    expect(graph.nodes.map((node) => node.id)).toEqual(["isolated", "a", "b"]);
++    expect(graph.edges.length).toBe(1);
++  });
++
++  it("fits multiline and long labels without overlapping nodes or clipping bounds", () => {
++    const label = "long target " + "x".repeat(200) + "\\nsecond line";
++    const graph = layoutGraph([label, "short", "actual\nnewline"], [], measure);
++    expect(graph.nodes[0].lines).toEqual(["long target " + "x".repeat(200), "second line"]);
++    expect(graph.nodes[2].lines).toEqual(["actual", "newline"]);
++    expect(graph.nodes[0].width).toBeGreaterThan(measure(graph.nodes[0].lines[0]));
++    for (const node of graph.nodes) {
++      expect(node.x).toBeGreaterThanOrEqual(0);
++      expect(node.y).toBeGreaterThanOrEqual(0);
++      expect(node.x + node.width).toBeLessThan(graph.width);
++      expect(node.y + node.height).toBeLessThan(graph.height);
++    }
++    expect(graph.nodes[0].y + graph.nodes[0].height).toBeLessThan(graph.nodes[1].y);
++  });
++
++  it("retains cycles, self loops, and their outgoing dependencies", () => {
++    const edges = [edge("a", "b"), edge("b", "a"), edge("a", "a"), edge("b", "c")];
++    const graph = layoutGraph([], edges, measure);
++    expect(graph.edges.length).toBe(4);
++    expect(graph.nodes.length).toBe(3);
++    const [a, b, c] = graph.nodes;
++    expect(c.x).toBeGreaterThan(b.x);
++    expect(graph.edges.find((link) => link.source === "a" && link.target === "a")!.path).toContain(" L ");
++    expect(graph.edges.find((link) => link.source === "b" && link.target === "a")!.path).toContain(" L ");
++    expect(a.x).toBeLessThan(b.x);
++    expect(layoutGraph([], edges, measure)).toEqual(graph);
++  });
++
++  it("routes skip-layer edges outside intermediate node rectangles", () => {
++    for (const ids of [
++      ["a", "b", "c"],
++      ["a", "wide sibling".repeat(20), "b", "tall\\nnode\\nlabel", "c", "d"],
++    ]) {
++      const edges =
++        ids.length === 3
++          ? [edge("a", "b"), edge("b", "c"), edge("a", "c")]
++          : [edge("a", "b"), edge("b", "c"), edge("c", "d"), edge("a", ids[3]), edge(ids[3], "c"), edge("a", "d")];
++      const graph = layoutGraph(ids, edges, measure);
++      assertClearPaths(graph, "skip-layer graph");
++    }
++  });
++
++  it("routes adjacent-column fanout around a wide isolated node", () => {
++    const graph = layoutGraph(
++      ["a", "x".repeat(100), "b", "c", "d"],
++      [edge("a", "b"), edge("a", "c"), edge("a", "d")],
++      measure
++    );
++    assertClearPaths(graph, "wide isolated node fanout");
++  });
++
++  it("avoids every non-endpoint rectangle in randomized small DAGs", () => {
++    let seed = 0x12345678;
++    const random = () => {
++      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
++      return seed / 0x100000000;
++    };
++    for (let trial = 0; trial < 300; trial++) {
++      const count = 2 + Math.floor(random() * 14);
++      const ids = Array.from(
++        { length: count },
++        (_, i) => `${i}:${"x".repeat(Math.floor(random() * 150))}${"\nline".repeat(Math.floor(random() * 5))}`
++      );
++      const edges: GraphEdge[] = [];
++      const density = random();
++      for (let i = 0; i < count; i++) {
++        for (let j = i + 1; j < count; j++) {
++          if (random() < density) edges.push(edge(ids[i], ids[j]));
++        }
++      }
++      // Shuffle declarations independently of the topological order.
++      const declarations = [...ids];
++      for (let i = count - 1; i > 0; i--) {
++        const j = Math.floor(random() * (i + 1));
++        [declarations[i], declarations[j]] = [declarations[j], declarations[i]];
++      }
++      assertClearPaths(layoutGraph(declarations, edges, measure), `DAG trial ${trial}`);
++      // Exercise the same gutters for cycles and self-loops as well.
++      edges.push(edge(ids[count - 1], ids[0]), edge(ids[0], ids[0]));
++      assertClearPaths(layoutGraph(declarations, edges, measure), `cyclic trial ${trial}`);
++    }
++  });
++
++  it("handles a chain beyond the large graph guard without recursion", () => {
++    const edges = Array.from({ length: 12000 }, (_, i) => edge(String(i), String(i + 1)));
++    const graph = layoutGraph([], edges, measure);
++    expect(graph.nodes.length).toBe(12001);
++    expect(graph.edges.length).toBe(12000);
++    expect(Number.isFinite(graph.width)).toBeTrue();
++    expect(graph.nodes[12000].x).toBeGreaterThan(graph.nodes[11999].x);
++  });
++});
+-- 
+2.43.0
+
+

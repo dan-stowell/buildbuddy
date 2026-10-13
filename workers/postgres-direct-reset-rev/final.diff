@@ -1,0 +1,53 @@
+diff --git a/server/testutil/testpostgres/testpostgres.go b/server/testutil/testpostgres/testpostgres.go
+index 89885d003..9869e73ce 100644
+--- a/server/testutil/testpostgres/testpostgres.go
++++ b/server/testutil/testpostgres/testpostgres.go
+@@ -97,7 +97,11 @@ func Start(t testing.TB, reuseServer bool) string {
+ 		Path:     dbName,
+ 		RawQuery: url.Values(map[string][]string{"sslmode": {"disable"}}).Encode(),
+ 	}
+-	db, err := sql.Open("pgx", dsn.String())
++	// Reset from the control database so this connection does not prevent
++	// dropping the test database. Keep the returned DSN pointed at the test DB.
++	controlDSN := *dsn
++	controlDSN.Path = "postgres"
++	db, err := sql.Open("pgx", controlDSN.String())
+ 	require.NoError(t, err)
+ 	defer db.Close()
+ 	for {
+@@ -109,28 +113,17 @@ func Start(t testing.TB, reuseServer bool) string {
+ 		// auto-migration.
+ 		if reuseServer {
+ 			log.Debug("Attempting to reset database.")
++			resetStart := time.Now()
+ 
+-			cmd := exec.Command(
+-				"docker", "exec",
+-				"-u", "postgres",
+-				containerName,
+-				"dropdb", "-f", dbName,
+-			)
+-			cmd.Stderr = &logWriter{"docker exec dropdb"}
+-			err := cmd.Run()
++			// PostgreSQL 15 supports FORCE, which terminates connections left
++			// by the previous test. Quote the identifier (the name has a hyphen).
++			quotedDBName := `"` + strings.ReplaceAll(dbName, `"`, `""`) + `"`
++			_, err := db.Exec("DROP DATABASE IF EXISTS " + quotedDBName + " WITH (FORCE)")
+ 			require.NoError(t, err)
+-
+-			cmd = exec.Command(
+-				"docker", "exec",
+-				"-u", "postgres",
+-				containerName,
+-				"createdb", dbName,
+-			)
+-			cmd.Stderr = &logWriter{"docker exec createdb"}
+-			err = cmd.Run()
++			_, err = db.Exec("CREATE DATABASE " + quotedDBName)
+ 			require.NoError(t, err)
+ 
+-			log.Debug("Reset database.")
++			log.Infof("Reset postgres database in %s", time.Since(resetStart))
+ 		}
+ 
+ 		return dsn.String()

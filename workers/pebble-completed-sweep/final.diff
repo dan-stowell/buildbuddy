@@ -1,0 +1,183 @@
+diff --git a/enterprise/server/backends/pebble_cache/pebble_cache.go b/enterprise/server/backends/pebble_cache/pebble_cache.go
+index 577529d96..215572e5f 100644
+--- a/enterprise/server/backends/pebble_cache/pebble_cache.go
++++ b/enterprise/server/backends/pebble_cache/pebble_cache.go
+@@ -2980,6 +2980,43 @@ func (p *PebbleCache) TestingWaitForGC(ctx context.Context) error {
+ 	return nil
+ }
+ 
++// TestingWaitForEvictionSweep waits for size accounting to catch up, then for
++// a janitor sweep started after setup to complete, even below the threshold.
++func (p *PebbleCache) TestingWaitForEvictionSweep(ctx context.Context, partitionID string, minSizeBytes int64) error {
++	p.statusMu.Lock()
++	var evictor *partitionEvictor
++	for _, e := range p.evictors {
++		if e.part.ID == partitionID {
++			evictor = e
++			break
++		}
++	}
++	p.statusMu.Unlock()
++	if evictor == nil {
++		return status.NotFoundError("partition not found")
++	}
++	for {
++		evictor.mu.Lock()
++		ready := evictor.sizeBytes >= minSizeBytes
++		evictor.mu.Unlock()
++		if ready {
++			break
++		}
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		case <-time.After(time.Millisecond):
++		}
++	}
++	done := evictor.lru.TestingSweepDone()
++	select {
++	case <-done:
++		return nil
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}
++
+ type evictionKey struct {
+ 	bytes []byte
+ }
+diff --git a/enterprise/server/backends/pebble_cache/pebble_cache_test.go b/enterprise/server/backends/pebble_cache/pebble_cache_test.go
+index 83c45a395..d598beff3 100644
+--- a/enterprise/server/backends/pebble_cache/pebble_cache_test.go
++++ b/enterprise/server/backends/pebble_cache/pebble_cache_test.go
+@@ -1689,8 +1689,10 @@ func TestPartitionJanitorCutoffThreshold(t *testing.T) {
+ 		// under the configured 1.0 cutoff.
+ 		resourceKeys := write(t, ctx, pc, 95)
+ 
+-		// Give the janitor a chance to run, then verify nothing was evicted.
+-		time.Sleep(3 * time.Second)
++		// Wait for a fresh janitor sweep after size accounting catches up.
++		sweepCtx, cancelSweep := context.WithTimeout(ctx, 30*time.Second)
++		defer cancelSweep()
++		require.NoError(t, pc.TestingWaitForEvictionSweep(sweepCtx, pebble_cache.DefaultPartitionID, 95_000))
+ 		for _, r := range resourceKeys {
+ 			exists, err := pc.Contains(ctx, r)
+ 			require.NoError(t, err)
+diff --git a/server/util/approxlru/approxlru.go b/server/util/approxlru/approxlru.go
+index e96f58839..d50ded4f0 100644
+--- a/server/util/approxlru/approxlru.go
++++ b/server/util/approxlru/approxlru.go
+@@ -72,13 +72,14 @@ type LRU[T Key] struct {
+ 
+ 	samplePool []*Sample[T]
+ 
+-	mu              sync.Mutex
+-	ctx             context.Context
+-	cancelCtx       context.CancelFunc
+-	globalSizeBytes int64
+-	localSizeBytes  int64
+-	lastRun         time.Time
+-	lastEvicted     *Sample[T]
++	mu               sync.Mutex
++	ctx              context.Context
++	cancelCtx        context.CancelFunc
++	globalSizeBytes  int64
++	localSizeBytes   int64
++	lastRun          time.Time
++	lastEvicted      *Sample[T]
++	testingSweepDone chan struct{}
+ 
+ 	clock clockwork.Clock
+ }
+@@ -378,9 +379,16 @@ func (l *LRU[T]) evictor() {
+ 		case <-l.ctx.Done():
+ 			return
+ 		case <-ticker.C:
++			l.mu.Lock()
++			done := l.testingSweepDone
++			l.testingSweepDone = nil
++			l.mu.Unlock()
+ 			if err := l.ttl(); err != nil {
+ 				log.Warningf("could not evict: %s", err)
+ 			}
++			if done != nil {
++				close(done)
++			}
+ 		}
+ 	}
+ }
+@@ -396,3 +404,14 @@ func (l *LRU[T]) LastEvicted() *Sample[T] {
+ 	defer l.mu.Unlock()
+ 	return l.lastEvicted
+ }
++
++// TestingSweepDone returns a signal for completion of a janitor sweep started
++// after this call, including sweeps that find the cache below its threshold.
++func (l *LRU[T]) TestingSweepDone() <-chan struct{} {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	if l.testingSweepDone == nil {
++		l.testingSweepDone = make(chan struct{})
++	}
++	return l.testingSweepDone
++}
+diff --git a/server/util/approxlru/approxlru_test.go b/server/util/approxlru/approxlru_test.go
+index d1c9aaa68..f2e02009a 100644
+--- a/server/util/approxlru/approxlru_test.go
++++ b/server/util/approxlru/approxlru_test.go
+@@ -176,3 +176,55 @@ func TestRefresh(t *testing.T) {
+ 	}
+ 	c.mu.Unlock()
+ }
++
++func TestSweepWaitIgnoresRunningSweep(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	started := make(chan chan struct{}, 1)
++	l, err := approxlru.New(&approxlru.Opts[*entry]{
++		MaxSizeBytes: 1, SamplePoolSize: 1, SamplesPerEviction: 1,
++		OnEvict: func(context.Context, *approxlru.Sample[*entry]) error { t.Error("unexpected eviction"); return nil },
++		OnSample: func(context.Context, int) ([]*approxlru.Sample[*entry], error) {
++			release := make(chan struct{})
++			select {
++			case started <- release:
++			case <-ctx.Done():
++				return nil, ctx.Err()
++			}
++			select {
++			case <-release:
++			case <-ctx.Done():
++				return nil, ctx.Err()
++			}
++			return nil, status.InternalError("end controlled test sweep")
++		},
++	})
++	require.NoError(t, err)
++	l.UpdateSizeBytes(2)
++	l.Start()
++	defer l.Stop()
++	nextGate := func() chan struct{} {
++		select {
++		case gate := <-started:
++			return gate
++		case <-ctx.Done():
++			t.Fatal(ctx.Err())
++			return nil
++		}
++	}
++	first := nextGate()
++	observation := l.TestingSweepDone()
++	close(first)
++	second := nextGate() // The old sweep finished; the observed sweep is blocked.
++	select {
++	case <-observation:
++		t.Fatal("already-running sweep satisfied newly registered wait")
++	default:
++	}
++	close(second)
++	select {
++	case <-observation:
++	case <-ctx.Done():
++		t.Fatal(ctx.Err())
++	}
++}

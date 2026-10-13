@@ -1,0 +1,305 @@
+diff --git a/enterprise/server/selfauth/BUILD b/enterprise/server/selfauth/BUILD
+index f9433b444..b1c1689b1 100644
+--- a/enterprise/server/selfauth/BUILD
++++ b/enterprise/server/selfauth/BUILD
+@@ -1,4 +1,4 @@
+-load("@io_bazel_rules_go//go:def.bzl", "go_library")
++load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+ 
+ package(default_visibility = ["//enterprise:__subpackages__"])
+ 
+@@ -12,9 +12,16 @@ go_library(
+         "//server/http/interceptors",
+         "//server/util/log",
+         "//server/util/status",
+-        "@com_github_lestrrat_go_jwx//jwa",
+-        "@com_github_lestrrat_go_jwx//jwk",
+-        "@com_github_lestrrat_go_jwx//jwt",
++        "@com_github_golang_jwt_jwt_v4//:jwt",
+         "@org_golang_x_oauth2//:oauth2",
+     ],
+ )
++
++go_test(
++    name = "selfauth_test",
++    size = "small",
++    srcs = ["selfauth_test.go"],
++    data = ["testdata/jwks.json"],
++    embed = [":selfauth"],
++    deps = ["@com_github_golang_jwt_jwt_v4//:jwt"],
++)
+diff --git a/enterprise/server/selfauth/selfauth.go b/enterprise/server/selfauth/selfauth.go
+index 20ba1eace..10012d383 100644
+--- a/enterprise/server/selfauth/selfauth.go
++++ b/enterprise/server/selfauth/selfauth.go
+@@ -17,9 +17,7 @@ import (
+ 	"github.com/buildbuddy-io/buildbuddy/server/http/interceptors"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+-	"github.com/lestrrat-go/jwx/jwa"
+-	"github.com/lestrrat-go/jwx/jwk"
+-	"github.com/lestrrat-go/jwx/jwt"
++	"github.com/golang-jwt/jwt/v4"
+ 	"golang.org/x/oauth2"
+ )
+ 
+@@ -73,8 +71,8 @@ func Enabled() bool {
+ }
+ 
+ type selfAuth struct {
+-	rsaPrivateKey jwk.RSAPrivateKey
+-	rsaPublicKey  jwk.RSAPublicKey
++	rsaPrivateKey *rsa.PrivateKey
++	rsaPublicKey  *rsa.PublicKey
+ }
+ 
+ type configurationJSON struct {
+@@ -126,26 +124,9 @@ func NewSelfAuth() (*selfAuth, error) {
+ 		Primes: []*big.Int{&p, &q},
+ 	}
+ 	privateKey.Precompute()
+-	jwkKey, err := jwk.New(privateKey)
+-	if err != nil {
+-		return nil, status.InternalErrorf("Failed to create private key: %s\n", err)
+-	}
+-	jwkPrivateKey, ok := jwkKey.(jwk.RSAPrivateKey)
+-	if !ok {
+-		return nil, status.InternalErrorf("Expected jwk.RSAPrivateKey, got %T\n", jwkKey)
+-	}
+-
+-	jwkKey, err = jwk.New(privateKey.PublicKey)
+-	if err != nil {
+-		return nil, status.InternalErrorf("Failed to create public key: %s\n", err)
+-	}
+-	jwkPublicKey, ok := jwkKey.(jwk.RSAPublicKey)
+-	if !ok {
+-		return nil, status.InternalErrorf("Expected jwk.RSAPublicKey, got %T\n", jwkKey)
+-	}
+ 	return &selfAuth{
+-		rsaPrivateKey: jwkPrivateKey,
+-		rsaPublicKey:  jwkPublicKey,
++		rsaPrivateKey: privateKey,
++		rsaPublicKey:  &privateKey.PublicKey,
+ 	}, nil
+ }
+ 
+@@ -227,26 +208,21 @@ func (o *selfAuth) AccessToken(w http.ResponseWriter, r *http.Request) {
+ 		w.WriteHeader(http.StatusInternalServerError)
+ 		return
+ 	}
+-	token := jwt.New()
+-	token.Set(jwt.AudienceKey, "buildbuddy")
+-	token.Set(jwt.ExpirationKey, time.Now().Add(time.Hour).Unix())
+-	token.Set(jwt.JwtIDKey, base64.StdEncoding.EncodeToString(idKey))
+-	token.Set(jwt.IssuedAtKey, time.Now().Unix())
+-	token.Set(jwt.IssuerKey, o.IssuerURL().String())
+-	token.Set(jwt.SubjectKey, "")
+-
+-	token.Set("email", "buildbuddy@example.com")
+-	token.Set("name", "buildbuddy")
+-	token.Set("given_name", "Default")
+-
+-	// This value is a hash of the access token, so must match. It can be
+-	// computed with the following python snippet:
+-	//
+-	// base64.b64encode(hashlib.sha256("AccessToken").digest()[:16]).rstrip("=")
+-	//
+-	token.Set("at_hash", "LkjhI6Ijpj638f0mirBH2g")
+-
+-	signed, err := jwt.Sign(token, jwa.RS256, o.rsaPrivateKey)
++	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
++		"aud":        []string{ClientID},
++		"exp":        time.Now().Add(time.Hour).Unix(),
++		"jti":        base64.StdEncoding.EncodeToString(idKey),
++		"iat":        time.Now().Unix(),
++		"iss":        o.IssuerURL().String(),
++		"sub":        "",
++		"email":      "buildbuddy@example.com",
++		"name":       "buildbuddy",
++		"given_name": "Default",
++		// Base64url-encoded first 16 bytes of SHA-256("AccessToken").
++		"at_hash": "LkjhI6Ijpj638f0mirBH2g",
++	})
++
++	signed, err := token.SignedString(o.rsaPrivateKey)
+ 	if err != nil {
+ 		log.Errorf("Error signing token: %v", err)
+ 		w.WriteHeader(http.StatusInternalServerError)
+@@ -256,13 +232,26 @@ func (o *selfAuth) AccessToken(w http.ResponseWriter, r *http.Request) {
+ 		AccessToken:  "AccessToken",
+ 		RefreshToken: "RefreshToken",
+ 		ExpiresIn:    3600,
+-		IdToken:      string(signed),
++		IdToken:      signed,
+ 	})
+ }
+ 
+ // Jwks handles requests to /.well-known/jwks.json, returning the keyset for our oauth
+ func (o *selfAuth) Jwks(w http.ResponseWriter, r *http.Request) {
+-	set := jwk.NewSet()
+-	set.Add(o.rsaPublicKey)
+-	writeJSONResponse(w, r, set)
++	// Keep the field order and unpadded base64url encoding of the original
++	// JWKS response. The fixed key has no kid (nor alg or use metadata).
++	writeJSONResponse(w, r, struct {
++		Keys []rsaJWK `json:"keys"`
++	}{Keys: []rsaJWK{{
++		E:   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(o.rsaPublicKey.E)).Bytes()),
++		Kty: "RSA",
++		N:   base64.RawURLEncoding.EncodeToString(o.rsaPublicKey.N.Bytes()),
++	}}})
++}
++
++// rsaJWK contains only the public RSA parameters, in the original JSON order.
++type rsaJWK struct {
++	E   string `json:"e"`
++	Kty string `json:"kty"`
++	N   string `json:"n"`
+ }
+diff --git a/enterprise/server/selfauth/selfauth_test.go b/enterprise/server/selfauth/selfauth_test.go
+new file mode 100644
+index 000000000..b3186d1a1
+--- /dev/null
++++ b/enterprise/server/selfauth/selfauth_test.go
+@@ -0,0 +1,125 @@
++package selfauth
++
++import (
++	"crypto"
++	"crypto/rsa"
++	"crypto/sha256"
++	"encoding/base64"
++	"encoding/json"
++	"math/big"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/golang-jwt/jwt/v4"
++)
++
++func TestJWKSMatchesOldOutput(t *testing.T) {
++	o, err := NewSelfAuth()
++	if err != nil {
++		t.Fatal(err)
++	}
++	w := httptest.NewRecorder()
++	o.Jwks(w, httptest.NewRequest(http.MethodGet, "/.well-known/jwks.json", nil))
++	want, err := os.ReadFile("testdata/jwks.json")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if w.Code != http.StatusOK || w.Header().Get("Content-Type") != "application/json;charset=UTF-8" {
++		t.Fatalf("unexpected response: %v", w.Result())
++	}
++	if w.Body.String() != string(want) {
++		t.Fatalf("JWKS changed:\ngot %s\nwant %s", w.Body.String(), want)
++	}
++}
++
++func TestTokenVerifiesWithPublishedJWKS(t *testing.T) {
++	o, err := NewSelfAuth()
++	if err != nil {
++		t.Fatal(err)
++	}
++	keys := httptest.NewRecorder()
++	o.Jwks(keys, httptest.NewRequest(http.MethodGet, "/.well-known/jwks.json", nil))
++	// Decode as a client would, without using the server's key or JWK type.
++	var set struct{ Keys []struct{ E, Kty, N string } }
++	if err := json.Unmarshal(keys.Body.Bytes(), &set); err != nil {
++		t.Fatal(err)
++	}
++	if len(set.Keys) != 1 || set.Keys[0].Kty != "RSA" {
++		t.Fatalf("unexpected keys: %+v", set)
++	}
++	n, err := base64.RawURLEncoding.DecodeString(set.Keys[0].N)
++	if err != nil {
++		t.Fatal(err)
++	}
++	e, err := base64.RawURLEncoding.DecodeString(set.Keys[0].E)
++	if err != nil {
++		t.Fatal(err)
++	}
++	key := &rsa.PublicKey{N: new(big.Int).SetBytes(n), E: int(new(big.Int).SetBytes(e).Int64())}
++	before := time.Now().Unix()
++	w := httptest.NewRecorder()
++	o.AccessToken(w, httptest.NewRequest(http.MethodPost, "/oauth/access_token", nil))
++	after := time.Now().Unix()
++	if w.Code != http.StatusOK {
++		t.Fatalf("token endpoint returned %d: %s", w.Code, w.Body.String())
++	}
++	var response tokenJSON
++	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
++		t.Fatal(err)
++	}
++	if response.AccessToken != "AccessToken" || response.RefreshToken != "RefreshToken" || response.ExpiresIn != 3600 || response.TokenType != "" {
++		t.Fatalf("unexpected response: %+v", response)
++	}
++	token, err := jwt.Parse(response.IdToken, func(token *jwt.Token) (any, error) { return key, nil }, jwt.WithValidMethods([]string{"RS256"}))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !token.Valid {
++		t.Fatal("invalid token")
++	}
++	header, _ := json.Marshal(token.Header)
++	if string(header) != `{"alg":"RS256","typ":"JWT"}` {
++		t.Fatalf("header changed: %s", header)
++	}
++	claims := token.Claims.(jwt.MapClaims)
++	if len(claims) != 10 {
++		t.Fatalf("unexpected claims: %+v", claims)
++	}
++	for k, want := range map[string]string{"iss": o.IssuerURL().String(), "sub": "", "email": "buildbuddy@example.com", "name": "buildbuddy", "given_name": "Default", "at_hash": "LkjhI6Ijpj638f0mirBH2g"} {
++		if claims[k] != want {
++			t.Errorf("%s = %v, want %q", k, claims[k], want)
++		}
++	}
++	aud, ok := claims["aud"].([]any)
++	if !ok || len(aud) != 1 || aud[0] != ClientID {
++		t.Fatalf("audience changed: %v", claims["aud"])
++	}
++	for k, offset := range map[string]int64{"iat": 0, "exp": 3600} {
++		value, ok := claims[k].(float64)
++		if !ok || int64(value) < before+offset || int64(value) > after+offset {
++			t.Errorf("unexpected %s: %v", k, claims[k])
++		}
++	}
++	id, ok := claims["jti"].(string)
++	if !ok {
++		t.Fatal("missing jti")
++	}
++	decodedID, err := base64.StdEncoding.DecodeString(id)
++	if err != nil || len(decodedID) != 32 {
++		t.Fatalf("invalid jti: %q", id)
++	}
++	// Also verify independently with crypto/rsa, avoiding a same-library round trip.
++	parts := strings.Split(response.IdToken, ".")
++	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
++	if err != nil {
++		t.Fatal(err)
++	}
++	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
++	if err := rsa.VerifyPKCS1v15(key, crypto.SHA256, digest[:], signature); err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/enterprise/server/selfauth/testdata/jwks.json b/enterprise/server/selfauth/testdata/jwks.json
+new file mode 100644
+index 000000000..90be81457
+--- /dev/null
++++ b/enterprise/server/selfauth/testdata/jwks.json
+@@ -0,0 +1,9 @@
++{
++  "keys": [
++    {
++      "e": "AQAB",
++      "kty": "RSA",
++      "n": "vPXkA3h_InI-o9Q1B01ysoRZGDlazlSwOMX5Q8KgLsOSKyUDYCI07AWV60da4eAUgbI6BNE6B_vw2jH8gInEKb-0DyOKTPGv2t0mPq5a-I-C8xbXIVLwTHBm0mWaiiDQbcaQLBSzxhZ8BTa8VyMK8RO_XIGPoNSnJhfLcKg5pmrIenzKDnlPDE2vEPWe8E84cknnmZQVRbbyae_Vqnu-XbadKXuhOro2r1Yz4n49jLHZfUVuyoSbLbYBoTBkdiadO5wCAU9edKl9Bt4LtBuSC24MXK4WGWCuX5P7ujENLAMl8Evn5qabD5mMOlFWJUtlBp2iZQhOzJdHtsshMq25pw"
++    }
++  ]
++}
+\ No newline at end of file

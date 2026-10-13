@@ -1,0 +1,160 @@
+diff --git a/server/interfaces/BUILD b/server/interfaces/BUILD
+index d10225fb7..a1befc19d 100644
+--- a/server/interfaces/BUILD
++++ b/server/interfaces/BUILD
+@@ -47,6 +47,7 @@ go_library(
+         "//server/tables",
+         "//server/usage/sku",
+         "//server/util/clickhouse/schema",
++        "//server/util/healthcheck/checker",
+         "//server/util/platform",
+         "//server/util/proto",
+         "@com_github_golang_jwt_jwt_v4//:jwt",
+diff --git a/server/interfaces/interfaces.go b/server/interfaces/interfaces.go
+index aaad550bc..763ae83c8 100644
+--- a/server/interfaces/interfaces.go
++++ b/server/interfaces/interfaces.go
+@@ -15,6 +15,7 @@ import (
+ 	"github.com/buildbuddy-io/buildbuddy/server/tables"
+ 	"github.com/buildbuddy-io/buildbuddy/server/usage/sku"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/clickhouse/schema"
++	"github.com/buildbuddy-io/buildbuddy/server/util/healthcheck/checker"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
+ 	"github.com/golang-jwt/jwt/v4"
+@@ -1470,17 +1471,8 @@ type RepoDownloader interface {
+ 	TestRepoAccess(ctx context.Context, repoURL, username, accessToken string) error
+ }
+ 
+-type Checker interface {
+-	// Returns nil on success, error on failure. Returning an error will
+-	// indicate to the health checker that this service is unhealthy and
+-	// that the server is not ready to serve.
+-	Check(ctx context.Context) error
+-}
+-type CheckerFunc func(ctx context.Context) error
+-
+-func (f CheckerFunc) Check(ctx context.Context) error {
+-	return f(ctx)
+-}
++type Checker = checker.Checker
++type CheckerFunc = checker.CheckerFunc
+ 
+ type HealthChecker interface {
+ 	// AddHealthCheck adds a healthcheck -- the server's readiness is dependent on all
+diff --git a/server/util/healthcheck/BUILD b/server/util/healthcheck/BUILD
+index 6c3b6dcd8..cdee969d7 100644
+--- a/server/util/healthcheck/BUILD
++++ b/server/util/healthcheck/BUILD
+@@ -6,8 +6,8 @@ go_library(
+     importpath = "github.com/buildbuddy-io/buildbuddy/server/util/healthcheck",
+     visibility = ["//visibility:public"],
+     deps = [
+-        "//server/interfaces",
+         "//server/metrics",
++        "//server/util/healthcheck/checker",
+         "//server/util/log",
+         "//server/util/status",
+         "//server/util/statusz",
+diff --git a/server/util/healthcheck/checker/BUILD b/server/util/healthcheck/checker/BUILD
+new file mode 100644
+index 000000000..548e12565
+--- /dev/null
++++ b/server/util/healthcheck/checker/BUILD
+@@ -0,0 +1,8 @@
++load("@io_bazel_rules_go//go:def.bzl", "go_library")
++
++go_library(
++    name = "checker",
++    srcs = ["checker.go"],
++    importpath = "github.com/buildbuddy-io/buildbuddy/server/util/healthcheck/checker",
++    visibility = ["//visibility:public"],
++)
+diff --git a/server/util/healthcheck/checker/checker.go b/server/util/healthcheck/checker/checker.go
+new file mode 100644
+index 000000000..a6fb48d2c
+--- /dev/null
++++ b/server/util/healthcheck/checker/checker.go
+@@ -0,0 +1,15 @@
++package checker
++
++import "context"
++
++type Checker interface {
++	// Returns nil on success, error on failure. Returning an error will
++	// indicate to the health checker that this service is unhealthy and
++	// that the server is not ready to serve.
++	Check(ctx context.Context) error
++}
++type CheckerFunc func(ctx context.Context) error
++
++func (f CheckerFunc) Check(ctx context.Context) error {
++	return f(ctx)
++}
+diff --git a/server/util/healthcheck/healthcheck.go b/server/util/healthcheck/healthcheck.go
+index ca91cdec7..4df5fbc4b 100644
+--- a/server/util/healthcheck/healthcheck.go
++++ b/server/util/healthcheck/healthcheck.go
+@@ -15,8 +15,8 @@ import (
+ 	"syscall"
+ 	"time"
+ 
+-	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+ 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
++	"github.com/buildbuddy-io/buildbuddy/server/util/healthcheck/checker"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/statusz"
+@@ -50,12 +50,12 @@ type HealthChecker struct {
+ 	done          chan bool
+ 	quit          chan struct{}
+ 	checkersMu    sync.Mutex
+-	checkers      map[string]interfaces.Checker
++	checkers      map[string]checker.Checker
+ 	lastStatus    []*serviceStatus
+ 	serverType    string
+ 	shutdownOnce  sync.Once
+ 	mu            sync.RWMutex // protects: shutdownFuncs, readyToServe, shuttingDown
+-	shutdownFuncs []interfaces.CheckerFunc
++	shutdownFuncs []checker.CheckerFunc
+ 	readyToServe  bool
+ 	shuttingDown  bool
+ 	watchdogTimer *watchdog.Timer
+@@ -66,10 +66,10 @@ func NewHealthChecker(serverType string) *HealthChecker {
+ 		serverType:    serverType,
+ 		done:          make(chan bool),
+ 		quit:          make(chan struct{}),
+-		shutdownFuncs: make([]interfaces.CheckerFunc, 0),
++		shutdownFuncs: make([]checker.CheckerFunc, 0),
+ 		readyToServe:  true,
+ 		checkersMu:    sync.Mutex{},
+-		checkers:      make(map[string]interfaces.Checker, 0),
++		checkers:      make(map[string]checker.Checker, 0),
+ 		lastStatus:    make([]*serviceStatus, 0),
+ 		watchdogTimer: watchdog.New(*maxUnreadyDuration),
+ 	}
+@@ -201,13 +201,13 @@ func (h *HealthChecker) handleShutdownFuncs() {
+ 	close(h.done)
+ }
+ 
+-func (h *HealthChecker) RegisterShutdownFunction(f interfaces.CheckerFunc) {
++func (h *HealthChecker) RegisterShutdownFunction(f checker.CheckerFunc) {
+ 	h.mu.Lock()
+ 	h.shutdownFuncs = append(h.shutdownFuncs, f)
+ 	h.mu.Unlock()
+ }
+ 
+-func (h *HealthChecker) AddHealthCheck(name string, f interfaces.Checker) {
++func (h *HealthChecker) AddHealthCheck(name string, f checker.Checker) {
+ 	h.checkersMu.Lock()
+ 	h.checkers[name] = f
+ 	h.checkersMu.Unlock()
+@@ -238,7 +238,7 @@ func (h *HealthChecker) runHealthChecks(ctx context.Context) {
+ 	statusDataMu := sync.Mutex{}
+ 
+ 	h.checkersMu.Lock()
+-	checkers := make(map[string]interfaces.Checker, len(h.checkers))
++	checkers := make(map[string]checker.Checker, len(h.checkers))
+ 	maps.Copy(checkers, h.checkers)
+ 	h.checkersMu.Unlock()
+ 

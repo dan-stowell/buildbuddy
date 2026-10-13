@@ -1,0 +1,151 @@
+# Reduce CLI integration test duration with sharding
+
+
+CLI integration tests run on every CI build, and both CLI and stream-run-logs integration targets have independent top-level tests that can run across more shards. Increase CLI sharding from 4 to 8 and run the five stream-run-logs test groups on 5 shards. Both changes reduced measured test duration in two remote before/after comparisons, while preserving the complete test-case set.
+
+Only two BUILD attributes change, with one commit per target. All test sources, assertions, scenarios, timeouts, tags, and dependencies remain unchanged. Every integration test case passed 10/10 repetitions before and 10/10 after, with automatic retries disabled.
+
+Index sharding was evaluated and omitted: the modeled 120s duration did not reproduce (0.6–0.7s measured), so additional shards are not justified.
+
+## Method and timings
+
+All measurements used **BuildBuddy Remote Bazel**, including remote test execution (`--config=ci`). No local fallback was needed. Origin used the public fork for remote-runner fetches during validation and has been restored to `https://github.int.exe.xyz/dan-stowell/buildbuddy.git` for PR tooling. No push or PR has been performed.
+
+Command (same flags before/after):
+
+```sh
+bash -lc 'cd ~/repo && bb remote test <targets> --config=ci --nocache_test_results --runs_per_test=5 --flaky_test_attempts=1 --test_output=all --test_summary=detailed'
+```
+
+Pair 1 targeted all three tests; pair 2 targeted only the two integration tests. Each pair used identical targets and flags before and after. Automatic retries were disabled; cached test results were disabled. Target duration below is Bazel's detailed-summary wall duration (maximum test action/shard duration across five repetitions), not total build/analysis time or the sum of shard durations. This is the parallel test execution critical-path proxy; it excludes runner provisioning and queued time. Remote resource/load variation is substantial, so these are measured reductions in that metric, not guaranteed end-to-end CI savings. The second pair rechecked the result after the initial build/cache warm-up.
+
+| Target | Shards before → after | Pair 1 before → after | Pair 2 before → after |
+| --- | --- | --- | --- |
+| codesearch/index:index_test | 1 → 1 (unchanged) | 0.7s → 0.3s | Not rerun |
+| cli/test/integration/cli:cli_test | 4 → 8 | 142.6s → 64.2s (78.4s less) | 107.5s → 50.0s (57.5s less) |
+| enterprise/server/test/integration/cli/stream_run_logs:stream_run_logs_test | 1 → 5 | 32.6s → 21.9s (10.7s less) | 55.3s → 19.3s (36.0s less) |
+
+Index's faster second measurement is environment variation, not an index change. An initial single-run premise check also passed all three targets; its index Go test durations totaled roughly 0.3s. The surveyed saving estimates are not reproduced as exact numbers, but both integration changes improved the measured duration in two independent comparisons.
+
+Detailed-summary statistics (max / min / average / deviation, seconds):
+
+| Target/configuration | Pair 1 | Pair 2 |
+| --- | --- | --- |
+| Index unchanged, before | 0.7 / 0.6 / 0.6 / 0.0 | — |
+| Index unchanged, after | 0.3 / 0.3 / 0.3 / 0.0 | — |
+| CLI 4 shards | 142.6 / 14.0 / 60.3 / 40.7 | 107.5 / 13.0 / 52.7 / 27.8 |
+| CLI 8 shards | 64.2 / 12.0 / 29.1 / 11.4 | 50.0 / 5.0 / 22.5 / 10.9 |
+| Stream unsharded | 32.6 / 20.9 / 23.8 / 4.5 | 55.3 / 50.5 / 53.2 / 1.9 |
+| Stream 5 shards | 21.9 / 0.7 / 9.6 / 7.6 | 19.3 / 0.7 / 8.3 / 7.0 |
+
+Averages/minima summarize individual shard actions (20/40 CLI actions and 5/25 stream actions per invocation), so changing shard count changes the population; use the maximum column for the duration comparison.
+
+## Evidence
+
+- baseline5: https://app.buildbuddy.io/invocation/c07fe9b7-0df4-4934-a72d-9c5a2c6ff27d (local captured output: `/tmp/sharding-baseline5.log`)
+- after5: https://app.buildbuddy.io/invocation/fd6f1e6b-0dbd-4c9c-a7f8-2249c2053ae7 (local captured output: `/tmp/sharding-after5.log`)
+- warm-before5: https://app.buildbuddy.io/invocation/8777fd87-3027-45a7-88df-8ee106a0a9ad (local captured output: `/tmp/sharding-warm-before5.log`)
+- warm-after5: https://app.buildbuddy.io/invocation/a067de91-da22-4a01-a19f-16b441f1c14e (local captured output: `/tmp/sharding-warm-after5.log`)
+
+## Coverage and repeated-run results
+
+Parsed every `--- PASS:` entry from Bazel's Go test output, grouped by target, for both pairs. Before and after case sets are exactly equal, and each entry occurs five times per invocation. Lists below explicitly show both columns, including nested cases; no cases were skipped. For each changed target every entry passed **10/10 before and 10/10 after**, with zero failures and no retries (two invocations × five repetitions). Index entries passed **5/5 before and 5/5 after** unchanged. Initial premise-check passes are additional and excluded from these counts. These repetitions found no flakes; they cannot establish a zero long-term flake rate.
+
+### `//codesearch/index:index_test`
+
+30 top-level tests; 30 total output entries including nested cases.
+
+| Before | After | Passing repetitions before / after |
+| --- | --- | --- |
+| `TestCompactDeletes` | `TestCompactDeletes` | 5/5 / 5/5 |
+| `TestCompactDeletesPreservesFrequencies` | `TestCompactDeletesPreservesFrequencies` | 5/5 / 5/5 |
+| `TestDBFormatAddOnly` | `TestDBFormatAddOnly` | 5/5 / 5/5 |
+| `TestDBFormatCompactDeletes` | `TestDBFormatCompactDeletes` | 5/5 / 5/5 |
+| `TestDBFormatUpdate` | `TestDBFormatUpdate` | 5/5 / 5/5 |
+| `TestDeleteMatchingDocuments` | `TestDeleteMatchingDocuments` | 5/5 / 5/5 |
+| `TestDeletes` | `TestDeletes` | 5/5 / 5/5 |
+| `TestDropNamespace` | `TestDropNamespace` | 5/5 / 5/5 |
+| `TestGetStoredDocument` | `TestGetStoredDocument` | 5/5 / 5/5 |
+| `TestGetStoredFieldsSeeksRequestedFields` | `TestGetStoredFieldsSeeksRequestedFields` | 5/5 / 5/5 |
+| `TestIncrementalIndexing` | `TestIncrementalIndexing` | 5/5 / 5/5 |
+| `TestLazyDocFieldSeeksRequestedField` | `TestLazyDocFieldSeeksRequestedField` | 5/5 / 5/5 |
+| `TestMergeActuallyMerges` | `TestMergeActuallyMerges` | 5/5 / 5/5 |
+| `TestMergerAllOnesStaysPlain` | `TestMergerAllOnesStaysPlain` | 5/5 / 5/5 |
+| `TestMergerCountedWithPlain` | `TestMergerCountedWithPlain` | 5/5 / 5/5 |
+| `TestMergerEmptyBase` | `TestMergerEmptyBase` | 5/5 / 5/5 |
+| `TestMergerOrderIndependence` | `TestMergerOrderIndependence` | 5/5 / 5/5 |
+| `TestMergerPreservesDisjointTFPayloads` | `TestMergerPreservesDisjointTFPayloads` | 5/5 / 5/5 |
+| `TestMergerSumsTFForSharedDocs` | `TestMergerSumsTFForSharedDocs` | 5/5 / 5/5 |
+| `TestMetadataDocs` | `TestMetadataDocs` | 5/5 / 5/5 |
+| `TestNamespaceSeparation` | `TestNamespaceSeparation` | 5/5 / 5/5 |
+| `TestRawQueryDocumentMatchesIncludeFieldLengths` | `TestRawQueryDocumentMatchesIncludeFieldLengths` | 5/5 / 5/5 |
+| `TestRawQueryDocumentMatchesIncludeFrequencies` | `TestRawQueryDocumentMatchesIncludeFrequencies` | 5/5 / 5/5 |
+| `TestSQuery` | `TestSQuery` | 5/5 / 5/5 |
+| `TestSparseNgramFrequenciesAcrossMultipleDocs` | `TestSparseNgramFrequenciesAcrossMultipleDocs` | 5/5 / 5/5 |
+| `TestSparseNgramFrequenciesArePersisted` | `TestSparseNgramFrequenciesArePersisted` | 5/5 / 5/5 |
+| `TestStoredVsUnstoredFields` | `TestStoredVsUnstoredFields` | 5/5 / 5/5 |
+| `TestTFPayloadsSurviveMultiWriterFlush` | `TestTFPayloadsSurviveMultiWriterFlush` | 5/5 / 5/5 |
+| `TestUpdateSameDocThriceInSameBatch` | `TestUpdateSameDocThriceInSameBatch` | 5/5 / 5/5 |
+| `TestUpdateSameDocTwiceInSameBatch` | `TestUpdateSameDocTwiceInSameBatch` | 5/5 / 5/5 |
+
+### `//cli/test/integration/cli:cli_test`
+
+24 top-level tests; 30 total output entries including nested cases.
+
+| Before | After | Passing repetitions before / after |
+| --- | --- | --- |
+| `TestBBRC_Plugin` | `TestBBRC_Plugin` | 10/10 / 10/10 |
+| `TestBBRC_SidecarRollback` | `TestBBRC_SidecarRollback` | 10/10 / 10/10 |
+| `TestBBRC_Watcher` | `TestBBRC_Watcher` | 10/10 / 10/10 |
+| `TestBazelBuildWithBuildBuddyServices` | `TestBazelBuildWithBuildBuddyServices` | 10/10 / 10/10 |
+| `TestBazelBuildWithLocalPlugin` | `TestBazelBuildWithLocalPlugin` | 10/10 / 10/10 |
+| `TestBazelHelp` | `TestBazelHelp` | 10/10 / 10/10 |
+| `TestBazelHelp_IgnoresBBRC` | `TestBazelHelp_IgnoresBBRC` | 10/10 / 10/10 |
+| `TestBazelHelp_UsesBazelrc` | `TestBazelHelp_UsesBazelrc` | 10/10 / 10/10 |
+| `TestBazelModDumpRepoMappingEmptyString` | `TestBazelModDumpRepoMappingEmptyString` | 10/10 / 10/10 |
+| `TestBazelRun` | `TestBazelRun` | 10/10 / 10/10 |
+| `TestBazelRunWithLocalPlugin` | `TestBazelRunWithLocalPlugin` | 10/10 / 10/10 |
+| `TestBazelVersion` | `TestBazelVersion` | 10/10 / 10/10 |
+| `TestCLIDoesNotRestartBazelServer` | `TestCLIDoesNotRestartBazelServer` | 10/10 / 10/10 |
+| `TestFixDiff` | `TestFixDiff` | 10/10 / 10/10 |
+| `TestHelpWithoutHomeEnv` | `TestHelpWithoutHomeEnv` | 10/10 / 10/10 |
+| `TestInvokeViaBazelisk` | `TestInvokeViaBazelisk` | 10/10 / 10/10 |
+| `TestLateBazelrcAddedByBazeliskWrapper` | `TestLateBazelrcAddedByBazeliskWrapper` | 10/10 / 10/10 |
+| `TestLateBazelrcAddedByBazeliskWrapper/add_--bazelrc=/dev/null` | `TestLateBazelrcAddedByBazeliskWrapper/add_--bazelrc=/dev/null` | 10/10 / 10/10 |
+| `TestLateBazelrcAddedByBazeliskWrapper/add_--ignore_all_rc_files` | `TestLateBazelrcAddedByBazeliskWrapper/add_--ignore_all_rc_files` | 10/10 / 10/10 |
+| `TestLateBazelrcAddedByBazeliskWrapper/add_bazelrc` | `TestLateBazelrcAddedByBazeliskWrapper/add_bazelrc` | 10/10 / 10/10 |
+| `TestLateBazelrcAddedByPreBazelPlugin` | `TestLateBazelrcAddedByPreBazelPlugin` | 10/10 / 10/10 |
+| `TestLateBazelrcAddedByPreBazelPlugin/add_--bazelrc=/dev/null` | `TestLateBazelrcAddedByPreBazelPlugin/add_--bazelrc=/dev/null` | 10/10 / 10/10 |
+| `TestLateBazelrcAddedByPreBazelPlugin/add_--ignore_all_rc_files` | `TestLateBazelrcAddedByPreBazelPlugin/add_--ignore_all_rc_files` | 10/10 / 10/10 |
+| `TestLateBazelrcAddedByPreBazelPlugin/add_bazelrc` | `TestLateBazelrcAddedByPreBazelPlugin/add_bazelrc` | 10/10 / 10/10 |
+| `TestLateConfigAddedByBazeliskWrapper` | `TestLateConfigAddedByBazeliskWrapper` | 10/10 / 10/10 |
+| `TestParseGlobalFlags` | `TestParseGlobalFlags` | 10/10 / 10/10 |
+| `TestQueryFile` | `TestQueryFile` | 10/10 / 10/10 |
+| `TestTargetPatternFile` | `TestTargetPatternFile` | 10/10 / 10/10 |
+| `TestTerminalOutput` | `TestTerminalOutput` | 10/10 / 10/10 |
+| `TestWorkspaceBazelrcAppliedOnce` | `TestWorkspaceBazelrcAppliedOnce` | 10/10 / 10/10 |
+
+### `//enterprise/server/test/integration/cli/stream_run_logs:stream_run_logs_test`
+
+5 top-level tests; 6 total output entries including nested cases.
+
+| Before | After | Passing repetitions before / after |
+| --- | --- | --- |
+| `TestFailingCommand` | `TestFailingCommand` | 10/10 / 10/10 |
+| `TestFlushingMultipleChunks` | `TestFlushingMultipleChunks` | 10/10 / 10/10 |
+| `TestSignalForwarding` | `TestSignalForwarding` | 10/10 / 10/10 |
+| `TestUploadFailure` | `TestUploadFailure` | 10/10 / 10/10 |
+| `TestUploadFailure/failure_mode=warn` | `TestUploadFailure/failure_mode=warn` | 10/10 / 10/10 |
+| `TestWithBuild` | `TestWithBuild` | 10/10 / 10/10 |
+
+## Not done
+
+No index sharding commit: the premise is wrong for this checkout/environment, and there is no measured 120s test workload to reduce. No coverage-changing refactors or CI changes. The PR contains only the two BUILD files in separate target commits. This report is retained on disk, untracked and excluded from all branch commits. No empty or unverified index commit was created.
+
+
+---
+Part of a coordinated effort to simplify the build and speed up slow tests while preserving coverage. Reviewed by a fresh-context reviewer before opening.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_01NPAch3p4ukdf3wsrFsi6r3

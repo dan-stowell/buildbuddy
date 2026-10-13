@@ -1,0 +1,272 @@
+diff --git a/cli/remotebazel/BUILD b/cli/remotebazel/BUILD
+index 60d4692df..637530de3 100644
+--- a/cli/remotebazel/BUILD
++++ b/cli/remotebazel/BUILD
+@@ -40,7 +40,7 @@ go_library(
+         "//server/util/rexec",
+         "//server/util/shlex",
+         "//server/util/status",
+-        "@com_github_alecaivazis_survey_v2//:survey",
++        "@com_github_manifoldco_promptui//:promptui",
+         "@org_golang_google_genproto_googleapis_bytestream//:bytestream",
+         "@org_golang_google_grpc//metadata",
+         "@org_golang_x_sync//errgroup",
+@@ -70,5 +70,6 @@ go_test(
+         "@com_github_stretchr_testify//assert",
+         "@com_github_stretchr_testify//require",
+         "@org_golang_google_grpc//:grpc",
++        "@org_golang_x_term//:term",
+     ],
+ )
+diff --git a/cli/remotebazel/remotebazel.go b/cli/remotebazel/remotebazel.go
+index 7f2d07812..25bf320e4 100644
+--- a/cli/remotebazel/remotebazel.go
++++ b/cli/remotebazel/remotebazel.go
+@@ -19,7 +19,6 @@ import (
+ 	"syscall"
+ 	"time"
+ 
+-	"github.com/AlecAivazis/survey/v2"
+ 	"github.com/buildbuddy-io/buildbuddy/cli/arg"
+ 	"github.com/buildbuddy-io/buildbuddy/cli/log"
+ 	"github.com/buildbuddy-io/buildbuddy/cli/login"
+@@ -39,6 +38,7 @@ import (
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/rexec"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/shlex"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
++	"github.com/manifoldco/promptui"
+ 	"golang.org/x/sync/errgroup"
+ 	"golang.org/x/sys/unix"
+ 	"google.golang.org/grpc/metadata"
+@@ -224,27 +224,35 @@ func determineRemote() (*gitRemote, error) {
+ 		remoteNames = append(remoteNames, fmt.Sprintf("%s (%s)", r.name, r.url))
+ 	}
+ 
+-	selectedRemoteAndURL := ""
+-	prompt := &survey.Select{
+-		Message: "Select the git remote that will be used by the remote Bazel instance to fetch your repo:",
+-		Options: remoteNames,
++	prompt := promptui.Select{
++		Label:             "Select the git remote that will be used by the remote Bazel instance to fetch your repo",
++		Items:             remoteNames,
++		Size:              7,
++		Stdin:             os.Stdin,
++		Stdout:            os.Stderr,
++		StartInSearchMode: true,
++		// Keep printable characters, including '/' in URLs, available for filtering.
++		Keys: &promptui.SelectKeys{
++			Prev:     promptui.Key{Code: promptui.KeyPrev, Display: promptui.KeyPrevDisplay},
++			Next:     promptui.Key{Code: promptui.KeyNext, Display: promptui.KeyNextDisplay},
++			PageUp:   promptui.Key{Code: promptui.KeyBackward, Display: promptui.KeyBackwardDisplay},
++			PageDown: promptui.Key{Code: promptui.KeyForward, Display: promptui.KeyForwardDisplay},
++			Search:   promptui.Key{Code: '\x13', Display: "Ctrl+S"},
++		},
++		Searcher: func(input string, index int) bool {
++			return strings.Contains(strings.ToLower(remoteNames[index]), strings.ToLower(input))
++		},
+ 	}
+-	if err := survey.AskOne(prompt, &selectedRemoteAndURL); err != nil {
++	index, _, err := prompt.Run()
++	if err != nil {
+ 		return nil, fmt.Errorf("select git remote: %w", err)
+ 	}
+ 
+-	selectedRemote, _, _ := strings.Cut(selectedRemoteAndURL, " (")
+-	for _, r := range remotes {
+-		if r.name == selectedRemote {
+-			err = storage.WriteRepoConfig(gitConfigRemoteBazelRemote, r.name)
+-			if err != nil {
+-				log.Warnf("failed to cache selected remote in .git/config: %s", err)
+-			}
+-			return r, nil
+-		}
++	r := remotes[index]
++	if err := storage.WriteRepoConfig(gitConfigRemoteBazelRemote, r.name); err != nil {
++		log.Warnf("failed to cache selected remote in .git/config: %s", err)
+ 	}
+-
+-	return nil, status.InternalError("selected remote is not configured")
++	return r, nil
+ }
+ 
+ // parseRemote parses the string output of a `git remote` command into a `gitRemote` struct.
+diff --git a/cli/remotebazel/remotebazel_test.go b/cli/remotebazel/remotebazel_test.go
+index 5f37fad59..968061226 100644
+--- a/cli/remotebazel/remotebazel_test.go
++++ b/cli/remotebazel/remotebazel_test.go
+@@ -1,11 +1,13 @@
+ package remotebazel
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"fmt"
+ 	"io"
+ 	"math"
+ 	"os"
++	"os/exec"
+ 	"path/filepath"
+ 	"strings"
+ 	"sync"
+@@ -25,6 +27,7 @@ import (
+ 	"github.com/creack/pty"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
++	"golang.org/x/term"
+ 	"google.golang.org/grpc"
+ 
+ 	bespb "github.com/buildbuddy-io/buildbuddy/proto/build_event_stream"
+@@ -734,6 +737,94 @@ func TestGitConfig_FetchURL(t *testing.T) {
+ 	}
+ }
+ 
++// Run the picker in a subprocess so readline sees real terminal file descriptors.
++func TestDetermineRemote_PTY(t *testing.T) {
++	if os.Getenv("BB_REMOTE_PICKER_HELPER") == "1" {
++		r, err := determineRemote()
++		if err != nil {
++			fmt.Printf("error: %s\n", err)
++		} else {
++			fmt.Printf("remote: %s %s\n", r.name, r.url)
++		}
++		return
++	}
++	for _, tc := range []struct {
++		name, input, cached, want string
++	}{
++		{"default", "\r", "", "remote: extra https://example.com/extra"},
++		{"next", "\x1b[B\r", "", "remote: origin https://example.com/origin"},
++		{"search", "ORIGIN\r", "", "remote: origin https://example.com/origin"},
++		{"URL search", "HTTPS://EXAMPLE.COM/ORIGIN\r", "", "remote: origin https://example.com/origin"},
++		{"stale cache", "\x1b[B\r", "deleted", "remote: origin https://example.com/origin"},
++		{"cancel", "\x03", "", "error: select git remote: ^C"},
++		{"cached", "", "origin", "remote: origin https://example.com/origin"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			repo, _ := testgit.MakeTempRepo(t, map[string]string{"README": "test"})
++			testshell.Run(t, repo, "git remote add extra https://example.com/extra && git remote add origin https://example.com/origin")
++			if tc.cached != "" {
++				testshell.Run(t, repo, fmt.Sprintf("git config %s.%s %s", gitConfigSection, gitConfigRemoteBazelRemote, tc.cached))
++			}
++			master, tty, err := pty.Open()
++			require.NoError(t, err)
++			defer master.Close()
++			defer tty.Close()
++			require.NoError(t, pty.Setsize(master, &pty.Winsize{Rows: 24, Cols: 120}))
++			before, err := term.GetState(int(tty.Fd()))
++			require.NoError(t, err)
++			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
++			defer cancel()
++			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDetermineRemote_PTY$")
++			cmd.Dir = repo
++			cmd.Env = append(os.Environ(), "BB_REMOTE_PICKER_HELPER=1")
++			var stdout bytes.Buffer
++			cmd.Stdin, cmd.Stderr, cmd.Stdout = tty, tty, &stdout
++			output := lockingbuffer.New()
++			go func() { _, _ = io.Copy(output, master) }()
++			require.NoError(t, cmd.Start())
++			if tc.input != "" {
++				// Wait until the prompt is rendered and raw mode is enabled before typing.
++				require.Eventually(t, func() bool {
++					return strings.Contains(output.String(), "example.com/origin")
++				}, 10*time.Second, 10*time.Millisecond)
++				_, err = master.Write([]byte(tc.input))
++				require.NoError(t, err)
++			}
++			require.NoError(t, cmd.Wait(), output.String())
++			require.Contains(t, stdout.String(), tc.want)
++			require.NotContains(t, stdout.String(), "Select the git remote")
++			after, err := term.GetState(int(tty.Fd()))
++			require.NoError(t, err)
++			require.Equal(t, before, after, "picker must restore terminal settings")
++			cached := testshell.Run(t, repo, fmt.Sprintf("git config --get %s.%s || true", gitConfigSection, gitConfigRemoteBazelRemote))
++			if tc.name == "cancel" {
++				require.Empty(t, strings.TrimSpace(cached))
++			} else {
++				selected := strings.Fields(tc.want)[1]
++				require.Equal(t, selected, strings.TrimSpace(cached))
++			}
++		})
++	}
++}
++
++func TestDetermineRemote_NonTerminalEOF(t *testing.T) {
++	repo, _ := testgit.MakeTempRepo(t, map[string]string{"README": "test"})
++	testshell.Run(t, repo, "git remote add extra https://example.com/extra && git remote add origin https://example.com/origin")
++	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
++	defer cancel()
++	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDetermineRemote_PTY$")
++	cmd.Dir = repo
++	cmd.Env = append(os.Environ(), "BB_REMOTE_PICKER_HELPER=1")
++	cmd.Stdin = strings.NewReader("")
++	var stdout, stderr bytes.Buffer
++	cmd.Stdout, cmd.Stderr = &stdout, &stderr
++	require.NoError(t, cmd.Run())
++	require.Contains(t, stdout.String(), "error: select git remote: ^D")
++	require.NotContains(t, stdout.String(), "Select the git remote")
++	cached := testshell.Run(t, repo, fmt.Sprintf("git config --get %s.%s || true", gitConfigSection, gitConfigRemoteBazelRemote))
++	require.Empty(t, strings.TrimSpace(cached))
++}
++
+ func TestGeneratingPatches(t *testing.T) {
+ 	// Setup the "remote" repo
+ 	remoteRepoPath, _ := testgit.MakeTempRepo(t, map[string]string{
+diff --git a/cli/remotebazel/result.md b/cli/remotebazel/result.md
+new file mode 100644
+index 000000000..54760f9fb
+--- /dev/null
++++ b/cli/remotebazel/result.md
+@@ -0,0 +1,53 @@
++# Remote-Bazel picker: Survey → Promptui
++
++## Change and premise
++
++Before editing, `rg -n 'AlecAivazis/survey|promptui' --glob '*.go' --glob BUILD` found Survey used only by `cli/remotebazel`; Promptui was already used by `cli/add` and `cli/picker`. The baseline Bazel dependency query confirmed Survey, go-shellquote, and mgutz/ansi in the remote-Bazel library graph. The dependency-reduction premise holds.
++
++Replaced Survey Select/AskOne with Promptui Select/Run. Kept the prompt text, seven-row list, case-insensitive substring search (including URLs containing `/`), stdin input and stderr prompt output, single-remote shortcut, cached-remote lookup, stale-cache fallback, wrapped selection errors, and warning-only handling of cache-write failures. Map the returned index directly to the configured remote. BUILD now uses the existing Promptui repository. Search starts enabled; Ctrl-S toggles it so `/` stays available for URL filtering, while arrow/page keys keep Promptui defaults.
++
++Added subprocess tests with a pseudo-terminal for default selection, arrow selection, typed name/URL search, stale cache, Ctrl-C without caching, cache reuse, and restoration of terminal state. Added a non-terminal EOF test. PTY subprocesses put stdin/stderr on a terminal while capturing stdout separately, testing redirected stdout and ensuring prompts stay on stderr. Existing Git configuration tests remain.
++
++## Measurements
++
++Both measurements used `bazel query 'deps(//cli/remotebazel:remotebazel)'`, with baseline commit `770b88bc89c0b20059d42a237e8c7923ff5b7215` BUILD dependency before replacement and the updated BUILD afterward. Counts include source-file and metadata labels, not just rules. Parse unique stdout lines starting with `//` or `@` (exclude log/progress lines).
++
++| Metric | Before | After | Delta |
++| --- | ---: | ---: | ---: |
++| Library transitive labels | 5,967 | 5,918 | -49 |
++| Library external labels | 5,521 | 5,472 | -49 |
++| Local go_library/go_test targets | 2 | 2 | 0 |
++| Library direct BUILD deps | 34 | 34 | 0 |
++| Test direct BUILD deps | 17 | 18 | +1 |
++| External BUILD dependency entries | 9 | 10 | +1 |
++| Production Go LOC | 1,755 | 1,763 | +8 |
++| Test Go LOC | 1,128 | 1,219 | +91 |
++
++The additional test dependency is already-present `golang.org/x/term` for portable terminal-state assertions. Local target/dep counts use the same Python regexes on baseline and updated BUILD: `^go_(?:library|test)\(` for targets, quoted labels inside each `deps = [...]` for direct deps, and quoted `@` labels inside those arrays for external entries. LOC uses `wc -l` on each Go file for both versions (`git show 770b88bc89c0b20059d42a237e8c7923ff5b7215:<path>` supplies the baseline).
++
++Three repositories leave this library graph: Survey, go-shellquote, and mgutz/ansi. Two enter: Promptui and readline, both already used by other CLI packages. No module declaration was removed in this change; the whole-module gain awaits the separate dependency-removal PR. Binary size was not measured.
++
++## Validation
++
++Long commands ran under `nohup ... > /tmp/remotebazel-*.log 2>&1 < /dev/null &` and were polled.
++
++- Baseline and updated `bazel query 'deps(//cli/remotebazel:remotebazel)'`: passed.
++- `bazel query 'rdeps(//..., //cli/remotebazel:remotebazel, 1)'`: interrupted after loading 2,648 packages. It triggered builds of unrelated default-execution and executor Docker images and reduced free disk space to 4.3 GB on this 25 GB VM. No test/build was abandoned for being slow. Subsequently `docker builder prune --force` cleared 4.127 GB of inactive build cache left by image setup, restoring roughly 7.5 GB free for the scoped build. Later, removing only downloaded archive files larger than 10 MiB from Bazel's content-addressable repository cache reclaimed another 1,797 MiB; extracted repositories and compiled outputs were retained:
++  `find /home/exedev/.cache/bazel/_bazel_exedev/cache/repos/v1/content_addressable -type f -name file -size +10M -delete`. Finally, the interrupted full-repository query had downloaded Chromium for macOS ARM64/x64 and Windows x64; removing those unused platform browser cache directories reclaimed roughly another 1 GB before linking. As disk pressure increased before linking, the remaining unused Linux Chromium and driver caches were also removed. After the build failed, 439 MiB of reusable sandbox scratch data was cleared; subsequent commands disable sandbox-directory reuse and use one build job. Compiled outputs were retained.
++- Narrowed query `bazel query 'rdeps(//cli/... + //enterprise/server/test/integration/remote_bazel:all, //cli/remotebazel:remotebazel, 1)'`: passed, returning the library, its test, `//cli/cli_command/register:register`, and `//enterprise/server/test/integration/remote_bazel:remote_bazel_test`. Repository-wide `rg -n '"//cli/remotebazel' --glob BUILD --glob BUILD.bazel` found exactly the two external users included in this narrowed universe: CLI command registration and the remote-Bazel integration test.
++- `bazel test --jobs=2 --local_test_jobs=1 --remote_executor= --bes_backend= --lockfile_mode=off //cli/remotebazel:all //cli/cli_command/register:register //enterprise/server/test/integration/remote_bazel:remote_bazel_test`: failed after 7,151 seconds because disk filled while nogo wrote `enterprise/server/remote_execution/filecache/filecache.facts`; both tests were skipped. Almost all dependency compilation completed and was cached.
++- `bazel test --jobs=1 --local_test_jobs=1 --noreuse_sandbox_directories --remote_executor= --bes_backend= --lockfile_mode=off //cli/remotebazel:all`: passed all tests and nogo checks in 56 seconds after adding the URL-search key mapping and regression test. All seven PTY cases and the non-terminal EOF case passed.
++- `bazel test --jobs=1 --local_test_jobs=1 --noreuse_sandbox_directories --remote_executor= --bes_backend= --lockfile_mode=off //cli/cli_command/register:register //enterprise/server/test/integration/remote_bazel:remote_bazel_test`: all targets compiled and nogo checks passed; the integration test failed all seven shards because the local scheduler could not fit hosted-runner requests of `milli_cpu=3000, memory_bytes=7500000000` on this two-CPU VM. The error was `no registered executors ... can fit a task`; every shard logged executor resource rejections and none logged disk errors. This fails before remote execution, independently of the picker.
++- `git diff --check`: passed.
++
++The picker command was repeated after removing the redundant trailing colon from the Label (Promptui supplies its own colon): passed in 9.354 seconds, including all tests and nogo checks.
++
++## Dependencies and exclusions
++
++Shared dependency files were not edited. Survey, go-shellquote, and mgutz/ansi now have no first-party Go or BUILD users: `rg -n 'AlecAivazis/survey|kballard/go-shellquote|mgutz/ansi' --glob '*.go' --glob BUILD` produced no matches (exit 1). The baseline/updated dependency queries also show all three repositories disappearing from the affected graph. Survey's generated external BUILD depended on go-shellquote, and its core BUILD depended on mgutz/ansi. A generated-BUILD scan also ran:
++
++```sh
++rg -n -L '"@com_github_(mgutz_ansi|kballard_go_shellquote)//' --glob BUILD.bazel /home/exedev/.cache/bazel/_bazel_exedev/71099934f9d3af2730aa81dc5fd03b9c/external/gazelle++go_deps+*
++```
++
++It found exactly two edges: Survey's root BUILD → go-shellquote and Survey's core BUILD → mgutz/ansi. No other fetched module BUILD referenced either. Together with the first-party scan, this supports removing all three modules in the separate dependency PR. Dependency declarations remain for the separate serialized removal PR. Executor capacity and integration-test scheduling code were not changed outside scope to force the end-to-end suite to pass. No push or PR. The report is in `cli/remotebazel/result.md` to keep every tracked edit within scope.

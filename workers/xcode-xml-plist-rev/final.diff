@@ -1,0 +1,290 @@
+diff --git a/server/xcode/BUILD b/server/xcode/BUILD
+index a284fedcc..5bc797b0d 100644
+--- a/server/xcode/BUILD
++++ b/server/xcode/BUILD
+@@ -5,6 +5,7 @@ go_library(
+     srcs = [
+         "xcode.go",
+         "xcode_darwin.go",
++        "xcode_plist.go",
+     ],
+     cgo = True,
+     clinkopts = select({
+@@ -21,7 +22,6 @@ go_library(
+             "//server/util/flag",
+             "//server/util/log",
+             "//server/util/status",
+-            "@com_github_groob_plist//:plist",
+         ],
+         "//conditions:default": [],
+     }),
+@@ -29,9 +29,11 @@ go_library(
+ 
+ go_test(
+     name = "xcode_test",
+-    srcs = ["xcode_darwin_test.go"],
++    srcs = [
++        "xcode_darwin_test.go",
++        "xcode_plist_test.go",
++    ],
+     embed = [":xcode"],
+-    target_compatible_with = ["@platforms//os:macos"],
+     deps = select({
+         "@io_bazel_rules_go//go/platform:darwin": [
+             "@com_github_stretchr_testify//require",
+diff --git a/server/xcode/result.md b/server/xcode/result.md
+new file mode 100644
+index 000000000..c0dfc8995
+--- /dev/null
++++ b/server/xcode/result.md
+@@ -0,0 +1,58 @@
++# Xcode plist XML decode
++
++Reverified the premise before editing: `rg -n 'groob/plist|com_github_groob_plist' --glob '!go.sum' --glob '!MODULE.bazel.lock'` found exactly one Go import and one BUILD dependency, both in server/xcode, plus shared dependency declarations. The actual file read is `Contents/version.plist`; the existing implementation already uses an XML-only decoder. The dependency reduction is real; binary size was not measured.
++
++Replaced groob/plist with encoding/xml in platform-neutral xcode_plist.go. The parser reads ordered key/value elements, keeps the two version strings, and skips entire unknown values (including nested dictionaries and arrays). Existing file-open/decode error wrappers remain; the opened file is now closed. Tests exercise a fixture with reordered keys, unknown nested values, missing fields, malformed pairs, wrong field types, missing root dictionaries, and truncated XML. Added the parser and its Linux-runnable test to BUILD.
++
++## Measurements
++
++Same measurement code for HEAD (before) and the working tree (after), counting server/xcode Go files and BUILD only:
++
++| Metric | Before | After |
++| --- | ---: | ---: |
++| go_library/go_test targets | 2 | 2 |
++| Unique direct dependency labels | 6 | 5 |
++| Unique external dependency labels | 2 | 1 |
++| Lines of Go and BUILD | 434 | 565 |
++| First-party groob/plist imports | 1 | 0 |
++
++Reused the existing xcode_test target and removed its macOS compatibility restriction so the portable tests run on Linux. The locator tests remain Darwin-only via their source build tag. Dependency counts include both existing targets and all platform-select branches, excluding platform selector labels.
++
++Measurement command (run before committing; HEAD is the baseline):
++
++```sh
++python3 - <<'PY'
++import pathlib,re,subprocess
++for label in ['before','after']:
++ if label=='before':
++  paths=subprocess.check_output(['git','ls-tree','-r','--name-only','HEAD','server/xcode'],text=True).splitlines()
++  texts={p:subprocess.check_output(['git','show','HEAD:'+p],text=True) for p in paths if p.endswith('.go') or p.endswith('/BUILD')}
++ else: texts={str(p):p.read_text() for p in pathlib.Path('server/xcode').iterdir() if p.suffix=='.go' or p.name=='BUILD'}
++ build=texts['server/xcode/BUILD']
++ deps=set()
++ for block in re.findall(r'    deps = select\(\{(.*?)\n    \}\),',build,re.S): deps.update(re.findall(r'^\s+"((?:@|//)[^"]+)",$',block,re.M))
++ print(label, len(re.findall(r'^go_(?:library|test)\(',build,re.M)),len(deps),sum(d.startswith('@') for d in deps),sum(len(s.splitlines()) for s in texts.values()))
++PY
++```
++
++## Verification
++
++- `go test ./server/xcode/...`: PASS on Linux.
++- `go test server/xcode/xcode_plist.go server/xcode/xcode_plist_test.go`: PASS.
++- `GOOS=darwin go vet ./server/xcode/...`: FAIL: existing xcode_darwin_test.go references NewXcodeLocator, but cross-compilation disables cgo and excludes xcode_darwin.go. Apple CoreServices requires a Darwin SDK/toolchain.
++- `GOOS=darwin go vet server/xcode/xcode_plist.go server/xcode/xcode_plist_test.go`: PASS.
++- `GOOS=darwin go test -c -o /tmp/xcode-plist-darwin.test server/xcode/xcode_plist.go server/xcode/xcode_plist_test.go`: PASS (Darwin cross-compile of parser and tests).
++- `git diff --check`: PASS.
++
++- `bazel test //server/xcode:xcode_test`: PASS on Linux, including nogo checks. Final log: /tmp/xcode-bazel-test-complete.log. An initial separate parser-test target also passed; it was subsequently consolidated into xcode_test to keep the target count unchanged.
++- `bazel build --config=target-darwin-arm64 //server/xcode:xcode`: PASS, including nogo checks. Final log: /tmp/xcode-darwin-build-complete.log. `go tool nm bazel-bin/server/xcode/xcode.a` confirms the archive contains NewXcodeLocator, xcodePlistForPath, and decodeXcodePlist, so the actual cgo Darwin locator was compiled.
++- `bazel query 'rdeps(//..., //server/xcode:xcode, 1)'`: FAIL in unrelated Docker repository setup: default_execution_image Docker build timed out. Log: /tmp/xcode-rdeps-before.log.
++- `bazel query 'rdeps(set(//server/xcode:all //enterprise/server/cmd/executor:all //enterprise/server/test/integration/remote_execution/rbetest:all), //server/xcode:xcode, 1)'`: FAIL during default_execution_image setup with disk exhaustion (exit 7). Log: /tmp/xcode-rdeps-scoped.log.
++- `rg -n '//server/xcode|server/xcode"' --glob BUILD --glob '*.go' enterprise server`: identifies executor_lib and rbetest as the direct consumers.
++- `bazel build //enterprise/server/cmd/executor:executor_lib //enterprise/server/test/integration/remote_execution/rbetest:rbetest`: FAIL after about 52 minutes, at GoCompilePkg //proto:failure_details_go_proto with compiler exit 1. The filesystem had only 2.4 MB free at failure; the compiler emitted no further diagnostic. These consumers are not fully verified. Log: /tmp/xcode-rdeps-build.log.
++
++Long Bazel commands ran under nohup with logs in /tmp and were polled to completion. Earlier Darwin and test attempts failed explicitly with "No space left on device"; final package test and Darwin build succeeded after cache cleanup. No native Darwin runtime tests could run on this Linux VM.
++
++## Dependency cleanup and scope
++
++`rg -n 'groob/plist|com_github_groob_plist' --glob '*.go' --glob BUILD --glob BUILD.bazel .` now returns no matches. github.com/groob/plist has no remaining first-party source or BUILD users. Its go.mod/go.sum and Bazel module declarations are intentionally left for the serialized dependency cleanup PR. No binary-size claim is made. All repository edits, including this report, are under server/xcode. To recover from the 25 GB filesystem filling during verification, removed unused Docker build cache (`docker builder prune -f`), disposable downloaded Bazel archive payloads (2.4 GB), Go's build cache (`go clean -cache`), and generated .a files in three configurations used by the failed consumer build. Extracted repositories and the package's compiled artifacts were retained. These cache operations were outside the source-edit scope and were necessary for the final verification; they changed no additional repository files. The large consumer build was not retried after disk exhaustion.
+diff --git a/server/xcode/xcode_darwin.go b/server/xcode/xcode_darwin.go
+index e048d9d4b..ae2e097ab 100644
+--- a/server/xcode/xcode_darwin.go
++++ b/server/xcode/xcode_darwin.go
+@@ -24,7 +24,6 @@ import (
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+-	"github.com/groob/plist"
+ )
+ 
+ const xcodeBundleID = "com.apple.dt.Xcode"
+@@ -62,12 +61,6 @@ type xcodeVersion struct {
+ 	sdks map[string]string
+ }
+ 
+-// The interesting bits to pull from Xcode's version plist.
+-type xcodePlist struct {
+-	CFBundleShortVersionString string `plist:"CFBundleShortVersionString"`
+-	ProductBuildVersion        string `plist:"ProductBuildVersion"`
+-}
+-
+ func NewXcodeLocator() *xcodeLocator {
+ 	xl := &xcodeLocator{}
+ 	xl.locate()
+@@ -210,15 +203,16 @@ func versionMap(urlRefs []C.CFURLRef) map[string]*xcodeVersion {
+ }
+ 
+ func xcodePlistForPath(path string) (*xcodePlist, error) {
+-	var xcodePlist xcodePlist
+ 	versionFileReader, err := os.Open(path)
+ 	if err != nil {
+ 		return nil, status.InternalErrorf("Failed to open %s: %s", path, err.Error())
+ 	}
+-	if err := plist.NewXMLDecoder(versionFileReader).Decode(&xcodePlist); err != nil {
++	defer versionFileReader.Close()
++	xcodePlist, err := decodeXcodePlist(versionFileReader)
++	if err != nil {
+ 		return nil, status.InternalErrorf("Failed to decode %s: %s", path, err.Error())
+ 	}
+-	return &xcodePlist, nil
++	return xcodePlist, nil
+ }
+ 
+ func commandLineToolsVersion(developerDir string) *xcodeVersion {
+diff --git a/server/xcode/xcode_plist.go b/server/xcode/xcode_plist.go
+new file mode 100644
+index 000000000..dbc42e9dd
+--- /dev/null
++++ b/server/xcode/xcode_plist.go
+@@ -0,0 +1,85 @@
++package xcode
++
++import (
++	"encoding/xml"
++	"fmt"
++	"io"
++)
++
++// The interesting bits to pull from Xcode's version plist.
++type xcodePlist struct {
++	CFBundleShortVersionString string
++	ProductBuildVersion        string
++}
++
++func decodeXcodePlist(r io.Reader) (*xcodePlist, error) {
++	var document struct {
++		XMLName xml.Name    `xml:"plist"`
++		Dict    *xcodePlist `xml:"dict"`
++	}
++	if err := xml.NewDecoder(r).Decode(&document); err != nil {
++		return nil, err
++	}
++	if document.Dict == nil {
++		return nil, fmt.Errorf("expected plist dictionary")
++	}
++	return document.Dict, nil
++}
++
++// A plist dictionary alternates keys and values; unknown values may themselves
++// contain dictionaries, so skip their entire element.
++func (p *xcodePlist) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
++	for {
++		token, err := d.Token()
++		if err != nil {
++			return err
++		}
++		switch token := token.(type) {
++		case xml.EndElement:
++			if token.Name == start.Name {
++				return nil
++			}
++		case xml.StartElement:
++			if token.Name.Local != "key" {
++				return fmt.Errorf("expected plist key, got %s", token.Name.Local)
++			}
++			var key string
++			if err := d.DecodeElement(&key, &token); err != nil {
++				return err
++			}
++			var value xml.StartElement
++			for {
++				token, err := d.Token()
++				if err != nil {
++					return err
++				}
++				if element, ok := token.(xml.StartElement); ok {
++					value = element
++					break
++				}
++				if _, ok := token.(xml.EndElement); ok {
++					return fmt.Errorf("missing plist value for %s", key)
++				}
++			}
++			var destination *string
++			switch key {
++			case "CFBundleShortVersionString":
++				destination = &p.CFBundleShortVersionString
++			case "ProductBuildVersion":
++				destination = &p.ProductBuildVersion
++			}
++			if destination == nil {
++				if err := d.Skip(); err != nil {
++					return err
++				}
++			} else {
++				if value.Name.Local != "string" {
++					return fmt.Errorf("expected plist string for %s, got %s", key, value.Name.Local)
++				}
++				if err := d.DecodeElement(destination, &value); err != nil {
++					return err
++				}
++			}
++		}
++	}
++}
+diff --git a/server/xcode/xcode_plist_test.go b/server/xcode/xcode_plist_test.go
+new file mode 100644
+index 000000000..1a082206a
+--- /dev/null
++++ b/server/xcode/xcode_plist_test.go
+@@ -0,0 +1,50 @@
++package xcode
++
++import (
++	"strings"
++	"testing"
++)
++
++func TestDecodeXcodePlist(t *testing.T) {
++	const fixture = `<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0"><dict>
++<key>Unknown</key><dict><key>ProductBuildVersion</key><string>ignored</string></dict>
++<key>ProductBuildVersion</key><string>16A242</string>
++<key>Other</key><array><integer>1</integer><true/></array>
++<key>CFBundleShortVersionString</key><string>16.0</string>
++<key>Last</key><data>AA==</data>
++</dict></plist>`
++	p, err := decodeXcodePlist(strings.NewReader(fixture))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if p.CFBundleShortVersionString != "16.0" || p.ProductBuildVersion != "16A242" {
++		t.Fatalf("unexpected plist: %+v", p)
++	}
++}
++
++func TestDecodeXcodePlistErrors(t *testing.T) {
++	for _, input := range []string{
++		`<plist><string>not a dictionary</string></plist>`,
++		`<plist/>`,
++		`<plist><dict><key>ProductBuildVersion</key></dict></plist>`,
++		`<plist><dict><key>ProductBuildVersion</key><integer>1</integer></dict></plist>`,
++		`<plist><dict><string>unpaired</string></dict></plist>`,
++		`<plist><dict><key>Unknown</key><dict>`,
++	} {
++		if _, err := decodeXcodePlist(strings.NewReader(input)); err == nil {
++			t.Errorf("expected error for %s", input)
++		}
++	}
++}
++
++func TestDecodeXcodePlistMissingFields(t *testing.T) {
++	p, err := decodeXcodePlist(strings.NewReader(`<plist><dict/></plist>`))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if *p != (xcodePlist{}) {
++		t.Fatalf("unexpected plist: %+v", p)
++	}
++}

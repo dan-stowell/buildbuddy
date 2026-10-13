@@ -1,0 +1,73 @@
+diff --git a/enterprise/server/test/integration/workflow/workflow_test.go b/enterprise/server/test/integration/workflow/workflow_test.go
+index bed92dddf..bf4d32e85 100644
+--- a/enterprise/server/test/integration/workflow/workflow_test.go
++++ b/enterprise/server/test/integration/workflow/workflow_test.go
+@@ -299,15 +299,20 @@ func triggerLegacyWebhook(t *testing.T, gitProvider *testgit.FakeProvider, workf
+ 	workflowService.ServeHTTP(testhttp.NewResponseWriter(t), req)
+ }
+ 
++// Preserve the original backoff sleep budget: 50ms + 100ms + ... + 51.2s.
++const workflowPollTimeout = 102350 * time.Millisecond
++
+ func waitForAnyWorkflowInvocationCreated(t *testing.T, ctx context.Context, bb bbspb.BuildBuddyServiceClient, reqCtx *ctxpb.RequestContext, excludeInvocationIDs ...string) string {
+ 	excluded := set.From(excludeInvocationIDs...)
+ 
+-	for delay := 50 * time.Millisecond; delay < 1*time.Minute; delay *= 2 {
++	deadline := time.Now().Add(workflowPollTimeout)
++	for delay := 50 * time.Millisecond; time.Now().Before(deadline); delay = min(2*delay, 100*time.Millisecond) {
+ 		searchResp, err := bb.SearchInvocation(ctx, &inpb.SearchInvocationRequest{
+ 			RequestContext: reqCtx,
+ 			Query:          &inpb.InvocationQuery{GroupId: reqCtx.GetGroupId()},
+ 		})
+ 		if err != nil && strings.Contains(err.Error(), "not found") {
++			time.Sleep(min(delay, time.Until(deadline)))
+ 			continue
+ 		}
+ 		require.NoError(t, err)
+@@ -321,7 +326,7 @@ func waitForAnyWorkflowInvocationCreated(t *testing.T, ctx context.Context, bb b
+ 			}
+ 		}
+ 
+-		time.Sleep(delay)
++		time.Sleep(min(delay, time.Until(deadline)))
+ 	}
+ 
+ 	require.FailNowf(t, "timeout", "Timed out waiting for workflow invocation to be created")
+@@ -329,7 +334,8 @@ func waitForAnyWorkflowInvocationCreated(t *testing.T, ctx context.Context, bb b
+ }
+ 
+ func waitForInvocationStatus(t *testing.T, ctx context.Context, bb bbspb.BuildBuddyServiceClient, reqCtx *ctxpb.RequestContext, invocationID string, expectedStatus inspb.InvocationStatus) *inpb.Invocation {
+-	for delay := 50 * time.Millisecond; delay < 1*time.Minute; delay *= 2 {
++	deadline := time.Now().Add(workflowPollTimeout)
++	for delay := 50 * time.Millisecond; time.Now().Before(deadline); delay = min(2*delay, 100*time.Millisecond) {
+ 		inv := getInvocation(t, ctx, bb, reqCtx, invocationID, false /*fetchChildren*/)
+ 		status := inv.GetInvocationStatus()
+ 
+@@ -344,7 +350,7 @@ func waitForInvocationStatus(t *testing.T, ctx context.Context, bb bbspb.BuildBu
+ 			return inv
+ 		}
+ 
+-		time.Sleep(delay)
++		time.Sleep(min(delay, time.Until(deadline)))
+ 	}
+ 
+ 	require.FailNowf(t, "timeout", "Timed out waiting for invocation to reach expected status %v", expectedStatus)
+@@ -585,7 +591,8 @@ func TestCancel(t *testing.T) {
+ 	// either have completed or been disconnected.
+ 	for _, child := range invWithChildren.ChildInvocations {
+ 		found := false
+-		for delay := 50 * time.Millisecond; delay < 1*time.Minute; delay *= 2 {
++		deadline := time.Now().Add(workflowPollTimeout)
++		for delay := 50 * time.Millisecond; time.Now().Before(deadline); delay = min(2*delay, 100*time.Millisecond) {
+ 			inv := getInvocation(t, ctx, bb, reqCtx, child.InvocationId, false /*fetchChildren*/)
+ 			status := inv.GetInvocationStatus()
+ 
+@@ -593,7 +600,7 @@ func TestCancel(t *testing.T) {
+ 				found = true
+ 				break
+ 			}
+-			time.Sleep(delay)
++			time.Sleep(min(delay, time.Until(deadline)))
+ 		}
+ 
+ 		if !found {

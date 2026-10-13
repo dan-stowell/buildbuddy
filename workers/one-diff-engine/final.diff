@@ -1,0 +1,113 @@
+diff --git a/result.md b/result.md
+new file mode 100644
+index 000000000..8ba6ff461
+--- /dev/null
++++ b/result.md
+@@ -0,0 +1,107 @@
++# Result: stopped before the port
++
++The single-user premise is correct, but a direct replacement with `diff` changes rendered semantic highlights. Following the task's stop condition, I left diff.tsx and BUILD unchanged. This report is the only repository change; its location outside app/util is required by the requested deliverable.
++
++`diff-match-patch` computes character edits then performs semantic cleanup: small equality elimination, boundary shifting, and overlap extraction. `diff` 8.0.3 has no equivalent cleanup API. Preserving the existing behavior would require a maintained cleanup implementation and validation of different underlying edit choices. This investigation establishes incompatibility of the direct replacements, not impossibility of a custom compatibility implementation. That larger rewrite is not a demonstrated simplification, so I did not force it through.
++
++## Usage evidence
++
++```sh
++rg 'diff-match-patch' --glob '!*lock*' --glob '!package.json'
++rg 'from "diff"' app enterprise
++rg -n 'util:diff|util/diff' app enterprise
++```
++
++The only first-party import is app/util/diff.tsx. Its BUILD target depends on `//:node_modules/diff-match-patch` and `//:node_modules/@types/diff-match-patch`. `diff` is already imported by enterprise/app/code/code.tsx and code_v2.tsx. The utility is used by compare_invocations and compare_actions. No external modules became unused: both old dependency labels remain. All dependency manifests and lockfiles remain unchanged.
++
++## Fixture check
++
++Used the exact locked versions, diff 8.0.3 and diff-match-patch 1.0.5, downloaded from the public npm registry to /tmp/diff-port-check. Node 22.16.0 was downloaded there because Node/npm were absent from PATH. No repository dependency installation was performed.
++
++Ten old-output snapshots passed. Comparison covers the text versus highlighted-span structure on both sides, ignoring React keys, matching renderLeftDiffs/renderRightDiffs.
++
++| Candidate | Equivalent fixtures | Different fixtures |
++| --- | --- | --- |
++| diffChars | 8/10 | build flag, word deletion |
++| diffWordsWithSpace | 8/10 | character replacement, path |
++
++Brackets below indicate highlighted text:
++
++| Input change | Old rendering | Candidate rendering |
++| --- | --- | --- |
++| fastbuild → opt | `[fastbuild]` → `[opt]` | diffChars: `[fas]t[build]` → `[op]t` |
++| foo bar baz → foo baz | `foo [bar ]baz` → `foo baz` | diffChars: `foo ba[r ba]z` → `foo baz` |
++| abc → axc | `a[b]c` → `a[x]c` | diffWordsWithSpace: `[abc]` → `[axc]` |
++| /foo/bar → /foo/baz | `/foo/ba[r]` → `/foo/ba[z]` | diffWordsWithSpace: `/foo/[bar]` → `/foo/[baz]` |
++
++Executed:
++
++```sh
++/tmp/diff-port-check/node-v22.16.0-linux-x64/bin/node /tmp/diff-port-check/fixtures.cjs
++```
++
++Exit 0: all snapshots and expected mismatch lists passed. This is an investigation check, not a passing equivalence test for a port. The full script is preserved below without adding permanent targets for the abandoned replacement. To reproduce, extract the two npm packages to `dmp/package` and `diff/package` alongside this script.
++
++```javascript
++const assert = require('node:assert/strict');
++const DMP = require('./dmp/package');
++const diff = require('./diff/package');
++const dmp = new DMP();
++const fixtures = [
++  ['empty', '', '', []],
++  ['equal', 'same', 'same', [[0, 'same']]],
++  ['insertion', '', 'added', [[1, 'added']]],
++  ['deletion', 'removed', '', [[-1, 'removed']]],
++  ['word replacement', 'The cat came.', 'The dog came.', [[0, 'The '], [-1, 'cat'], [1, 'dog'], [0, ' came.']]],
++  ['character replacement', 'abc', 'axc', [[0, 'a'], [-1, 'b'], [1, 'x'], [0, 'c']]],
++  ['build flag', '--compilation_mode=fastbuild', '--compilation_mode=opt', [[0, '--compilation_mode='], [-1, 'fastbuild'], [1, 'opt']]],
++  ['word deletion', 'foo bar baz', 'foo baz', [[0, 'foo '], [-1, 'bar '], [0, 'baz']]],
++  ['path', '/foo/bar', '/foo/baz', [[0, '/foo/ba'], [-1, 'r'], [1, 'z']]],
++  ['word insertion', 'hello world', 'hello brave world', [[0, 'hello '], [1, 'brave '], [0, 'world']]],
++];
++// This is precisely the text and highlighted-span structure emitted by renderLeft/RightDiffs.
++const render = (parts) => [-1, 1].map(side => parts.filter(([type]) => type === 0 || type === side).map(([type, text]) => [type === 0 ? 'text' : 'span', text]));
++const mismatches = { diffChars: [], diffWordsWithSpace: [] };
++for (const [name, a, b, expected] of fixtures) {
++  const old = dmp.diff_main(a, b); dmp.diff_cleanupSemantic(old);
++  assert.deepEqual(old.map(([type,text]) => [type,text]), expected, name);
++  for (const method of Object.keys(mismatches)) {
++    const candidate = diff[method](a,b).map(c => [c.removed ? -1 : c.added ? 1 : 0, c.value]);
++    if (JSON.stringify(render(candidate)) !== JSON.stringify(render(expected))) mismatches[method].push(name);
++  }
++}
++assert.deepEqual(mismatches, {diffChars: ['build flag', 'word deletion'], diffWordsWithSpace: ['character replacement', 'path']});
++console.log(JSON.stringify({fixtures: fixtures.length, originalSnapshots: 'PASS', renderedMismatches: mismatches}, null, 2));
++```
++
++## Before/after measurements
++
++The same command was run before and after:
++
++```sh
++python3 - <<'PY'
++from pathlib import Path
++import re
++s=Path('app/util/BUILD').read_text()
++b=re.search(r'ts_library\(\n    name = "diff",.*?\n\)',s,re.S).group()
++print('diff library targets:', 1)
++print('direct dependency labels:',len(re.findall(r'"//:',b)))
++print('diff-match-patch dependency labels:',len(re.findall(r'"//:node_modules/(?:@types/)?diff-match-patch"',b)))
++print('diff.tsx LOC:',len(Path('app/util/diff.tsx').read_text().splitlines()))
++PY
++```
++
++| Metric | Before | After |
++| --- | ---: | ---: |
++| diff library targets | 1 | 1 |
++| Direct dependency labels | 4 | 4 |
++| diff-match-patch package/type labels | 2 | 2 |
++| diff.tsx LOC | 182 | 182 |
++
++These are source counts, not transitive graph counts or binary size measurements. No reduction is claimed.
++
++## Bazel and choices
++
++Attempted `bazel query 'deps(//app/util:diff)'` (including an initial nohup launch to /tmp/diff-before-query.log). The foreground query loaded 17 packages; I cancelled it after deciding to stop the port, since no build target was changed and transitive graph measurements were no longer needed. Result: `ERROR: query interrupted`; no transitive counts are claimed. A background `bazel query 'rdeps(//..., //app/util:diff, 1)'` launch produced no result in /tmp/diff-rdeps.log. Direct consumers were verified by the source/BUILD searches above. No Bazel build was started or abandoned.
++
++No build/test targets changed, so no Bazel build or test was needed. The fixture check ran the actual locked algorithms. I chose not to switch imports, carry over semantic cleanup code, add permanent investigation targets, remove dependencies, or edit shared dependency files.

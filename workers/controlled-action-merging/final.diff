@@ -1,0 +1,65 @@
+diff --git a/result.md b/result.md
+new file mode 100644
+index 000000000..65893d494
+--- /dev/null
++++ b/result.md
+@@ -0,0 +1,59 @@
++# Result: stopped after verifying the premise
++
++The expected ~60 seconds of test-time saving is incorrect on this checkout. Following the instruction to stop if the premise is wrong, no test changes are retained. The proposed controlled-command replacement and top-level custom-resource variants were drafted, then reverted once the baseline timing became available. Only this report is committed.
++
++## Remote measurements
++
++Both baseline invocations used BuildBuddy Remote Bazel, the same target and filter, with caching of test results disabled:
++
++```sh
++bb remote test //enterprise/server/test/integration/remote_execution:remote_execution_test \
++  --test_filter='TestActionMerging_LongTask|TestCustomResources' \
++  --test_output=all --nocache_test_results
++```
++
++The second invocation additionally used `--experimental_ui_max_stdouterr_bytes=20000000`: the first invocation suppressed the long-task shard's output because it exceeded the default output limit.
++
++- [First baseline](https://app.buildbuddy.io/invocation/7f3db197-ff14-42cf-9686-ac12fb83ece2): target passed; Bazel elapsed 276.626s, critical path 93.00s. Custom-resource cases took 2.11s and 2.02s (parent 4.13s). Long-task duration was suppressed.
++- [Second baseline](https://app.buildbuddy.io/invocation/2f35260d-0853-4e24-81b6-2d9a7323bb0a): target passed; Bazel elapsed 121.799s, critical path 21.74s. `TestActionMerging_LongTask` took **11.02s**. Custom-resource cases took 2.16s and 1.76s (parent 3.92s).
++
++The second baseline logs show executor shutdown beginning at 00:33:30.355 UTC and command cancellation at 00:33:40.356 UTC (`command was canceled: signal: killed`). The test does not wait for `sleep 60` to finish naturally: cleanup incurs approximately ten seconds before canceling it. Thus removing the command cannot save ~60s of test time or ~20s of this target's wall time under these conditions. A smaller saving might exist, but it is not the stated premise.
++
++After timing: not applicable; there is no retained implementation change. No before/after speedup is claimed. Bazel elapsed times above include build/setup overhead and are not estimates of a code-change speedup.
++
++## Test cases and coverage
++
++The second baseline's Bazel test output lists every selected case as passing:
++
++```text
++--- PASS: TestActionMerging_LongTask (11.02s)
++--- PASS: TestCustomResources/respects_custom_resources_if_measured_size_is_available (2.16s)
++--- PASS: TestCustomResources/respects_custom_resources_if_measured_size_is_unavailable (1.76s)
++--- PASS: TestCustomResources (3.92s)
++```
++
++Before case list:
++
++```text
++TestActionMerging_LongTask
++TestCustomResources
++TestCustomResources/respects_custom_resources_if_measured_size_is_available
++TestCustomResources/respects_custom_resources_if_measured_size_is_unavailable
++```
++
++After case list (unchanged source, identical set):
++
++```text
++TestActionMerging_LongTask
++TestCustomResources
++TestCustomResources/respects_custom_resources_if_measured_size_is_available
++TestCustomResources/respects_custom_resources_if_measured_size_is_unavailable
++```
++
++Both unmodified baseline target runs passed (2/2). The second explicitly reports all selected cases passing; the first reports both custom-resource cases passing and the target passing, with the long-task shard output suppressed. No tests, assertions, scenarios, tags, harness files, or build configurations were changed. The full unfiltered target was not run.
++
++A five-run remote verification of the draft was submitted before the second baseline returned its timing, then interrupted after discovering the false premise. It is not counted as passing verification. No changed tests remain, so a five-run flakiness claim is not applicable.
++
++## Setup and scope
++
++Installed the missing BuildBuddy CLI in the VM and configured origin's fetch URL to the public fork and push URL to the internal mirror as requested. No local Bazel fallback was needed. `result.md` is the explicitly requested deliverable outside the test-source scope. No pushes or PRs were made.

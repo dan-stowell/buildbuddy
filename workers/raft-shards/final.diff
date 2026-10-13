@@ -1,0 +1,49 @@
+diff --git a/enterprise/server/raft/client/BUILD b/enterprise/server/raft/client/BUILD
+index 47d6d0f97..1bcaef3fb 100644
+--- a/enterprise/server/raft/client/BUILD
++++ b/enterprise/server/raft/client/BUILD
+@@ -40,6 +40,7 @@ go_library(
+ go_test(
+     name = "client_test",
+     srcs = ["client_test.go"],
++    shard_count = 4,
+     deps = [
+         ":client",
+         "//enterprise/server/raft/constants",
+diff --git a/enterprise/server/raft/metadata/BUILD b/enterprise/server/raft/metadata/BUILD
+index 921efca55..dbfc714f9 100644
+--- a/enterprise/server/raft/metadata/BUILD
++++ b/enterprise/server/raft/metadata/BUILD
+@@ -51,6 +51,7 @@ go_test(
+         "metadata_test.go",
+     ],
+     embed = [":metadata"],
++    shard_count = 4,
+     exec_properties = {
+         "test.EstimatedComputeUnits": "8",
+         "test.EstimatedMemory": "8GB",
+diff --git a/enterprise/server/raft/sender/BUILD b/enterprise/server/raft/sender/BUILD
+index 1c5e41724..cd3f34064 100644
+--- a/enterprise/server/raft/sender/BUILD
++++ b/enterprise/server/raft/sender/BUILD
+@@ -34,6 +34,7 @@ go_library(
+ go_test(
+     name = "sender_test",
+     srcs = ["sender_test.go"],
++    shard_count = 4,
+     exec_properties = {
+         "test.EstimatedComputeUnits": "8",
+         "test.EstimatedMemory": "8GB",
+diff --git a/enterprise/server/raft/store/BUILD b/enterprise/server/raft/store/BUILD
+index 69b6ebb8c..eb03a88ea 100644
+--- a/enterprise/server/raft/store/BUILD
++++ b/enterprise/server/raft/store/BUILD
+@@ -68,7 +68,7 @@ go_test(
+         "test.EstimatedComputeUnits": "10",
+         "test.workload-isolation-type": "firecracker",
+     },
+-    shard_count = 8,
++    shard_count = 16,
+     tags = ["block-network"],
+     deps = [
+         "//enterprise/server/filestore",

@@ -1,0 +1,162 @@
+diff --git a/enterprise/server/util/rbeutil/BUILD b/enterprise/server/util/rbeutil/BUILD
+deleted file mode 100644
+index 679cb4e3c..000000000
+--- a/enterprise/server/util/rbeutil/BUILD
++++ /dev/null
+@@ -1,9 +0,0 @@
+-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+-
+-package(default_visibility = ["//enterprise:__subpackages__"])
+-
+-go_library(
+-    name = "rbeutil",
+-    srcs = ["rbeutil.go"],
+-    importpath = "github.com/buildbuddy-io/buildbuddy/enterprise/server/util/rbeutil",
+-)
+diff --git a/enterprise/server/util/rbeutil/rbeutil.go b/enterprise/server/util/rbeutil/rbeutil.go
+deleted file mode 100644
+index 9285d351e..000000000
+--- a/enterprise/server/util/rbeutil/rbeutil.go
++++ /dev/null
+@@ -1,25 +0,0 @@
+-package rbeutil
+-
+-import "strings"
+-
+-const (
+-	// Certain RBE features rely on predictable names for resources so that different apps can co-operate
+-	// without needing any direct communication or shared state. For example, a client may be waiting for execution
+-	// progress updates on one app and updates may be published by other apps. This co-operation is possible because
+-	// all the apps generate the same PubSub channel name based on the execution ID.
+-	// Occasionally we need to introduce changes that affect these shared resources. To be able to roll out these
+-	// changes safely, we encode the scheme being used as part of the execution ID. This allows apps to determine which
+-	// naming/protocol they should for a given execution without knowing anything about other apps.
+-
+-	// V2ExecutionIDPrefix is used for rolling out changes to the Redis PubSub stream keys used for remote execution
+-	// status updates and for task key updates. Notably under the new scheme both the PubSub stream keys and the task
+-	// keys use the task ID as the hash for the ring client to ensure that PubSub channel and task metadata for a single
+-	// task are placed on the same Redis shard. The other change is that we publish a dummy marker message to the PubSub
+-	// stream when the PubSub channel is created so that we can properly detect whether the PubSub stream has
+-	// disappeared from redis.
+-	V2ExecutionIDPrefix = "v2/"
+-)
+-
+-func IsV2ExecutionID(executionID string) bool {
+-	return strings.HasPrefix(executionID, V2ExecutionIDPrefix)
+-}
+diff --git a/server/testutil/pubsub/BUILD b/server/testutil/pubsub/BUILD
+deleted file mode 100644
+index c333232d0..000000000
+--- a/server/testutil/pubsub/BUILD
++++ /dev/null
+@@ -1,12 +0,0 @@
+-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+-
+-go_library(
+-    name = "pubsub",
+-    srcs = ["pubsub.go"],
+-    importpath = "github.com/buildbuddy-io/buildbuddy/server/testutil/pubsub",
+-    visibility = ["//visibility:public"],
+-    deps = [
+-        "//server/interfaces",
+-        "//server/util/log",
+-    ],
+-)
+diff --git a/server/testutil/pubsub/pubsub.go b/server/testutil/pubsub/pubsub.go
+deleted file mode 100644
+index 758933e39..000000000
+--- a/server/testutil/pubsub/pubsub.go
++++ /dev/null
+@@ -1,92 +0,0 @@
+-package pubsub
+-
+-import (
+-	"context"
+-	"sync"
+-
+-	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+-	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+-)
+-
+-type TestSubscriber struct {
+-	name string
+-	ch   chan string
+-
+-	mu     sync.Mutex
+-	closed bool
+-}
+-
+-func (s *TestSubscriber) publish(message string) {
+-	s.mu.Lock()
+-	defer s.mu.Unlock()
+-
+-	if s.closed {
+-		// In practice, we wouldn't be alerted to this error since the
+-		// subscriber wouldn't exist once closed. But in tests, publishing a
+-		// message to a topic with no subscribers might be indicative of a bug,
+-		// so we log a warning here for easier debugging.
+-		log.Warningf("TestSubscriber on channel %q is closed; dropping message %q", s.name, message)
+-		return
+-	}
+-
+-	select {
+-	case s.ch <- message:
+-	default:
+-		log.Warningf("TestSubscriber on channel %q dropped message %q", s.name, message)
+-	}
+-}
+-
+-func (s *TestSubscriber) Close() error {
+-	s.mu.Lock()
+-	defer s.mu.Unlock()
+-
+-	close(s.ch)
+-	s.closed = true
+-	return nil
+-}
+-
+-func (s *TestSubscriber) Chan() <-chan string {
+-	return s.ch
+-}
+-
+-type TestPubSub struct {
+-	subs   map[string][]*TestSubscriber
+-	mu     sync.RWMutex
+-	closed bool
+-}
+-
+-func NewTestPubSub() interfaces.PubSub {
+-	return &TestPubSub{
+-		mu:     sync.RWMutex{},
+-		subs:   make(map[string][]*TestSubscriber, 0),
+-		closed: false,
+-	}
+-}
+-
+-func (ps *TestPubSub) Publish(ctx context.Context, channelName string, message string) error {
+-	ps.mu.RLock()
+-	defer ps.mu.RUnlock()
+-
+-	if ps.closed {
+-		return nil
+-	}
+-
+-	for _, sub := range ps.subs[channelName] {
+-		sub.publish(message)
+-	}
+-
+-	return nil
+-}
+-
+-func (ps *TestPubSub) Subscribe(ctx context.Context, channelName string) interfaces.Subscriber {
+-	ps.mu.Lock()
+-	defer ps.mu.Unlock()
+-
+-	sub := &TestSubscriber{
+-		name: channelName,
+-		ch:   make(chan string, 1),
+-	}
+-	ps.subs[channelName] = append(ps.subs[channelName], sub)
+-
+-	return sub
+-}

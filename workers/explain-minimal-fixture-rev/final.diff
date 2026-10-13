@@ -1,0 +1,64 @@
+diff --git a/cli/test/integration/explain/explain_test.go b/cli/test/integration/explain/explain_test.go
+index 9d30ea45f..08690218c 100644
+--- a/cli/test/integration/explain/explain_test.go
++++ b/cli/test/integration/explain/explain_test.go
+@@ -1,6 +1,8 @@
+ package main
+ 
+ import (
++	"os"
++	"path/filepath"
+ 	"testing"
+ 
+ 	"github.com/bazelbuild/rules_go/go/runfiles"
+@@ -25,6 +27,20 @@ func runfilePath(t *testing.T, rlocationPath string) string {
+ 	return p
+ }
+ 
++// Keep each case independent and exercise explain without a Bazel or Git workspace.
++func fixtureLogs(t *testing.T) (dir, old, new string) {
++	t.Helper()
++	dir = t.TempDir()
++	copyLog := func(rlocationPath, name string) string {
++		data, err := os.ReadFile(runfilePath(t, rlocationPath))
++		require.NoError(t, err)
++		p := filepath.Join(dir, name)
++		require.NoError(t, os.WriteFile(p, data, 0600))
++		return p
++	}
++	return dir, copyLog(oldCompactLogRunfilePath, "old.binpb.zst"), copyLog(newCompactLogRunfilePath, "new.binpb.zst")
++}
++
+ // The two compact execution logs are for builds of the same two genrule
+ // targets but with different output contents, so we expect bb explain to
+ // report both spawns as modified.
+@@ -44,12 +60,10 @@ func assertExpectedDiff(t *testing.T, result *spawn_diff.DiffResult) {
+ }
+ 
+ func TestExplainJsonOutputIsClean(t *testing.T) {
+-	ws := testcli.NewWorkspace(t)
+-	old := runfilePath(t, oldCompactLogRunfilePath)
+-	new := runfilePath(t, newCompactLogRunfilePath)
++	dir, old, new := fixtureLogs(t)
+ 
+ 	stdout, stderr, err := testcli.SplitOutput(
+-		testcli.Command(t, ws, "explain",
++		testcli.Command(t, dir, "explain",
+ 			"--old="+old,
+ 			"--new="+new,
+ 			"--output_format=json",
+@@ -64,12 +78,10 @@ func TestExplainJsonOutputIsClean(t *testing.T) {
+ }
+ 
+ func TestExplainProtoOutputIsClean(t *testing.T) {
+-	ws := testcli.NewWorkspace(t)
+-	old := runfilePath(t, oldCompactLogRunfilePath)
+-	new := runfilePath(t, newCompactLogRunfilePath)
++	dir, old, new := fixtureLogs(t)
+ 
+ 	stdout, stderr, err := testcli.SplitOutput(
+-		testcli.Command(t, ws, "explain",
++		testcli.Command(t, dir, "explain",
+ 			"--old="+old,
+ 			"--new="+new,
+ 			"--output_format=proto",

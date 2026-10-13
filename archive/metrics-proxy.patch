@@ -1,0 +1,2609 @@
+From 438cf1f67c5cd26ac98a09ba5b16c967aceb7af9 Mon Sep 17 00:00:00 2001
+From: codex worker <codex-worker@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 22:37:16 +0000
+Subject: [PATCH 1/3] Add observe-only proxy IO metrics with per-batch
+ attribution
+
+---
+ .../server/action_cache_server_proxy/BUILD    |  10 +-
+ .../action_cache_server_proxy.go              |  26 ++
+ .../observations_test.go                      | 115 ++++++
+ .../byte_stream_server_proxy.go               |  11 +
+ .../byte_stream_server_proxy_test.go          |  60 ++-
+ .../server/cmd/cache_proxy/cache_proxy.go     |   6 +-
+ .../BUILD                                     |   3 +
+ ...ontent_addressable_storage_server_proxy.go |  47 +++
+ ...t_addressable_storage_server_proxy_test.go | 122 ++++++-
+ .../hit_tracker_client/hit_tracker_client.go  |   2 +-
+ .../server/ocifetcher_server_proxy/BUILD      |   1 +
+ .../ocifetcher_server_proxy.go                |   3 +
+ .../server/routing/routing_service/BUILD      |   1 +
+ .../routing_service/routing_service.go        |   5 +-
+ enterprise/server/util/proxy_util/BUILD       |  34 +-
+ .../server/util/proxy_util/observations.go    | 345 ++++++++++++++++++
+ .../util/proxy_util/observations_test.go      | 186 ++++++++++
+ result.md                                     | 112 ++++++
+ server/metrics/metrics.go                     |  72 ++++
+ 19 files changed, 1150 insertions(+), 11 deletions(-)
+ create mode 100644 enterprise/server/action_cache_server_proxy/observations_test.go
+ create mode 100644 enterprise/server/util/proxy_util/observations.go
+ create mode 100644 enterprise/server/util/proxy_util/observations_test.go
+ create mode 100644 result.md
+
+diff --git a/enterprise/server/action_cache_server_proxy/BUILD b/enterprise/server/action_cache_server_proxy/BUILD
+index e71ec80e2..8950ea30e 100644
+--- a/enterprise/server/action_cache_server_proxy/BUILD
++++ b/enterprise/server/action_cache_server_proxy/BUILD
+@@ -38,7 +38,10 @@ go_library(
+ go_test(
+     name = "action_cache_server_proxy_test",
+     size = "small",
+-    srcs = ["action_cache_server_proxy_test.go"],
++    srcs = [
++        "action_cache_server_proxy_test.go",
++        "observations_test.go",
++    ],
+     embed = [":action_cache_server_proxy"],
+     deps = [
+         "//enterprise/server/clientidentity",
+@@ -47,6 +50,7 @@ go_test(
+         "//proto:remote_execution_go_proto",
+         "//proto:resource_go_proto",
+         "//server/interfaces",
++        "//server/metrics",
+         "//server/remote_cache/action_cache_server",
+         "//server/remote_cache/digest",
+         "//server/rpc/interceptors",
+@@ -60,6 +64,10 @@ go_test(
+         "@com_github_open_feature_go_sdk//openfeature",
+         "@com_github_open_feature_go_sdk//openfeature/memprovider",
+         "@com_github_open_feature_go_sdk//openfeature/testing",
++        "@com_github_jonboulle_clockwork//:clockwork",
++        "@com_github_prometheus_client_golang//prometheus",
++        "@com_github_prometheus_client_golang//prometheus/testutil",
++        "@com_github_prometheus_client_model//io/prometheus/client:go",
+         "@com_github_stretchr_testify//require",
+         "@org_golang_google_grpc//:grpc",
+         "@org_golang_google_grpc//metadata",
+diff --git a/enterprise/server/action_cache_server_proxy/action_cache_server_proxy.go b/enterprise/server/action_cache_server_proxy/action_cache_server_proxy.go
+index 30e2c346f..c3cc07f1e 100644
+--- a/enterprise/server/action_cache_server_proxy/action_cache_server_proxy.go
++++ b/enterprise/server/action_cache_server_proxy/action_cache_server_proxy.go
+@@ -238,6 +238,7 @@ func (s *ActionCacheServerProxy) GetActionResult(ctx context.Context, req *repb.
+ 		return nil, err
+ 	}
+ 	if authutil.EncryptionEnabled(ctx, s.authenticator) && !s.supportsEncryption {
++		proxy_util.SetLocalOutcome(ctx, "uncacheable")
+ 		resp, err := s.remoteACClient.GetActionResult(ctx, req)
+ 		labels := prometheus.Labels{
+ 			metrics.StatusLabel:            status.MetricsLabel(err),
+@@ -278,6 +279,7 @@ func (s *ActionCacheServerProxy) GetActionResult(ctx context.Context, req *repb.
+ 	// any locally stored action result matches that stored remotely.
+ 	var local *repb.ActionResult
+ 	var localKey *digest.ACResourceName
++	var localMetadata *interfaces.CacheMetadata
+ 	ttl := s.actionCacheTTL(ctx)
+ 	if *cacheActionResults {
+ 		localKey, err = getACKeyForGetActionResultRequest(req)
+@@ -297,7 +299,13 @@ func (s *ActionCacheServerProxy) GetActionResult(ctx context.Context, req *repb.
+ 		if err != nil && !status.IsNotFoundError(err) {
+ 			return nil, err
+ 		}
++		localMetadata = localACMD
++		// Observation failures must never affect the result or TTL decision.
++		if *proxy_util.ObserveACAge && localDigest != nil && localMetadata == nil {
++			localMetadata, _ = s.localCache.Metadata(localReadCtx, localKey.ToProto())
++		}
+ 		if localDigest != nil {
++			proxy_util.SetLocalOutcome(ctx, "hit")
+ 			// TODO: Consider async app revalidation of TTL hits, updating or deleting
+ 			// the local AC entry if the authoritative result changed.
+ 			if ttlFastPathEligible && s.isLocalActionResultFresh(localACMD, ttl) {
+@@ -327,7 +335,25 @@ func (s *ActionCacheServerProxy) GetActionResult(ctx context.Context, req *repb.
+ 		}
+ 	}
+ 
++	if *cacheActionResults && local == nil {
++		proxy_util.SetLocalOutcome(ctx, "miss")
++	}
+ 	resp, err := s.remoteACClient.GetActionResult(ctx, req)
++	if local != nil {
++		outcome := "changed"
++		if err != nil || resp == nil {
++			outcome = "error"
++		} else if proto.Equal(req.GetCachedActionResultDigest(), resp.GetActionResultDigest()) {
++			outcome = "unchanged"
++		}
++		metrics.CacheProxyACRevalidations.WithLabelValues(outcome).Inc()
++		if outcome == "changed" && localMetadata != nil && localMetadata.LastModifyTimeUsec > 0 {
++			age := s.env.GetClock().Now().Sub(time.UnixMicro(localMetadata.LastModifyTimeUsec)).Seconds()
++			if age >= 0 {
++				metrics.CacheProxyACChangedAgeSeconds.WithLabelValues().Observe(age)
++			}
++		}
++	}
+ 	labels := prometheus.Labels{
+ 		metrics.StatusLabel:           status.MetricsLabel(err),
+ 		metrics.CacheProxyRequestType: metrics.DefaultCacheProxyRequestLabel,
+diff --git a/enterprise/server/action_cache_server_proxy/observations_test.go b/enterprise/server/action_cache_server_proxy/observations_test.go
+new file mode 100644
+index 000000000..9130673e7
+--- /dev/null
++++ b/enterprise/server/action_cache_server_proxy/observations_test.go
+@@ -0,0 +1,115 @@
++package action_cache_server_proxy
++
++import (
++	"context"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
++	"github.com/buildbuddy-io/buildbuddy/server/metrics"
++	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
++	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
++	"github.com/buildbuddy-io/buildbuddy/server/util/status"
++	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
++	"github.com/jonboulle/clockwork"
++	"github.com/prometheus/client_golang/prometheus"
++	"github.com/prometheus/client_golang/prometheus/testutil"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/grpc"
++
++	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
++	rspb "github.com/buildbuddy-io/buildbuddy/proto/resource"
++	dto "github.com/prometheus/client_model/go"
++)
++
++type revalidationClient struct {
++	repb.ActionCacheClient
++	outcome string
++}
++
++func (c *revalidationClient) GetActionResult(ctx context.Context, req *repb.GetActionResultRequest, _ ...grpc.CallOption) (*repb.ActionResult, error) {
++	switch c.outcome {
++	case "unchanged":
++		return &repb.ActionResult{ActionResultDigest: req.GetCachedActionResultDigest()}, nil
++	case "error":
++		return nil, status.UnavailableError("remote unavailable")
++	default:
++		return &repb.ActionResult{ExitCode: 2}, nil
++	}
++}
++
++type observingMetadataCache struct {
++	*localOnlyCache
++	calls int
++	fail  bool
++}
++
++func (c *observingMetadataCache) Metadata(ctx context.Context, r *rspb.ResourceName) (*interfaces.CacheMetadata, error) {
++	c.calls++
++	if c.fail {
++		return nil, status.UnavailableError("metadata unavailable")
++	}
++	return c.localOnlyCache.Metadata(ctx, r)
++}
++func changedAgeSnapshot(t *testing.T) (uint64, float64) {
++	t.Helper()
++	m := &dto.Metric{}
++	require.NoError(t, metrics.CacheProxyACChangedAgeSeconds.WithLabelValues().(prometheus.Metric).Write(m))
++	return m.GetHistogram().GetSampleCount(), m.GetHistogram().GetSampleSum()
++}
++func TestActionCacheRevalidationObservations(t *testing.T) {
++	for _, tc := range []struct {
++		name, outcome          string
++		observe, metadataError bool
++	}{
++		{"unchanged", "unchanged", true, false},
++		{"changed", "changed", true, false},
++		{"remote_error", "error", true, false},
++		{"metadata_error_is_ignored", "changed", true, true},
++		{"default_off_has_no_extra_lookup", "changed", false, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			flags.Set(t, "cache_proxy.cache_action_results", true)
++			flags.Set(t, "cache_proxy.observe_action_cache_age", tc.observe)
++			env := testenv.GetTestEnv(t)
++			now := time.Unix(2000, 0)
++			env.SetClock(clockwork.NewFakeClockAt(now))
++			ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("user", "GR123"))
++			env.SetAuthenticator(ta)
++			ctx, err := ta.WithAuthenticatedUser(context.Background(), "user")
++			require.NoError(t, err)
++			req := &repb.GetActionResultRequest{ActionDigest: &repb.Digest{Hash: strings.Repeat("a", 64), SizeBytes: 1}, DigestFunction: repb.DigestFunction_SHA256}
++			cache := &observingMetadataCache{localOnlyCache: newLocalOnlyCache(), fail: tc.metadataError}
++			seedLocalActionResult(t, cache.localOnlyCache, req, &repb.ActionResult{ExitCode: 1}, now.Add(-2*time.Minute).UnixMicro())
++			proxy := &ActionCacheServerProxy{env: env, authenticator: ta, localCache: cache, remoteACClient: &revalidationClient{outcome: tc.outcome}}
++			counter := metrics.CacheProxyACRevalidations.WithLabelValues(tc.outcome)
++			before := testutil.ToFloat64(counter)
++			count, sum := changedAgeSnapshot(t)
++			resp, err := proxy.GetActionResult(ctx, req)
++			if tc.outcome == "error" {
++				require.True(t, status.IsUnavailableError(err))
++			} else {
++				require.NoError(t, err)
++				want := int32(2)
++				if tc.outcome == "unchanged" {
++					want = 1
++				}
++				require.Equal(t, want, resp.GetExitCode())
++			}
++			require.Equal(t, float64(1), testutil.ToFloat64(counter)-before)
++			afterCount, afterSum := changedAgeSnapshot(t)
++			if tc.observe && tc.outcome == "changed" && !tc.metadataError {
++				require.Equal(t, count+1, afterCount)
++				require.Equal(t, float64(120), afterSum-sum)
++			} else {
++				require.Equal(t, count, afterCount)
++			}
++			if tc.observe {
++				require.Equal(t, 1, cache.calls)
++			} else {
++				require.Zero(t, cache.calls)
++			}
++		})
++	}
++}
+diff --git a/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy.go b/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy.go
+index 6a7a546b7..5cc350d43 100644
+--- a/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy.go
++++ b/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy.go
+@@ -165,6 +165,10 @@ func (s *ByteStreamServerProxy) Read(req *bspb.ReadRequest, stream bspb.ByteStre
+ 		bytesLocal:   readMetrics.bytesLocal,
+ 		bytesRemote:  readMetrics.bytesRemote,
+ 	}
++	proxy_util.SetLocalOutcome(ctx, readMetrics.cacheStatus)
++	if (req.GetReadOffset() != 0 || req.GetReadLimit() != 0) && readMetrics.cacheStatus == metrics.MissStatusLabel {
++		metrics.CacheProxyPartialReadMisses.WithLabelValues().Inc()
++	}
+ 	recordReadMetrics(bsm, readMetrics.cacheStatus)
+ 	return err
+ }
+@@ -799,6 +803,13 @@ func (s *ByteStreamServerProxy) readRemoteWriteLocal(req *bspb.ReadRequest, stre
+ 		uploadRN: rn.NewUploadString(),
+ 	}
+ 	localErr := s.local.Write(readThrough)
++	if req.GetReadOffset() != 0 || req.GetReadLimit() != 0 {
++		outcome := "committed"
++		if localErr != nil || !readThrough.localWriteFinished {
++			outcome = "failed"
++		}
++		metrics.CacheProxyPartialReadWrites.WithLabelValues(outcome).Inc()
++	}
+ 
+ 	if localErr != nil {
+ 		log.CtxDebugf(ctx, "Error writing to local ByteStreamServer: %v", err)
+diff --git a/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy_test.go b/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy_test.go
+index 76ccd9ccb..0cfb69866 100644
+--- a/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy_test.go
++++ b/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy_test.go
+@@ -2403,7 +2403,7 @@ func TestReadChunkedFallsBackToLocalBlob(t *testing.T) {
+ 	go remoteRun()
+ 
+ 	var splitBlobCalls atomic.Int32
+-	remoteConn, err := testenv.LocalGRPCConn(t, ctx, remoteLis, grpc.WithUnaryInterceptor(func(
++	remoteConn, err := testenv.LocalGRPCConn(t, ctx, remoteLis, grpc.WithStatsHandler(&proxy_util.RemoteStatsHandler{}), grpc.WithUnaryInterceptor(func(
+ 		ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption,
+ 	) error {
+ 		if strings.HasSuffix(method, "/SplitBlob") {
+@@ -2421,7 +2421,7 @@ func TestReadChunkedFallsBackToLocalBlob(t *testing.T) {
+ 	proxyEnv.SetLocalByteStreamServer(proxyBSS)
+ 	proxyServer, err := New(proxyEnv)
+ 	require.NoError(t, err)
+-	proxyGRPC, proxyRun, proxyLis := testenv.RegisterLocalGRPCServer(t, proxyEnv)
++	proxyGRPC, proxyRun, proxyLis := testenv.RegisterLocalGRPCServer(t, proxyEnv, grpc.ChainStreamInterceptor(proxy_util.ObservationStreamInterceptor))
+ 	bspb.RegisterByteStreamServer(proxyGRPC, proxyServer)
+ 	go proxyRun()
+ 	proxyConn, err := testenv.LocalGRPCConn(t, ctx, proxyLis)
+@@ -2438,6 +2438,7 @@ func TestReadChunkedFallsBackToLocalBlob(t *testing.T) {
+ 	blobRN := digest.NewCASResourceName(blobDigest, "", repb.DigestFunction_BLAKE3)
+ 	require.NoError(t, proxyEnv.GetCache().Set(ctx, blobRN.ToProto(), originalData))
+ 
++	before := testutil.ToFloat64(metrics.CacheProxySplitBlobLocalHits.WithLabelValues())
+ 	downloadStream, err := proxy.Read(ctx, &bspb.ReadRequest{ResourceName: blobRN.DownloadString()})
+ 	require.NoError(t, err)
+ 
+@@ -2452,6 +2453,7 @@ func TestReadChunkedFallsBackToLocalBlob(t *testing.T) {
+ 	}
+ 
+ 	require.Equal(t, originalData, got)
++	require.Equal(t, before+1, testutil.ToFloat64(metrics.CacheProxySplitBlobLocalHits.WithLabelValues()))
+ 	require.Equal(t, int32(1), splitBlobCalls.Load(), "chunked-eligible reads should try SplitBlob first")
+ }
+ 
+@@ -3651,3 +3653,57 @@ func BenchmarkReadChunkedMixedLocalRemote(b *testing.B) {
+ 		}
+ 	}
+ }
++
++func TestPartialReadLocalWriteObservations(t *testing.T) {
++	for _, tc := range []struct {
++		name          string
++		offset, limit int64
++		outcome       string
++	}{
++		{name: "full_blob_with_limit_commits", limit: 1024, outcome: "committed"},
++		{name: "offset_fails_validation", offset: 1, outcome: "failed"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			ctx := testContext()
++			remoteEnv := testenv.GetTestEnv(t)
++			proxyEnv := testenv.GetTestEnv(t)
++			remote, _, _, _ := runRemoteServices(ctx, remoteEnv, t)
++			proxy := runBSProxy(ctx, remote, proxyEnv, t)
++			localCtx, err := prefix.AttachUserPrefixToContext(ctx, proxyEnv.GetAuthenticator())
++			require.NoError(t, err)
++			remoteCtx, err := prefix.AttachUserPrefixToContext(ctx, remoteEnv.GetAuthenticator())
++			require.NoError(t, err)
++			resource, data := testdigest.RandomCASResourceBuf(t, 1024)
++			rn, err := digest.CASResourceNameFromProto(resource)
++			require.NoError(t, err)
++			require.NoError(t, remoteEnv.GetCache().Set(remoteCtx, rn.ToProto(), data))
++			beforeMisses := testutil.ToFloat64(metrics.CacheProxyPartialReadMisses.WithLabelValues())
++			beforeCommitted := testutil.ToFloat64(metrics.CacheProxyPartialReadWrites.WithLabelValues("committed"))
++			beforeFailed := testutil.ToFloat64(metrics.CacheProxyPartialReadWrites.WithLabelValues("failed"))
++			stream, err := proxy.Read(ctx, &bspb.ReadRequest{ResourceName: rn.DownloadString(), ReadOffset: tc.offset, ReadLimit: tc.limit})
++			require.NoError(t, err)
++			var got []byte
++			for {
++				resp, err := stream.Recv()
++				if err == io.EOF {
++					break
++				}
++				require.NoError(t, err)
++				got = append(got, resp.Data...)
++			}
++			require.Equal(t, data[tc.offset:], got)
++			require.Equal(t, beforeMisses+1, testutil.ToFloat64(metrics.CacheProxyPartialReadMisses.WithLabelValues()))
++			committedDelta, failedDelta := float64(0), float64(0)
++			if tc.outcome == "committed" {
++				committedDelta = 1
++			} else {
++				failedDelta = 1
++			}
++			require.Equal(t, beforeCommitted+committedDelta, testutil.ToFloat64(metrics.CacheProxyPartialReadWrites.WithLabelValues("committed")))
++			require.Equal(t, beforeFailed+failedDelta, testutil.ToFloat64(metrics.CacheProxyPartialReadWrites.WithLabelValues("failed")))
++			found, err := proxyEnv.GetCache().Contains(localCtx, rn.ToProto())
++			require.NoError(t, err)
++			require.Equal(t, tc.outcome == "committed", found)
++		})
++	}
++}
+diff --git a/enterprise/server/cmd/cache_proxy/cache_proxy.go b/enterprise/server/cmd/cache_proxy/cache_proxy.go
+index 4c5c0af98..a15607d69 100644
+--- a/enterprise/server/cmd/cache_proxy/cache_proxy.go
++++ b/enterprise/server/cmd/cache_proxy/cache_proxy.go
+@@ -251,9 +251,11 @@ func startGRPCServers(env *real_environment.RealEnv) error {
+ 	grpcServerConfig := grpc_server.GRPCServerConfig{
+ 		ExtraChainedUnaryInterceptors: []grpc.UnaryServerInterceptor{
+ 			interceptors.PropagateMetadataUnaryInterceptor(proxy_util.HeadersToPropagate...),
++			proxy_util.ObservationUnaryInterceptor,
+ 		},
+ 		ExtraChainedStreamInterceptors: []grpc.StreamServerInterceptor{
+ 			interceptors.PropagateMetadataStreamInterceptor(proxy_util.HeadersToPropagate...),
++			proxy_util.ObservationStreamInterceptor,
+ 		},
+ 		PostAuthUnaryInterceptors:  []grpc.UnaryServerInterceptor{trafficStatsHandler.UnaryInterceptor},
+ 		PostAuthStreamInterceptors: []grpc.StreamServerInterceptor{trafficStatsHandler.StreamInterceptor},
+@@ -310,14 +312,14 @@ func startInternalGRPCServers(env *real_environment.RealEnv) error {
+ 
+ func registerGRPCServices(grpcServer *grpc.Server, env *real_environment.RealEnv) {
+ 	// Connect to the remote cache and initialize gRPC clients.
+-	conn, err := grpc_client.DialInternal(env, cache_proxy_config.RemoteCacheTarget())
++	conn, err := grpc_client.DialInternal(env, cache_proxy_config.RemoteCacheTarget(), grpc.WithStatsHandler(proxy_util.RemoteStatsHandler{}))
+ 	if err != nil {
+ 		log.Fatalf("Error dialing remote cache: %s", err.Error())
+ 	}
+ 	// TODO: Before this can be enabled, https://github.com/buildbuddy-io/buildbuddy-internal/issues/6146
+ 	// must be resolved.
+ 	if routing_service.IsCacheRoutingEnabled() {
+-		if err := routing_service.RegisterRoutingService(env); err != nil {
++		if err := routing_service.RegisterRoutingService(env, grpc.WithStatsHandler(proxy_util.RemoteStatsHandler{})); err != nil {
+ 			log.Fatalf("Error initializing routing service: %s", err.Error())
+ 		}
+ 
+diff --git a/enterprise/server/content_addressable_storage_server_proxy/BUILD b/enterprise/server/content_addressable_storage_server_proxy/BUILD
+index 030824af4..91b0e78af 100644
+--- a/enterprise/server/content_addressable_storage_server_proxy/BUILD
++++ b/enterprise/server/content_addressable_storage_server_proxy/BUILD
+@@ -43,6 +43,9 @@ go_test(
+         "//enterprise/server/util/proxy_util",
+         "//proto:remote_execution_go_proto",
+         "//server/metrics",
++        "//server/interfaces",
++        "//server/util/proto",
++        "//server/util/prefix",
+         "//server/remote_cache/byte_stream_server",
+         "//server/remote_cache/cachetools",
+         "//server/remote_cache/content_addressable_storage_server",
+diff --git a/enterprise/server/content_addressable_storage_server_proxy/content_addressable_storage_server_proxy.go b/enterprise/server/content_addressable_storage_server_proxy/content_addressable_storage_server_proxy.go
+index 14558e469..2bc4ad97e 100644
+--- a/enterprise/server/content_addressable_storage_server_proxy/content_addressable_storage_server_proxy.go
++++ b/enterprise/server/content_addressable_storage_server_proxy/content_addressable_storage_server_proxy.go
+@@ -6,6 +6,7 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"strconv"
++	"time"
+ 
+ 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_crypter"
+ 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/proxy_util"
+@@ -45,6 +46,10 @@ type CASServerProxy struct {
+ 	remote             repb.ContentAddressableStorageClient
+ 	localCache         interfaces.Cache
+ 
++	// Observe-only request reuse tracker, allocated only when enabled at startup.
++	recentDigests *proxy_util.RecentTracker
++	now           func() time.Time
++
+ 	// Local, in-memory caches for digests served in response to FindMissingBlobs
+ 	// requests. It would be better if this could be in the backing "local"
+ 	// cache, but that poses two problems:
+@@ -132,6 +137,10 @@ func New(env environment.Env) (*CASServerProxy, error) {
+ 			}
+ 		}
+ 	}
++	if *proxy_util.ObserveFindMissing {
++		proxy.recentDigests = proxy_util.NewRecentTracker(100_000)
++		proxy.now = env.GetClock().Now
++	}
+ 	return &proxy, nil
+ }
+ 
+@@ -227,6 +236,24 @@ func (s *CASServerProxy) FindMissingBlobs(ctx context.Context, req *repb.FindMis
+ 		return s.local.FindMissingBlobs(ctx, req)
+ 	}
+ 
++	if s.recentDigests != nil {
++		user, authErr := s.authenticator.AuthenticatedUser(ctx)
++		groupID := interfaces.AuthAnonymousUser
++		if authErr == nil {
++			groupID = user.GetGroupID()
++		}
++		if authErr == nil || authutil.IsAnonymousUserError(authErr) {
++			keys := make([]string, 0, len(req.GetBlobDigests()))
++			for _, d := range req.GetBlobDigests() {
++				keys = append(keys, s.findMissingBlobsCacheKey(groupID, req, d)+"/"+strconv.FormatBool(cdc.IsChunked(ctx)))
++			}
++			hits := s.recentDigests.ObserveBatch(keys, s.now())
++			for i, window := range []string{"1m", "5m", "15m"} {
++				metrics.CacheProxyFindMissingRecentDigests.WithLabelValues(window, "hit").Add(float64(hits[i]))
++				metrics.CacheProxyFindMissingRecentDigests.WithLabelValues(window, "miss").Add(float64(len(keys) - hits[i]))
++			}
++		}
++	}
+ 	ctx, spn := tracing.StartSpan(ctx)
+ 	defer spn.End()
+ 	tracing.AddStringAttributeToCurrentSpan(ctx, "requested-blobs", strconv.Itoa(len(req.BlobDigests)))
+@@ -278,6 +305,14 @@ func (s *CASServerProxy) FindMissingBlobs(ctx context.Context, req *repb.FindMis
+ 	counters.blobCacheHits.Add(float64(blobCacheHits))
+ 	counters.chunkCacheHits.Add(float64(chunkCacheHits))
+ 
++	outcome := "miss"
++	if len(misses) == 0 {
++		outcome = "hit"
++	} else if len(misses) < len(req.GetBlobDigests()) {
++		outcome = "partial"
++	}
++	proxy_util.SetLocalOutcome(ctx, outcome)
++
+ 	// All digests were found in the FindMissingBlobs cache, return.
+ 	if len(misses) == 0 {
+ 		return &repb.FindMissingBlobsResponse{}, nil
+@@ -383,6 +418,10 @@ func (s *CASServerProxy) BatchReadBlobs(ctx context.Context, req *repb.BatchRead
+ 		return nil, status.UnimplementedError("Skip remote not implemented")
+ 	}
+ 
++	// GetTree issues multiple batches; each batch must retain its own outcome.
++	ctx, observation := proxy_util.StartObservation(ctx)
++	defer observation.Finish()
++
+ 	ctx, spn := tracing.StartSpan(ctx)
+ 	defer spn.End()
+ 	tracing.AddStringAttributeToCurrentSpan(ctx, "requested-blobs", strconv.Itoa(len(req.Digests)))
+@@ -402,6 +441,7 @@ func (s *CASServerProxy) BatchReadBlobs(ctx context.Context, req *repb.BatchRead
+ 				"BatchReadBlobs",
+ 				metrics.MissStatusLabel,
+ 				newCacheMetrics().addReadMetrics(metrics.MissStatusLabel, resp.GetResponses()))
++			proxy_util.SetLocalOutcome(ctx, "miss")
+ 			return s.batchReadBlobsRemote(ctx, req)
+ 		}
+ 		localResp = resp
+@@ -440,6 +480,13 @@ func (s *CASServerProxy) BatchReadBlobs(ctx context.Context, req *repb.BatchRead
+ 		AcceptableCompressors: req.AcceptableCompressors,
+ 		DigestFunction:        req.DigestFunction,
+ 	}
++	outcome := "miss"
++	if remoteOnly {
++		outcome = "uncacheable"
++	} else if len(mergedResp.Responses) > 0 {
++		outcome = "partial"
++	}
++	proxy_util.SetLocalOutcome(ctx, outcome)
+ 	remoteResp, err := s.batchReadBlobsRemote(ctx, &remoteReq)
+ 	if err != nil {
+ 		// Don't record metrics here (for now at least)
+diff --git a/enterprise/server/content_addressable_storage_server_proxy/content_addressable_storage_server_proxy_test.go b/enterprise/server/content_addressable_storage_server_proxy/content_addressable_storage_server_proxy_test.go
+index 1fb03bc75..85b7542d5 100644
+--- a/enterprise/server/content_addressable_storage_server_proxy/content_addressable_storage_server_proxy_test.go
++++ b/enterprise/server/content_addressable_storage_server_proxy/content_addressable_storage_server_proxy_test.go
+@@ -15,6 +15,7 @@ import (
+ 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/byte_stream_server_proxy"
+ 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/experiments"
+ 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/proxy_util"
++	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+ 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
+ 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/byte_stream_server"
+ 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
+@@ -26,6 +27,8 @@ import (
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/cdc"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/findmissing"
++	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
++	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/uuid"
+ 	"github.com/jonboulle/clockwork"
+@@ -37,6 +40,7 @@ import (
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/metadata"
+ 	"google.golang.org/grpc/status"
++	"io"
+ 
+ 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
+ 	bspb "google.golang.org/genproto/googleapis/bytestream"
+@@ -106,7 +110,7 @@ func runCASProxy(ctx context.Context, clientConn *grpc.ClientConn, env *testenv.
+ 	require.NoError(t, err)
+ 	bsServer, err := byte_stream_server_proxy.New(env)
+ 	require.NoError(t, err)
+-	grpcServer, runFunc, lis := testenv.RegisterLocalGRPCServer(t, env)
++	grpcServer, runFunc, lis := testenv.RegisterLocalGRPCServer(t, env, grpc.ChainStreamInterceptor(proxy_util.ObservationStreamInterceptor), grpc.ChainUnaryInterceptor(proxy_util.ObservationUnaryInterceptor))
+ 	repb.RegisterContentAddressableStorageServer(grpcServer, casServer)
+ 	bspb.RegisterByteStreamServer(grpcServer, bsServer)
+ 	go runFunc()
+@@ -1068,3 +1072,119 @@ func TestFindMissingBlobs_QuorumBypassesPresenceCache(t *testing.T) {
+ 		require.Equal(t, i, requestCount.Load())
+ 	}
+ }
++
++// observationCAS uses real gRPC messages so byte accounting exercises the stats handler.
++type observationCAS struct {
++	repb.UnimplementedContentAddressableStorageServer
++	blobs                       map[string][]byte
++	err                         error
++	requestBytes, responseBytes []int
++}
++
++func (s *observationCAS) BatchReadBlobs(ctx context.Context, req *repb.BatchReadBlobsRequest) (*repb.BatchReadBlobsResponse, error) {
++	s.requestBytes = append(s.requestBytes, proto.Size(req))
++	if s.err != nil {
++		return nil, s.err
++	}
++	resp := &repb.BatchReadBlobsResponse{}
++	for _, d := range req.Digests {
++		resp.Responses = append(resp.Responses, &repb.BatchReadBlobsResponse_Response{
++			Digest: d, Data: s.blobs[d.Hash], Status: status.New(codes.OK, "").Proto(),
++		})
++	}
++	s.responseBytes = append(s.responseBytes, proto.Size(resp))
++	return resp, nil
++}
++
++func observedCASConnection(t *testing.T, remote *observationCAS) *grpc.ClientConn {
++	env := testenv.GetTestEnv(t)
++	server, run, lis := testenv.RegisterLocalGRPCServer(t, env)
++	repb.RegisterContentAddressableStorageServer(server, remote)
++	go run()
++	conn, err := testenv.LocalGRPCConn(t, testContext(), lis, grpc.WithStatsHandler(&proxy_util.RemoteStatsHandler{}))
++	require.NoError(t, err)
++	t.Cleanup(func() { conn.Close() })
++	return conn
++}
++
++func TestGetTreeBatchObservation(t *testing.T) {
++	flags.Set(t, "cache_proxy.enable_get_tree_caching", true)
++	ctx := testContext()
++	env := testenv.GetTestEnv(t)
++	localCtx, err := prefix.AttachUserPrefixToContext(ctx, env.GetAuthenticator())
++	require.NoError(t, err)
++	remote := &observationCAS{blobs: make(map[string][]byte)}
++	addDir := func(dir *repb.Directory, local bool) *repb.Digest {
++		data, err := proto.Marshal(dir)
++		require.NoError(t, err)
++		d, err := digest.Compute(bytes.NewReader(data), repb.DigestFunction_SHA256)
++		require.NoError(t, err)
++		remote.blobs[d.Hash] = data
++		if local {
++			require.NoError(t, env.GetCache().Set(localCtx, digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256).ToProto(), data))
++		}
++		return d
++	}
++	leaf := addDir(&repb.Directory{Files: []*repb.FileNode{{Name: "leaf"}}}, false)
++	left := addDir(&repb.Directory{Directories: []*repb.DirectoryNode{{Name: "leaf", Digest: leaf}}}, true)
++	right := addDir(&repb.Directory{Files: []*repb.FileNode{{Name: "right"}}}, false)
++	root := addDir(&repb.Directory{Directories: []*repb.DirectoryNode{{Name: "left", Digest: left}, {Name: "right", Digest: right}}}, true)
++	conn := observedCASConnection(t, remote)
++	client := repb.NewContentAddressableStorageClient(runCASProxy(ctx, conn, env, t))
++	method := "build.bazel.remote.execution.v2.ContentAddressableStorage/BatchReadBlobs"
++	before := make(map[string]float64)
++	for _, outcome := range []string{"partial", "miss", "hit"} {
++		before[outcome] = testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, outcome))
++		for _, direction := range []string{"sent", "received"} {
++			before[outcome+direction] = testutil.ToFloat64(metrics.CacheProxyRemoteBytes.WithLabelValues(method, direction, outcome))
++		}
++	}
++	stream, err := client.GetTree(ctx, &repb.GetTreeRequest{RootDigest: root, DigestFunction: repb.DigestFunction_SHA256})
++	require.NoError(t, err)
++	var directories int
++	for {
++		resp, err := stream.Recv()
++		if err == io.EOF {
++			break
++		}
++		require.NoError(t, err)
++		directories += len(resp.Directories)
++	}
++	require.Equal(t, 4, directories)
++	require.Len(t, remote.requestBytes, 2)
++	for i, outcome := range []string{"partial", "miss"} {
++		require.Equal(t, before[outcome]+1, testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, outcome)))
++		require.Equal(t, before[outcome+"sent"]+float64(remote.requestBytes[i]), testutil.ToFloat64(metrics.CacheProxyRemoteBytes.WithLabelValues(method, "sent", outcome)))
++		require.Equal(t, before[outcome+"received"]+float64(remote.responseBytes[i]), testutil.ToFloat64(metrics.CacheProxyRemoteBytes.WithLabelValues(method, "received", outcome)))
++	}
++	require.Equal(t, before["hit"], testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "hit")))
++}
++
++func TestEncryptionBypassRemoteErrorObservation(t *testing.T) {
++	env := testenv.GetTestEnv(t)
++	user := testauth.User("user", "group")
++	user.CacheEncryptionEnabled = true
++	ta := testauth.NewTestAuthenticator(t, map[string]interfaces.UserInfo{"user": user})
++	env.SetAuthenticator(ta)
++	ctx, err := ta.WithAuthenticatedUser(testContext(), "user")
++	require.NoError(t, err)
++	remote := &observationCAS{err: status.Error(codes.Unavailable, "remote unavailable")}
++	conn := observedCASConnection(t, remote)
++	env.SetContentAddressableStorageClient(repb.NewContentAddressableStorageClient(conn))
++	env.SetByteStreamClient(bspb.NewByteStreamClient(conn))
++	local, err := content_addressable_storage_server.NewContentAddressableStorageServer(env)
++	require.NoError(t, err)
++	env.SetLocalCASServer(local)
++	proxy, err := New(env)
++	require.NoError(t, err)
++	method := "build.bazel.remote.execution.v2.ContentAddressableStorage/BatchReadBlobs"
++	beforeMiss := testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "miss"))
++	beforeUncacheable := testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "uncacheable"))
++	beforeBytes := testutil.ToFloat64(metrics.CacheProxyRemoteBytes.WithLabelValues(method, "sent", "uncacheable"))
++	req := readBlobsRequest([]*repb.Digest{digestProto(fooDigest, 3)})
++	_, err = proxy.BatchReadBlobs(ctx, req)
++	require.Equal(t, codes.Unavailable, status.Code(err))
++	require.Equal(t, beforeMiss, testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "miss")))
++	require.Equal(t, beforeUncacheable+1, testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "uncacheable")))
++	require.Equal(t, beforeBytes+float64(remote.requestBytes[0]), testutil.ToFloat64(metrics.CacheProxyRemoteBytes.WithLabelValues(method, "sent", "uncacheable")))
++}
+diff --git a/enterprise/server/hit_tracker_client/hit_tracker_client.go b/enterprise/server/hit_tracker_client/hit_tracker_client.go
+index 136464948..f9d408cf8 100644
+--- a/enterprise/server/hit_tracker_client/hit_tracker_client.go
++++ b/enterprise/server/hit_tracker_client/hit_tracker_client.go
+@@ -44,7 +44,7 @@ func Register(env *real_environment.RealEnv) error {
+ 		return nil
+ 	}
+ 
+-	conn, err := grpc_client.DialInternalWithPoolSize(env, target, *remoteHitTrackerWorkers)
++	conn, err := grpc_client.DialInternalWithPoolSize(env, target, *remoteHitTrackerWorkers, grpc.WithStatsHandler(proxy_util.RemoteStatsHandler{}))
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/enterprise/server/ocifetcher_server_proxy/BUILD b/enterprise/server/ocifetcher_server_proxy/BUILD
+index 361cff61b..850ab451d 100644
+--- a/enterprise/server/ocifetcher_server_proxy/BUILD
++++ b/enterprise/server/ocifetcher_server_proxy/BUILD
+@@ -9,6 +9,7 @@ go_library(
+     visibility = ["//visibility:public"],
+     deps = [
+         "//enterprise/server/oci/ocicache",
++        "//enterprise/server/util/proxy_util",
+         "//proto:oci_fetcher_go_proto",
+         "//proto:remote_execution_go_proto",
+         "//server/environment",
+diff --git a/enterprise/server/ocifetcher_server_proxy/ocifetcher_server_proxy.go b/enterprise/server/ocifetcher_server_proxy/ocifetcher_server_proxy.go
+index 37d0445ca..aa0588d6f 100644
+--- a/enterprise/server/ocifetcher_server_proxy/ocifetcher_server_proxy.go
++++ b/enterprise/server/ocifetcher_server_proxy/ocifetcher_server_proxy.go
+@@ -12,6 +12,7 @@ import (
+ 	"io"
+ 
+ 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/oci/ocicache"
++	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/proxy_util"
+ 	"github.com/buildbuddy-io/buildbuddy/server/environment"
+ 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
+ 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
+@@ -89,11 +90,13 @@ func (s *OCIFetcherServerProxy) FetchBlob(req *ofpb.FetchBlobRequest, stream ofp
+ 	// Also check FailedPrecondition: cachetools.GetBlob wraps NotFound cache
+ 	// misses as FailedPrecondition via MissingDigestError.
+ 	if err := fetchBlobFromLocalBS(ctx, s.localBSClient, hash, size, &grpcStreamWriter{stream: stream}); err == nil {
++		proxy_util.SetLocalOutcome(ctx, "hit")
+ 		return nil // local cache hit
+ 	} else if !status.IsNotFoundError(err) && !status.IsFailedPreconditionError(err) {
+ 		return err
+ 	}
+ 
++	proxy_util.SetLocalOutcome(ctx, "miss")
+ 	return s.dedupedFetchBlob(ctx, stream, digestRef, hash, size, req)
+ }
+ 
+diff --git a/enterprise/server/routing/routing_service/BUILD b/enterprise/server/routing/routing_service/BUILD
+index fc12a9bec..30afa8234 100644
+--- a/enterprise/server/routing/routing_service/BUILD
++++ b/enterprise/server/routing/routing_service/BUILD
+@@ -17,5 +17,6 @@ go_library(
+         "//server/util/grpc_client",
+         "//server/util/status",
+         "@org_golang_google_genproto_googleapis_bytestream//:bytestream",
++        "@org_golang_google_grpc//:grpc",
+     ],
+ )
+diff --git a/enterprise/server/routing/routing_service/routing_service.go b/enterprise/server/routing/routing_service/routing_service.go
+index 4ef81085d..ce0bb33e6 100644
+--- a/enterprise/server/routing/routing_service/routing_service.go
++++ b/enterprise/server/routing/routing_service/routing_service.go
+@@ -11,6 +11,7 @@ import (
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_client"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
++	"google.golang.org/grpc"
+ 
+ 	bspb "google.golang.org/genproto/googleapis/bytestream"
+ )
+@@ -42,7 +43,7 @@ type routingService struct {
+ 	clientSets map[string]*clientSet
+ }
+ 
+-func RegisterRoutingService(env *real_environment.RealEnv) error {
++func RegisterRoutingService(env *real_environment.RealEnv, dialOptions ...grpc.DialOption) error {
+ 	if len(*availableRoutes) == 0 {
+ 		return status.FailedPreconditionErrorf("Attempted to register routing service when no routes are available.")
+ 	}
+@@ -59,7 +60,7 @@ func RegisterRoutingService(env *real_environment.RealEnv) error {
+ 		if _, ok := clientSets[r]; ok {
+ 			continue
+ 		}
+-		conn, err := grpc_client.DialInternal(env, r)
++		conn, err := grpc_client.DialInternal(env, r, dialOptions...)
+ 		if err != nil {
+ 			// The default Dial() behavior doesn't wait for the connection, so
+ 			// this indicates some issue other than the server being down.
+diff --git a/enterprise/server/util/proxy_util/BUILD b/enterprise/server/util/proxy_util/BUILD
+index df57cc3d5..3ff8153de 100644
+--- a/enterprise/server/util/proxy_util/BUILD
++++ b/enterprise/server/util/proxy_util/BUILD
+@@ -1,20 +1,50 @@
+-load("@io_bazel_rules_go//go:def.bzl", "go_library")
++load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+ 
+ package(default_visibility = ["//enterprise:__subpackages__"])
+ 
+ go_library(
+     name = "proxy_util",
+-    srcs = ["proxy_util.go"],
++    srcs = [
++        "observations.go",
++        "proxy_util.go",
++    ],
+     importpath = "github.com/buildbuddy-io/buildbuddy/enterprise/server/util/proxy_util",
+     visibility = ["//visibility:public"],
+     deps = [
++        "//proto:oci_fetcher_go_proto",
++        "//proto:remote_execution_go_proto",
+         "//server/metrics",
++        "//server/remote_cache/digest",
+         "//server/util/authutil",
+         "//server/util/bazel_request",
+         "//server/util/cdc",
+         "//server/util/findmissing",
++        "//server/util/flag",
+         "//server/util/platform",
+         "//server/util/usageutil",
++        "@com_github_klauspost_compress//zstd",
++        "@org_golang_google_genproto_googleapis_bytestream//:bytestream",
++        "@org_golang_google_grpc//:grpc",
++        "@org_golang_google_grpc//codes",
+         "@org_golang_google_grpc//metadata",
++        "@org_golang_google_grpc//stats",
++        "@org_golang_google_grpc//status",
++    ],
++)
++
++go_test(
++    name = "proxy_util_test",
++    srcs = ["observations_test.go"],
++    embed = [":proxy_util"],
++    deps = [
++        "//proto:remote_execution_go_proto",
++        "//server/metrics",
++        "@com_github_prometheus_client_golang//prometheus",
++        "@com_github_prometheus_client_golang//prometheus/testutil",
++        "@com_github_prometheus_client_model//io/prometheus/client:go",
++        "@org_golang_google_genproto_googleapis_bytestream//:bytestream",
++        "@org_golang_google_grpc//codes",
++        "@org_golang_google_grpc//stats",
++        "@org_golang_google_grpc//status",
+     ],
+ )
+diff --git a/enterprise/server/util/proxy_util/observations.go b/enterprise/server/util/proxy_util/observations.go
+new file mode 100644
+index 000000000..939a304fa
+--- /dev/null
++++ b/enterprise/server/util/proxy_util/observations.go
+@@ -0,0 +1,345 @@
++package proxy_util
++
++import (
++	"container/list"
++	"context"
++	"crypto/sha256"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	ofpb "github.com/buildbuddy-io/buildbuddy/proto/oci_fetcher"
++	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
++	"github.com/buildbuddy-io/buildbuddy/server/metrics"
++	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
++	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
++	"github.com/klauspost/compress/zstd"
++	bspb "google.golang.org/genproto/googleapis/bytestream"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/stats"
++	"google.golang.org/grpc/status"
++)
++
++var IdentityZstdSampleEvery = flag.Int("cache_proxy.identity_zstd_sample_every", 0, "Observe-only: compress 1 in N complete identity blobs on the app link, skipping blobs over 1 MiB. Default off (0); adds request-path CPU, with at most two concurrent samples and bounded buffers.")
++var ObserveACAge = flag.Bool("cache_proxy.observe_action_cache_age", false, "Observe-only: fetch local AC metadata to measure the age of changed results. Default off; adds metadata work on local reads.")
++var ObserveFindMissing = flag.Bool("cache_proxy.observe_find_missing_reuse", false, "Observe-only: track requested FindMissingBlobs digests in a fixed 100,000-entry LRU to measure reuse within 1, 5 and 15 minutes. Default off; adds authentication and bounded tracking work per request.")
++
++type observationKey struct{}
++type remoteKey struct{ method, direction, compressor string }
++
++// Observation defers remote accounting until the request or batch's local outcome is known.
++// Only bounded method/direction/compressor aggregates are retained, never payloads.
++type Observation struct {
++	mu            sync.Mutex
++	outcome       string
++	counts        map[remoteKey]int64
++	finished      bool
++	splitNotFound bool
++}
++
++// StartObservation creates an independent scope, shadowing any parent observation.
++// Use a new scope when one request issues batches with different local outcomes.
++func StartObservation(ctx context.Context) (context.Context, *Observation) {
++	o := &Observation{outcome: "not_checked", counts: make(map[remoteKey]int64)}
++	return context.WithValue(ctx, observationKey{}, o), o
++}
++func SetLocalOutcome(ctx context.Context, outcome string) {
++	switch outcome {
++	case "hit", "miss", "partial", "uncacheable", "not_checked":
++	default:
++		outcome = "not_checked"
++	}
++	if o, ok := ctx.Value(observationKey{}).(*Observation); ok {
++		o.mu.Lock()
++		o.outcome = outcome
++		o.mu.Unlock()
++	}
++}
++func emitRemote(k remoteKey, n int64, outcome string) {
++	if k.direction == "" {
++		metrics.CacheProxyRemoteRPCs.WithLabelValues(k.method, outcome).Add(float64(n))
++	} else if k.compressor == "" {
++		metrics.CacheProxyRemoteBytes.WithLabelValues(k.method, k.direction, outcome).Add(float64(n))
++	} else {
++		metrics.CacheProxyLinkBlobBytes.WithLabelValues(k.method, k.direction, k.compressor).Add(float64(n))
++	}
++}
++func (o *Observation) Finish(errs ...error) {
++	o.mu.Lock()
++	defer o.mu.Unlock()
++	if o.finished {
++		return
++	}
++	o.finished = true
++	for k, n := range o.counts {
++		emitRemote(k, n, o.outcome)
++	}
++	o.counts = nil
++	if o.splitNotFound && o.outcome == "hit" && (len(errs) == 0 || errs[0] == nil) {
++		metrics.CacheProxySplitBlobLocalHits.WithLabelValues().Inc()
++	}
++}
++func addRemote(ctx context.Context, k remoteKey, n int64) {
++	if o, ok := ctx.Value(observationKey{}).(*Observation); ok {
++		o.mu.Lock()
++		defer o.mu.Unlock()
++		if !o.finished {
++			o.counts[k] += n
++			return
++		}
++		emitRemote(k, n, o.outcome)
++		return
++	}
++	emitRemote(k, n, "not_checked")
++}
++func ObservationUnaryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
++	ctx, o := StartObservation(ctx)
++	defer func() { o.Finish(err) }()
++	return handler(ctx, req)
++}
++
++type observedStream struct {
++	grpc.ServerStream
++	ctx context.Context
++}
++
++func (s *observedStream) Context() context.Context { return s.ctx }
++func ObservationStreamInterceptor(srv any, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) (err error) {
++	ctx, o := StartObservation(stream.Context())
++	defer func() { o.Finish(err) }()
++	return handler(srv, &observedStream{ServerStream: stream, ctx: ctx})
++}
++
++type rpcObservationKey struct{}
++type rpcObservation struct {
++	sampleStarted   bool
++	sampleHeld      bool
++	sampleData      []byte
++	sampleDirection string
++	expectedSize    int64
++	mu              sync.Mutex
++	method          string
++	compressor      string
++}
++
++// RemoteStatsHandler must be installed only on proxy-to-app connections.
++// Local loopback traffic must not be counted as app-link traffic.
++type RemoteStatsHandler struct{}
++
++// Only documented proxy services are accepted; method labels never come from resource names.
++func (RemoteStatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
++	parts := strings.Split(info.FullMethodName, "/")
++	method := "other"
++	if len(parts) == 3 {
++		switch parts[1] {
++		case "google.bytestream.ByteStream", "build.bazel.remote.execution.v2.ContentAddressableStorage", "build.bazel.remote.execution.v2.ActionCache", "build.bazel.remote.execution.v2.Capabilities", "oci_fetcher.OCIFetcher", "hit_tracker.HitTrackerService":
++			switch parts[2] {
++			case "Read", "Write", "QueryWriteStatus", "GetActionResult", "UpdateActionResult", "FindMissingBlobs", "BatchReadBlobs", "BatchUpdateBlobs", "GetTree", "SplitBlob", "SpliceBlob", "GetChunkMapping", "RegisterChunkMapping", "GetCapabilities", "FetchManifest", "FetchManifestMetadata", "FetchBlobMetadata", "FetchBlob", "Track":
++				method = parts[1] + "/" + parts[2]
++			}
++		}
++	}
++	compressor := "identity"
++	if strings.HasPrefix(method, "google.bytestream.ByteStream/") {
++		compressor = "unknown"
++	}
++	return context.WithValue(ctx, rpcObservationKey{}, &rpcObservation{method: method, compressor: compressor, expectedSize: -1})
++}
++func (RemoteStatsHandler) HandleRPC(ctx context.Context, event stats.RPCStats) {
++	r, ok := ctx.Value(rpcObservationKey{}).(*rpcObservation)
++	if !ok {
++		return
++	}
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	switch e := event.(type) {
++	case *stats.Begin:
++		addRemote(ctx, remoteKey{method: r.method}, 1)
++	case *stats.OutPayload:
++		addRemote(ctx, remoteKey{method: r.method, direction: "sent"}, int64(e.CompressedLength))
++		r.payload(ctx, e.Payload, "sent")
++	case *stats.InPayload:
++		addRemote(ctx, remoteKey{method: r.method, direction: "received"}, int64(e.CompressedLength))
++		r.payload(ctx, e.Payload, "received")
++	case *stats.End:
++		if r.sampleHeld {
++			if e.Error == nil && len(r.sampleData) > 0 && (r.expectedSize < 0 || int64(len(r.sampleData)) == r.expectedSize) {
++				encodeIdentitySample(r.sampleData, r.method, r.sampleDirection)
++			}
++			r.sampleData = nil
++			r.sampleHeld = false
++			<-sampleSlots
++		}
++		if strings.HasSuffix(r.method, "/SplitBlob") && status.Code(e.Error) == codes.NotFound {
++			if o, ok := ctx.Value(observationKey{}).(*Observation); ok {
++				o.mu.Lock()
++				o.splitNotFound = true
++				o.mu.Unlock()
++			}
++		}
++	}
++}
++func (RemoteStatsHandler) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context {
++	return ctx
++}
++func (RemoteStatsHandler) HandleConn(context.Context, stats.ConnStats) {}
++func compressorName(c repb.Compressor_Value) string {
++	switch c {
++	case repb.Compressor_IDENTITY:
++		return "identity"
++	case repb.Compressor_ZSTD:
++		return "zstd"
++	default:
++		return "unknown"
++	}
++}
++func (r *rpcObservation) blob(ctx context.Context, data []byte, c string, direction string, complete bool) {
++	addRemote(ctx, remoteKey{method: r.method, direction: direction, compressor: c}, int64(len(data)))
++	if complete && c == "identity" {
++		sampleIdentity(data, r.method, direction)
++	} else if !complete && c == "identity" && len(data) > 0 {
++		if !r.sampleStarted {
++			r.sampleStarted = true
++			n := *IdentityZstdSampleEvery
++			if n > 0 && sampleSequence.Add(1)%uint64(n) == 0 {
++				select {
++				case sampleSlots <- struct{}{}:
++					r.sampleHeld = true
++					r.sampleData = make([]byte, 0, 1<<20)
++					r.sampleDirection = direction
++				default:
++				}
++			}
++		}
++		if r.sampleHeld {
++			if len(r.sampleData)+len(data) > 1<<20 {
++				r.sampleData = nil
++				r.sampleHeld = false
++				<-sampleSlots
++			} else {
++				r.sampleData = append(r.sampleData, data...)
++			}
++		}
++	}
++}
++func (r *rpcObservation) payload(ctx context.Context, p any, direction string) {
++	switch p := p.(type) {
++	case *bspb.ReadRequest:
++		if p.GetReadOffset() != 0 || p.GetReadLimit() != 0 {
++			r.sampleStarted = true
++		}
++		if rn, err := digest.ParseDownloadResourceName(p.GetResourceName()); err == nil {
++			r.compressor = compressorName(rn.GetCompressor())
++			r.expectedSize = rn.GetDigest().GetSizeBytes()
++			if r.expectedSize > 1<<20 {
++				r.sampleStarted = true
++			}
++		}
++	case *bspb.WriteRequest:
++		if !r.sampleStarted && p.GetWriteOffset() != 0 {
++			r.sampleStarted = true
++		}
++		if p.GetResourceName() != "" {
++			if rn, err := digest.ParseUploadResourceName(p.GetResourceName()); err == nil {
++				r.compressor = compressorName(rn.GetCompressor())
++				r.expectedSize = rn.GetDigest().GetSizeBytes()
++				if r.expectedSize > 1<<20 {
++					r.sampleStarted = true
++				}
++			}
++		}
++		r.blob(ctx, p.GetData(), r.compressor, direction, false)
++	case *bspb.ReadResponse:
++		r.blob(ctx, p.GetData(), r.compressor, direction, false)
++	case *repb.BatchUpdateBlobsRequest:
++		for _, b := range p.GetRequests() {
++			r.blob(ctx, b.GetData(), compressorName(b.GetCompressor()), direction, true)
++		}
++	case *repb.BatchReadBlobsResponse:
++		for _, b := range p.GetResponses() {
++			r.blob(ctx, b.GetData(), compressorName(b.GetCompressor()), direction, true)
++		}
++	case *ofpb.FetchBlobResponse:
++		r.blob(ctx, p.GetData(), "identity", direction, false)
++	}
++}
++
++var sampleSequence atomic.Uint64
++var sampleSlots = make(chan struct{}, 2)
++var sampleEncoderOnce sync.Once
++var sampleEncoder *zstd.Encoder
++
++func sampleIdentity(data []byte, method, direction string) {
++	n := *IdentityZstdSampleEvery
++	if n <= 0 || len(data) == 0 || len(data) > 1<<20 || sampleSequence.Add(1)%uint64(n) != 0 {
++		return
++	}
++	select {
++	case sampleSlots <- struct{}{}:
++		defer func() { <-sampleSlots }()
++	default:
++		return
++	}
++	encodeIdentitySample(data, method, direction)
++}
++func encodeIdentitySample(data []byte, method, direction string) {
++	sampleEncoderOnce.Do(func() { sampleEncoder, _ = zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1)) })
++	if sampleEncoder == nil {
++		return
++	}
++	compressed := sampleEncoder.EncodeAll(data, nil)
++	metrics.CacheProxyIdentityZstdRatio.WithLabelValues(method, direction).Observe(float64(len(compressed)) / float64(len(data)))
++}
++
++// RecentTracker retains fixed-size hashed keys. ObserveBatch tests all keys before
++// inserting, so duplicates in one request do not count as previous requests.
++type RecentTracker struct {
++	mu       sync.Mutex
++	capacity int
++	entries  map[[32]byte]*list.Element
++	order    *list.List
++}
++type recentEntry struct {
++	key  [32]byte
++	seen time.Time
++}
++
++func NewRecentTracker(capacity int) *RecentTracker {
++	return &RecentTracker{capacity: capacity, entries: make(map[[32]byte]*list.Element), order: list.New()}
++}
++func (t *RecentTracker) ObserveBatch(keys []string, now time.Time) [3]int {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	var hits [3]int
++	windows := [3]time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute}
++	for _, key := range keys {
++		if e, ok := t.entries[sha256.Sum256([]byte(key))]; ok {
++			age := now.Sub(e.Value.(recentEntry).seen)
++			for i, w := range windows {
++				if age >= 0 && age <= w {
++					hits[i]++
++				}
++			}
++		}
++	}
++	if t.capacity <= 0 {
++		return hits
++	}
++	for _, key := range keys {
++		k := sha256.Sum256([]byte(key))
++		if e, ok := t.entries[k]; ok {
++			e.Value = recentEntry{k, now}
++			t.order.MoveToFront(e)
++		} else {
++			t.entries[k] = t.order.PushFront(recentEntry{k, now})
++		}
++		if t.order.Len() > t.capacity {
++			e := t.order.Back()
++			delete(t.entries, e.Value.(recentEntry).key)
++			t.order.Remove(e)
++		}
++	}
++	return hits
++}
+diff --git a/enterprise/server/util/proxy_util/observations_test.go b/enterprise/server/util/proxy_util/observations_test.go
+new file mode 100644
+index 000000000..648dea29f
+--- /dev/null
++++ b/enterprise/server/util/proxy_util/observations_test.go
+@@ -0,0 +1,186 @@
++package proxy_util
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
++	"github.com/buildbuddy-io/buildbuddy/server/metrics"
++	"github.com/prometheus/client_golang/prometheus"
++	"github.com/prometheus/client_golang/prometheus/testutil"
++	dto "github.com/prometheus/client_model/go"
++	bspb "google.golang.org/genproto/googleapis/bytestream"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/stats"
++	"google.golang.org/grpc/status"
++)
++
++func TestRecentTrackerWindowsAndBatchDuplicates(t *testing.T) {
++	tracker := NewRecentTracker(10)
++	now := time.Unix(1000, 0)
++	if got := tracker.ObserveBatch([]string{"a", "a"}, now); got != [3]int{} {
++		t.Fatal(got)
++	}
++	if got := tracker.ObserveBatch([]string{"a", "a"}, now.Add(time.Minute)); got != [3]int{2, 2, 2} {
++		t.Fatal(got)
++	}
++	if got := tracker.ObserveBatch([]string{"a"}, now.Add(3*time.Minute)); got != [3]int{0, 1, 1} {
++		t.Fatal(got)
++	}
++	if got := tracker.ObserveBatch([]string{"a"}, now.Add(9*time.Minute)); got != [3]int{0, 0, 1} {
++		t.Fatal(got)
++	}
++	if got := tracker.ObserveBatch([]string{"a"}, now.Add(25*time.Minute)); got != [3]int{} {
++		t.Fatal(got)
++	}
++}
++func TestRecentTrackerEvictionAndIsolation(t *testing.T) {
++	tracker := NewRecentTracker(2)
++	now := time.Now()
++	tracker.ObserveBatch([]string{"group1/blob", "group2/blob"}, now)
++	tracker.ObserveBatch([]string{"group1/blob"}, now)
++	tracker.ObserveBatch([]string{"other"}, now)
++	if got := tracker.ObserveBatch([]string{"group2/blob", "group1/blob"}, now); got != [3]int{1, 1, 1} {
++		t.Fatal(got)
++	}
++	if len(tracker.entries) != 2 {
++		t.Fatal(len(tracker.entries))
++	}
++	if got := NewRecentTracker(0).ObserveBatch([]string{"a"}, now); got != [3]int{} {
++		t.Fatal(got)
++	}
++}
++func TestRecentTrackerConcurrentBound(t *testing.T) {
++	tracker := NewRecentTracker(16)
++	var wg sync.WaitGroup
++	for i := range 8 {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			for j := range 100 {
++				tracker.ObserveBatch([]string{fmt.Sprintf("%d/%d", i, j)}, time.Now())
++			}
++		}(i)
++	}
++	wg.Wait()
++	if len(tracker.entries) != 16 {
++		t.Fatal(len(tracker.entries))
++	}
++}
++func TestRemoteObservationUsesFinalLocalOutcome(t *testing.T) {
++	ctx, o := StartObservation(context.Background())
++	h := RemoteStatsHandler{}
++	method := "build.bazel.remote.execution.v2.ContentAddressableStorage/SplitBlob"
++	ctx = h.TagRPC(ctx, &stats.RPCTagInfo{FullMethodName: "/" + method})
++	counter := metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "hit")
++	before := testutil.ToFloat64(counter)
++	wasted := testutil.ToFloat64(metrics.CacheProxySplitBlobLocalHits.WithLabelValues())
++	sent := metrics.CacheProxyRemoteBytes.WithLabelValues(method, "sent", "hit")
++	sentBefore := testutil.ToFloat64(sent)
++	h.HandleRPC(ctx, &stats.Begin{})
++	h.HandleRPC(ctx, &stats.OutPayload{Length: 100, CompressedLength: 42})
++	h.HandleRPC(ctx, &stats.End{Error: status.Error(codes.NotFound, "missing")})
++	SetLocalOutcome(ctx, "hit")
++	o.Finish()
++	o.Finish()
++	if got := testutil.ToFloat64(counter) - before; got != 1 {
++		t.Fatal(got)
++	}
++	if got := testutil.ToFloat64(metrics.CacheProxySplitBlobLocalHits.WithLabelValues()) - wasted; got != 1 {
++		t.Fatal(got)
++	}
++	if got := testutil.ToFloat64(sent) - sentBefore; got != 42 {
++		t.Fatal(got)
++	}
++	// Background work which outlives the handler is still accounted for.
++	h.HandleRPC(ctx, &stats.Begin{})
++	if got := testutil.ToFloat64(counter) - before; got != 2 {
++		t.Fatal(got)
++	}
++}
++func TestRemoteBatchBlobBytes(t *testing.T) {
++	h := RemoteStatsHandler{}
++	method := "build.bazel.remote.execution.v2.ContentAddressableStorage/BatchReadBlobs"
++	ctx := h.TagRPC(context.Background(), &stats.RPCTagInfo{FullMethodName: "/" + method})
++	identity := metrics.CacheProxyLinkBlobBytes.WithLabelValues(method, "received", "identity")
++	compressed := metrics.CacheProxyLinkBlobBytes.WithLabelValues(method, "received", "zstd")
++	a, b := testutil.ToFloat64(identity), testutil.ToFloat64(compressed)
++	h.HandleRPC(ctx, &stats.InPayload{Length: 100, Payload: &repb.BatchReadBlobsResponse{Responses: []*repb.BatchReadBlobsResponse_Response{{Data: []byte("abc")}, {Data: []byte("xy"), Compressor: repb.Compressor_ZSTD}}}})
++	if testutil.ToFloat64(identity)-a != 3 || testutil.ToFloat64(compressed)-b != 2 {
++		t.Fatal("incorrect blob accounting")
++	}
++}
++
++func TestStreamingSamplingBoundsAndPartialReads(t *testing.T) {
++	old := *IdentityZstdSampleEvery
++	*IdentityZstdSampleEvery = 1
++	defer func() { *IdentityZstdSampleEvery = old }()
++	h := RemoteStatsHandler{}
++	for _, tc := range []struct {
++		name     string
++		offset   int64
++		size     int
++		wantHeld bool
++	}{
++		{"small", 0, 32, true}, {"oversize", 0, (1 << 20) + 1, false}, {"partial", 1, 32, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			ctx := h.TagRPC(context.Background(), &stats.RPCTagInfo{FullMethodName: "/google.bytestream.ByteStream/Read"})
++			h.HandleRPC(ctx, &stats.OutPayload{Payload: &bspb.ReadRequest{ResourceName: "blobs/" + strings.Repeat("a", 64) + "/32", ReadOffset: tc.offset}})
++			h.HandleRPC(ctx, &stats.InPayload{Payload: &bspb.ReadResponse{Data: make([]byte, tc.size)}})
++			r := ctx.Value(rpcObservationKey{}).(*rpcObservation)
++			if r.sampleHeld != tc.wantHeld || len(r.sampleData) > 1<<20 {
++				t.Fatalf("held=%v buffer=%d", r.sampleHeld, len(r.sampleData))
++			}
++			// A failed RPC releases its sample without observing a ratio.
++			h.HandleRPC(ctx, &stats.End{Error: status.Error(codes.Canceled, "cancelled")})
++			if r.sampleHeld || r.sampleData != nil {
++				t.Fatal("sample retained after end")
++			}
++		})
++	}
++	if len(sampleSlots) != 0 {
++		t.Fatal("sample slots leaked")
++	}
++}
++func TestRemoteMethodLabelsAreBounded(t *testing.T) {
++	h := RemoteStatsHandler{}
++	for _, method := range []string{"/google.bytestream.ByteStream/arbitrary-blob-name", "/arbitrary-service/Read"} {
++		ctx := h.TagRPC(context.Background(), &stats.RPCTagInfo{FullMethodName: method})
++		if ctx.Value(rpcObservationKey{}).(*rpcObservation).method != "other" {
++			t.Fatal("unbounded label")
++		}
++	}
++}
++
++func TestStreamingSampleRequiresSuccessfulCompleteBlob(t *testing.T) {
++	old := *IdentityZstdSampleEvery
++	*IdentityZstdSampleEvery = 1
++	defer func() { *IdentityZstdSampleEvery = old }()
++	method := "google.bytestream.ByteStream/Read"
++	snapshot := func() uint64 {
++		m := &dto.Metric{}
++		if err := metrics.CacheProxyIdentityZstdRatio.WithLabelValues(method, "received").(prometheus.Metric).Write(m); err != nil {
++			t.Fatal(err)
++		}
++		return m.GetHistogram().GetSampleCount()
++	}
++	before := snapshot()
++	h := RemoteStatsHandler{}
++	for _, size := range []int{32, 16} {
++		ctx := h.TagRPC(context.Background(), &stats.RPCTagInfo{FullMethodName: "/" + method})
++		h.HandleRPC(ctx, &stats.OutPayload{Payload: &bspb.ReadRequest{ResourceName: "blobs/" + strings.Repeat("a", 64) + "/32"}})
++		h.HandleRPC(ctx, &stats.InPayload{Payload: &bspb.ReadResponse{Data: make([]byte, size)}})
++		h.HandleRPC(ctx, &stats.End{})
++	}
++	if got := snapshot() - before; got != 1 {
++		t.Fatal(got)
++	}
++	if len(sampleSlots) != 0 {
++		t.Fatal("sample slots leaked")
++	}
++}
+diff --git a/result.md b/result.md
+new file mode 100644
+index 000000000..67fde0530
+--- /dev/null
++++ b/result.md
+@@ -0,0 +1,112 @@
++# Measure cache proxy app-link optimization opportunities
++
++The proxy currently exports request and client-facing payload metrics, but those cannot attribute all app-link calls and bytes to a local hit or miss. Add observe-only remote accounting and targeted observations before changing IO behavior. Cache lookups, routing decisions, retries, compression negotiation, returned results, and local write behavior remain as they were.
++
++Existing metrics are retained and reused for client request denominators, chunk traffic/failures, AC unchanged-result counts, enabled FindMissing cache effectiveness, capabilities traffic, and hit-tracker batching. In particular, AC `remote_digest_match` already counts unchanged validation responses, but its byte counter measures the full substituted local result. CAS counters measure blobs and client requests, rather than every outgoing RPC. ByteStream byte counters include local traffic; chunk metrics do not pair SplitBlob NotFound with subsequent successful local service. Existing gRPC message-size histograms provide app-link byte totals by method, but lack the local lookup outcome and REv2 blob compressor. There were no partial-read commit or changed-AC-age metrics, and no FindMissing reuse measurement while caching is disabled. OCIFetcher instrumentation elsewhere records method/role/status and latency, while this proxy had no local-hit attribution.
++
++An observation collector scoped to the request (or to each BatchReadBlobs batch) receives gRPC client stats from the app connection and publishes after the proxy determines the local outcome. This attributes early calls (SplitBlob, OCI metadata) to the eventual hit/miss, and counts internal chunk RPCs individually. It also accounts for events from asynchronous calls that finish after the handler. Cached GetTree creates a separate observation scope for each BatchReadBlobs call, preserving mixed partial-hit and miss RPC/byte attribution across batches. Encryption-bypass batches set their uncacheable outcome before making the remote call, including remote errors. Method labels use an allowlist. No new metric labels contain digests, image names, groups, invocations, instances, or remote addresses. Existing metrics with group/action labels remain unchanged.
++
++`cache_status` is `hit`, `miss`, `partial`, `uncacheable`, or `not_checked`. These describe the request's local lookup, rather than the remote response: an AC local hit whose result changed remotely is still a local hit. Pass-through operations, writes with no lookup, FindMissing with caching disabled, and background batches use `not_checked`. Directions are relative to the proxy: `sent` to the app and `received` from the app. Remote bytes count gRPC-compressed protobuf message payloads, excluding gRPC/HTTP2 framing, metadata and TLS. Blob bytes separately count REv2/ByteStream/OCI data bytes in their identity/zstd encoding, excluding protobuf envelopes. A successful all-local read normally contributes zero remote reads, but can still contribute a metadata/manifest RPC.
++
++Three flags add optional request-path work, and default off:
++
++- `cache_proxy.observe_find_missing_reuse`: retain at most 100,000 SHA-256 hashed keys in a mutex-protected LRU per CAS proxy. Keys isolate authenticated group, instance, digest function, digest hash/size, and chunk mode. All entries in a request are checked before any are inserted, so duplicates within that request do not count as earlier requests. Windows are inclusive at 1, 5, and 15 minutes; each request refreshes last-seen time. Eviction and restarts underestimate repetition. Counts include requested digests regardless of whether the app reports them present, so reuse is an opportunity estimate, not an exact cache hit prediction. This works with FindMissing caching disabled and skips local-only/blackhole requests and authentication errors.
++- `cache_proxy.observe_action_cache_age`: perform an additional metadata lookup only if metadata was not already fetched for the existing TTL path. Ignore observation errors. Changed-result age uses pointer mtime (time since cached/refreshed), not atime. Already-available metadata is observed without enabling the flag; unknown or future timestamps are omitted. Unchanged responses and errors do not enter the age histogram.
++- `cache_proxy.identity_zstd_sample_every`: compress approximately one in N eligible identity blobs with zstd; 0 disables sampling. Complete blobs are capped at 1 MiB, with at most two concurrent samples across batch and stream RPCs and nonblocking sample admission. Streaming buffers are bounded to 1 MiB each; oversized blobs, partial/resumed ByteStream transfers, unsuccessful streams, empty data and compressed input are skipped. Known ByteStream sizes must match the observed data. Samples measure compressed/identity bytes: a ratio of 0.5 suggests roughly half the blob payload bytes. Samples are unweighted and favor eligible small blobs; compare with byte totals before estimating savings. The sampler uses its own encoder so it does not increment production compression counters.
++
++Partial-read misses count offset != 0 or limit != 0 requests classified as a local miss, including chunked reads that require remote chunks. Commit observations count only attempted local writes, including failures from incomplete streams and local validation; they do not imply the remote read failed. A wasted SplitBlob observation requires NotFound, an eventual local hit, and a successful proxy request. AC revalidation outcomes distinguish the remote's unchanged-digest response, a full changed result, and an error.
++
++# Metric inventory and example queries
++
++Each row describes one metric. Queries assume the input series are already scoped to cache proxy jobs, especially the generic gRPC metrics. Existing metrics continue to answer the questions they already cover; the new families add remote-link attribution and the missing observations. Counters keep the repository's existing naming convention (no added `_total` suffix except where already present).
++
++| Metric | Question answered | Type and labels | New/existing | Example PromQL |
++| --- | --- | --- | --- | --- |
++| `buildbuddy_proxy_action_cache_changed_age_seconds` | How old are local AC entries when remote validation returns a changed result? | Histogram; no labels | New | `histogram_quantile(0.95, sum by (le) (rate(buildbuddy_proxy_action_cache_changed_age_seconds_bucket[1h])))` |
++| `buildbuddy_proxy_action_cache_revalidations` | What fraction of local AC hits checked remotely returned an unchanged digest? | Counter; `outcome` | New | `sum(rate(buildbuddy_proxy_action_cache_revalidations{outcome="unchanged"}[5m])) / sum(rate(buildbuddy_proxy_action_cache_revalidations[5m]))` |
++| `buildbuddy_proxy_find_missing_recent_digests` | What fraction of requested digests appeared in a prior request within each window? | Counter; `window`, `cache_status` | New | `sum by (window) (rate(buildbuddy_proxy_find_missing_recent_digests{cache_status="hit"}[5m])) / sum by (window) (rate(buildbuddy_proxy_find_missing_recent_digests[5m]))` |
++| `buildbuddy_proxy_identity_zstd_ratio` | What is the mean zstd-to-identity size ratio for sampled eligible blobs? | Histogram; `method`, `direction` | New | `sum by (method, direction) (rate(buildbuddy_proxy_identity_zstd_ratio_sum[1h])) / sum by (method, direction) (rate(buildbuddy_proxy_identity_zstd_ratio_count[1h]))` |
++| `buildbuddy_proxy_link_blob_bytes` | How much encoded blob traffic uses identity versus zstd in each direction? | Counter; `method`, `direction`, `compression` | New | `sum by (direction, compression) (rate(buildbuddy_proxy_link_blob_bytes[5m]))` |
++| `buildbuddy_proxy_partial_read_local_misses` | How often do offset/limit reads fall back to remote after a local miss? | Counter; no labels | New | `sum(rate(buildbuddy_proxy_partial_read_local_misses[5m]))` |
++| `buildbuddy_proxy_partial_read_local_writes` | What fraction of attempted partial-read local writes failed to commit? | Counter; `outcome` | New | `sum(rate(buildbuddy_proxy_partial_read_local_writes{outcome="failed"}[5m])) / sum(rate(buildbuddy_proxy_partial_read_local_writes[5m]))` |
++| `buildbuddy_proxy_remote_bytes` | How many app-link message bytes does each method cause by local lookup outcome? Includes hit-tracker bytes. | Counter; `method`, `direction`, `cache_status` | New | `sum by (method, direction, cache_status) (rate(buildbuddy_proxy_remote_bytes[5m]))` |
++| `buildbuddy_proxy_remote_rpcs` | How many app RPC attempts does each method cause for a local hit, miss, or partial hit? | Counter; `method`, `cache_status` | New | `sum by (method, cache_status) (rate(buildbuddy_proxy_remote_rpcs[5m]))` |
++| `buildbuddy_proxy_split_blob_not_found_local_hits` | How often did remote SplitBlob return NotFound before a successful local read? | Counter; no labels | New | `sum(rate(buildbuddy_proxy_split_blob_not_found_local_hits[5m]))` |
++| `buildbuddy_proxy_action_cache_read_bytes` | How many client-facing AC bytes are served by source? This includes the substituted local result. | Counter; `status`, `cache_status`, `proxy_request_type`, `result_source` | Existing | `sum by (result_source) (rate(buildbuddy_proxy_action_cache_read_bytes[5m]))` |
++| `buildbuddy_proxy_action_cache_read_requests` | How many AC reads use unchanged-digest validation versus the TTL fast path? | Counter; `status`, `cache_status`, `proxy_request_type`, `result_source` | Existing | `sum by (result_source) (rate(buildbuddy_proxy_action_cache_read_requests[5m]))` |
++| `buildbuddy_proxy_action_cache_write_bytes` | The number of ActionCache.UpdateActionResult bytes served by a ActionCacheServerProxy by gRPC status and cache hit/miss status? | Counter; `status`, `cache_status`, `proxy_request_type` | Existing | `sum by (status, cache_status, proxy_request_type) (rate(buildbuddy_proxy_action_cache_write_bytes[5m]))` |
++| `buildbuddy_proxy_action_cache_write_requests` | The number of ActionCache.UpdateActionResult requests served by a ActionCacheServerProxy by gRPC status and cache hit/miss status? | Counter; `status`, `cache_status`, `proxy_request_type` | Existing | `sum by (status, cache_status, proxy_request_type) (rate(buildbuddy_proxy_action_cache_write_requests[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_read_blob_bytes` | Original blob size in bytes for chunked reads? | Counter; `status`, `compression` | Existing | `sum by (status, compression) (rate(buildbuddy_proxy_byte_stream_chunked_read_blob_bytes[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_read_bytes_local` | Bytes served from local cache to the client during chunked reads? | Counter; `status`, `compression` | Existing | `sum by (status, compression) (rate(buildbuddy_proxy_byte_stream_chunked_read_bytes_local[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_read_bytes_remote` | Bytes fetched from remote and served to the client during chunked reads? | Counter; `status`, `compression` | Existing | `sum by (status, compression) (rate(buildbuddy_proxy_byte_stream_chunked_read_bytes_remote[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_read_chunks_local` | Number of chunks served from local cache during chunked reads? | Counter; `status`, `compression` | Existing | `sum by (status, compression) (rate(buildbuddy_proxy_byte_stream_chunked_read_chunks_local[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_read_chunks_remote` | Number of chunks fetched from remote during chunked reads? | Counter; `status`, `compression` | Existing | `sum by (status, compression) (rate(buildbuddy_proxy_byte_stream_chunked_read_chunks_remote[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_read_chunks_total` | Total number of chunks read during chunked reads? | Counter; `status`, `compression` | Existing | `sum by (status, compression) (rate(buildbuddy_proxy_byte_stream_chunked_read_chunks_total[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_read_failures` | How often does SplitBlob fail? Existing failures cannot identify a later successful local fallback. | Counter; `reason`, `status` | Existing | `sum by (status) (rate(buildbuddy_proxy_byte_stream_chunked_read_failures{reason="split_blob_error"}[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_read_fast_path_attempts` | Number of chunked reads where the CDC read fast path was attempted, by outcome? | Counter; `outcome` | Existing | `sum by (outcome) (rate(buildbuddy_proxy_byte_stream_chunked_read_fast_path_attempts[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_read_local_manifest_store_attempts` | Number of attempts to store a CDC manifest in the proxy local cache after a successful remote SplitBlob? | Counter; `status` | Existing | `sum by (status) (rate(buildbuddy_proxy_byte_stream_chunked_read_local_manifest_store_attempts[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_read_local_write_back_failures` | Number of failures while writing remotely fetched chunks back to the local cache during chunked reads? | Counter; `status` | Existing | `sum by (status) (rate(buildbuddy_proxy_byte_stream_chunked_read_local_write_back_failures[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_read_requests` | Total number of successful chunked read requests? | Counter; `status`, `compression` | Existing | `sum by (status, compression) (rate(buildbuddy_proxy_byte_stream_chunked_read_requests[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_write_blob_bytes` | Original blob size in bytes for chunked writes? | Counter; `status`, `compression` | Existing | `sum by (status, compression) (rate(buildbuddy_proxy_byte_stream_chunked_write_blob_bytes[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_write_by_action_mnemonic_chunk_bytes_deduped` | Chunk bytes that were deduplicated (already existed on remote) during chunked writes by action mnemonic? | Counter; `status`, `compression`, `action_mnemonic` | Existing | `sum by (status, compression) (rate(buildbuddy_proxy_byte_stream_chunked_write_by_action_mnemonic_chunk_bytes_deduped[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_write_by_action_mnemonic_chunk_bytes_total` | Total chunk bytes produced during chunked writes by action mnemonic (sum of all chunk sizes)? | Counter; `status`, `compression`, `action_mnemonic` | Existing | `sum by (status, compression) (rate(buildbuddy_proxy_byte_stream_chunked_write_by_action_mnemonic_chunk_bytes_total[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_write_by_action_mnemonic_chunks_deduped` | Number of chunks that were deduplicated (already existed on remote) during chunked writes by action mnemonic? | Counter; `status`, `compression`, `action_mnemonic` | Existing | `sum by (status, compression) (rate(buildbuddy_proxy_byte_stream_chunked_write_by_action_mnemonic_chunks_deduped[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_write_by_action_mnemonic_chunks_total` | Total number of chunks produced during chunked writes by action mnemonic? | Counter; `status`, `compression`, `action_mnemonic` | Existing | `sum by (status, compression) (rate(buildbuddy_proxy_byte_stream_chunked_write_by_action_mnemonic_chunks_total[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_write_by_group_chunk_bytes_deduped` | Chunk bytes that were deduplicated (already existed on remote) during chunked writes by group ID? | Counter; `status`, `compression`, `group_id` | Existing | `sum by (status, compression) (rate(buildbuddy_proxy_byte_stream_chunked_write_by_group_chunk_bytes_deduped[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_write_by_group_chunk_bytes_total` | Total chunk bytes produced during chunked writes by group ID (sum of all chunk sizes)? | Counter; `status`, `compression`, `group_id` | Existing | `sum by (status, compression) (rate(buildbuddy_proxy_byte_stream_chunked_write_by_group_chunk_bytes_total[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_write_chunk_bytes_deduped` | Chunk bytes that were deduplicated (already existed on remote) during chunked writes? | Counter; `status`, `compression` | Existing | `sum by (status, compression) (rate(buildbuddy_proxy_byte_stream_chunked_write_chunk_bytes_deduped[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_write_chunk_bytes_total` | Total chunk bytes produced during chunked writes (sum of all chunk sizes)? | Counter; `status`, `compression` | Existing | `sum by (status, compression) (rate(buildbuddy_proxy_byte_stream_chunked_write_chunk_bytes_total[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_write_chunking_duration_usec` | Duration of the chunking phase (receive, decompress, chunk, compress, local write), in microseconds? | Histogram; `status`, `compression` | Existing | `histogram_quantile(0.95, sum by (le) (rate(buildbuddy_proxy_byte_stream_chunked_write_chunking_duration_usec_bucket[5m])))` |
++| `buildbuddy_proxy_byte_stream_chunked_write_chunks_deduped` | Number of chunks that were deduplicated (already existed on remote) during chunked writes? | Counter; `status`, `compression`, `group_id` | Existing | `sum by (status, compression) (rate(buildbuddy_proxy_byte_stream_chunked_write_chunks_deduped[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_write_chunks_total` | Total number of chunks produced during chunked writes? | Counter; `status`, `compression`, `group_id` | Existing | `sum by (status, compression) (rate(buildbuddy_proxy_byte_stream_chunked_write_chunks_total[5m]))` |
++| `buildbuddy_proxy_byte_stream_chunked_write_duration_usec` | Total duration of chunked write operations, in microseconds? | Histogram; `status`, `compression` | Existing | `histogram_quantile(0.95, sum by (le) (rate(buildbuddy_proxy_byte_stream_chunked_write_duration_usec_bucket[5m])))` |
++| `buildbuddy_proxy_byte_stream_chunked_write_remote_duration_usec` | Duration of the remote phase (FindMissingBlobs, upload, SpliceBlob), in microseconds? | Histogram; `status`, `compression` | Existing | `histogram_quantile(0.95, sum by (le) (rate(buildbuddy_proxy_byte_stream_chunked_write_remote_duration_usec_bucket[5m])))` |
++| `buildbuddy_proxy_byte_stream_chunked_write_upload_size_bytes` | Compressed upload size for remote chunk uploads during chunked writes? | Histogram; `status` | Existing | `histogram_quantile(0.95, sum by (le) (rate(buildbuddy_proxy_byte_stream_chunked_write_upload_size_bytes_bucket[5m])))` |
++| `buildbuddy_proxy_byte_stream_read_bytes` | The number of bytes read by ByteStream.Read RPCs served by a ByteStreamServerProxy broken down by gRPC status and cache hit/miss status? | Counter; `status`, `cache_status`, `proxy_request_type`, `compression`, `chunked`, `group_id` | Existing | `sum by (status, cache_status, proxy_request_type, compression, chunked) (rate(buildbuddy_proxy_byte_stream_read_bytes[5m]))` |
++| `buildbuddy_proxy_byte_stream_read_requests` | How many client ByteStream reads hit locally or miss, by compressor? | Counter; `status`, `cache_status`, `proxy_request_type`, `compression`, `chunked` | Existing | `sum by (cache_status, compression) (rate(buildbuddy_proxy_byte_stream_read_requests[5m]))` |
++| `buildbuddy_proxy_byte_stream_write_bytes` | The number of bytes written to a ByteStream.Write RPCs served by a ByteStreamServerProxy broken down by gRPC status and cache hit/miss status? | Counter; `status`, `cache_status`, `proxy_request_type`, `compression`, `chunked` | Existing | `sum by (status, cache_status, proxy_request_type, compression, chunked) (rate(buildbuddy_proxy_byte_stream_write_bytes[5m]))` |
++| `buildbuddy_proxy_byte_stream_write_requests` | The number of ByteStream.Write requests served by a ByteStreamServerProxy broken down by gRPC status and cache hit/miss status? | Counter; `status`, `cache_status`, `proxy_request_type`, `compression`, `chunked` | Existing | `sum by (status, cache_status, proxy_request_type, compression, chunked) (rate(buildbuddy_proxy_byte_stream_write_requests[5m]))` |
++| `buildbuddy_proxy_capabilities_bytes` | The number of bytes served by a CapabilitiesServerProxy by gRPC status and cache hit/miss status? | Counter; `status`, `cache_status` | Existing | `sum by (status, cache_status) (rate(buildbuddy_proxy_capabilities_bytes[5m]))` |
++| `buildbuddy_proxy_capabilities_requests` | The number of requests served by a CapabilitiesServerProxy by gRPC status and cache hit/miss status? | Counter; `status`, `cache_status` | Existing | `sum by (status, cache_status) (rate(buildbuddy_proxy_capabilities_requests[5m]))` |
++| `buildbuddy_proxy_content_addressable_storage_bytes` | How many encoded CAS client-facing bytes are served by operation, cache status and compressor? | Counter; `op`, `cache_status`, `compression` | Existing | `sum by (op, cache_status, compression) (rate(buildbuddy_proxy_content_addressable_storage_bytes[5m]))` |
++| `buildbuddy_proxy_content_addressable_storage_digests` | The number of digests served by a ContentAddressableStorageServerProxy by CAS operation and cache hit/miss status? | Counter; `op`, `cache_status`, `compression` | Existing | `sum by (op, cache_status, compression) (rate(buildbuddy_proxy_content_addressable_storage_digests[5m]))` |
++| `buildbuddy_proxy_content_addressable_storage_requests` | How many CAS client requests hit locally, miss, or partially hit? | Counter; `op`, `cache_status` | Existing | `sum by (op, cache_status) (rate(buildbuddy_proxy_content_addressable_storage_requests[5m]))` |
++| `buildbuddy_proxy_find_missing_blobs_cache_lookups` | What is the hit fraction once the existing FindMissing cache is enabled? | Counter; `cache_status`, `chunked`, `result_source` | Existing | `sum(rate(buildbuddy_proxy_find_missing_blobs_cache_lookups{cache_status="hit"}[5m])) / sum(rate(buildbuddy_proxy_find_missing_blobs_cache_lookups[5m]))` |
++| `buildbuddy_proxy_remote_hit_tracker_requests` | How many batched hit-tracker RPCs are sent? | Histogram; `group_id`, `status` | Existing | `sum(rate(buildbuddy_proxy_remote_hit_tracker_requests_count[5m]))` |
++| `buildbuddy_proxy_remote_hit_tracker_updates` | The number of remote hit-tracker updates enqueued, with the outcome of the enqueue operation? | Counter; `group_id`, `status` | Existing | `sum by (status) (rate(buildbuddy_proxy_remote_hit_tracker_updates[5m]))` |
++| `grpc_client_attempt_sent_total_compressed_message_size_bytes` | What are total outgoing compressed RPC message bytes by method, without hit/miss attribution? | Histogram; `grpc_method`, `grpc_status` | Existing (rpcutil) | `sum by (grpc_method) (rate(grpc_client_attempt_sent_total_compressed_message_size_bytes_sum[5m]))` |
++| `grpc_client_attempt_rcvd_total_compressed_message_size_bytes` | What are total incoming compressed RPC message bytes by method, without hit/miss attribution? | Histogram; `grpc_method`, `grpc_status` | Existing (rpcutil) | `sum by (grpc_method) (rate(grpc_client_attempt_rcvd_total_compressed_message_size_bytes_sum[5m]))` |
++| `buildbuddy_ocifetcher_request_count` | How many OCI requests run by method, role and status? Does not identify local hits. | Counter; `method`, `role`, `status` | Existing (OCI instrumentation) | `sum by (method, role, status) (rate(buildbuddy_ocifetcher_request_count[5m]))` |
++| `buildbuddy_ocifetcher_request_duration_usec` | How long do OCI requests take by method and role? | Histogram; `method`, `role` | Existing (OCI instrumentation) | `sum by (method, role) (rate(buildbuddy_ocifetcher_request_duration_usec_sum[5m])) / sum by (method, role) (rate(buildbuddy_ocifetcher_request_duration_usec_count[5m]))` |
++| `buildbuddy_proxy_remote_atime_updates` | How many remote atime updates are enqueued, by outcome? | Counter; `group_id`, `status` | Existing (atime updater) | `sum by (status) (rate(buildbuddy_proxy_remote_atime_updates[5m]))` |
++| `buildbuddy_proxy_remote_atime_update_requests` | How many background FindMissingBlobs RPCs update atimes? | Counter; `group_id`, `status` | Existing (atime updater) | `sum by (status) (rate(buildbuddy_proxy_remote_atime_update_requests[5m]))` |
++
++Hit-tracker request bytes require no separate metric: `sum(rate(buildbuddy_proxy_remote_bytes{method="hit_tracker.HitTrackerService/Track",direction="sent"}[5m]))` includes synchronous and batched Track RPCs. The existing Track histogram's `_sum` counts hits in batches, while `_count` counts requests; it did not count serialized bytes.
++
++The fraction of AC local hits that still went remote is `sum(rate(buildbuddy_proxy_action_cache_revalidations[5m])) / (sum(rate(buildbuddy_proxy_action_cache_revalidations[5m])) + sum(rate(buildbuddy_proxy_action_cache_read_requests{result_source="ttl_fast_path"}[5m])))`, for normal remote-authoritative requests. Inspect the `changed` and `error` outcomes separately before choosing a TTL; the age histogram is conditional on changed results and available metadata, not a survival curve for all local entries.
++
++# Integration with behavior tasks
++
++No sibling agents or branches named `proxy-splitblob` or `proxy-partial-read` were available in this workspace. The shared ByteStream edits are limited to recording the final read outcome, incrementing partial-read miss count, and recording whether an attempted read-through local write committed. SplitBlob detection lives in the stats handler, so moving the local lookup ahead of SplitBlob requires no added hook. The partial-read behavior task should retain the final read-outcome counter and emit commit observations only when it actually attempts a local write; skipped writes should not count as failures. AC TTL behavior already present in the checkout is preserved.
++
++The stats handler covers the default app connection, opt-in routing connections, and the hit-tracker connection. Routing registration accepts optional dial options so the proxy can install the observer without changing other routing users. Background atime updates use the observed CAS client, so their RPCs and bytes are also included, normally with `not_checked`. The existing atime request counter isolates those background calls from foreground FindMissingBlobs traffic.
++
++# Validation
++
++Added tests for inclusive reuse windows, same-request duplicates, refresh semantics, bounded LRU eviction, isolation, concurrent access, final-outcome attribution, remote byte accounting, mixed-compressor batch payloads, bounded method labels, and streaming sampling limits/partial-read exclusions, successful complete-blob sampling, and AC revalidation outcomes/age including ignored metadata errors and the default-off lookup behavior. Proxy integration tests also verify exact RPC and byte attribution for cached GetTree with an all-local batch followed by partial-hit and miss batches, encryption-bypass remote errors, SplitBlob NotFound followed by a successful local read, and real partial-read local writes that commit or fail validation. All six test targets passed uncached; the touched libraries and cache proxy binary built successfully, including required nogo static analysis.
++
++```sh
++bazel test --nocache_test_results \
++  //enterprise/server/util/proxy_util:all \
++  //enterprise/server/byte_stream_server_proxy:all \
++  //enterprise/server/content_addressable_storage_server_proxy:all \
++  //enterprise/server/action_cache_server_proxy:all \
++  //enterprise/server/capabilities_server_proxy:all \
++  //enterprise/server/ocifetcher_server_proxy:all \
++  //enterprise/server/hit_tracker_client:all \
++  //enterprise/server/cmd/cache_proxy:all \
++  //enterprise/server/routing/routing_service:all \
++  //server/metrics:all
++```
++
++[Bazel invocation](https://app.buildbuddy.io/invocation/4ab65adc-a14c-4efc-af71-4a2dcf246272). `git diff --check` also passes.
+diff --git a/server/metrics/metrics.go b/server/metrics/metrics.go
+index 7c414775d..9abea4528 100644
+--- a/server/metrics/metrics.go
++++ b/server/metrics/metrics.go
+@@ -4531,6 +4531,78 @@ var (
+ 		ChunkedOffsetReadLabel,
+ 	})
+ 
++	CacheProxyRemoteRPCs = promauto.NewCounterVec(prometheus.CounterOpts{
++		Namespace: bbNamespace,
++		Subsystem: "proxy",
++		Name:      "remote_rpcs",
++		Help:      "The number of proxy-to-app RPC attempts, by method and local lookup outcome.",
++	}, []string{"method", CacheHitMissStatus})
++
++	CacheProxyRemoteBytes = promauto.NewCounterVec(prometheus.CounterOpts{
++		Namespace: bbNamespace,
++		Subsystem: "proxy",
++		Name:      "remote_bytes",
++		Help:      "The number of compressed protobuf message bytes transferred on the proxy-to-app link, excluding gRPC and HTTP/2 framing, by method, direction and local lookup outcome.",
++	}, []string{"method", "direction", CacheHitMissStatus})
++
++	CacheProxyLinkBlobBytes = promauto.NewCounterVec(prometheus.CounterOpts{
++		Namespace: bbNamespace,
++		Subsystem: "proxy",
++		Name:      "link_blob_bytes",
++		Help:      "The number of encoded blob data bytes transferred on the proxy-to-app link by method, direction and compressor.",
++	}, []string{"method", "direction", CompressionType})
++
++	CacheProxySplitBlobLocalHits = promauto.NewCounterVec(prometheus.CounterOpts{
++		Namespace: bbNamespace,
++		Subsystem: "proxy",
++		Name:      "split_blob_not_found_local_hits",
++		Help:      "The number of chunk-eligible reads whose remote SplitBlob returned NotFound before the proxy served the blob locally.",
++	}, []string{})
++
++	CacheProxyPartialReadMisses = promauto.NewCounterVec(prometheus.CounterOpts{
++		Namespace: bbNamespace,
++		Subsystem: "proxy",
++		Name:      "partial_read_local_misses",
++		Help:      "The number of offset or limit reads that fell back to remote after a local miss.",
++	}, []string{})
++
++	CacheProxyPartialReadWrites = promauto.NewCounterVec(prometheus.CounterOpts{
++		Namespace: bbNamespace,
++		Subsystem: "proxy",
++		Name:      "partial_read_local_writes",
++		Help:      "The number of local write attempts for remote offset or limit reads by commit outcome.",
++	}, []string{"outcome"})
++
++	CacheProxyACRevalidations = promauto.NewCounterVec(prometheus.CounterOpts{
++		Namespace: bbNamespace,
++		Subsystem: "proxy",
++		Name:      "action_cache_revalidations",
++		Help:      "The number of locally cached action results checked remotely by unchanged digest, changed result or error outcome.",
++	}, []string{"outcome"})
++
++	CacheProxyACChangedAgeSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
++		Namespace: bbNamespace,
++		Subsystem: "proxy",
++		Name:      "action_cache_changed_age_seconds",
++		Help:      "The age in seconds since caching a local action result that remote revalidation found changed; observed when metadata is already available or the observe_action_cache_age flag enables an extra lookup.",
++		Buckets:   prometheus.ExponentialBuckets(1, 2, 20),
++	}, []string{})
++
++	CacheProxyFindMissingRecentDigests = promauto.NewCounterVec(prometheus.CounterOpts{
++		Namespace: bbNamespace,
++		Subsystem: "proxy",
++		Name:      "find_missing_recent_digests",
++		Help:      "The number of requested digests by recent observation window and hit or miss; bounded tracker evictions can underestimate repetition.",
++	}, []string{"window", CacheHitMissStatus})
++
++	CacheProxyIdentityZstdRatio = promauto.NewHistogramVec(prometheus.HistogramOpts{
++		Namespace: bbNamespace,
++		Subsystem: "proxy",
++		Name:      "identity_zstd_ratio",
++		Help:      "The sampled zstd encoded size divided by identity size for complete blobs up to 1 MiB; larger blobs and failed streams are skipped.",
++		Buckets:   []float64{0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 1, 1.1, 2},
++	}, []string{"method", "direction"})
++
+ 	CapabilitiesProxiedRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+ 		Namespace: bbNamespace,
+ 		Subsystem: "proxy",
+-- 
+2.43.0
+
+
+From 0b1276d3a9c48792865df060abe16feb1f6f5530 Mon Sep 17 00:00:00 2001
+From: codex worker <codex-worker@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 22:48:06 +0000
+Subject: [PATCH 2/3] Exclude local-only partial reads from remote fallback
+ metrics
+
+---
+ .../byte_stream_server_proxy.go               |  2 +-
+ .../byte_stream_server_proxy_test.go          | 22 +++++
+ .../util/proxy_util/observations_test.go      | 98 +++++++++++++++++++
+ result.md                                     | 14 ++-
+ 4 files changed, 134 insertions(+), 2 deletions(-)
+
+diff --git a/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy.go b/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy.go
+index 5cc350d43..42ac110c2 100644
+--- a/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy.go
++++ b/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy.go
+@@ -166,7 +166,7 @@ func (s *ByteStreamServerProxy) Read(req *bspb.ReadRequest, stream bspb.ByteStre
+ 		bytesRemote:  readMetrics.bytesRemote,
+ 	}
+ 	proxy_util.SetLocalOutcome(ctx, readMetrics.cacheStatus)
+-	if (req.GetReadOffset() != 0 || req.GetReadLimit() != 0) && readMetrics.cacheStatus == metrics.MissStatusLabel {
++	if (req.GetReadOffset() != 0 || req.GetReadLimit() != 0) && readMetrics.cacheStatus == metrics.MissStatusLabel && !proxy_util.SkipRemote(ctx) {
+ 		metrics.CacheProxyPartialReadMisses.WithLabelValues().Inc()
+ 	}
+ 	recordReadMetrics(bsm, readMetrics.cacheStatus)
+diff --git a/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy_test.go b/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy_test.go
+index 0cfb69866..d1e1ed132 100644
+--- a/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy_test.go
++++ b/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy_test.go
+@@ -3707,3 +3707,25 @@ func TestPartialReadLocalWriteObservations(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestLocalOnlyPartialReadMissDoesNotObserveRemoteFallback(t *testing.T) {
++	ctx := metadata.AppendToOutgoingContext(testContext(), proxy_util.SkipRemoteKey, "true")
++	remoteEnv := testenv.GetTestEnv(t)
++	proxyEnv := testenv.GetTestEnv(t)
++	remote, _, _, remoteReads := runRemoteServices(ctx, remoteEnv, t)
++	proxy := runBSProxy(ctx, remote, proxyEnv, t)
++	resource, _ := testdigest.RandomCASResourceBuf(t, 1024)
++	rn, err := digest.CASResourceNameFromProto(resource)
++	require.NoError(t, err)
++	beforeMisses := testutil.ToFloat64(metrics.CacheProxyPartialReadMisses.WithLabelValues())
++	beforeCommitted := testutil.ToFloat64(metrics.CacheProxyPartialReadWrites.WithLabelValues("committed"))
++	beforeFailed := testutil.ToFloat64(metrics.CacheProxyPartialReadWrites.WithLabelValues("failed"))
++	stream, err := proxy.Read(ctx, &bspb.ReadRequest{ResourceName: rn.DownloadString(), ReadOffset: 1, ReadLimit: 16})
++	require.NoError(t, err)
++	_, err = stream.Recv()
++	require.True(t, status.IsNotFoundError(err), "%v", err)
++	require.Zero(t, remoteReads.Load())
++	require.Equal(t, beforeMisses, testutil.ToFloat64(metrics.CacheProxyPartialReadMisses.WithLabelValues()))
++	require.Equal(t, beforeCommitted, testutil.ToFloat64(metrics.CacheProxyPartialReadWrites.WithLabelValues("committed")))
++	require.Equal(t, beforeFailed, testutil.ToFloat64(metrics.CacheProxyPartialReadWrites.WithLabelValues("failed")))
++}
+diff --git a/enterprise/server/util/proxy_util/observations_test.go b/enterprise/server/util/proxy_util/observations_test.go
+index 648dea29f..6f08f3097 100644
+--- a/enterprise/server/util/proxy_util/observations_test.go
++++ b/enterprise/server/util/proxy_util/observations_test.go
+@@ -184,3 +184,101 @@ func TestStreamingSampleRequiresSuccessfulCompleteBlob(t *testing.T) {
+ 		t.Fatal("sample slots leaked")
+ 	}
+ }
++
++func TestByteStreamWriteSampling(t *testing.T) {
++	old := *IdentityZstdSampleEvery
++	*IdentityZstdSampleEvery = 1
++	defer func() { *IdentityZstdSampleEvery = old }()
++	method := "google.bytestream.ByteStream/Write"
++	snapshot := func() uint64 {
++		m := &dto.Metric{}
++		if err := metrics.CacheProxyIdentityZstdRatio.WithLabelValues(method, "sent").(prometheus.Metric).Write(m); err != nil {
++			t.Fatal(err)
++		}
++		return m.GetHistogram().GetSampleCount()
++	}
++	h := RemoteStatsHandler{}
++	for _, tc := range []struct {
++		name        string
++		offset      int64
++		wantSamples uint64
++	}{
++		{name: "complete", wantSamples: 1},
++		{name: "resumed", offset: 16},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			before := snapshot()
++			ctx := h.TagRPC(context.Background(), &stats.RPCTagInfo{FullMethodName: "/" + method})
++			h.HandleRPC(ctx, &stats.OutPayload{Payload: &bspb.WriteRequest{
++				ResourceName: "uploads/00000000-0000-0000-0000-000000000001/blobs/" + strings.Repeat("a", 64) + "/32",
++				WriteOffset:  tc.offset, Data: make([]byte, 16),
++			}})
++			r := ctx.Value(rpcObservationKey{}).(*rpcObservation)
++			if r.sampleHeld != (tc.offset == 0) {
++				t.Fatalf("sampleHeld=%v for offset=%d", r.sampleHeld, tc.offset)
++			}
++			if tc.offset == 0 {
++				h.HandleRPC(ctx, &stats.OutPayload{Payload: &bspb.WriteRequest{WriteOffset: 16, Data: make([]byte, 16), FinishWrite: true}})
++			}
++			h.HandleRPC(ctx, &stats.End{})
++			if got := snapshot() - before; got != tc.wantSamples {
++				t.Fatalf("samples=%d, want %d", got, tc.wantSamples)
++			}
++			if r.sampleHeld || r.sampleData != nil || len(sampleSlots) != 0 {
++				t.Fatal("sample buffers or slots leaked")
++			}
++		})
++	}
++}
++
++func TestSamplingAdmissionWhenSlotsOccupied(t *testing.T) {
++	old := *IdentityZstdSampleEvery
++	*IdentityZstdSampleEvery = 1
++	defer func() { *IdentityZstdSampleEvery = old }()
++	h := RemoteStatsHandler{}
++	method := "google.bytestream.ByteStream/Write"
++	var held []context.Context
++	for range 2 {
++		ctx := h.TagRPC(context.Background(), &stats.RPCTagInfo{FullMethodName: "/" + method})
++		h.HandleRPC(ctx, &stats.OutPayload{Payload: &bspb.WriteRequest{
++			ResourceName: "uploads/00000000-0000-0000-0000-000000000001/blobs/" + strings.Repeat("a", 64) + "/32",
++			Data:         make([]byte, 16),
++		}})
++		held = append(held, ctx)
++	}
++	defer func() {
++		for _, ctx := range held {
++			h.HandleRPC(ctx, &stats.End{Error: status.Error(codes.Canceled, "cancelled")})
++		}
++		if len(sampleSlots) != 0 {
++			t.Fatal("sample slots leaked")
++		}
++	}()
++	if len(sampleSlots) != 2 {
++		t.Fatal("expected both sampling slots occupied")
++	}
++	ctx := h.TagRPC(context.Background(), &stats.RPCTagInfo{FullMethodName: "/" + method})
++	h.HandleRPC(ctx, &stats.OutPayload{Payload: &bspb.WriteRequest{
++		ResourceName: "uploads/00000000-0000-0000-0000-000000000001/blobs/" + strings.Repeat("a", 64) + "/32",
++		Data:         make([]byte, 16),
++	}})
++	r := ctx.Value(rpcObservationKey{}).(*rpcObservation)
++	if r.sampleHeld || r.sampleData != nil {
++		t.Fatal("streaming sample admitted without a free slot")
++	}
++	// Complete-blob sampling shares the same nonblocking admission bound.
++	m := &dto.Metric{}
++	counter := metrics.CacheProxyIdentityZstdRatio.WithLabelValues(method, "sent").(prometheus.Metric)
++	if err := counter.Write(m); err != nil {
++		t.Fatal(err)
++	}
++	before := m.GetHistogram().GetSampleCount()
++	sampleIdentity(make([]byte, 32), method, "sent")
++	if err := counter.Write(m); err != nil {
++		t.Fatal(err)
++	}
++	if m.GetHistogram().GetSampleCount() != before || len(sampleSlots) != 2 {
++		t.Fatal("complete sample admitted without a free slot")
++	}
++	h.HandleRPC(ctx, &stats.End{})
++}
+diff --git a/result.md b/result.md
+index 67fde0530..5a9ccf01d 100644
+--- a/result.md
++++ b/result.md
+@@ -14,7 +14,7 @@ Three flags add optional request-path work, and default off:
+ - `cache_proxy.observe_action_cache_age`: perform an additional metadata lookup only if metadata was not already fetched for the existing TTL path. Ignore observation errors. Changed-result age uses pointer mtime (time since cached/refreshed), not atime. Already-available metadata is observed without enabling the flag; unknown or future timestamps are omitted. Unchanged responses and errors do not enter the age histogram.
+ - `cache_proxy.identity_zstd_sample_every`: compress approximately one in N eligible identity blobs with zstd; 0 disables sampling. Complete blobs are capped at 1 MiB, with at most two concurrent samples across batch and stream RPCs and nonblocking sample admission. Streaming buffers are bounded to 1 MiB each; oversized blobs, partial/resumed ByteStream transfers, unsuccessful streams, empty data and compressed input are skipped. Known ByteStream sizes must match the observed data. Samples measure compressed/identity bytes: a ratio of 0.5 suggests roughly half the blob payload bytes. Samples are unweighted and favor eligible small blobs; compare with byte totals before estimating savings. The sampler uses its own encoder so it does not increment production compression counters.
+ 
+-Partial-read misses count offset != 0 or limit != 0 requests classified as a local miss, including chunked reads that require remote chunks. Commit observations count only attempted local writes, including failures from incomplete streams and local validation; they do not imply the remote read failed. A wasted SplitBlob observation requires NotFound, an eventual local hit, and a successful proxy request. AC revalidation outcomes distinguish the remote's unchanged-digest response, a full changed result, and an error.
++Partial-read misses count offset != 0 or limit != 0 requests classified as a local miss with remote access enabled, including chunked reads that require remote chunks. Local-only requests (proxy_skip_remote=true) are excluded, even when the local read fails; they also do not attempt or count local write-backs. Commit observations count only attempted local writes, including failures from incomplete streams and local validation; they do not imply the remote read failed. A wasted SplitBlob observation requires NotFound, an eventual local hit, and a successful proxy request. AC revalidation outcomes distinguish the remote's unchanged-digest response, a full changed result, and an error.
+ 
+ # Metric inventory and example queries
+ 
+@@ -110,3 +110,15 @@ bazel test --nocache_test_results \
+ ```
+ 
+ [Bazel invocation](https://app.buildbuddy.io/invocation/4ab65adc-a14c-4efc-af71-4a2dcf246272). `git diff --check` also passes.
++
++The follow-up keeps the production change to a remote-access guard on the partial-read fallback counter. Added a real proxy gRPC regression test asserting that a local-only partial-read miss makes no remote Read RPC and increments neither the fallback counter nor either local-write outcome. Sampling tests cover complete multi-message ByteStream writes, resumed-write exclusion, sample-buffer/slot release, and nonblocking streaming and complete-blob admission when both sampling slots are occupied.
++
++Follow-up validation:
++
++```sh
++bazel test --nocache_test_results \
++  //enterprise/server/byte_stream_server_proxy:all \
++  //enterprise/server/util/proxy_util:all
++```
++
++Both touched test targets passed uncached: [Bazel invocation](https://app.buildbuddy.io/invocation/f32bc789-f3f8-48a0-90e7-989ed9ffb6f3). Required nogo checks and `git diff --check` passed.
+-- 
+2.43.0
+
+
+From ffe6c1e8957b566406a3dee6ff12551c30ce7bf5 Mon Sep 17 00:00:00 2001
+From: codex worker <codex-worker@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 23:04:33 +0000
+Subject: [PATCH 3/3] Complete proxy metric attribution across chunked and
+ local read paths
+
+---
+ .../server/action_cache_server_proxy/BUILD    |   1 +
+ .../action_cache_server_proxy.go              |   1 +
+ .../observations_test.go                      |  62 +++++
+ .../server/byte_stream_server_proxy/BUILD     |   1 +
+ .../byte_stream_server_proxy.go               |  64 ++++-
+ .../byte_stream_server_proxy_test.go          | 252 +++++++++++++++++-
+ .../BUILD                                     |   1 +
+ ...ontent_addressable_storage_server_proxy.go |   3 +
+ ...t_addressable_storage_server_proxy_test.go |  72 +++++
+ result.md                                     | 115 ++++++--
+ 10 files changed, 544 insertions(+), 28 deletions(-)
+
+diff --git a/enterprise/server/action_cache_server_proxy/BUILD b/enterprise/server/action_cache_server_proxy/BUILD
+index 8950ea30e..30b6179f5 100644
+--- a/enterprise/server/action_cache_server_proxy/BUILD
++++ b/enterprise/server/action_cache_server_proxy/BUILD
+@@ -48,6 +48,7 @@ go_test(
+         "//enterprise/server/experiments",
+         "//enterprise/server/util/proxy_util",
+         "//proto:remote_execution_go_proto",
++        "//proto:hit_tracker_go_proto",
+         "//proto:resource_go_proto",
+         "//server/interfaces",
+         "//server/metrics",
+diff --git a/enterprise/server/action_cache_server_proxy/action_cache_server_proxy.go b/enterprise/server/action_cache_server_proxy/action_cache_server_proxy.go
+index c3cc07f1e..ad75d874e 100644
+--- a/enterprise/server/action_cache_server_proxy/action_cache_server_proxy.go
++++ b/enterprise/server/action_cache_server_proxy/action_cache_server_proxy.go
+@@ -263,6 +263,7 @@ func (s *ActionCacheServerProxy) GetActionResult(ctx context.Context, req *repb.
+ 		if err == nil {
+ 			cacheStatus = metrics.HitStatusLabel
+ 		}
++		proxy_util.SetLocalOutcome(ctx, cacheStatus)
+ 		labels := prometheus.Labels{
+ 			metrics.StatusLabel:            status.MetricsLabel(err),
+ 			metrics.CacheHitMissStatus:     cacheStatus,
+diff --git a/enterprise/server/action_cache_server_proxy/observations_test.go b/enterprise/server/action_cache_server_proxy/observations_test.go
+index 9130673e7..cf4848e0d 100644
+--- a/enterprise/server/action_cache_server_proxy/observations_test.go
++++ b/enterprise/server/action_cache_server_proxy/observations_test.go
+@@ -6,6 +6,7 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/proxy_util"
+ 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+ 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
+ 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
+@@ -17,7 +18,9 @@ import (
+ 	"github.com/prometheus/client_golang/prometheus/testutil"
+ 	"github.com/stretchr/testify/require"
+ 	"google.golang.org/grpc"
++	"google.golang.org/grpc/metadata"
+ 
++	hitpb "github.com/buildbuddy-io/buildbuddy/proto/hit_tracker"
+ 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
+ 	rspb "github.com/buildbuddy-io/buildbuddy/proto/resource"
+ 	dto "github.com/prometheus/client_model/go"
+@@ -113,3 +116,62 @@ func TestActionCacheRevalidationObservations(t *testing.T) {
+ 		})
+ 	}
+ }
++
++type localACWithSynchronousTracking struct {
++	repb.UnimplementedActionCacheServer
++	client hitpb.HitTrackerServiceClient
++	err    error
++}
++
++func (s *localACWithSynchronousTracking) GetActionResult(ctx context.Context, _ *repb.GetActionResultRequest) (*repb.ActionResult, error) {
++	if _, err := s.client.Track(ctx, &hitpb.TrackRequest{Server: "local-only"}); err != nil {
++		return nil, err
++	}
++	if s.err != nil {
++		return nil, s.err
++	}
++	return &repb.ActionResult{ExitCode: 1}, nil
++}
++
++type localOnlyHitService struct {
++	hitpb.UnimplementedHitTrackerServiceServer
++}
++
++func (*localOnlyHitService) Track(context.Context, *hitpb.TrackRequest) (*hitpb.TrackResponse, error) {
++	return &hitpb.TrackResponse{}, nil
++}
++func TestLocalOnlyACReadTrackingAttribution(t *testing.T) {
++	for _, outcome := range []string{"hit", "miss"} {
++		t.Run(outcome, func(t *testing.T) {
++			env := testenv.GetTestEnv(t)
++			ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("user", "GR123"))
++			env.SetAuthenticator(ta)
++			ctx, err := ta.WithAuthenticatedUser(context.Background(), "user")
++			require.NoError(t, err)
++			ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(proxy_util.SkipRemoteKey, "true"))
++			remoteEnv := testenv.GetTestEnv(t)
++			server, run, lis := testenv.RegisterLocalGRPCServer(t, remoteEnv)
++			hitpb.RegisterHitTrackerServiceServer(server, &localOnlyHitService{})
++			go run()
++			conn, err := testenv.LocalGRPCConn(t, ctx, lis, grpc.WithStatsHandler(&proxy_util.RemoteStatsHandler{}))
++			require.NoError(t, err)
++			t.Cleanup(func() { conn.Close() })
++			local := &localACWithSynchronousTracking{client: hitpb.NewHitTrackerServiceClient(conn)}
++			if outcome == "miss" {
++				local.err = status.NotFoundError("local miss")
++			}
++			proxy := &ActionCacheServerProxy{env: env, authenticator: ta, localACServer: local}
++			ctx, observation := proxy_util.StartObservation(ctx)
++			method := "hit_tracker.HitTrackerService/Track"
++			before := testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, outcome))
++			beforeUnknown := testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "not_checked"))
++			beforeBytes := testutil.ToFloat64(metrics.CacheProxyRemoteBytes.WithLabelValues(method, "sent", outcome))
++			_, err = proxy.GetActionResult(ctx, &repb.GetActionResultRequest{})
++			require.Equal(t, local.err, err)
++			observation.Finish(err)
++			require.Equal(t, before+1, testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, outcome)))
++			require.Equal(t, beforeUnknown, testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "not_checked")))
++			require.Greater(t, testutil.ToFloat64(metrics.CacheProxyRemoteBytes.WithLabelValues(method, "sent", outcome)), beforeBytes)
++		})
++	}
++}
+diff --git a/enterprise/server/byte_stream_server_proxy/BUILD b/enterprise/server/byte_stream_server_proxy/BUILD
+index e60159b24..0205eb7c1 100644
+--- a/enterprise/server/byte_stream_server_proxy/BUILD
++++ b/enterprise/server/byte_stream_server_proxy/BUILD
+@@ -55,6 +55,7 @@ go_test(
+         "//enterprise/server/experiments",
+         "//enterprise/server/util/proxy_util",
+         "//proto:remote_execution_go_proto",
++        "//proto:hit_tracker_go_proto",
+         "//proto:resource_go_proto",
+         "//server/interfaces",
+         "//server/metrics",
+diff --git a/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy.go b/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy.go
+index 42ac110c2..7dd33ef9b 100644
+--- a/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy.go
++++ b/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy.go
+@@ -142,7 +142,13 @@ func (s *meteredReadServerStream) Send(message *bspb.ReadResponse) error {
+ 
+ func (s *ByteStreamServerProxy) Read(req *bspb.ReadRequest, stream bspb.ByteStream_ReadServer) error {
+ 	if config.BlackholeAnonymousRequests() && authutil.IsAnonymousRequest(stream.Context(), s.authenticator) {
+-		return s.local.Read(req, stream)
++		err := s.local.Read(req, stream)
++		outcome := "hit"
++		if err != nil {
++			outcome = "miss"
++		}
++		proxy_util.SetLocalOutcome(stream.Context(), outcome)
++		return err
+ 	}
+ 	ctx, spn := tracing.StartSpan(stream.Context())
+ 	defer spn.End()
+@@ -166,13 +172,23 @@ func (s *ByteStreamServerProxy) Read(req *bspb.ReadRequest, stream bspb.ByteStre
+ 		bytesRemote:  readMetrics.bytesRemote,
+ 	}
+ 	proxy_util.SetLocalOutcome(ctx, readMetrics.cacheStatus)
+-	if (req.GetReadOffset() != 0 || req.GetReadLimit() != 0) && readMetrics.cacheStatus == metrics.MissStatusLabel && !proxy_util.SkipRemote(ctx) {
+-		metrics.CacheProxyPartialReadMisses.WithLabelValues().Inc()
+-	}
+ 	recordReadMetrics(bsm, readMetrics.cacheStatus)
+ 	return err
+ }
+ 
++// readFallbackKey carries one fallback observation across concurrent chunk reads.
++type readFallbackKey struct{}
++type readFallbackObservation struct {
++	attempted atomic.Bool
++	partial   bool
++}
++
++func (o *readFallbackObservation) record() {
++	if !o.attempted.Swap(true) && o.partial {
++		metrics.CacheProxyPartialReadMisses.WithLabelValues().Inc()
++	}
++}
++
+ type readMetrics struct {
+ 	cacheStatus  string // should be metrics.HitStatusLabel/MissStatusLabel
+ 	compressor   string
+@@ -186,6 +202,8 @@ type readMetrics struct {
+ }
+ 
+ func (s *ByteStreamServerProxy) read(ctx context.Context, req *bspb.ReadRequest, stream *meteredReadServerStream) (readMetrics, error) {
++	fallback := &readFallbackObservation{partial: req.GetReadOffset() != 0 || req.GetReadLimit() != 0}
++	ctx = context.WithValue(ctx, readFallbackKey{}, fallback)
+ 	if err := byte_stream_server.CheckReadPreconditions(req); err != nil {
+ 		return readMetrics{
+ 			cacheStatus: metrics.HitStatusLabel,
+@@ -248,7 +266,10 @@ func (s *ByteStreamServerProxy) read(ctx context.Context, req *bspb.ReadRequest,
+ 		}
+ 
+ 		if stream.frames > 0 {
+-			cacheStatus := metrics.MissStatusLabel
++			cacheStatus := metrics.HitStatusLabel
++			if fallback.attempted.Load() {
++				cacheStatus = metrics.MissStatusLabel
++			}
+ 			if remoteOnly {
+ 				cacheStatus = metrics.UncacheableStatusLabel
+ 			}
+@@ -272,6 +293,7 @@ func (s *ByteStreamServerProxy) read(ctx context.Context, req *bspb.ReadRequest,
+ 	// streaming to the client by doing an offset read from the remote
+ 	// cache, but keep it simple for now.
+ 	if localErr != nil && stream.frames == 0 {
++		fallback.record()
+ 		remoteErr := s.readRemoteWriteLocal(req, stream)
+ 		return readMetrics{
+ 			cacheStatus: metrics.MissStatusLabel,
+@@ -399,9 +421,17 @@ func (s *ByteStreamServerProxy) readChunked(ctx context.Context, req *bspb.ReadR
+ 				resourceName: rn.NewUploadString(),
+ 				data:         data,
+ 			}
+-			if err := s.local.Write(rawStream); err != nil {
++			writeErr := s.local.Write(rawStream)
++			if req.GetReadOffset() != 0 || req.GetReadLimit() != 0 {
++				outcome := "committed"
++				if writeErr != nil || !rawStream.writeFinished {
++					outcome = "failed"
++				}
++				metrics.CacheProxyPartialReadWrites.WithLabelValues(outcome).Inc()
++			}
++			if writeErr != nil {
+ 				metrics.ByteStreamProxyChunkedReadLocalWriteBackFailures.With(prometheus.Labels{
+-					metrics.StatusHumanReadableLabel: status.MetricsLabel(err),
++					metrics.StatusHumanReadableLabel: status.MetricsLabel(writeErr),
+ 				}).Inc()
+ 			}
+ 			return nil
+@@ -557,6 +587,10 @@ func drainChunkReadResults(bufPool *bytebufferpool.VariableSizePool, resultChans
+ }
+ 
+ func (s *ByteStreamServerProxy) readChunk(ctx context.Context, rn *digest.CASResourceName, offset int64, remoteOnly bool) chunkReadResult {
++	// Each chunk lookup has an independent outcome, including speculative reads.
++	ctx, observation := proxy_util.StartObservation(ctx)
++	defer observation.Finish()
++	proxy_util.SetLocalOutcome(ctx, "hit")
+ 	capacity := rn.GetDigest().GetSizeBytes() - offset
+ 	allowBufferGrowth := false
+ 	if rn.GetCompressor() == repb.Compressor_ZSTD {
+@@ -566,6 +600,8 @@ func (s *ByteStreamServerProxy) readChunk(ctx context.Context, rn *digest.CASRes
+ 		allowBufferGrowth = true
+ 	}
+ 	if remoteOnly {
++		proxy_util.SetLocalOutcome(ctx, "uncacheable")
++		ctx = context.WithValue(ctx, readFallbackKey{}, (*readFallbackObservation)(nil))
+ 		data, err := s.readRemoteChunk(ctx, rn, offset, capacity)
+ 		if err != nil {
+ 			return chunkReadResult{err: err, remote: true}
+@@ -592,6 +628,7 @@ func (s *ByteStreamServerProxy) readChunk(ctx context.Context, rn *digest.CASRes
+ 		}).Inc()
+ 	}
+ 
++	proxy_util.SetLocalOutcome(ctx, "miss")
+ 	data, err := s.readRemoteChunk(ctx, rn, offset, capacity)
+ 	if err != nil {
+ 		return chunkReadResult{err: err, remote: true}
+@@ -605,6 +642,9 @@ func (s *ByteStreamServerProxy) readRemoteChunk(ctx context.Context, rn *digest.
+ 		ReadOffset:   offset,
+ 	}
+ 	data, err := retry.Do(ctx, chunkReadRetryOptions(), func(ctx context.Context) ([]byte, error) {
++		if fallback, _ := ctx.Value(readFallbackKey{}).(*readFallbackObservation); fallback != nil {
++			fallback.record()
++		}
+ 		buf := s.bufPool.Get(capacity)
+ 		stream := newChunkBufferStream(ctx, buf, s.bufPool, rn.GetCompressor() == repb.Compressor_ZSTD)
+ 		err := s.readRemoteOnly(ctx, req, stream)
+@@ -1725,10 +1765,11 @@ func (s *ByteStreamServerProxy) sendBatchUpload(ctx context.Context, req *repb.B
+ type rawWriteStream struct {
+ 	bspb.ByteStream_WriteServer
+ 
+-	ctx          context.Context
+-	resourceName string
+-	data         []byte
+-	dataSent     bool
++	ctx           context.Context
++	resourceName  string
++	data          []byte
++	dataSent      bool
++	writeFinished bool
+ }
+ 
+ func (s *rawWriteStream) Recv() (*bspb.WriteRequest, error) {
+@@ -1745,6 +1786,7 @@ func (s *rawWriteStream) Recv() (*bspb.WriteRequest, error) {
+ }
+ 
+ func (s *rawWriteStream) SendAndClose(resp *bspb.WriteResponse) error {
++	s.writeFinished = true
+ 	return nil // No client to send response to
+ }
+ 
+diff --git a/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy_test.go b/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy_test.go
+index d1e1ed132..fd170c960 100644
+--- a/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy_test.go
++++ b/enterprise/server/byte_stream_server_proxy/byte_stream_server_proxy_test.go
+@@ -52,6 +52,7 @@ import (
+ 	"google.golang.org/grpc"
+ 	"google.golang.org/grpc/metadata"
+ 
++	hitpb "github.com/buildbuddy-io/buildbuddy/proto/hit_tracker"
+ 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
+ 	rspb "github.com/buildbuddy-io/buildbuddy/proto/resource"
+ 	bspb "google.golang.org/genproto/googleapis/bytestream"
+@@ -516,7 +517,7 @@ func runBSProxy(ctx context.Context, client bspb.ByteStreamClient, env *testenv.
+ 	env.SetLocalByteStreamServer(bss)
+ 	byteStreamServer, err := New(env)
+ 	require.NoError(t, err)
+-	grpcServer, runFunc, lis := testenv.RegisterLocalGRPCServer(t, env)
++	grpcServer, runFunc, lis := testenv.RegisterLocalGRPCServer(t, env, grpc.ChainStreamInterceptor(proxy_util.ObservationStreamInterceptor))
+ 	bspb.RegisterByteStreamServer(grpcServer, byteStreamServer)
+ 	go runFunc()
+ 	conn, err := testenv.LocalGRPCConn(t, ctx, lis)
+@@ -3729,3 +3730,252 @@ func TestLocalOnlyPartialReadMissDoesNotObserveRemoteFallback(t *testing.T) {
+ 	require.Equal(t, beforeCommitted, testutil.ToFloat64(metrics.CacheProxyPartialReadWrites.WithLabelValues("committed")))
+ 	require.Equal(t, beforeFailed, testutil.ToFloat64(metrics.CacheProxyPartialReadWrites.WithLabelValues("failed")))
+ }
++
++type failingChunkWriteCache struct{ interfaces.Cache }
++
++func (c *failingChunkWriteCache) Writer(context.Context, *rspb.ResourceName) (interfaces.CommittedWriteCloser, error) {
++	return nil, status.UnavailableError("injected chunk write failure")
++}
++
++func TestChunkedOffsetReadObservations(t *testing.T) {
++	for _, tc := range []struct {
++		name                                          string
++		failWrites, failRemote, failClient, encrypted bool
++	}{
++		{name: "committed"},
++		{name: "encrypted_offset", encrypted: true},
++		{name: "failed_write_back", failWrites: true},
++		{name: "failed_chunk_fetch_then_full_local_hit", failRemote: true},
++		{name: "local_chunks_client_error", failClient: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			provider := memprovider.NewInMemoryProvider(map[string]memprovider.InMemoryFlag{
++				"cache_proxy.attempt_chunked_reads": {State: memprovider.Enabled, DefaultVariant: "true", Variants: map[string]any{"true": true}},
++			})
++			require.NoError(t, openfeature.SetNamedProviderAndWait(t.Name(), provider))
++			fp, err := experiments.NewFlagProvider(t.Name())
++			require.NoError(t, err)
++			ctx := testContext()
++			remoteEnv := testenv.GetTestEnv(t)
++			proxyEnv := testenv.GetTestEnv(t)
++			readCtx := ctx
++			if tc.encrypted {
++				user := testauth.User("user", "group")
++				user.CacheEncryptionEnabled = true
++				ta := testauth.NewTestAuthenticator(t, map[string]interfaces.UserInfo{"user": user})
++				proxyEnv.SetAuthenticator(ta)
++				readCtx, err = ta.WithAuthenticatedUser(ctx, "user")
++				require.NoError(t, err)
++			}
++			remoteEnv.SetExperimentFlagProvider(fp)
++			proxyEnv.SetExperimentFlagProvider(fp)
++			remoteBSS, err := byte_stream_server.NewByteStreamServer(remoteEnv)
++			require.NoError(t, err)
++			remoteCAS, err := content_addressable_storage_server.NewContentAddressableStorageServer(remoteEnv)
++			require.NoError(t, err)
++			server, run, lis := testenv.RegisterLocalGRPCServer(t, remoteEnv)
++			var remoteReadServer bspb.ByteStreamServer = remoteBSS
++			if tc.failRemote {
++				remoteReadServer = &errorObservedByteStreamServer{ByteStreamServer: remoteBSS}
++			}
++			bspb.RegisterByteStreamServer(server, remoteReadServer)
++			repb.RegisterContentAddressableStorageServer(server, remoteCAS)
++			go run()
++			conn, err := testenv.LocalGRPCConn(t, ctx, lis, grpc.WithStatsHandler(&proxy_util.RemoteStatsHandler{}))
++			require.NoError(t, err)
++			t.Cleanup(func() { conn.Close() })
++			localCtx, err := prefix.AttachUserPrefixToContext(ctx, proxyEnv.GetAuthenticator())
++			require.NoError(t, err)
++			remoteCtx, err := prefix.AttachUserPrefixToContext(ctx, remoteEnv.GetAuthenticator())
++			require.NoError(t, err)
++			_, data := testdigest.RandomCASResourceBuf(t, 6*1024*1024)
++			blobDigest, err := digest.Compute(bytes.NewReader(data), repb.DigestFunction_BLAKE3)
++			require.NoError(t, err)
++			rn := digest.NewCASResourceName(blobDigest, "", repb.DigestFunction_BLAKE3)
++			var chunks []*repb.Digest
++			for i := range 3 {
++				part := data[i*2*1024*1024 : (i+1)*2*1024*1024]
++				d, err := digest.Compute(bytes.NewReader(part), repb.DigestFunction_BLAKE3)
++				require.NoError(t, err)
++				chunks = append(chunks, d)
++				require.NoError(t, remoteEnv.GetCache().Set(remoteCtx, digest.NewCASResourceName(d, "", repb.DigestFunction_BLAKE3).ToProto(), part))
++				if tc.failClient {
++					require.NoError(t, proxyEnv.GetCache().Set(localCtx, digest.NewCASResourceName(d, "", repb.DigestFunction_BLAKE3).ToProto(), part))
++				}
++			}
++			casClient := repb.NewContentAddressableStorageClient(conn)
++			_, err = casClient.SpliceBlob(ctx, &repb.SpliceBlobRequest{BlobDigest: blobDigest, ChunkDigests: chunks, DigestFunction: repb.DigestFunction_BLAKE3})
++			require.NoError(t, err)
++			if tc.failRemote {
++				require.NoError(t, proxyEnv.GetCache().Set(localCtx, rn.ToProto(), data))
++			}
++			if tc.failWrites {
++				proxyEnv.SetCache(&failingChunkWriteCache{Cache: proxyEnv.GetCache()})
++			}
++			proxyEnv.SetContentAddressableStorageClient(casClient)
++			proxy := runBSProxy(ctx, bspb.NewByteStreamClient(conn), proxyEnv, t)
++			beforeMisses := testutil.ToFloat64(metrics.CacheProxyPartialReadMisses.WithLabelValues())
++			beforeCommitted := testutil.ToFloat64(metrics.CacheProxyPartialReadWrites.WithLabelValues("committed"))
++			beforeFailed := testutil.ToFloat64(metrics.CacheProxyPartialReadWrites.WithLabelValues("failed"))
++			method := "google.bytestream.ByteStream/Read"
++			beforeRemoteMisses := testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "miss"))
++			beforeUncacheable := testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "uncacheable"))
++			beforeRemoteHits := testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "hit"))
++			beforeSent := testutil.ToFloat64(metrics.CacheProxyRemoteBytes.WithLabelValues(method, "sent", "miss"))
++			if tc.failClient {
++				server, err := New(proxyEnv)
++				require.NoError(t, err)
++				observationCtx, observation := proxy_util.StartObservation(ctx)
++				splitMethod := "build.bazel.remote.execution.v2.ContentAddressableStorage/SplitBlob"
++				beforeHit := testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(splitMethod, "hit"))
++				beforeMiss := testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(splitMethod, "miss"))
++				err = server.Read(&bspb.ReadRequest{ResourceName: rn.DownloadString(), ReadOffset: 1}, &failingObservedReadStream{ctx: observationCtx})
++				require.True(t, status.IsCanceledError(err))
++				observation.Finish(err)
++				require.Equal(t, beforeHit+1, testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(splitMethod, "hit")))
++				require.Equal(t, beforeMiss, testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(splitMethod, "miss")))
++				require.Equal(t, beforeMisses, testutil.ToFloat64(metrics.CacheProxyPartialReadMisses.WithLabelValues()))
++				require.Equal(t, beforeCommitted, testutil.ToFloat64(metrics.CacheProxyPartialReadWrites.WithLabelValues("committed")))
++				require.Equal(t, beforeFailed, testutil.ToFloat64(metrics.CacheProxyPartialReadWrites.WithLabelValues("failed")))
++				return
++			}
++			stream, err := proxy.Read(readCtx, &bspb.ReadRequest{ResourceName: rn.DownloadString(), ReadOffset: 1})
++			require.NoError(t, err)
++			var got []byte
++			for {
++				resp, err := stream.Recv()
++				if err == io.EOF {
++					break
++				}
++				require.NoError(t, err)
++				got = append(got, resp.Data...)
++			}
++			require.Equal(t, data[1:], got)
++			fallbackCount := float64(1)
++			if tc.encrypted {
++				fallbackCount = 0
++			}
++			require.Equal(t, beforeMisses+fallbackCount, testutil.ToFloat64(metrics.CacheProxyPartialReadMisses.WithLabelValues()))
++			committed, failed := float64(2), float64(0)
++			if tc.failWrites {
++				committed, failed = 0, 2
++			}
++			if tc.failRemote || tc.encrypted {
++				committed, failed = 0, 0
++			}
++			require.Equal(t, beforeCommitted+committed, testutil.ToFloat64(metrics.CacheProxyPartialReadWrites.WithLabelValues("committed")))
++			require.Equal(t, beforeFailed+failed, testutil.ToFloat64(metrics.CacheProxyPartialReadWrites.WithLabelValues("failed")))
++			if tc.encrypted {
++				require.Equal(t, beforeRemoteMisses, testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "miss")))
++				require.Equal(t, beforeUncacheable+3, testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "uncacheable")))
++				for _, d := range chunks {
++					found, err := proxyEnv.GetCache().Contains(localCtx, digest.NewCASResourceName(d, "", repb.DigestFunction_BLAKE3).ToProto())
++					require.NoError(t, err)
++					require.False(t, found)
++				}
++				return
++			}
++			// Speculative failed chunk RPCs retain miss attribution even when the
++			// complete blob is subsequently served from the local cache.
++			require.Eventually(t, func() bool {
++				return testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "miss")) > beforeRemoteMisses
++			}, time.Second, time.Millisecond)
++			require.Equal(t, beforeRemoteHits, testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "hit")))
++			require.Greater(t, testutil.ToFloat64(metrics.CacheProxyRemoteBytes.WithLabelValues(method, "sent", "miss")), beforeSent)
++			if !tc.failRemote {
++				for i, d := range chunks {
++					found, err := proxyEnv.GetCache().Contains(localCtx, digest.NewCASResourceName(d, "", repb.DigestFunction_BLAKE3).ToProto())
++					require.NoError(t, err)
++					require.Equal(t, !tc.failWrites && i != 0, found)
++				}
++			}
++		})
++	}
++}
++
++type failingObservedReadStream struct {
++	grpc.ServerStream
++	ctx   context.Context
++	sends int
++}
++
++func (s *failingObservedReadStream) Context() context.Context { return s.ctx }
++func (s *failingObservedReadStream) Send(*bspb.ReadResponse) error {
++	s.sends++
++	if s.sends == 2 {
++		return status.CanceledError("client closed stream")
++	}
++	return nil
++}
++
++type errorObservedByteStreamServer struct{ bspb.ByteStreamServer }
++
++func (*errorObservedByteStreamServer) Read(*bspb.ReadRequest, bspb.ByteStream_ReadServer) error {
++	return status.NotFoundError("chunk disappeared after SplitBlob")
++}
++
++type synchronousReadHitFactory struct {
++	interfaces.HitTrackerFactory
++	client hitpb.HitTrackerServiceClient
++}
++
++func (f *synchronousReadHitFactory) NewCASHitTracker(ctx context.Context, _ *repb.RequestMetadata) interfaces.HitTracker {
++	return &synchronousReadHitTracker{ctx: ctx, client: f.client}
++}
++
++type synchronousReadHitTracker struct {
++	interfaces.HitTracker
++	ctx    context.Context
++	client hitpb.HitTrackerServiceClient
++}
++
++func (h *synchronousReadHitTracker) TrackDownload(*repb.Digest) interfaces.TransferTimer {
++	return &synchronousReadTimer{ctx: h.ctx, client: h.client}
++}
++
++type synchronousReadTimer struct {
++	interfaces.TransferTimer
++	ctx    context.Context
++	client hitpb.HitTrackerServiceClient
++}
++
++func (t *synchronousReadTimer) CloseWithBytesTransferred(int64, int64, repb.Compressor_Value, string) error {
++	_, err := t.client.Track(t.ctx, &hitpb.TrackRequest{Server: "empty-read"})
++	return err
++}
++
++type observedReadHitService struct {
++	hitpb.UnimplementedHitTrackerServiceServer
++}
++
++func (*observedReadHitService) Track(context.Context, *hitpb.TrackRequest) (*hitpb.TrackResponse, error) {
++	return &hitpb.TrackResponse{}, nil
++}
++func TestBlackholeEmptyReadTrackingAttribution(t *testing.T) {
++	flags.Set(t, "auth.blackhole_anonymous_cache_requests", true)
++	ctx := testContext()
++	remoteEnv := testenv.GetTestEnv(t)
++	server, run, lis := testenv.RegisterLocalGRPCServer(t, remoteEnv)
++	hitpb.RegisterHitTrackerServiceServer(server, &observedReadHitService{})
++	go run()
++	conn, err := testenv.LocalGRPCConn(t, ctx, lis, grpc.WithStatsHandler(&proxy_util.RemoteStatsHandler{}))
++	require.NoError(t, err)
++	t.Cleanup(func() { conn.Close() })
++	env := testenv.GetTestEnv(t)
++	env.SetHitTrackerFactory(&synchronousReadHitFactory{client: hitpb.NewHitTrackerServiceClient(conn)})
++	proxy := runBSProxy(ctx, bspb.NewByteStreamClient(conn), env, t)
++	d, err := digest.Compute(bytes.NewReader(nil), repb.DigestFunction_SHA256)
++	require.NoError(t, err)
++	rn := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256)
++	method := "hit_tracker.HitTrackerService/Track"
++	before := testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "hit"))
++	beforeUnknown := testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "not_checked"))
++	beforeBytes := testutil.ToFloat64(metrics.CacheProxyRemoteBytes.WithLabelValues(method, "sent", "hit"))
++	stream, err := proxy.Read(ctx, &bspb.ReadRequest{ResourceName: rn.DownloadString()})
++	require.NoError(t, err)
++	_, err = stream.Recv()
++	require.Equal(t, io.EOF, err)
++	require.Equal(t, before+1, testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "hit")))
++	require.Equal(t, beforeUnknown, testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "not_checked")))
++	require.Greater(t, testutil.ToFloat64(metrics.CacheProxyRemoteBytes.WithLabelValues(method, "sent", "hit")), beforeBytes)
++}
+diff --git a/enterprise/server/content_addressable_storage_server_proxy/BUILD b/enterprise/server/content_addressable_storage_server_proxy/BUILD
+index 91b0e78af..22cbaae40 100644
+--- a/enterprise/server/content_addressable_storage_server_proxy/BUILD
++++ b/enterprise/server/content_addressable_storage_server_proxy/BUILD
+@@ -42,6 +42,7 @@ go_test(
+         "//enterprise/server/experiments",
+         "//enterprise/server/util/proxy_util",
+         "//proto:remote_execution_go_proto",
++        "//proto:hit_tracker_go_proto",
+         "//server/metrics",
+         "//server/interfaces",
+         "//server/util/proto",
+diff --git a/enterprise/server/content_addressable_storage_server_proxy/content_addressable_storage_server_proxy.go b/enterprise/server/content_addressable_storage_server_proxy/content_addressable_storage_server_proxy.go
+index 2bc4ad97e..4826c0221 100644
+--- a/enterprise/server/content_addressable_storage_server_proxy/content_addressable_storage_server_proxy.go
++++ b/enterprise/server/content_addressable_storage_server_proxy/content_addressable_storage_server_proxy.go
+@@ -435,6 +435,9 @@ func (s *CASServerProxy) BatchReadBlobs(ctx context.Context, req *repb.BatchRead
+ 	localResp := &repb.BatchReadBlobsResponse{}
+ 	remoteOnly := authutil.EncryptionEnabled(ctx, s.authenticator) && !s.supportsEncryption
+ 	if !remoteOnly {
++		// Local hit tracking may issue synchronous remote RPCs during the read.
++		// The batch scope retains this outcome, or revises it after a miss.
++		proxy_util.SetLocalOutcome(ctx, "hit")
+ 		resp, err := s.local.BatchReadBlobs(ctx, req)
+ 		if err != nil {
+ 			recordMetrics(
+diff --git a/enterprise/server/content_addressable_storage_server_proxy/content_addressable_storage_server_proxy_test.go b/enterprise/server/content_addressable_storage_server_proxy/content_addressable_storage_server_proxy_test.go
+index 85b7542d5..aab9dad26 100644
+--- a/enterprise/server/content_addressable_storage_server_proxy/content_addressable_storage_server_proxy_test.go
++++ b/enterprise/server/content_addressable_storage_server_proxy/content_addressable_storage_server_proxy_test.go
+@@ -42,6 +42,7 @@ import (
+ 	"google.golang.org/grpc/status"
+ 	"io"
+ 
++	hitpb "github.com/buildbuddy-io/buildbuddy/proto/hit_tracker"
+ 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
+ 	bspb "google.golang.org/genproto/googleapis/bytestream"
+ )
+@@ -1188,3 +1189,74 @@ func TestEncryptionBypassRemoteErrorObservation(t *testing.T) {
+ 	require.Equal(t, beforeUncacheable+1, testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "uncacheable")))
+ 	require.Equal(t, beforeBytes+float64(remote.requestBytes[0]), testutil.ToFloat64(metrics.CacheProxyRemoteBytes.WithLabelValues(method, "sent", "uncacheable")))
+ }
++
++type synchronousHitFactory struct {
++	interfaces.HitTrackerFactory
++	client hitpb.HitTrackerServiceClient
++}
++
++func (f *synchronousHitFactory) NewCASHitTracker(ctx context.Context, _ *repb.RequestMetadata) interfaces.HitTracker {
++	return &synchronousHitTracker{ctx: ctx, client: f.client}
++}
++
++type synchronousHitTracker struct {
++	interfaces.HitTracker
++	ctx    context.Context
++	client hitpb.HitTrackerServiceClient
++}
++
++func (h *synchronousHitTracker) TrackMiss(*repb.Digest) error { return nil }
++func (h *synchronousHitTracker) TrackDownload(*repb.Digest) interfaces.TransferTimer {
++	return &synchronousTransferTimer{ctx: h.ctx, client: h.client}
++}
++func (h *synchronousHitTracker) TrackUpload(*repb.Digest) interfaces.TransferTimer {
++	return &synchronousTransferTimer{ctx: h.ctx, client: h.client}
++}
++
++type synchronousTransferTimer struct {
++	interfaces.TransferTimer
++	ctx    context.Context
++	client hitpb.HitTrackerServiceClient
++}
++
++func (t *synchronousTransferTimer) CloseWithBytesTransferred(int64, int64, repb.Compressor_Value, string) error {
++	_, err := t.client.Track(t.ctx, &hitpb.TrackRequest{Server: "synchronous"})
++	return err
++}
++
++type observationHitService struct {
++	hitpb.UnimplementedHitTrackerServiceServer
++}
++
++func (*observationHitService) Track(context.Context, *hitpb.TrackRequest) (*hitpb.TrackResponse, error) {
++	return &hitpb.TrackResponse{}, nil
++}
++
++func TestAllLocalBatchReadSynchronousHitTracking(t *testing.T) {
++	ctx := testContext()
++	remoteEnv := testenv.GetTestEnv(t)
++	server, run, lis := testenv.RegisterLocalGRPCServer(t, remoteEnv)
++	hitpb.RegisterHitTrackerServiceServer(server, &observationHitService{})
++	go run()
++	conn, err := testenv.LocalGRPCConn(t, ctx, lis, grpc.WithStatsHandler(&proxy_util.RemoteStatsHandler{}))
++	require.NoError(t, err)
++	t.Cleanup(func() { conn.Close() })
++	env := testenv.GetTestEnv(t)
++	env.SetHitTrackerFactory(&synchronousHitFactory{client: hitpb.NewHitTrackerServiceClient(conn)})
++	localCtx, err := prefix.AttachUserPrefixToContext(ctx, env.GetAuthenticator())
++	require.NoError(t, err)
++	d := digestProto(fooDigest, 3)
++	require.NoError(t, env.GetCache().Set(localCtx, digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256).ToProto(), []byte("foo")))
++	client := repb.NewContentAddressableStorageClient(runCASProxy(ctx, conn, env, t))
++	method := "hit_tracker.HitTrackerService/Track"
++	beforeHit := testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "hit"))
++	beforeUnknown := testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "not_checked"))
++	beforeBytes := testutil.ToFloat64(metrics.CacheProxyRemoteBytes.WithLabelValues(method, "sent", "hit"))
++	resp, err := client.BatchReadBlobs(ctx, readBlobsRequest([]*repb.Digest{d}))
++	require.NoError(t, err)
++	require.Len(t, resp.Responses, 1)
++	require.Equal(t, []byte("foo"), resp.Responses[0].Data)
++	require.Equal(t, beforeHit+1, testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "hit")))
++	require.Equal(t, beforeUnknown, testutil.ToFloat64(metrics.CacheProxyRemoteRPCs.WithLabelValues(method, "not_checked")))
++	require.Equal(t, beforeBytes+float64(proto.Size(&hitpb.TrackRequest{Server: "synchronous"})), testutil.ToFloat64(metrics.CacheProxyRemoteBytes.WithLabelValues(method, "sent", "hit")))
++}
+diff --git a/result.md b/result.md
+index 5a9ccf01d..b7d41269f 100644
+--- a/result.md
++++ b/result.md
+@@ -4,7 +4,7 @@ The proxy currently exports request and client-facing payload metrics, but those
+ 
+ Existing metrics are retained and reused for client request denominators, chunk traffic/failures, AC unchanged-result counts, enabled FindMissing cache effectiveness, capabilities traffic, and hit-tracker batching. In particular, AC `remote_digest_match` already counts unchanged validation responses, but its byte counter measures the full substituted local result. CAS counters measure blobs and client requests, rather than every outgoing RPC. ByteStream byte counters include local traffic; chunk metrics do not pair SplitBlob NotFound with subsequent successful local service. Existing gRPC message-size histograms provide app-link byte totals by method, but lack the local lookup outcome and REv2 blob compressor. There were no partial-read commit or changed-AC-age metrics, and no FindMissing reuse measurement while caching is disabled. OCIFetcher instrumentation elsewhere records method/role/status and latency, while this proxy had no local-hit attribution.
+ 
+-An observation collector scoped to the request (or to each BatchReadBlobs batch) receives gRPC client stats from the app connection and publishes after the proxy determines the local outcome. This attributes early calls (SplitBlob, OCI metadata) to the eventual hit/miss, and counts internal chunk RPCs individually. It also accounts for events from asynchronous calls that finish after the handler. Cached GetTree creates a separate observation scope for each BatchReadBlobs call, preserving mixed partial-hit and miss RPC/byte attribution across batches. Encryption-bypass batches set their uncacheable outcome before making the remote call, including remote errors. Method labels use an allowlist. No new metric labels contain digests, image names, groups, invocations, instances, or remote addresses. Existing metrics with group/action labels remain unchanged.
++An observation collector scoped to the request, each BatchReadBlobs batch, or each chunk lookup receives gRPC client stats from the app connection and publishes after the proxy determines the local outcome. This attributes early calls (SplitBlob, OCI metadata) to the eventual hit/miss, and counts internal chunk RPCs individually. It also accounts for events from asynchronous calls that finish after the handler. Cached GetTree creates a separate observation scope for each BatchReadBlobs call, preserving mixed partial-hit and miss RPC/byte attribution across batches. Encryption-bypass batches set their uncacheable outcome before making the remote call, including remote errors. Chunk lookups also use independent scopes: a failed or speculative remote chunk read stays a miss even if the proxy later serves the complete blob locally, and local chunk hit-tracker RPCs retain hit attribution. Method labels use an allowlist. No new metric labels contain digests, image names, groups, invocations, instances, or remote addresses. Existing metrics with group/action labels remain unchanged.
+ 
+ `cache_status` is `hit`, `miss`, `partial`, `uncacheable`, or `not_checked`. These describe the request's local lookup, rather than the remote response: an AC local hit whose result changed remotely is still a local hit. Pass-through operations, writes with no lookup, FindMissing with caching disabled, and background batches use `not_checked`. Directions are relative to the proxy: `sent` to the app and `received` from the app. Remote bytes count gRPC-compressed protobuf message payloads, excluding gRPC/HTTP2 framing, metadata and TLS. Blob bytes separately count REv2/ByteStream/OCI data bytes in their identity/zstd encoding, excluding protobuf envelopes. A successful all-local read normally contributes zero remote reads, but can still contribute a metadata/manifest RPC.
+ 
+@@ -14,7 +14,7 @@ Three flags add optional request-path work, and default off:
+ - `cache_proxy.observe_action_cache_age`: perform an additional metadata lookup only if metadata was not already fetched for the existing TTL path. Ignore observation errors. Changed-result age uses pointer mtime (time since cached/refreshed), not atime. Already-available metadata is observed without enabling the flag; unknown or future timestamps are omitted. Unchanged responses and errors do not enter the age histogram.
+ - `cache_proxy.identity_zstd_sample_every`: compress approximately one in N eligible identity blobs with zstd; 0 disables sampling. Complete blobs are capped at 1 MiB, with at most two concurrent samples across batch and stream RPCs and nonblocking sample admission. Streaming buffers are bounded to 1 MiB each; oversized blobs, partial/resumed ByteStream transfers, unsuccessful streams, empty data and compressed input are skipped. Known ByteStream sizes must match the observed data. Samples measure compressed/identity bytes: a ratio of 0.5 suggests roughly half the blob payload bytes. Samples are unweighted and favor eligible small blobs; compare with byte totals before estimating savings. The sampler uses its own encoder so it does not increment production compression counters.
+ 
+-Partial-read misses count offset != 0 or limit != 0 requests classified as a local miss with remote access enabled, including chunked reads that require remote chunks. Local-only requests (proxy_skip_remote=true) are excluded, even when the local read fails; they also do not attempt or count local write-backs. Commit observations count only attempted local writes, including failures from incomplete streams and local validation; they do not imply the remote read failed. A wasted SplitBlob observation requires NotFound, an eventual local hit, and a successful proxy request. AC revalidation outcomes distinguish the remote's unchanged-digest response, a full changed result, and an error.
++Partial-read misses count offset != 0 or limit != 0 requests that actually attempt a remote read after a local blob or chunk miss. A shared atomic observation records each request once, including failed or speculative chunk fetches and a later successful full-blob local fallback. Encryption-bypass reads perform no local lookup and are excluded. Local-only requests (proxy_skip_remote=true) are excluded, even when the local read fails; they also do not attempt or count local write-backs. Commit observations count only attempted local writes, including complete-chunk write-backs on offset reads and failures from incomplete streams and local validation; they do not imply the remote read failed. Writes are counted per attempt (per chunk for chunked reads), while fallback misses are counted per request. Incomplete offset chunks, already-local chunks, and encryption-bypass chunks are not written and add no write outcome. A wasted SplitBlob observation requires NotFound, an eventual local hit, and a successful proxy request. AC revalidation outcomes distinguish the remote's unchanged-digest response, a full changed result, and an error.
+ 
+ # Metric inventory and example queries
+ 
+@@ -87,7 +87,7 @@ The fraction of AC local hits that still went remote is `sum(rate(buildbuddy_pro
+ 
+ # Integration with behavior tasks
+ 
+-No sibling agents or branches named `proxy-splitblob` or `proxy-partial-read` were available in this workspace. The shared ByteStream edits are limited to recording the final read outcome, incrementing partial-read miss count, and recording whether an attempted read-through local write committed. SplitBlob detection lives in the stats handler, so moving the local lookup ahead of SplitBlob requires no added hook. The partial-read behavior task should retain the final read-outcome counter and emit commit observations only when it actually attempts a local write; skipped writes should not count as failures. AC TTL behavior already present in the checkout is preserved.
++No sibling agents or branches named `proxy-splitblob` or `proxy-partial-read` were available in this workspace. The ByteStream hooks record the final read outcome, per-chunk lookup outcomes, the first actual remote fallback after a local miss, and whether attempted read-through or chunk write-backs committed. SplitBlob detection lives in the stats handler, so moving the local lookup ahead of SplitBlob requires no added hook. The partial-read behavior task should retain the final read-outcome counter and emit commit observations only when it actually attempts a local write; skipped writes should not count as failures. AC TTL behavior already present in the checkout is preserved.
+ 
+ The stats handler covers the default app connection, opt-in routing connections, and the hit-tracker connection. Routing registration accepts optional dial options so the proxy can install the observer without changing other routing users. Background atime updates use the observed CAS client, so their RPCs and bytes are also included, normally with `not_checked`. The existing atime request counter isolates those background calls from foreground FindMissingBlobs traffic.
+ 
+@@ -109,16 +109,99 @@ bazel test --nocache_test_results \
+   //server/metrics:all
+ ```
+ 
+-[Bazel invocation](https://app.buildbuddy.io/invocation/4ab65adc-a14c-4efc-af71-4a2dcf246272). `git diff --check` also passes.
+-
+-The follow-up keeps the production change to a remote-access guard on the partial-read fallback counter. Added a real proxy gRPC regression test asserting that a local-only partial-read miss makes no remote Read RPC and increments neither the fallback counter nor either local-write outcome. Sampling tests cover complete multi-message ByteStream writes, resumed-write exclusion, sample-buffer/slot release, and nonblocking streaming and complete-blob admission when both sampling slots are occupied.
+-
+-Follow-up validation:
+-
+-```sh
+-bazel test --nocache_test_results \
+-  //enterprise/server/byte_stream_server_proxy:all \
+-  //enterprise/server/util/proxy_util:all
+-```
+-
+-Both touched test targets passed uncached: [Bazel invocation](https://app.buildbuddy.io/invocation/f32bc789-f3f8-48a0-90e7-989ed9ffb6f3). Required nogo checks and `git diff --check` passed.
++[Bazel invocation](https://app.buildbuddy.io/invocation/1d50103c-2f26-479f-b026-cf21ee9fcb9f). `git diff --check` also passes.
++
++# RPC path attribution audit
++
++Audited every public RPC in ByteStream, CAS, ActionCache, Capabilities and OCIFetcher, plus their internal app calls, the server observation interceptors, default/routed app connections, asynchronous atime calls, synchronous/batched hit tracking, and the blob sampler. The table describes the final implementation. No cache lookup, response, retry, skip-remote policy, encryption policy, or write-back decision changed.
++
++Notation: **R(label; methods)** means `buildbuddy_proxy_remote_rpcs{cache_status=label,method=...}` increments once per attempted outgoing RPC and `buildbuddy_proxy_remote_bytes{cache_status=label,method=...,direction=sent|received}` adds actual compressed protobuf message lengths. ByteStream method labels start with `google.bytestream.ByteStream/`; CAS/AC/Capabilities use their full REv2 service names; OCI uses `oci_fetcher.OCIFetcher/`; tracking uses `hit_tracker.HitTrackerService/Track`. Requests rejected before any app call, or routing/client failures before a gRPC attempt, add neither R nor remote bytes. Remote failures retain the local outcome; received bytes count only messages actually received. Retry attempts count separately.
++
++**D(method)** means `buildbuddy_proxy_link_blob_bytes{method=...,direction=sent|received,compression=identity|zstd|unknown}` adds only encoded blob data observed on that app RPC. Read/Write resource names and batch response/request compressors determine the label. OCI uses identity transport encoding (registry gzip is part of the blob). Eligible complete identity payloads additionally feed `identity_zstd_ratio{method,direction}` only with sampling enabled, within the 1 MiB/two-slot bounds. Partial/resumed/failed/incomplete streams do not produce samples; full chunks on an offset read can qualify independently. Metadata, hit tracking, capabilities and mappings contain no blob data and do not add D.
++
++Existing counter names below omit the `buildbuddy_proxy_` prefix and correspond to the inventory above. BS-read means `byte_stream_read_requests/bytes`, with status, cache_status, proxy_request_type, compression and chunked (legacy bytes also have group_id); BS-write is the corresponding write pair, whose legacy cache_status is always miss. CAS means `content_addressable_storage_requests/digests/bytes` with op, cache_status and payload compression. AC-read/write are their corresponding pairs with status, cache_status, proxy_request_type and read result_source. Existing metric semantics and labels are retained unless noted in the fixes below.
++
++| RPC/path | Remote RPC/byte attribution | Other counters/labels touched |
++| --- | --- | --- |
++| ByteStream.Read: invalid offset/limit or invalid resource | No app RPC | Existing BS-read error, legacy hit/unknown; no fallback/write count |
++| ByteStream.Read: ordinary local hit, including stream error after local data | R(hit; synchronous Track, if any); no remote Read | BS-read hit; no partial fallback/write count |
++| ByteStream.Read: local miss/error before data, remote read succeeds or fails | R(miss; Read and synchronous Track during read-through) + D(Read) | BS-read miss with actual final status; partial_read_local_misses once if offset/limit; partial_read_local_writes committed/failed only if local Write attempted |
++| ByteStream.Read: remote stream creation fails before local Write | R(miss; Read), actual sent/received bytes | Partial fallback once; neither local-write outcome |
++| ByteStream.Read: read-through write returns without SendAndClose, validation fails, or stream is incomplete | R(miss; Read) + D(Read) | Attempted partial write is failed; successful local SendAndClose plus nil error is committed; response status follows the existing read path |
++| ByteStream.Read: skip_remote local hit/miss/error | R(hit/miss; synchronous Track if emitted); no remote Read/SplitBlob | BS-read hit/miss, proxy_request_type=local_only; no fallback or write count |
++| ByteStream.Read: encryption bypass, success/error, ordinary or chunked | R(uncacheable; Read, SplitBlob if used) + D(Read) | BS-read uncacheable; no local-miss fallback count and no local writes |
++| ByteStream.Read: encryption bypass plus skip_remote | No app RPC; rejected before lookup | BS-read uncacheable/FailedPrecondition; no fallback/write count |
++| ByteStream.Read: chunk manifest fast-path hit | No SplitBlob RPC; chunk RPCs follow rows below | Existing chunked_read_fast_path_attempts{outcome=hit}; aggregate BS-read/chunk counters on success |
++| ByteStream.Read: fast-path miss/unavailable/invalid, or fast-path disabled | R(eventual request hit/miss/uncacheable; SplitBlob) | Existing fast-path outcome when enabled; manifest-store attempt status on successful SplitBlob |
++| ByteStream.Read: SplitBlob NotFound, then successful full-blob local read | R(hit; SplitBlob, synchronous Track if any) | split_blob_not_found_local_hits once only if the final request succeeds; BS-read hit; no fallback unless a remote Read was actually attempted |
++| ByteStream.Read: SplitBlob error then ordinary remote fallback | R(miss or uncacheable; SplitBlob and Read) + D(Read) | chunked_read_failures{reason=split_blob_error,status}; ordinary-read counters and partial fallback/write rules |
++| ByteStream.Read: chunk local hit | Independent R(hit; synchronous Track if any); no remote chunk Read | Successful request adds chunks_local/bytes_local to existing chunked-read counters |
++| ByteStream.Read: chunk local miss/read error, remote chunk success/error/retry | Independent R(miss; Read and synchronous Track for that lookup) + D(Read), including speculative attempts | Partial fallback once across all chunks; existing chunk-local/remote failure reason+status counters; successful consumed chunks add chunks_remote/bytes_remote |
++| ByteStream.Read: chunk encryption bypass | Independent R(uncacheable; Read) + D(Read) | No local lookup, write-back, or local-miss counter |
++| ByteStream.Read: offset within first remote chunk | R(miss; chunk Read) + D(Read) | Partial fallback once; incomplete first chunk is skipped for write-back and adds no write outcome |
++| ByteStream.Read: complete remote chunk write-back on an offset read | Chunk Read remains R(miss); any synchronous upload Track inherits the request scope | partial_read_local_writes{outcome=committed\|failed} once per attempted chunk write; committed requires nil Write error and SendAndClose; failures also increment chunked_read_local_write_back_failures{status} |
++| ByteStream.Read: local chunks or encryption-only chunks on an offset read | R(hit; Track) for local chunks, R(uncacheable; Read) for encryption-only chunks | Neither local-write outcome; all-local chunks also add no partial fallback |
++| ByteStream.Read: failed chunk fetch before client data, then full-blob local success | Failed chunk calls retain independent R(miss; Read); parent SplitBlob/ordinary local tracking are R(hit) | Partial fallback still counts once; no chunk writes for unconsumed/failed results |
++| ByteStream.Read: client error after local chunks only | R(hit; SplitBlob if used, local synchronous Track); no remote chunk Read | BS-read hit with error status; no partial fallback/write count |
++| ByteStream.Read: error after remote chunks started or data streamed | Chunk calls keep R(miss or uncacheable) even after the handler finishes; parent is miss if a fallback started, otherwise hit (uncacheable for encryption) | Partial fallback observed at the first actual attempt; attempted detached write-backs still report outcomes; existing error counters retain their status |
++| ByteStream.Write: ordinary dual-write; local writer fails, remote succeeds/fails | R(not_checked; Write, any synchronous upload Track) + D(Write) | BS-write miss, actual status/compressor; no read/fallback/write-back counters |
++| ByteStream.Write: skip_remote local write, success/error | No remote Write; R(not_checked; synchronous upload Track if any) | BS-write local_only; no read-observation counters |
++| ByteStream.Write: encryption-only write, success/error | R(not_checked; Write) + D(Write); no local lookup | BS-write actual status; no read-observation counters |
++| ByteStream.Write: encryption-only plus skip_remote | No app RPC; existing FailedPrecondition rejection | BS-write error; no read-observation counters |
++| ByteStream.Write: chunked upload, deduplicated/missing chunks | R(not_checked; FindMissingBlobs, BatchUpdateBlobs and SpliceBlob as issued) + D(BatchUpdateBlobs) | Existing chunked-write dedup/chunk/blob/compressed-byte counters, FMB/upload size histograms, splice-recovery/failure counters; upload Track is not_checked |
++| ByteStream.Write: chunking rejected before consumption, fallback to ordinary upload | R(not_checked; outgoing methods actually attempted) + D for payloads | Ordinary BS-write counters; no synthetic RPC/byte count for the rejected chunking attempt |
++| ByteStream.Write: chunking error after partial consumption | R(not_checked; outgoing methods already attempted), including asynchronous completions | Existing chunk failure counters as emitted; legacy BS-write pair is not emitted by this early return; remote accounting is independent and complete |
++| ByteStream.QueryWriteStatus: normal/encryption success/error | R(not_checked; QueryWriteStatus); no local lookup | No blob/fallback/write-back counters |
++| ByteStream.QueryWriteStatus: skip_remote | No app RPC; existing Unimplemented rejection | No new counters |
++| CAS.BatchReadBlobs: all-local batch, including each cached GetTree batch | Batch starts hit before local read; R(hit; synchronous Track); no remote BatchReadBlobs | CAS request/digest/byte hit counters |
++| CAS.BatchReadBlobs: mixed local/remote batch | Independent R(partial; BatchReadBlobs and Track for that batch) + D(BatchReadBlobs) | CAS request partial; digest/byte counters separate local hit and remote miss, by compressor |
++| CAS.BatchReadBlobs: all missing locally | Independent R(miss; BatchReadBlobs and Track for that batch) + D(BatchReadBlobs) | Existing CAS request partial after success; all returned digest/byte sources are miss |
++| CAS.BatchReadBlobs: local RPC error, remote fallback success/error | Independent R(miss; BatchReadBlobs and synchronous Track) + D(BatchReadBlobs) | Existing CAS miss recorded for local RPC failure |
++| CAS.BatchReadBlobs: remote error after local lookup | R(miss/partial; BatchReadBlobs), retaining the batch outcome | Existing CAS success counters are not emitted by this error return; local synchronous tracking remains accounted |
++| CAS.BatchReadBlobs: encryption bypass, success/error | R(uncacheable; BatchReadBlobs) + D(BatchReadBlobs), set before remote call | Successful CAS uncacheable counters; no local lookup/write/tracking |
++| CAS.BatchReadBlobs: skip_remote | No app RPC; existing Unimplemented rejection | No new counters |
++| CAS.FindMissingBlobs: cache disabled, quorum required, experiment bypass, or authentication error bypass | R(not_checked; FindMissingBlobs) | find_missing_recent_digests{window=1m\|5m\|15m,cache_status=hit\|miss} only when observation flag enabled and tracking authentication succeeds |
++| CAS.FindMissingBlobs: enabled existence-cache all hit | No remote FMB | Existing find_missing_blobs_cache_lookups hit by chunked/result_source; recent-digest observation if enabled |
++| CAS.FindMissingBlobs: enabled existence-cache partial/all miss, remote success/error | R(partial/miss; FindMissingBlobs) | Existing local-cache hit lookup counters; existing remote-found cache-miss counter only after success; recent observation independent of remote success |
++| CAS.FindMissingBlobs: skip_remote, hit/missing/error, either encryption setting | Local FMB only; no app RPC | No reuse tracking or proxy existence-cache lookups on this early return; encryption does not bypass the existence-only lookup |
++| CAS.BatchUpdateBlobs: normal local+remote write, local write error, or encryption-only remote write | R(not_checked; BatchUpdateBlobs and any synchronous upload Track) + D(BatchUpdateBlobs) | Existing CAS request/digest/byte miss counters; no read lookup or write-back counters |
++| CAS.BatchUpdateBlobs: skip_remote | No app RPC; existing Unimplemented rejection | No new counters |
++| CAS.GetTree: caching enabled, any local/partial/missing batches, including encryption bypass/error | No remote GetTree; each BatchReadBlobs has independent hit/partial/miss/uncacheable attribution as above | CAS BatchReadBlobs counters per batch; one batch cannot relabel another |
++| CAS.GetTree: caching disabled, any remote response/error | R(not_checked; GetTree); no local lookup | Existing CAS GetTree miss request/digest/byte counters on exit |
++| CAS.GetTree: skip_remote | No app RPC; existing Unimplemented rejection | No new counters |
++| CAS.SplitBlob: passthrough, normal/encryption success/error | R(not_checked; SplitBlob); no local lookup | Never increments wasted-SplitBlob/local-hit counter by itself |
++| CAS.SpliceBlob: passthrough, normal/encryption success/error | R(not_checked; SpliceBlob); no local lookup | No blob or read-observation counters |
++| CAS.SplitBlob / SpliceBlob: skip_remote | No app RPC; existing Unimplemented rejection | No new counters |
++| CAS.GetChunkMapping: all responses, remote/send error | R(not_checked; GetChunkMapping), every actual message | No blob counters; existing code forwards even with skip_remote or encryption |
++| CAS.RegisterChunkMapping: requests, close response, remote/send/receive error | R(not_checked; RegisterChunkMapping), every actual message | No blob counters; existing code forwards even with skip_remote or encryption |
++| AC.GetActionResult: caching disabled | R(not_checked; GetActionResult); no local lookup | AC-read miss/result_source=remote_result, actual status |
++| AC.GetActionResult: local miss, remote success/error | R(miss; GetActionResult) | AC-read miss/remote_result; no local-hit revalidation count |
++| AC.GetActionResult: local hit, unchanged/changed/remote error | R(hit; GetActionResult) | action_cache_revalidations{outcome=unchanged\|changed\|error}; changed age histogram only with available metadata; AC-read source remote_digest_match for unchanged, remote_result otherwise |
++| AC.GetActionResult: TTL-fresh local hit | R(hit; synchronous Track if any); no remote GetActionResult | AC-read hit/ttl_fast_path; no revalidation/changed-age observation |
++| AC.GetActionResult: local key, metadata or value error before remote validation | No remote GetActionResult | No new remote counters; observe-age-only metadata errors are ignored and do not change the selected path |
++| AC.GetActionResult: skip_remote local hit/miss/error | R(hit/miss; synchronous Track if emitted); no remote GetActionResult | AC-read local_only; no revalidation/age count |
++| AC.GetActionResult: encryption bypass, even with skip_remote, success/error | R(uncacheable; GetActionResult) before call | AC-read uncacheable/remote_uncacheable; no local lookup or revalidation |
++| AC.UpdateActionResult: normal/encryption remote update, success/error | R(not_checked; UpdateActionResult); no read lookup | AC-write miss, actual status; subsequent local refresh remains a write without read observations |
++| AC.UpdateActionResult: skip_remote with local encryption support or unencrypted | Local update only; R(not_checked; synchronous upload Track if any) | AC-write local_only; no read observations |
++| AC.UpdateActionResult: skip_remote but encryption unsupported locally | Existing remote update path, R(not_checked; UpdateActionResult) | AC-write labels follow existing request type; no new policy change |
++| AC.GetActionResult / UpdateActionResult: restricted-access validation error | No app RPC | No new counters |
++| Capabilities.GetCapabilities: every success/error, including skip_remote/encryption | R(not_checked; GetCapabilities); no local lookup | Existing capabilities_requests/bytes with legacy cache_status=miss and numeric gRPC status |
++| OCI.FetchManifest: every success/error, including skip_remote/encryption | R(not_checked; FetchManifest) | No new blob/read counters |
++| OCI.FetchManifestMetadata: every success/error, including skip_remote/encryption | R(not_checked; FetchManifestMetadata) | No new blob/read counters |
++| OCI.FetchBlobMetadata: every success/error, including skip_remote/encryption | R(not_checked; FetchBlobMetadata) | No new blob/read counters |
++| OCI.FetchBlob: invalid digest reference | No app RPC | No new counters |
++| OCI.FetchBlob: metadata error before local lookup | R(not_checked; FetchBlobMetadata) | No blob/read counters; local presence was not checked |
++| OCI.FetchBlob: successful local hit | R(hit; FetchBlobMetadata); no remote FetchBlob | Loopback ByteStream bytes are excluded from app-link counters |
++| OCI.FetchBlob: local miss, singleflight leader | R(miss; FetchBlobMetadata and FetchBlob) + D(FetchBlob) | Local upload/read uses unobserved loopback clients; local write/remote/send error retains miss |
++| OCI.FetchBlob: local miss, singleflight waiter | R(miss; its own FetchBlobMetadata); no duplicate FetchBlob | Leader's FetchBlob keeps its miss scope, including after leader cancellation; no multiplied RPC/byte counts |
++| OCI.FetchBlob: local lookup fails with non-miss error | R(not_checked; FetchBlobMetadata) | No fallback; presence not conclusively checked; response follows original local error |
++| OCI.FetchBlob: skip_remote/encryption flags | Same FetchBlob hit/miss/unknown paths above | Neither flag changes this proxy's existing OCI policy |
++| Anonymous blackhole: BS Read/Write/QueryWriteStatus; CAS FindMissing/BatchRead/BatchUpdate/GetTree/SplitBlob/SpliceBlob; AC Get/Update | Direct local-server blackhole path, no app cache RPC | Local servers reject nonempty reads/discard writes; no proxy fallback/write-back observations. Discarded BS writes can send synchronous upload Track, labeled not_checked; empty BS reads are the separate hit path below. Capabilities, OCI and mapping methods have no blackhole branch and follow their rows above |
++| ByteStream.Read: anonymous blackhole empty blob | R(hit; synchronous Track); no app Read | Empty blobs succeed locally, including hit tracking; no fallback/write-back count |
++| Synchronous hit tracking during a read/TTL hit or read-through write | R(enclosing lookup outcome; Track), request and response message bytes | No blob counters; no added group/invocation labels |
++| Batched background hit tracking | R(not_checked; Track), all serialized sent bytes | Existing remote_hit_tracker_updates{status=enqueued\|dropped_*}; remote_hit_tracker_requests{status} histogram per async batch |
++| Background atime update batches | R(not_checked; FindMissingBlobs), serialized messages | Existing remote_atime_updates and remote_atime_update_requests status counters; no foreground reuse tracking |
++
++The new corrections found by this audit are covered by `TestChunkedOffsetReadObservations` (committed/failed chunk writes, failed chunk fetch followed by full local success, client error after local chunks, and encryption-bypass exclusion), `TestAllLocalBatchReadSynchronousHitTracking` (real local CAS and real gRPC Track RPC/bytes labeled hit), `TestLocalOnlyACReadTrackingAttribution` (local-only hit/error labels with a real Track connection), and `TestBlackholeEmptyReadTrackingAttribution` (real local BS empty-blob read with synchronous Track). Existing GetTree mixed-batch, encryption-error, ordinary partial-write, local-only miss and sampling tests remain in place. Chunk RPC scopes and the atomic per-request fallback observation also cover concurrent/speculative calls; local-only and encryption-only reads cannot increment the fallback counter.
++
++The complete touched-package Bazel command above passed with --nocache_test_results after these audit fixes: six test targets passed, all touched libraries and the proxy binary built, and required nogo checks passed. `git diff --check` passed.
+-- 
+2.43.0
+
+

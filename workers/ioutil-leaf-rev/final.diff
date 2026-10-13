@@ -1,0 +1,231 @@
+diff --git a/result.md b/result.md
+new file mode 100644
+index 000000000..14e58ca16
+--- /dev/null
++++ b/result.md
+@@ -0,0 +1,82 @@
++# Decouple ioutil from server/interfaces
++
++Replaced ioutil's only uses of `server/interfaces` with local `Committer` and
++`CommittedWriteCloser` interfaces, and removed `//server/interfaces` from its
++BUILD dependencies. The method sets are identical. `CustomCommitWriteCloser`
++keeps its existing name and method set; no exported function returned
++`interfaces.CommittedWriteCloser`, so no alias or caller changes were needed.
++
++Added a regression test covering structural implementation of the local
++interfaces, forwarding the underlying commit, callback order and byte count,
++underlying commit errors, repeated commit rejection, and close forwarding.
++
++## Dependency measurements
++
++The baseline was measured before editing. Both label counts use:
++
++```sh
++bazel query 'deps(//server/util/ioutil)' | wc -l
++```
++
++| Measurement | Before | After |
++| --- | ---: | ---: |
++| Total dependency labels (including sources and implicit dependencies) | 4,576 | 1,630 |
++| First-party dependency labels (`//`) | 289 | 37 |
++| External dependency labels (`@`) | 4,287 | 1,593 |
++| First-party rules, including implicit analyzer rules | 187 | 32 |
++| First-party rules excluding 29 unchanged analyzer/config rules | 158 | 3 |
++| ioutil.go lines (`wc -l`) | 446 | 457 |
++| BUILD lines (`wc -l`) | 27 | 26 |
++| ioutil_test.go lines (`wc -l`) | 275 | 333 |
++
++Query outputs were captured in `/tmp/ioutil-{before,after}-deps.txt` and counted
++with `wc -l`; prefix counts come from the same captured outputs. Rule counts
++were obtained with `kind(".* rule", ...)`: baseline first-party labels were
++saved before editing and classified afterward; the after query was
++`kind(".* rule", deps(//server/util/ioutil)) intersect //...`.
++The unchanged implicit rules are `//:nogo_config`, `//:vet`, `//:vet_actual`,
++and the 26 `//rules/go/analyzer` rules. Thus the survey's 158 → 3 estimate is
++confirmed when those implicit rules are excluded. The remaining three rules
++are ioutil, bytebufferpool, and status.
++
++## Validation
++
++- `gofmt` and `git diff --check`: passed.
++- `bazel query 'rdeps(//..., //server/util/ioutil, 1)'`: failed (exit 7) while
++  fetching the unrelated `+dockerfile_image+default_execution_image`
++  repository. Its `/bin/docker build --no-cache` command timed out. A redundant
++  queued retry was interrupted after this failure was established.
++- Fallback: `bazel query 'attr("deps", "//server/util/ioutil(:ioutil)?", //...)'`
++  succeeded and found 31 direct dependents. This matches all 31 references
++  found by `rg -n 'server/util/ioutil' --glob BUILD`; all are deps entries.
++  Targets are saved in `/tmp/ioutil-direct-rdeps.txt`, with ioutil itself added
++  to `/tmp/ioutil-build-targets.txt`.
++- An initial build invocation supplied both a positional target and
++  `--target_pattern_file`; Bazel rejected it (exit 2). Corrected below.
++- `bazel test --jobs=2 //server/util/ioutil:ioutil_test`: passed (exit 0),
++  including required nogo validation; 1 test target passed, 3,566 actions,
++  1,774.653 seconds.
++- `bazel build --jobs=2 --target_pattern_file=/tmp/ioutil-build-targets.txt`:
++  passed (exit 0): 32 targets, including all 31 direct dependents and their
++  test binaries, plus required nogo validation. 4,012 executed actions,
++  3,316.168 seconds; dependent tests were built without running them.
++
++Long commands run under `nohup`, with logs in `/tmp/ioutil-build-direct.log`
++and `/tmp/ioutil-build-retry.log`.
++
++## Scope and dependency ownership
++
++Only `server/util/ioutil/` and this required report changed. No callers,
++shared dependency files, lockfiles, external modules, or interfaces definitions
++were edited. No external module becomes unused: removing this edge leaves
++interfaces and its entire dependency closure reachable elsewhere.
++Evidence: `rg -l '"//server/interfaces"' --glob BUILD server enterprise | wc -l`
++returns 198 remaining BUILD files with direct users. No dependency cleanup is
++needed for the separate serialized PR.
++
++The unrelated Docker repository failure was not fixed, and dependent tests
++are built but not run; the changed package's tests are run.
++
++To preserve disk space during local compilation, removed approximately 2.06 GiB of old
++large downloaded archives from Bazel's content-addressable archive cache.
++Extracted repositories and build outputs were retained.
+diff --git a/server/util/ioutil/BUILD b/server/util/ioutil/BUILD
+index e94b9af3e..fc37b9502 100644
+--- a/server/util/ioutil/BUILD
++++ b/server/util/ioutil/BUILD
+@@ -6,7 +6,6 @@ go_library(
+     importpath = "github.com/buildbuddy-io/buildbuddy/server/util/ioutil",
+     visibility = ["//visibility:public"],
+     deps = [
+-        "//server/interfaces",
+         "//server/util/bytebufferpool",
+         "//server/util/status",
+     ],
+diff --git a/server/util/ioutil/ioutil.go b/server/util/ioutil/ioutil.go
+index 6cd09350f..1b3f89c38 100644
+--- a/server/util/ioutil/ioutil.go
++++ b/server/util/ioutil/ioutil.go
+@@ -7,7 +7,6 @@ import (
+ 	"io"
+ 	"os"
+ 
+-	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/bytebufferpool"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+ )
+@@ -71,8 +70,20 @@ func LimitReadCloser(reader io.ReadCloser, limit int64) io.ReadCloser {
+ type CloseFunc func() error
+ type CommitFunc func(int64) error
+ 
++// Committer finalizes a write.
++type Committer interface {
++	Commit() error
++}
++
++// CommittedWriteCloser is a writer that can finalize a write and release resources.
++type CommittedWriteCloser interface {
++	io.Writer
++	io.Closer
++	Committer
++}
++
+ type CustomCommitWriteCloser interface {
+-	interfaces.CommittedWriteCloser
++	CommittedWriteCloser
+ 
+ 	SetCloseFn(CloseFunc)
+ 	SetCommitFn(CommitFunc)
+@@ -109,7 +120,7 @@ func (c *customCommitWriteCloser) Commit() error {
+ 		c.committed = true
+ 	}()
+ 
+-	if committer, ok := c.w.(interfaces.Committer); ok {
++	if committer, ok := c.w.(Committer); ok {
+ 		if err := committer.Commit(); err != nil {
+ 			return err
+ 		}
+@@ -153,9 +164,9 @@ type customCommitWriteSeekCloser struct {
+ 	io.Seeker
+ }
+ 
+-// NewCustomCommitWriteCloser wraps an io.Writer/interfaces.CommittedWriteCloser
++// NewCustomCommitWriteCloser wraps an io.Writer or CommittedWriteCloser
+ // and returns a customCommitWriteCloser, which implements
+-// interfaces.CommittedWriteCloser but allows adding on custom logic that will
++// CommittedWriteCloser but allows adding on custom logic that will
+ // be called when Commit or Close methods are called. If the wrapped writer
+ // implements io.Seeker, the returned value will also implement io.Seeker.
+ func NewCustomCommitWriteCloser(w io.Writer) CustomCommitWriteCloser {
+diff --git a/server/util/ioutil/ioutil_test.go b/server/util/ioutil/ioutil_test.go
+index 9e9324145..05dcabd88 100644
+--- a/server/util/ioutil/ioutil_test.go
++++ b/server/util/ioutil/ioutil_test.go
+@@ -3,6 +3,7 @@ package ioutil_test
+ import (
+ 	"bytes"
+ 	"errors"
++	"fmt"
+ 	"io"
+ 	"os"
+ 	"path/filepath"
+@@ -34,6 +35,63 @@ func TestCustomCommitWriteCloser_SecondCommitFails(t *testing.T) {
+ 	require.NoError(t, err)
+ }
+ 
++type committingWriter struct {
++	bytes.Buffer
++	commitFn func() error
++	closeFn  func() error
++}
++
++func (w *committingWriter) Commit() error { return w.commitFn() }
++func (w *committingWriter) Close() error  { return w.closeFn() }
++
++func TestCustomCommitWriteCloser_UnderlyingCommitter(t *testing.T) {
++	for _, failCommit := range []bool{false, true} {
++		t.Run(fmt.Sprintf("failCommit=%t", failCommit), func(t *testing.T) {
++			var calls []string
++			commitErr := errors.New("underlying commit failed")
++			w := &committingWriter{
++				commitFn: func() error {
++					calls = append(calls, "underlying commit")
++					if failCommit {
++						return commitErr
++					}
++					return nil
++				},
++				closeFn: func() error {
++					calls = append(calls, "underlying close")
++					return nil
++				},
++			}
++			var underlying ioutil.CommittedWriteCloser = w
++			cwc := ioutil.NewCustomCommitWriteCloser(underlying)
++			cwc.SetCommitFn(func(n int64) error {
++				require.Equal(t, int64(3), n)
++				calls = append(calls, "custom commit")
++				return nil
++			})
++			cwc.SetCloseFn(func() error {
++				calls = append(calls, "custom close")
++				return nil
++			})
++			_, err := cwc.Write([]byte("abc"))
++			require.NoError(t, err)
++			if failCommit {
++				require.ErrorIs(t, cwc.Commit(), commitErr)
++			} else {
++				require.NoError(t, cwc.Commit())
++			}
++			require.Error(t, cwc.Commit())
++			require.NoError(t, cwc.Close())
++			want := []string{"underlying commit"}
++			if !failCommit {
++				want = append(want, "custom commit")
++			}
++			want = append(want, "underlying close", "custom close")
++			require.Equal(t, want, calls)
++		})
++	}
++}
++
+ func TestReadAllLimited(t *testing.T) {
+ 	for _, testCase := range []struct {
+ 		name      string

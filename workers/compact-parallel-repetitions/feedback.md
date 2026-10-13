@@ -1,0 +1,1 @@
+Review approved. Remove result.md from the branch history (it must not be in the PR): e.g. `git rm --cached result.md` and amend (or rebase if it is in an earlier commit), keeping the file on disk. Verify `git diff --stat origin/master...HEAD` lists only code files. Change nothing else.

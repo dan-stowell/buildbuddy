@@ -1,0 +1,226 @@
+diff --git a/server/xcode/BUILD b/server/xcode/BUILD
+index a284fedcc..5bc797b0d 100644
+--- a/server/xcode/BUILD
++++ b/server/xcode/BUILD
+@@ -5,6 +5,7 @@ go_library(
+     srcs = [
+         "xcode.go",
+         "xcode_darwin.go",
++        "xcode_plist.go",
+     ],
+     cgo = True,
+     clinkopts = select({
+@@ -21,7 +22,6 @@ go_library(
+             "//server/util/flag",
+             "//server/util/log",
+             "//server/util/status",
+-            "@com_github_groob_plist//:plist",
+         ],
+         "//conditions:default": [],
+     }),
+@@ -29,9 +29,11 @@ go_library(
+ 
+ go_test(
+     name = "xcode_test",
+-    srcs = ["xcode_darwin_test.go"],
++    srcs = [
++        "xcode_darwin_test.go",
++        "xcode_plist_test.go",
++    ],
+     embed = [":xcode"],
+-    target_compatible_with = ["@platforms//os:macos"],
+     deps = select({
+         "@io_bazel_rules_go//go/platform:darwin": [
+             "@com_github_stretchr_testify//require",
+diff --git a/server/xcode/xcode_darwin.go b/server/xcode/xcode_darwin.go
+index e048d9d4b..ae2e097ab 100644
+--- a/server/xcode/xcode_darwin.go
++++ b/server/xcode/xcode_darwin.go
+@@ -24,7 +24,6 @@ import (
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+-	"github.com/groob/plist"
+ )
+ 
+ const xcodeBundleID = "com.apple.dt.Xcode"
+@@ -62,12 +61,6 @@ type xcodeVersion struct {
+ 	sdks map[string]string
+ }
+ 
+-// The interesting bits to pull from Xcode's version plist.
+-type xcodePlist struct {
+-	CFBundleShortVersionString string `plist:"CFBundleShortVersionString"`
+-	ProductBuildVersion        string `plist:"ProductBuildVersion"`
+-}
+-
+ func NewXcodeLocator() *xcodeLocator {
+ 	xl := &xcodeLocator{}
+ 	xl.locate()
+@@ -210,15 +203,16 @@ func versionMap(urlRefs []C.CFURLRef) map[string]*xcodeVersion {
+ }
+ 
+ func xcodePlistForPath(path string) (*xcodePlist, error) {
+-	var xcodePlist xcodePlist
+ 	versionFileReader, err := os.Open(path)
+ 	if err != nil {
+ 		return nil, status.InternalErrorf("Failed to open %s: %s", path, err.Error())
+ 	}
+-	if err := plist.NewXMLDecoder(versionFileReader).Decode(&xcodePlist); err != nil {
++	defer versionFileReader.Close()
++	xcodePlist, err := decodeXcodePlist(versionFileReader)
++	if err != nil {
+ 		return nil, status.InternalErrorf("Failed to decode %s: %s", path, err.Error())
+ 	}
+-	return &xcodePlist, nil
++	return xcodePlist, nil
+ }
+ 
+ func commandLineToolsVersion(developerDir string) *xcodeVersion {
+diff --git a/server/xcode/xcode_plist.go b/server/xcode/xcode_plist.go
+new file mode 100644
+index 000000000..dbc42e9dd
+--- /dev/null
++++ b/server/xcode/xcode_plist.go
+@@ -0,0 +1,85 @@
++package xcode
++
++import (
++	"encoding/xml"
++	"fmt"
++	"io"
++)
++
++// The interesting bits to pull from Xcode's version plist.
++type xcodePlist struct {
++	CFBundleShortVersionString string
++	ProductBuildVersion        string
++}
++
++func decodeXcodePlist(r io.Reader) (*xcodePlist, error) {
++	var document struct {
++		XMLName xml.Name    `xml:"plist"`
++		Dict    *xcodePlist `xml:"dict"`
++	}
++	if err := xml.NewDecoder(r).Decode(&document); err != nil {
++		return nil, err
++	}
++	if document.Dict == nil {
++		return nil, fmt.Errorf("expected plist dictionary")
++	}
++	return document.Dict, nil
++}
++
++// A plist dictionary alternates keys and values; unknown values may themselves
++// contain dictionaries, so skip their entire element.
++func (p *xcodePlist) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
++	for {
++		token, err := d.Token()
++		if err != nil {
++			return err
++		}
++		switch token := token.(type) {
++		case xml.EndElement:
++			if token.Name == start.Name {
++				return nil
++			}
++		case xml.StartElement:
++			if token.Name.Local != "key" {
++				return fmt.Errorf("expected plist key, got %s", token.Name.Local)
++			}
++			var key string
++			if err := d.DecodeElement(&key, &token); err != nil {
++				return err
++			}
++			var value xml.StartElement
++			for {
++				token, err := d.Token()
++				if err != nil {
++					return err
++				}
++				if element, ok := token.(xml.StartElement); ok {
++					value = element
++					break
++				}
++				if _, ok := token.(xml.EndElement); ok {
++					return fmt.Errorf("missing plist value for %s", key)
++				}
++			}
++			var destination *string
++			switch key {
++			case "CFBundleShortVersionString":
++				destination = &p.CFBundleShortVersionString
++			case "ProductBuildVersion":
++				destination = &p.ProductBuildVersion
++			}
++			if destination == nil {
++				if err := d.Skip(); err != nil {
++					return err
++				}
++			} else {
++				if value.Name.Local != "string" {
++					return fmt.Errorf("expected plist string for %s, got %s", key, value.Name.Local)
++				}
++				if err := d.DecodeElement(destination, &value); err != nil {
++					return err
++				}
++			}
++		}
++	}
++}
+diff --git a/server/xcode/xcode_plist_test.go b/server/xcode/xcode_plist_test.go
+new file mode 100644
+index 000000000..1a082206a
+--- /dev/null
++++ b/server/xcode/xcode_plist_test.go
+@@ -0,0 +1,50 @@
++package xcode
++
++import (
++	"strings"
++	"testing"
++)
++
++func TestDecodeXcodePlist(t *testing.T) {
++	const fixture = `<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0"><dict>
++<key>Unknown</key><dict><key>ProductBuildVersion</key><string>ignored</string></dict>
++<key>ProductBuildVersion</key><string>16A242</string>
++<key>Other</key><array><integer>1</integer><true/></array>
++<key>CFBundleShortVersionString</key><string>16.0</string>
++<key>Last</key><data>AA==</data>
++</dict></plist>`
++	p, err := decodeXcodePlist(strings.NewReader(fixture))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if p.CFBundleShortVersionString != "16.0" || p.ProductBuildVersion != "16A242" {
++		t.Fatalf("unexpected plist: %+v", p)
++	}
++}
++
++func TestDecodeXcodePlistErrors(t *testing.T) {
++	for _, input := range []string{
++		`<plist><string>not a dictionary</string></plist>`,
++		`<plist/>`,
++		`<plist><dict><key>ProductBuildVersion</key></dict></plist>`,
++		`<plist><dict><key>ProductBuildVersion</key><integer>1</integer></dict></plist>`,
++		`<plist><dict><string>unpaired</string></dict></plist>`,
++		`<plist><dict><key>Unknown</key><dict>`,
++	} {
++		if _, err := decodeXcodePlist(strings.NewReader(input)); err == nil {
++			t.Errorf("expected error for %s", input)
++		}
++	}
++}
++
++func TestDecodeXcodePlistMissingFields(t *testing.T) {
++	p, err := decodeXcodePlist(strings.NewReader(`<plist><dict/></plist>`))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if *p != (xcodePlist{}) {
++		t.Fatalf("unexpected plist: %+v", p)
++	}
++}

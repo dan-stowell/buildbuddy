@@ -1,0 +1,297 @@
+diff --git a/enterprise/server/crypter_key_cache/BUILD b/enterprise/server/crypter_key_cache/BUILD
+index d9931ee74..f40657181 100644
+--- a/enterprise/server/crypter_key_cache/BUILD
++++ b/enterprise/server/crypter_key_cache/BUILD
+@@ -16,7 +16,6 @@ go_library(
+         "//server/util/status",
+         "//third_party/singleflight",
+         "@com_github_jonboulle_clockwork//:clockwork",
+-        "@org_uber_go_atomic//:atomic",
+     ],
+ )
+ 
+diff --git a/enterprise/server/crypter_key_cache/crypter_key_cache.go b/enterprise/server/crypter_key_cache/crypter_key_cache.go
+index 0a1f7c171..04080ec4a 100644
+--- a/enterprise/server/crypter_key_cache/crypter_key_cache.go
++++ b/enterprise/server/crypter_key_cache/crypter_key_cache.go
+@@ -5,6 +5,7 @@ import (
+ 	"flag"
+ 	"fmt"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/crypter"
+@@ -15,7 +16,6 @@ import (
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+ 	"github.com/buildbuddy-io/buildbuddy/third_party/singleflight"
+ 	"github.com/jonboulle/clockwork"
+-	"go.uber.org/atomic"
+ 
+ 	sgpb "github.com/buildbuddy-io/buildbuddy/proto/storage"
+ )
+@@ -128,9 +128,9 @@ func (c *KeyCache) checkCacheEntry(ck CacheKey, ce *cacheEntry) {
+ 		return
+ 	}
+ 
+-	c.activeRefreshOps.Inc()
++	c.activeRefreshOps.Add(1)
+ 	go func() {
+-		defer c.activeRefreshOps.Dec()
++		defer c.activeRefreshOps.Add(-1)
+ 		ctx, cancel := context.WithTimeout(c.env.GetServerContext(), keyRefreshDeadline)
+ 		defer cancel()
+ 		ce.mu.Lock()
+diff --git a/enterprise/server/scheduling/task_router/BUILD b/enterprise/server/scheduling/task_router/BUILD
+index dda1b4ed4..9aca00e3e 100644
+--- a/enterprise/server/scheduling/task_router/BUILD
++++ b/enterprise/server/scheduling/task_router/BUILD
+@@ -41,6 +41,5 @@ go_test(
+         "@com_github_open_feature_go_sdk//openfeature/testing",
+         "@com_github_open_feature_go_sdk_contrib_providers_flagd//pkg",
+         "@com_github_stretchr_testify//require",
+-        "@org_golang_x_exp//slices",
+     ],
+ )
+diff --git a/enterprise/server/scheduling/task_router/task_router_test.go b/enterprise/server/scheduling/task_router/task_router_test.go
+index a7142d315..295511d88 100644
+--- a/enterprise/server/scheduling/task_router/task_router_test.go
++++ b/enterprise/server/scheduling/task_router/task_router_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"fmt"
+ 	"math"
+ 	"os"
++	"slices"
+ 	"testing"
+ 
+ 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/experiments"
+@@ -20,7 +21,6 @@ import (
+ 	"github.com/open-feature/go-sdk/openfeature"
+ 	"github.com/open-feature/go-sdk/openfeature/memprovider"
+ 	"github.com/stretchr/testify/require"
+-	"golang.org/x/exp/slices"
+ 
+ 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
+ 	flagd "github.com/open-feature/go-sdk-contrib/providers/flagd/pkg"
+diff --git a/enterprise/tools/rbeperf/BUILD b/enterprise/tools/rbeperf/BUILD
+index 6d146eae3..bbbdbc2f9 100644
+--- a/enterprise/tools/rbeperf/BUILD
++++ b/enterprise/tools/rbeperf/BUILD
+@@ -1,6 +1,6 @@
+ load("@io_bazel_rules_docker//container:container.bzl", "container_push")
+ load("@io_bazel_rules_docker//go:image.bzl", "go_image")
+-load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
++load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+ load("@rules_oci//oci:defs.bzl", "oci_image", "oci_push")
+ load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+ 
+@@ -81,3 +81,13 @@ oci_push(
+     remote_tags = "//deployment:oci_tag_file",
+     repository = "gcr.io/flame-build/rbeperf-oci",
+ )
++
++# Compare parsers before changing command-line tokenization.
++go_test(
++    name = "rbeperf_test",
++    srcs = ["rbeperf_test.go"],
++    deps = [
++        "//server/util/shlex",
++        "@com_github_mattn_go_shellwords//:go-shellwords",
++    ],
++)
+diff --git a/enterprise/tools/rbeperf/rbeperf_test.go b/enterprise/tools/rbeperf/rbeperf_test.go
+new file mode 100644
+index 000000000..f69d6d427
+--- /dev/null
++++ b/enterprise/tools/rbeperf/rbeperf_test.go
+@@ -0,0 +1,44 @@
++package main
++
++import (
++	"reflect"
++	"testing"
++
++	"github.com/buildbuddy-io/buildbuddy/server/util/shlex"
++	"github.com/mattn/go-shellwords"
++)
++
++func TestParserComparison(t *testing.T) {
++	for _, tc := range []struct {
++		name, input string
++		different   bool
++		wantErr     bool
++	}{
++		{"plain", "echo one two", false, false},
++		{"quotes", `echo 'one two' "three four"`, false, false},
++		{"adjacent_quotes", `echo a'b c'"d"`, false, false},
++		{"escaped_space", `echo one\ two`, false, false},
++		{"escaped_quote", `echo "a\"b"`, false, false},
++		{"double_quote_escape", `echo "a\qb"`, false, false},
++		{"empty_args", `echo '' "" end`, false, false},
++		{"empty_command", "", false, false},
++		{"unclosed_single", `echo 'bad`, false, true},
++		{"unclosed_double", `echo "bad`, false, true},
++		{"trailing_escape", `echo bad\`, false, true},
++		{"semicolon", `echo first; echo second`, true, false},
++		{"comment", `echo first # comment`, true, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			a, ae := shellwords.Parse(tc.input)
++			b, be := shlex.Split(tc.input)
++			if (ae != nil) != tc.wantErr || (be != nil) != tc.wantErr {
++				t.Fatalf("shellwords error=%v, shlex error=%v; want error=%v", ae, be, tc.wantErr)
++			}
++			different := (ae == nil) != (be == nil) || (ae == nil && be == nil && !reflect.DeepEqual(a, b))
++			t.Logf("shellwords=%q err=%v; shlex=%q err=%v", a, ae, b, be)
++			if different != tc.different {
++				t.Errorf("difference=%v, expected %v", different, tc.different)
++			}
++		})
++	}
++}
+diff --git a/result.md b/result.md
+new file mode 100644
+index 000000000..72d8b5a39
+--- /dev/null
++++ b/result.md
+@@ -0,0 +1,109 @@
++# Go dependency swaps
++
++Implemented (a): crypter_key_cache uses stdlib sync/atomic.Int32, with Add(1)/Add(-1) replacing Inc/Dec. The zero value and Load behavior are preserved; existing cache refresh concurrency tests exercise the counter.
++
++Skipped (b): replacing shellwords.Parse with server/util/shlex.Split would change remote command arguments. A retained 13-case table test compares quotes, adjacent quotes, escapes, empty arguments, empty commands, malformed input, semicolons, and comments. Both parsers reject the tested malformed inputs (error text and partial results differ, but prepareCommands returns on any error). However:
++
++| Input | shellwords.Parse | shlex.Split |
++| --- | --- | --- |
++| `echo first # comment` | `["echo", "first", "#", "comment"]` | `["echo", "first"]` |
++| `echo first; echo second` | `["echo", "first"]` | `["echo", "first;", "echo", "second"]` |
++
++There is no input restriction in prepareCommands that makes these differences irrelevant. The production parser and its dependency remain unchanged. The table test adds a test target and test dependencies, as explicitly requested.
++
++Implemented (c): task_router_test and approxlru_test use stdlib slices for IndexFunc, Reverse, and SortFunc. The repository's Go version supports these APIs; no call-site behavior change is needed. Removed the corresponding BUILD dependencies. No shared dependency files were intentionally changed. result.md is the requested exception to the package-only edit scope.
++
++## Measurements
++
++Measured before any edits and after all edits using the same Python command below. Counts are BUILD target declarations, explicit Go deps label occurrences, external Go deps label occurrences, and all Go source/test lines within each package. Inline embed/base/platform labels are outside this metric. These measure direct edges; they do not estimate binary size or transitive closure savings.
++
++| Package | Targets before → after | Dependency labels before → after | External labels before → after | Go LOC before → after |
++| --- | --- | --- | --- | --- |
++| enterprise/server/crypter_key_cache | 2 → 2 | 18 → 17 | 4 → 3 | 712 → 712 |
++| enterprise/tools/rbeperf | 7 → 8 | 20 → 22 | 9 → 10 | 889 → 933 |
++| enterprise/server/scheduling/task_router | 2 → 2 | 28 → 27 | 7 → 6 | 1651 → 1651 |
++| server/util/approxlru | 2 → 2 | 9 → 8 | 5 → 4 | 576 → 576 |
++
++The successful swaps remove three first-party edges to two modules, not the survey's proposed three modules. Including the comparison test, total external dependency label occurrences decrease from 25 to 23 (three removed, one added).
++
++```python
++import pathlib, re, json
++paths = ['enterprise/server/crypter_key_cache', 'enterprise/tools/rbeperf',
++         'enterprise/server/scheduling/task_router', 'server/util/approxlru']
++for d in paths:
++    b = pathlib.Path(d + '/BUILD').read_text()
++    print(d, json.dumps(dict(
++        targets=len(re.findall(r'^    name = ', b, re.M)),
++        deps=len(re.findall(r'^        "(?:@|//|:)', b, re.M)),
++        external_labels=len(re.findall(r'^        "@', b, re.M)),
++        go_loc=sum(len(p.read_text().splitlines()) for p in pathlib.Path(d).glob('*.go')))))
++```
++
++## Module users
++
++Same repository-wide command before and after:
++
++```sh
++rg -n 'go.uber.org/atomic|github.com/mattn/go-shellwords|golang.org/x/exp/slices|@org_uber_go_atomic|@com_github_mattn_go_shellwords|@org_golang_x_exp//slices' --glob '*.go' --glob BUILD --glob BUILD.bazel
++```
++
++Before: Uber atomic had one Go import and one BUILD edge, both in crypter_key_cache. After: no matches for Uber atomic. Thus go.uber.org/atomic has no remaining first-party source/BUILD users in this search; shared dependency declarations stay untouched for the serialized cleanup. shellwords remains in rbeperf production and its comparison test. x/exp/slices remains in enterprise/server/util/cpuset (cpuset.go:17 and BUILD:22); neither module is now unused by first-party code.
++
++## Verification
++
++All long commands were launched with `nohup bash -c '…; echo $? > /tmp/dep-swaps-<name>.exit' > /tmp/dep-swaps-<name>.log 2>&1 < /dev/null &` and polled to completion. Local builds used two jobs, disabled remote execution/cache explicitly, and disabled lockfile updates.
++
++Passed (exit 0), all three tests executed successfully:
++
++```sh
++bazel test --jobs=2 --remote_executor= --remote_cache= --lockfile_mode=off \
++  //enterprise/tools/rbeperf:rbeperf_test \
++  //enterprise/server/scheduling/task_router:task_router_test \
++  //server/util/approxlru:approxlru_test
++```
++
++Passed (exit 0), race detection available and enabled; one test target executed successfully:
++
++```sh
++bazel test --jobs=2 --remote_executor= --remote_cache= --lockfile_mode=off --config=race \
++  //enterprise/server/crypter_key_cache:crypter_key_cache_test
++```
++
++The prescribed global direct reverse-dependency query was attempted and allowed to finish. It failed with exit 7 because an unrelated Docker repository fetch timed out building `dockerfiles/default_execution_image/Dockerfile`; no package tests failed:
++
++```sh
++bazel query 'rdeps(//..., set(//enterprise/server/crypter_key_cache:crypter_key_cache //enterprise/tools/rbeperf:rbeperf_lib //enterprise/server/scheduling/task_router:task_router_test //server/util/approxlru:approxlru_test), 1)'
++```
++
++Fallback: searched all BUILD/BUILD.bazel files for references to the changed targets:
++
++```sh
++rg -n 'enterprise/server/crypter_key_cache|enterprise/tools/rbeperf:rbeperf_lib|task_router:task_router_test|approxlru:approxlru_test' --glob BUILD --glob BUILD.bazel
++```
++
++The crypter_key_cache references were in crypter_service/BUILD:11, :39 and remote_crypter/BUILD:12. Other references were only the cache's own importpath. The unchanged rbeperf library no longer needs verification of its binary/image dependents; its new test is the actual changed target. Confirmed the candidate packages with this scoped query, which passed (exit 0):
++
++```sh
++bazel query --lockfile_mode=off 'rdeps(set(//enterprise/server/crypter_key_cache:* //enterprise/server/crypter_service:* //enterprise/server/remote_crypter:* //enterprise/tools/rbeperf:rbeperf_test //enterprise/server/scheduling/task_router:task_router_test //server/util/approxlru:approxlru_test), set(//enterprise/server/crypter_key_cache:crypter_key_cache //enterprise/server/crypter_key_cache:crypter_key_cache_test //enterprise/tools/rbeperf:rbeperf_test //enterprise/server/scheduling/task_router:task_router_test //server/util/approxlru:approxlru_test), 1)'
++```
++
++It returned the five changed library/test targets plus:
++
++- //enterprise/server/crypter_service:crypter_service
++- //enterprise/server/crypter_service:crypter_service_test
++- //enterprise/server/remote_crypter:remote_crypter
++
++Direct-dependent verification passed (exit 0): both library targets built successfully, and crypter_service_test executed successfully:
++
++```sh
++bazel test --jobs=2 --remote_executor= --remote_cache= --lockfile_mode=off \
++  //enterprise/server/crypter_service:crypter_service \
++  //enterprise/server/crypter_service:crypter_service_test \
++  //enterprise/server/remote_crypter:remote_crypter
++```
++
++The preliminary parser comparison also passed via `cd /tmp/dep-parser-check && go test -v`, using a copy of the repo Split implementation and the exact parser versions pinned in go.mod, in an isolated temporary module. The retained Bazel table test verifies the actual repository package. `git diff --check` passed. No shared dependency files were changed.
++
++## Commits
++
++One commit per independent item: (a) `aed1e29a5`, stdlib atomic; (b) `f3aaa2f24`, parser comparison documenting why the swap is skipped; (c) the final commit, stdlib slices and this report. Committed on the current branch; nothing pushed and no PR opened.
+diff --git a/server/util/approxlru/BUILD b/server/util/approxlru/BUILD
+index 96f52d193..d81a41f3e 100644
+--- a/server/util/approxlru/BUILD
++++ b/server/util/approxlru/BUILD
+@@ -21,6 +21,5 @@ go_test(
+         ":approxlru",
+         "//server/util/status",
+         "@com_github_stretchr_testify//require",
+-        "@org_golang_x_exp//slices",
+     ],
+ )
+diff --git a/server/util/approxlru/approxlru_test.go b/server/util/approxlru/approxlru_test.go
+index d1c9aaa68..adc136dff 100644
+--- a/server/util/approxlru/approxlru_test.go
++++ b/server/util/approxlru/approxlru_test.go
+@@ -3,6 +3,7 @@ package approxlru_test
+ import (
+ 	"context"
+ 	"math/rand"
++	"slices"
+ 	"strconv"
+ 	"sync"
+ 	"testing"
+@@ -11,7 +12,6 @@ import (
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/approxlru"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+ 	"github.com/stretchr/testify/require"
+-	"golang.org/x/exp/slices"
+ )
+ 
+ type entry struct {

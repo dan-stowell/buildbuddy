@@ -1,0 +1,246 @@
+diff --git a/enterprise/server/remote_execution/commandutil/BUILD b/enterprise/server/remote_execution/commandutil/BUILD
+index c0986d529..ed9759265 100644
+--- a/enterprise/server/remote_execution/commandutil/BUILD
++++ b/enterprise/server/remote_execution/commandutil/BUILD
+@@ -17,10 +17,9 @@ go_library(
+         "//server/interfaces",
+         "//server/util/log",
+         "//server/util/status",
+-        "@com_github_mitchellh_go_ps//:go-ps",
++        "@com_github_shirou_gopsutil_v3//process",
+     ] + select({
+         "@io_bazel_rules_go//go/platform:windows": [
+-            "@com_github_shirou_gopsutil_v3//process",
+             "@org_golang_x_sys//windows",
+         ],
+         "//conditions:default": [],
+@@ -35,6 +34,7 @@ go_test(
+         "commandutil_test.go",
+         "commandutil_unix_test.go",
+         "commandutil_windows_test.go",
++        "enumeration_linux_test.go",
+     ],
+     data = select({
+         "@io_bazel_rules_go//go/platform:windows": [],
+diff --git a/enterprise/server/remote_execution/commandutil/commandutil.go b/enterprise/server/remote_execution/commandutil/commandutil.go
+index e5b5c0b47..6c0bb234e 100644
+--- a/enterprise/server/remote_execution/commandutil/commandutil.go
++++ b/enterprise/server/remote_execution/commandutil/commandutil.go
+@@ -20,7 +20,7 @@ import (
+ 
+ 	espb "github.com/buildbuddy-io/buildbuddy/proto/execution_stats"
+ 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
+-	ps "github.com/mitchellh/go-ps"
++	procutil "github.com/shirou/gopsutil/v3/process"
+ )
+ 
+ const (
+@@ -348,16 +348,21 @@ func rusageCPUNanos(rusage *espb.Rusage) int64 {
+ 
+ // ChildPids returns all *direct* child pids of a process identified by pid.
+ func ChildPids(pid int) ([]int, error) {
+-	procs, err := ps.Processes()
++	procs, err := procutil.Processes()
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	var out []int
+ 	for _, proc := range procs {
+-		if proc.PPid() != pid {
++		ppid, err := proc.Ppid()
++		if err != nil {
++			// Processes may exit or become inaccessible during enumeration.
++			continue
++		}
++		if int(ppid) != pid {
+ 			continue
+ 		}
+-		out = append(out, proc.Pid())
++		out = append(out, int(proc.Pid))
+ 	}
+ 	return out, nil
+ }
+diff --git a/enterprise/server/remote_execution/commandutil/enumeration_linux_test.go b/enterprise/server/remote_execution/commandutil/enumeration_linux_test.go
+new file mode 100644
+index 000000000..fd0b28be0
+--- /dev/null
++++ b/enterprise/server/remote_execution/commandutil/enumeration_linux_test.go
+@@ -0,0 +1,54 @@
++//go:build linux
++
++package commandutil_test
++
++import (
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/commandutil"
++	"github.com/stretchr/testify/require"
++)
++
++func TestProcessEnumeration(t *testing.T) {
++	if os.Geteuid() == 0 {
++		t.Skip("permission error coverage requires an unprivileged user")
++	}
++	root := t.TempDir()
++	t.Setenv("HOST_PROC", root)
++	// gopsutil checks PID existence even when reading a synthetic procfs.
++	startProcess := func() int {
++		cmd := exec.Command("sleep", "60")
++		require.NoError(t, cmd.Start())
++		t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
++		return cmd.Process.Pid
++	}
++	rootPid, childPid, grandchildPid := os.Getpid(), startProcess(), startProcess()
++	for pid, ppid := range map[int]int{rootPid: 0, childPid: rootPid, grandchildPid: childPid} {
++		dir := filepath.Join(root, fmt.Sprint(pid))
++		require.NoError(t, os.Mkdir(dir, 0700))
++		stat := fmt.Sprintf("%d (test process) S %d%s\n", pid, ppid, strings.Repeat(" 0", 48))
++		require.NoError(t, os.WriteFile(filepath.Join(dir, "stat"), []byte(stat), 0600))
++	}
++	// A process whose stat has disappeared must not fail the whole enumeration.
++	missingPid := startProcess()
++	require.NoError(t, os.Mkdir(filepath.Join(root, fmt.Sprint(missingPid)), 0700))
++	// Likewise, skip a process whose stat cannot be read due to permissions.
++	inaccessiblePid := startProcess()
++	dir := filepath.Join(root, fmt.Sprint(inaccessiblePid))
++	require.NoError(t, os.Mkdir(dir, 0700))
++	require.NoError(t, os.WriteFile(filepath.Join(dir, "stat"), []byte(fmt.Sprintf("%d (inaccessible) S %d%s\n", inaccessiblePid, rootPid, strings.Repeat(" 0", 48))), 0000))
++	pids, err := commandutil.ChildPids(os.Getpid())
++	require.NoError(t, err)
++	require.ElementsMatch(t, []int{childPid}, pids)
++}
++
++func TestProcessEnumerationError(t *testing.T) {
++	t.Setenv("HOST_PROC", filepath.Join(t.TempDir(), "missing"))
++	_, err := commandutil.ChildPids(os.Getpid())
++	require.Error(t, err)
++}
+diff --git a/enterprise/server/util/procstats/BUILD b/enterprise/server/util/procstats/BUILD
+index d0264f31e..c818c8518 100644
+--- a/enterprise/server/util/procstats/BUILD
++++ b/enterprise/server/util/procstats/BUILD
+@@ -9,16 +9,18 @@ go_library(
+     deps = [
+         "//proto:remote_execution_go_proto",
+         "//server/util/lib/set",
+-        "@com_github_mitchellh_go_ps//:go-ps",
+         "@com_github_shirou_gopsutil_v3//process",
+     ],
+ )
+ 
+ go_test(
+     name = "procstats_test",
+-    srcs = ["procstats_test.go"],
++    srcs = [
++        "enumeration_linux_test.go",
++        "procstats_test.go",
++    ],
++    embed = [":procstats"],
+     deps = [
+-        ":procstats",
+         "//proto:remote_execution_go_proto",
+         "@com_github_stretchr_testify//require",
+     ],
+diff --git a/enterprise/server/util/procstats/enumeration_linux_test.go b/enterprise/server/util/procstats/enumeration_linux_test.go
+new file mode 100644
+index 000000000..ac2daad67
+--- /dev/null
++++ b/enterprise/server/util/procstats/enumeration_linux_test.go
+@@ -0,0 +1,56 @@
++//go:build linux
++
++package procstats
++
++import (
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestProcessEnumeration(t *testing.T) {
++	if os.Geteuid() == 0 {
++		t.Skip("permission error coverage requires an unprivileged user")
++	}
++	root := t.TempDir()
++	t.Setenv("HOST_PROC", root)
++	// gopsutil checks PID existence even when reading a synthetic procfs.
++	startProcess := func() int {
++		cmd := exec.Command("sleep", "60")
++		require.NoError(t, cmd.Start())
++		t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
++		return cmd.Process.Pid
++	}
++	rootPid, childPid, grandchildPid := os.Getpid(), startProcess(), startProcess()
++	for pid, ppid := range map[int]int{rootPid: 0, childPid: rootPid, grandchildPid: childPid} {
++		dir := filepath.Join(root, fmt.Sprint(pid))
++		require.NoError(t, os.Mkdir(dir, 0700))
++		stat := fmt.Sprintf("%d (test process) S %d%s\n", pid, ppid, strings.Repeat(" 0", 48))
++		require.NoError(t, os.WriteFile(filepath.Join(dir, "stat"), []byte(stat), 0600))
++	}
++	// A process whose stat has disappeared must not fail the whole enumeration.
++	missingPid := startProcess()
++	require.NoError(t, os.Mkdir(filepath.Join(root, fmt.Sprint(missingPid)), 0700))
++	// Likewise, skip a process whose stat cannot be read due to permissions.
++	inaccessiblePid := startProcess()
++	dir := filepath.Join(root, fmt.Sprint(inaccessiblePid))
++	require.NoError(t, os.Mkdir(dir, 0700))
++	require.NoError(t, os.WriteFile(filepath.Join(dir, "stat"), []byte(fmt.Sprintf("%d (inaccessible) S %d%s\n", inaccessiblePid, rootPid, strings.Repeat(" 0", 48))), 0000))
++	pids, err := pidsInTree(os.Getpid())
++	require.NoError(t, err)
++	require.Len(t, pids, 3)
++	for _, pid := range []int{rootPid, childPid, grandchildPid} {
++		require.True(t, pids.Contains(pid))
++	}
++}
++
++func TestProcessEnumerationError(t *testing.T) {
++	t.Setenv("HOST_PROC", filepath.Join(t.TempDir(), "missing"))
++	_, err := pidsInTree(os.Getpid())
++	require.Error(t, err)
++}
+diff --git a/enterprise/server/util/procstats/procstats.go b/enterprise/server/util/procstats/procstats.go
+index e7e6cdf38..a5960580b 100644
+--- a/enterprise/server/util/procstats/procstats.go
++++ b/enterprise/server/util/procstats/procstats.go
+@@ -6,7 +6,6 @@ import (
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/lib/set"
+ 
+ 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
+-	ps "github.com/mitchellh/go-ps"
+ 	procutil "github.com/shirou/gopsutil/v3/process"
+ )
+ 
+@@ -178,15 +177,20 @@ func statTree(pid int) (map[int]*repb.UsageStats, error) {
+ // to use this process-tree accounting for resident memory; see
+ // enterprise/server/remote_execution/commandutil/commandutil_windows.go.
+ func pidsInTree(pid int) (set.Set[int], error) {
+-	procs, err := ps.Processes()
++	procs, err := procutil.Processes()
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	children := make(map[int][]int, len(procs))
+ 	for _, p := range procs {
+-		ppid := p.PPid()
++		parentPid, err := p.Ppid()
++		if err != nil {
++			// Processes may exit or become inaccessible during enumeration.
++			continue
++		}
++		ppid := int(parentPid)
+ 		c := children[ppid]
+-		c = append(c, p.Pid())
++		c = append(c, int(p.Pid))
+ 		children[ppid] = c
+ 	}
+ 	pidsVisited := make(set.Set[int])

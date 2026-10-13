@@ -1,0 +1,128 @@
+diff --git a/enterprise/server/test/integration/workflow/workflow_test.go b/enterprise/server/test/integration/workflow/workflow_test.go
+index bed92dddf..bf4d32e85 100644
+--- a/enterprise/server/test/integration/workflow/workflow_test.go
++++ b/enterprise/server/test/integration/workflow/workflow_test.go
+@@ -299,15 +299,20 @@ func triggerLegacyWebhook(t *testing.T, gitProvider *testgit.FakeProvider, workf
+ 	workflowService.ServeHTTP(testhttp.NewResponseWriter(t), req)
+ }
+ 
++// Preserve the original backoff sleep budget: 50ms + 100ms + ... + 51.2s.
++const workflowPollTimeout = 102350 * time.Millisecond
++
+ func waitForAnyWorkflowInvocationCreated(t *testing.T, ctx context.Context, bb bbspb.BuildBuddyServiceClient, reqCtx *ctxpb.RequestContext, excludeInvocationIDs ...string) string {
+ 	excluded := set.From(excludeInvocationIDs...)
+ 
+-	for delay := 50 * time.Millisecond; delay < 1*time.Minute; delay *= 2 {
++	deadline := time.Now().Add(workflowPollTimeout)
++	for delay := 50 * time.Millisecond; time.Now().Before(deadline); delay = min(2*delay, 100*time.Millisecond) {
+ 		searchResp, err := bb.SearchInvocation(ctx, &inpb.SearchInvocationRequest{
+ 			RequestContext: reqCtx,
+ 			Query:          &inpb.InvocationQuery{GroupId: reqCtx.GetGroupId()},
+ 		})
+ 		if err != nil && strings.Contains(err.Error(), "not found") {
++			time.Sleep(min(delay, time.Until(deadline)))
+ 			continue
+ 		}
+ 		require.NoError(t, err)
+@@ -321,7 +326,7 @@ func waitForAnyWorkflowInvocationCreated(t *testing.T, ctx context.Context, bb b
+ 			}
+ 		}
+ 
+-		time.Sleep(delay)
++		time.Sleep(min(delay, time.Until(deadline)))
+ 	}
+ 
+ 	require.FailNowf(t, "timeout", "Timed out waiting for workflow invocation to be created")
+@@ -329,7 +334,8 @@ func waitForAnyWorkflowInvocationCreated(t *testing.T, ctx context.Context, bb b
+ }
+ 
+ func waitForInvocationStatus(t *testing.T, ctx context.Context, bb bbspb.BuildBuddyServiceClient, reqCtx *ctxpb.RequestContext, invocationID string, expectedStatus inspb.InvocationStatus) *inpb.Invocation {
+-	for delay := 50 * time.Millisecond; delay < 1*time.Minute; delay *= 2 {
++	deadline := time.Now().Add(workflowPollTimeout)
++	for delay := 50 * time.Millisecond; time.Now().Before(deadline); delay = min(2*delay, 100*time.Millisecond) {
+ 		inv := getInvocation(t, ctx, bb, reqCtx, invocationID, false /*fetchChildren*/)
+ 		status := inv.GetInvocationStatus()
+ 
+@@ -344,7 +350,7 @@ func waitForInvocationStatus(t *testing.T, ctx context.Context, bb bbspb.BuildBu
+ 			return inv
+ 		}
+ 
+-		time.Sleep(delay)
++		time.Sleep(min(delay, time.Until(deadline)))
+ 	}
+ 
+ 	require.FailNowf(t, "timeout", "Timed out waiting for invocation to reach expected status %v", expectedStatus)
+@@ -585,7 +591,8 @@ func TestCancel(t *testing.T) {
+ 	// either have completed or been disconnected.
+ 	for _, child := range invWithChildren.ChildInvocations {
+ 		found := false
+-		for delay := 50 * time.Millisecond; delay < 1*time.Minute; delay *= 2 {
++		deadline := time.Now().Add(workflowPollTimeout)
++		for delay := 50 * time.Millisecond; time.Now().Before(deadline); delay = min(2*delay, 100*time.Millisecond) {
+ 			inv := getInvocation(t, ctx, bb, reqCtx, child.InvocationId, false /*fetchChildren*/)
+ 			status := inv.GetInvocationStatus()
+ 
+@@ -593,7 +600,7 @@ func TestCancel(t *testing.T) {
+ 				found = true
+ 				break
+ 			}
+-			time.Sleep(delay)
++			time.Sleep(min(delay, time.Until(deadline)))
+ 		}
+ 
+ 		if !found {
+diff --git a/result.md b/result.md
+new file mode 100644
+index 000000000..f7625ff59
+--- /dev/null
++++ b/result.md
+@@ -0,0 +1,49 @@
++# Workflow polling backoff
++
++Changed only `enterprise/server/test/integration/workflow/workflow_test.go`, plus this requested report. Capped all three polling loops (workflow creation, invocation status, and cancellation child completion) at 100 ms, starting at 50 ms. Each wait uses an elapsed-time deadline and bounds its final sleep by the remaining time. Preserved the original full backoff sleep budget of 102.35 seconds (50 ms + 100 ms + ... + 51.2 s), rather than interpreting the old delay limit as a one-minute timeout. RPC time now counts toward the deadline; in-flight RPCs still use the existing context. The retryable “not found” branch also sleeps to avoid busy polling. All conditions, assertions, scenarios, and six shards remain intact.
++
++## Premise and timing
++
++Source inspection confirmed three exponential polling loops with delays up to 51.2 seconds. The measured saving is real in these runs; it is not a controlled estimate of upstream CI savings.
++
++Used BuildBuddy Remote Bazel throughout; no local test fallback was needed. The CLI was initially absent and was installed outside the repository. Configured origin fetch to the public fork and retained the internal mirror as the push URL, as requested. No pushes or PRs.
++
++First baseline command: `bb remote test //enterprise/server/test/integration/workflow:workflow_test --runs_per_test=5 --nocache_test_results`. It passed; Bazel elapsed time was 404.785 s, including compilation. [Initial runner](https://app.buildbuddy.io/invocation/91a81aac-555e-4943-b9e8-e14f160876a3).
++
++For the comparable before/after measurements, used the same remote script on each version: run `bazel test //enterprise/server/test/integration/workflow:workflow_test --runs_per_test=5 --nocache_test_results`, then parse every `bazel-testlogs/enterprise/server/test/integration/workflow/workflow_test/**/test.xml` with Python ElementTree. Both produced 30 XML files (six shards × five runs), containing 45 case executions.
++
++| Metric (seconds) | Before | After |
++| --- | ---: | ---: |
++| Bazel elapsed time, including build | 298.036 | 294.642 |
++| Bazel critical path | 96.19 | 86.35 |
++| Median shard duration (sum of XML testcase times, 30 shards) | 39.160 | 28.845 |
++| Sum of XML testcase durations across five runs | 1068.58 | 786.03 |
++| Median slowest shard per repetition | 63.23 | 44.41 |
++
++Median shard duration improved by 10.315 s; median slowest shard improved by 18.82 s. Runner provisioning, compilation, cache state, and shared remote load affect end-to-end times. Five repeats show variability, so these numbers do not establish a precise universal saving or eliminate flakiness risk.
++
++[Before runner](https://app.buildbuddy.io/invocation/183a5dc5-7add-4138-862c-019e2b1ebbb9) · [Before Bazel](https://app.buildbuddy.io/invocation/40e0355e-1569-49d1-9f2c-36e08de52323)
++
++[After runner](https://app.buildbuddy.io/invocation/3b258102-9c73-4e95-a6d9-d44a67ce9b76) · [After Bazel](https://app.buildbuddy.io/invocation/b4123f6e-0368-4d46-bbcc-f6ce1123619b)
++
++## Before and after test-case lists and repeated outcomes
++
++The following lists come from the test XML, not source enumeration. The before and after case sets are identical. Each row passed 5/5 before and 5/5 after; neither version had failures, errors, or skips. The initial baseline additionally passed five repetitions. Timings below are median XML testcase durations.
++
++| Before case | After case | Before (s), passes | After (s), passes |
++| --- | --- | ---: | ---: |
++| TestBazelUseCLI | TestBazelUseCLI | 28.53, 5/5 | 22.58, 5/5 |
++| TestCancel | TestCancel | 12.02, 5/5 | 8.21, 5/5 |
++| TestCancelOlderRunsOnSameBranch | TestCancelOlderRunsOnSameBranch | 61.03, 5/5 | 34.27, 5/5 |
++| TestCancelOlderRunsOnSameBranch_MultipleWorkflows | TestCancelOlderRunsOnSameBranch_MultipleWorkflows | 23.18, 5/5 | 16.97, 5/5 |
++| TestExecuteAsync | TestExecuteAsync | 5.86, 5/5 | 6.95, 5/5 |
++| TestExecuteWorkflow | TestExecuteWorkflow | 20.12, 5/5 | 21.11, 5/5 |
++| TestInvalidYAML | TestInvalidYAML | 1.19, 5/5 | 1.55, 5/5 |
++| TestTriggerLegacyWorkflowViaWebhook | TestTriggerLegacyWorkflowViaWebhook | 28.16, 5/5 | 18.78, 5/5 |
++| TestTriggerViaWebhook | TestTriggerViaWebhook | 31.29, 5/5 | 25.70, 5/5 |
++
++Both comparable invocations exited 0 and reported “Executed 1 out of 1 test: 1 test passes.” Overall changed-version result: 30/30 shard runs and 45/45 case executions passed. `gofmt` and `git diff --check` also passed.
++
++## Scope and limitations
++
++Did not shorten the full wait budget, remove scenarios, change assertions, change sharding, add sleeps to successful paths, or edit dependency/build/CI files. Did not add tests that mirror the loop implementation; repeated execution of the existing integration cases exercised the behavior. This report is the explicitly requested exception to the single-source-file edit scope. No local timings were collected.

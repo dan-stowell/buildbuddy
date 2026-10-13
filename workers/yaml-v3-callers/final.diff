@@ -1,0 +1,123 @@
+diff --git a/result.md b/result.md
+new file mode 100644
+index 000000000..65a49200b
+--- /dev/null
++++ b/result.md
+@@ -0,0 +1,117 @@
++# yaml.v2 migration survey: stopped to preserve behavior
++
++No callers were migrated. The seven import edges exist, and yaml.v3 is already
++present, but substituting v3 does not preserve the existing buildbuddy.yaml parse
++contract. Following the instruction to stop rather than force a behavior-changing
++change, this commit records the survey only.
++
++## Verified behavior
++
++Compared the repository's exact versions, yaml.v2 v2.4.0 and yaml.v3 v3.0.1,
++using a standalone Go program outside the repository. The probe used structured
++config/action/resource-request fields matching the workflow parser, including
++`*time.Duration` and `any`. Both libraries used non-strict `Unmarshal`, as
++`config.NewConfig` does. Results:
++
++| YAML input | v2 | v3 |
++| --- | --- | --- |
++| Empty input or `---` | Empty config, no error | Same |
++| Unknown top-level field alongside actions | Ignored, no error | Same |
++| `resource_requests: {cpu: 1, memory: 1.5}` | `int(1)`, `float64(1.5)` | Same |
++| `resource_requests: {disk: {size: 1}}` | `map[interface{}]interface{}` | `map[string]interface{}` |
++| `resource_requests: {cpu: on}` | `bool(true)` | `string("on")` |
++| `resource_requests: {memory: 2026-10-12}` | `string("2026-10-12")` | `time.Time` |
++| `actions: [{name: first, name: last}]` | Accepted; name is `last` | Error: mapping key already defined |
++| `actions: [{timeout: 1000}]` | Accepted; timeout is 1 microsecond | Error: cannot unmarshal `!!int` into `time.Duration` |
++
++These are observable differences. For example, `GetEstimatedCPU` returns an empty
++string for v2's boolean `on`, but would return `"on"` for v3's string; the date
++case changes `GetEstimatedMemory` in the opposite direction. Duplicate keys and
++numeric durations turn previously accepted workflows into errors. Existing
++workflow tests cover basic configs, multiline commands and invalid YAML, but do
++not cover these compatibility cases.
++
++Preservation may be possible with a separately implemented and validated v2
++compatibility layer; this survey does not claim it is mathematically impossible.
++An import/BUILD substitution alone is demonstrably insufficient. In particular,
++v3's duplicate-key check is enabled internally without a public decoder option to
++disable it. Simply choosing non-strict decoding does not restore v2 behavior.
++I did not introduce a new compatibility decoder while reporting this as a
++dependency simplification, or silently narrow the accepted input contract.
++
++## Before / after
++
++Ran the same commands before and after the survey:
++
++```sh
++rg -l 'gopkg.in/yaml.v2' --glob '*.go' | wc -l
++rg -l '@in_gopkg_yaml_v2//:yaml_v2' --glob BUILD | wc -l
++```
++
++| Metric | Before | After |
++| --- | ---: | ---: |
++| First-party Go source files importing yaml.v2 | 8 | 8 |
++| BUILD files declaring the yaml.v2 external label | 8 | 8 |
++| In-scope importing source files / BUILD files | 7 / 7 | 7 / 7 |
++| Removed import edges / targets | 0 / 0 | 0 / 0 |
++| Production source LOC changed | 0 | 0 |
++
++The eighth importer is `cli/translate/yaml`, which was left untouched. No external
++module became unused. The grep evidence above still shows eight first-party
++yaml.v2 users. No binary-size or build-time savings are claimed.
++
++## Verification commands
++
++The standalone comparison ran successfully (exit 0):
++
++```sh
++mkdir -p /tmp/yaml-migration-survey
++cd /tmp/yaml-migration-survey
++go mod init yaml-survey
++go get gopkg.in/yaml.v2@v2.4.0 gopkg.in/yaml.v3@v3.0.1
++# main.go contains the structured comparison described below.
++go run .
++```
++
++For reproduction, use these types with both libraries' `Unmarshal`, and compare
++the errors and values for each input in the table (wrap resource-request examples
++in `actions: [{resource_requests: ...}]`):
++
++```go
++type Config struct {
++    Actions []Action `yaml:"actions"`
++}
++type Action struct {
++    Name string `yaml:"name"`
++    Timeout *time.Duration `yaml:"timeout"`
++    ResourceRequests ResourceRequests `yaml:"resource_requests"`
++}
++type ResourceRequests struct {
++    CPU any `yaml:"cpu"`
++    Memory any `yaml:"memory"`
++    Disk any `yaml:"disk"`
++}
++```
++
++Probe source and output are at `/tmp/yaml-migration-survey/main.go` and
++`/tmp/yaml-migration-survey/results.txt` on this VM. This was a differential
++decoder experiment, not a repository build or test-suite pass.
++
++No Bazel builds or tests were needed because no source or BUILD target changed.
++The direct-rdeps survey query was launched in the background with `nohup`, logging
++to `/tmp/yaml-rdeps.log`:
++
++```sh
++bazel query 'rdeps(//..., set(//cli/config:config //cli/plugin:plugin //enterprise/server/cmd/ci_runner:ci_runner_lib //enterprise/server/hostedrunner:hostedrunner //enterprise/server/workflow/config:config //enterprise/server/workflow/service:service //enterprise/server/test/integration/ci_runner:ci_runner_test), 1)' --output=label
++```
++
++The query was cancelled with SIGINT during package loading after deciding to stop
++the migration; there are no changed targets needing a reverse-dependency test
++set. It did not produce a completed target list, and no query success is claimed.
++
++## Scope and omissions
++
++Only this explicitly requested report was added outside the package-source scope.
++No shared dependency files, lockfiles, source, tests or BUILD files were edited.
++No golden tests were added because the migration was stopped at the premise
++verification stage. No changes were pushed and no PR was opened.

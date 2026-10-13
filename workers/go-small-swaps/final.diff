@@ -1,0 +1,182 @@
+diff --git a/enterprise/server/crypter_key_cache/BUILD b/enterprise/server/crypter_key_cache/BUILD
+index d9931ee74..f40657181 100644
+--- a/enterprise/server/crypter_key_cache/BUILD
++++ b/enterprise/server/crypter_key_cache/BUILD
+@@ -16,7 +16,6 @@ go_library(
+         "//server/util/status",
+         "//third_party/singleflight",
+         "@com_github_jonboulle_clockwork//:clockwork",
+-        "@org_uber_go_atomic//:atomic",
+     ],
+ )
+ 
+diff --git a/enterprise/server/crypter_key_cache/crypter_key_cache.go b/enterprise/server/crypter_key_cache/crypter_key_cache.go
+index 0a1f7c171..04080ec4a 100644
+--- a/enterprise/server/crypter_key_cache/crypter_key_cache.go
++++ b/enterprise/server/crypter_key_cache/crypter_key_cache.go
+@@ -5,6 +5,7 @@ import (
+ 	"flag"
+ 	"fmt"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/crypter"
+@@ -15,7 +16,6 @@ import (
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+ 	"github.com/buildbuddy-io/buildbuddy/third_party/singleflight"
+ 	"github.com/jonboulle/clockwork"
+-	"go.uber.org/atomic"
+ 
+ 	sgpb "github.com/buildbuddy-io/buildbuddy/proto/storage"
+ )
+@@ -128,9 +128,9 @@ func (c *KeyCache) checkCacheEntry(ck CacheKey, ce *cacheEntry) {
+ 		return
+ 	}
+ 
+-	c.activeRefreshOps.Inc()
++	c.activeRefreshOps.Add(1)
+ 	go func() {
+-		defer c.activeRefreshOps.Dec()
++		defer c.activeRefreshOps.Add(-1)
+ 		ctx, cancel := context.WithTimeout(c.env.GetServerContext(), keyRefreshDeadline)
+ 		defer cancel()
+ 		ce.mu.Lock()
+diff --git a/enterprise/server/scheduling/task_router/BUILD b/enterprise/server/scheduling/task_router/BUILD
+index dda1b4ed4..9aca00e3e 100644
+--- a/enterprise/server/scheduling/task_router/BUILD
++++ b/enterprise/server/scheduling/task_router/BUILD
+@@ -41,6 +41,5 @@ go_test(
+         "@com_github_open_feature_go_sdk//openfeature/testing",
+         "@com_github_open_feature_go_sdk_contrib_providers_flagd//pkg",
+         "@com_github_stretchr_testify//require",
+-        "@org_golang_x_exp//slices",
+     ],
+ )
+diff --git a/enterprise/server/scheduling/task_router/task_router_test.go b/enterprise/server/scheduling/task_router/task_router_test.go
+index a7142d315..295511d88 100644
+--- a/enterprise/server/scheduling/task_router/task_router_test.go
++++ b/enterprise/server/scheduling/task_router/task_router_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"fmt"
+ 	"math"
+ 	"os"
++	"slices"
+ 	"testing"
+ 
+ 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/experiments"
+@@ -20,7 +21,6 @@ import (
+ 	"github.com/open-feature/go-sdk/openfeature"
+ 	"github.com/open-feature/go-sdk/openfeature/memprovider"
+ 	"github.com/stretchr/testify/require"
+-	"golang.org/x/exp/slices"
+ 
+ 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
+ 	flagd "github.com/open-feature/go-sdk-contrib/providers/flagd/pkg"
+diff --git a/enterprise/tools/rbeperf/BUILD b/enterprise/tools/rbeperf/BUILD
+index 6d146eae3..bbbdbc2f9 100644
+--- a/enterprise/tools/rbeperf/BUILD
++++ b/enterprise/tools/rbeperf/BUILD
+@@ -1,6 +1,6 @@
+ load("@io_bazel_rules_docker//container:container.bzl", "container_push")
+ load("@io_bazel_rules_docker//go:image.bzl", "go_image")
+-load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
++load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+ load("@rules_oci//oci:defs.bzl", "oci_image", "oci_push")
+ load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+ 
+@@ -81,3 +81,13 @@ oci_push(
+     remote_tags = "//deployment:oci_tag_file",
+     repository = "gcr.io/flame-build/rbeperf-oci",
+ )
++
++# Compare parsers before changing command-line tokenization.
++go_test(
++    name = "rbeperf_test",
++    srcs = ["rbeperf_test.go"],
++    deps = [
++        "//server/util/shlex",
++        "@com_github_mattn_go_shellwords//:go-shellwords",
++    ],
++)
+diff --git a/enterprise/tools/rbeperf/rbeperf_test.go b/enterprise/tools/rbeperf/rbeperf_test.go
+new file mode 100644
+index 000000000..f69d6d427
+--- /dev/null
++++ b/enterprise/tools/rbeperf/rbeperf_test.go
+@@ -0,0 +1,44 @@
++package main
++
++import (
++	"reflect"
++	"testing"
++
++	"github.com/buildbuddy-io/buildbuddy/server/util/shlex"
++	"github.com/mattn/go-shellwords"
++)
++
++func TestParserComparison(t *testing.T) {
++	for _, tc := range []struct {
++		name, input string
++		different   bool
++		wantErr     bool
++	}{
++		{"plain", "echo one two", false, false},
++		{"quotes", `echo 'one two' "three four"`, false, false},
++		{"adjacent_quotes", `echo a'b c'"d"`, false, false},
++		{"escaped_space", `echo one\ two`, false, false},
++		{"escaped_quote", `echo "a\"b"`, false, false},
++		{"double_quote_escape", `echo "a\qb"`, false, false},
++		{"empty_args", `echo '' "" end`, false, false},
++		{"empty_command", "", false, false},
++		{"unclosed_single", `echo 'bad`, false, true},
++		{"unclosed_double", `echo "bad`, false, true},
++		{"trailing_escape", `echo bad\`, false, true},
++		{"semicolon", `echo first; echo second`, true, false},
++		{"comment", `echo first # comment`, true, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			a, ae := shellwords.Parse(tc.input)
++			b, be := shlex.Split(tc.input)
++			if (ae != nil) != tc.wantErr || (be != nil) != tc.wantErr {
++				t.Fatalf("shellwords error=%v, shlex error=%v; want error=%v", ae, be, tc.wantErr)
++			}
++			different := (ae == nil) != (be == nil) || (ae == nil && be == nil && !reflect.DeepEqual(a, b))
++			t.Logf("shellwords=%q err=%v; shlex=%q err=%v", a, ae, b, be)
++			if different != tc.different {
++				t.Errorf("difference=%v, expected %v", different, tc.different)
++			}
++		})
++	}
++}
+diff --git a/server/util/approxlru/BUILD b/server/util/approxlru/BUILD
+index 96f52d193..d81a41f3e 100644
+--- a/server/util/approxlru/BUILD
++++ b/server/util/approxlru/BUILD
+@@ -21,6 +21,5 @@ go_test(
+         ":approxlru",
+         "//server/util/status",
+         "@com_github_stretchr_testify//require",
+-        "@org_golang_x_exp//slices",
+     ],
+ )
+diff --git a/server/util/approxlru/approxlru_test.go b/server/util/approxlru/approxlru_test.go
+index d1c9aaa68..adc136dff 100644
+--- a/server/util/approxlru/approxlru_test.go
++++ b/server/util/approxlru/approxlru_test.go
+@@ -3,6 +3,7 @@ package approxlru_test
+ import (
+ 	"context"
+ 	"math/rand"
++	"slices"
+ 	"strconv"
+ 	"sync"
+ 	"testing"
+@@ -11,7 +12,6 @@ import (
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/approxlru"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+ 	"github.com/stretchr/testify/require"
+-	"golang.org/x/exp/slices"
+ )
+ 
+ type entry struct {

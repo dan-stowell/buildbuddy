@@ -1,0 +1,74 @@
+# Server notification subscriber readiness
+
+Re-verified the premise before editing: `TestPubSub` slept for 3 seconds
+before publishing, and all five baseline executions took 3.02–3.03 seconds.
+`server_notification.go` uses `serverNotifications/` plus the service name;
+the test's two services therefore subscribe to `serverNotifications/app`.
+
+Replaced the fixed sleep with `require.Eventually` polling Redis `PUBSUB NUMSUB`
+every 5ms until that channel has exactly two subscribers. The readiness timeout
+is 10 seconds, allowing slow startup without imposing a delay on successful
+runs. Redis errors do not satisfy readiness. The existing message publication
+and both protobuf equality assertions are unchanged.
+
+## Validation and timing
+
+Both measurements used BuildBuddy Remote Bazel, with identical commands:
+
+```sh
+bb remote test //enterprise/server/server_notification:server_notification_test \
+  --runs_per_test=5 --nocache_test_results --test_output=all
+```
+
+The CLI was initially missing and was installed using the installation script
+documented in `docs/cli.md`. The origin fetch URL was set to the public fork,
+with the push URL kept on the internal mirror, as requested. No local fallback
+was needed.
+
+Per-case times below are Go's `--- PASS: TestPubSub` durations from Bazel test
+output, using the same measurement method before and after:
+
+| Run | Before (seconds) | After (seconds) | Result before / after |
+| --- | ---: | ---: | --- |
+| 1 | 3.03 | 0.03 | PASS / PASS |
+| 2 | 3.02 | 0.03 | PASS / PASS |
+| 3 | 3.03 | 0.04 | PASS / PASS |
+| 4 | 3.03 | 0.03 | PASS / PASS |
+| 5 | 3.03 | 0.03 | PASS / PASS |
+
+Mean case duration: 3.028s before, 0.032s after; saving 2.996s (about 99%).
+The modeled 5.3s target duration was not reproduced as a case duration, but the
+predicted 3-second saving was confirmed. Whole Bazel invocation elapsed time
+was 23.581s before and 17.379s after; this includes build/analysis overhead and
+is not an isolated measurement of the test change.
+
+Before invocation: https://app.buildbuddy.io/invocation/c4eb943f-3fb2-4d0d-a94f-58517be5e039
+
+After invocation: https://app.buildbuddy.io/invocation/9d73e26a-f6a1-4f2c-9425-c4428ddb3431
+
+## Coverage and repeated runs
+
+Complete test-case lists extracted from the Bazel test output:
+
+| Before | After |
+| --- | --- |
+| TestPubSub | TestPubSub |
+
+The sets are identical. Every case passed in each execution: baseline 5/5,
+changed test 5/5, with no failures or skips. The same scenario still verifies
+delivery of the existing invalidation message to both services. Five passing
+runs provide evidence against flakiness, not a guarantee; readiness now checks
+Redis's actual subscriptions instead of assuming startup completes in 3 seconds.
+
+`git diff --check` passed, and the test file was formatted with `gofmt`.
+No production code, build files, dependencies, assertions, or other tests were
+changed. The only file outside the requested test scope is this explicitly
+requested report. No push or PR was performed.
+
+
+---
+Part of a coordinated effort to speed up slow tests while preserving coverage. Reviewed by a fresh-context reviewer before opening.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_01NPAch3p4ukdf3wsrFsi6r3

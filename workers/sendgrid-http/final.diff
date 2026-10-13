@@ -1,0 +1,242 @@
+diff --git a/enterprise/server/backends/email/BUILD b/enterprise/server/backends/email/BUILD
+index b760bebfd..0c01d9a26 100644
+--- a/enterprise/server/backends/email/BUILD
++++ b/enterprise/server/backends/email/BUILD
+@@ -10,9 +10,6 @@ go_library(
+         "//server/http/httpclient",
+         "//server/util/flag",
+         "//server/util/status",
+-        "@com_github_sendgrid_rest//:rest",
+-        "@com_github_sendgrid_sendgrid_go//:sendgrid-go",
+-        "@com_github_sendgrid_sendgrid_go//helpers/mail",
+     ],
+ )
+ 
+diff --git a/enterprise/server/backends/email/email.go b/enterprise/server/backends/email/email.go
+index 9b9054ae0..ec00d9244 100644
+--- a/enterprise/server/backends/email/email.go
++++ b/enterprise/server/backends/email/email.go
+@@ -1,16 +1,15 @@
+ package email
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
++	"io"
+ 	"net/http"
+ 
+ 	"github.com/buildbuddy-io/buildbuddy/server/http/httpclient"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
+ 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+-
+-	sendgridrest "github.com/sendgrid/rest"
+-	sendgrid "github.com/sendgrid/sendgrid-go"
+-	sendgridmail "github.com/sendgrid/sendgrid-go/helpers/mail"
+ )
+ 
+ var (
+@@ -50,7 +49,7 @@ type Message struct {
+ 
+ // Client sends email notifications.
+ type Client struct {
+-	client       *sendgridrest.Client
++	client       *http.Client
+ 	sendgridHost string
+ }
+ 
+@@ -71,7 +70,7 @@ func NewClient(config ClientConfig) *Client {
+ 		httpClient = httpclient.New(nil, "sendgrid")
+ 	}
+ 	return &Client{
+-		client:       &sendgridrest.Client{HTTPClient: httpClient},
++		client:       httpClient,
+ 		sendgridHost: config.SendGridHost,
+ 	}
+ }
+@@ -86,31 +85,61 @@ func (c *Client) Send(ctx context.Context, msg *Message) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	return sendWithClient(ctx, c.client, newRequest(email, c.sendgridHost))
+-}
+-
+-func newRequest(email *sendgridmail.SGMailV3, host string) sendgridrest.Request {
+-	request := sendgrid.GetRequest(*sendgridAPIKey, "/v3/mail/send", host)
+-	request.Method = sendgridrest.Post
+-	request.Body = sendgridmail.GetRequestBody(email)
+-	return request
+-}
+-
+-func sendWithClient(ctx context.Context, client *sendgridrest.Client, request sendgridrest.Request) error {
+-	resp, err := client.SendWithContext(ctx, request)
++	body, err := json.Marshal(email)
++	if err != nil {
++		return status.UnavailableErrorf("send email through SendGrid: %s", err)
++	}
++	host := c.sendgridHost
++	if host == "" {
++		host = "https://api.sendgrid.com"
++	}
++	request, err := http.NewRequestWithContext(ctx, http.MethodPost, host+"/v3/mail/send", bytes.NewReader(body))
++	if err != nil {
++		return status.UnavailableErrorf("send email through SendGrid: %s", err)
++	}
++	request.Header.Set("Authorization", "Bearer "+*sendgridAPIKey)
++	request.Header.Set("Content-Type", "application/json")
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("User-Agent", "sendgrid/3.16.1;go")
++	resp, err := c.client.Do(request)
+ 	if err != nil {
+ 		return status.UnavailableErrorf("send email through SendGrid: %s", err)
+ 	}
+-	if resp == nil {
+-		return status.UnavailableError("send email through SendGrid: empty response")
++	defer resp.Body.Close()
++	responseBody, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return status.UnavailableErrorf("send email through SendGrid: %s", err)
+ 	}
+ 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+-		return status.UnavailableErrorf("SendGrid returned HTTP %d: %s", resp.StatusCode, resp.Body)
++		return status.UnavailableErrorf("SendGrid returned HTTP %d: %s", resp.StatusCode, responseBody)
+ 	}
+ 	return nil
+ }
+ 
+-func buildEmail(msg *Message) (*sendgridmail.SGMailV3, error) {
++// These types describe the subset of the SendGrid mail API used here.
++// Names are omitted when empty, matching the previous SDK encoding.
++type mailAddress struct {
++	Name  string `json:"name,omitempty"`
++	Email string `json:"email,omitempty"`
++}
++
++type personalization struct {
++	To []mailAddress `json:"to"`
++}
++
++type content struct {
++	Type  string `json:"type"`
++	Value string `json:"value"`
++}
++
++type mailRequest struct {
++	From             mailAddress       `json:"from"`
++	Subject          string            `json:"subject"`
++	Personalizations []personalization `json:"personalizations"`
++	Content          []content         `json:"content"`
++}
++
++func buildEmail(msg *Message) (*mailRequest, error) {
+ 	if msg == nil {
+ 		return nil, status.InvalidArgumentError("message is required")
+ 	}
+@@ -137,15 +166,14 @@ func buildEmail(msg *Message) (*sendgridmail.SGMailV3, error) {
+ 		return nil, status.InvalidArgumentError("body is required")
+ 	}
+ 
+-	email := sendgridmail.NewV3Mail()
+-	email.SetFrom(toSendGridAddress(from))
+-	email.Subject = msg.Subject
+-	email.AddContent(sendgridmail.NewContent("text/html", msg.Body))
+-
++	email := &mailRequest{
++		From:    toMailAddress(from),
++		Subject: msg.Subject,
++		Content: []content{{Type: "text/html", Value: msg.Body}},
++	}
+ 	for _, recipient := range recipients {
+-		personalization := sendgridmail.NewPersonalization()
+-		personalization.AddTos(toSendGridAddress(recipient))
+-		email.AddPersonalizations(personalization)
++		// Separate personalizations keep recipients private from one another.
++		email.Personalizations = append(email.Personalizations, personalization{To: []mailAddress{toMailAddress(recipient)}})
+ 	}
+ 
+ 	return email, nil
+@@ -155,6 +183,6 @@ func defaultFrom() Address {
+ 	return *defaultFromAddress
+ }
+ 
+-func toSendGridAddress(address Address) *sendgridmail.Email {
+-	return sendgridmail.NewEmail(address.Name, address.Email)
++func toMailAddress(address Address) mailAddress {
++	return mailAddress(address)
+ }
+diff --git a/enterprise/server/backends/email/email_test.go b/enterprise/server/backends/email/email_test.go
+index 606b418fa..a6a498914 100644
+--- a/enterprise/server/backends/email/email_test.go
++++ b/enterprise/server/backends/email/email_test.go
+@@ -1,6 +1,7 @@
+ package email_test
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"encoding/json"
+ 	"io"
+@@ -112,6 +113,28 @@ func TestSend(t *testing.T) {
+ 			wantErr:      "SendGrid returned HTTP 500: nope",
+ 			wantRequests: []capturedRequest{validRequest},
+ 		},
++		{
++			name:         "accepts HTTP 200",
++			message:      validMessage,
++			statusCode:   http.StatusOK,
++			wantRequests: []capturedRequest{validRequest},
++		},
++		{
++			name:         "rejects HTTP 300",
++			message:      validMessage,
++			statusCode:   http.StatusMultipleChoices,
++			responseBody: "unexpected redirect",
++			wantErr:      "SendGrid returned HTTP 300: unexpected redirect",
++			wantRequests: []capturedRequest{validRequest},
++		},
++		{
++			name:         "returns authentication failure",
++			message:      validMessage,
++			statusCode:   http.StatusUnauthorized,
++			responseBody: "invalid key",
++			wantErr:      "SendGrid returned HTTP 401: invalid key",
++			wantRequests: []capturedRequest{validRequest},
++		},
+ 		{
+ 			name:       "requires message",
+ 			statusCode: http.StatusAccepted,
+@@ -199,6 +222,23 @@ func TestSend(t *testing.T) {
+ 	}
+ }
+ 
++func TestSendCanceledContext(t *testing.T) {
++	flags.Set(t, "notifications.email.sendgrid.api_key", "test-api-key")
++	server := runFakeSendgridServer(t, http.StatusAccepted, "")
++	client := email.NewClient(email.ClientConfig{HTTPClient: server.httpClient, SendGridHost: server.url})
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	err := client.Send(ctx, &email.Message{
++		From:        email.Address{Email: "sender@example.com"},
++		ToAddresses: []email.Address{{Email: "recipient@example.com"}},
++		Subject:     "Build complete",
++		Body:        "<p>Done</p>",
++	})
++	require.ErrorContains(t, err, "send email through SendGrid:")
++	require.ErrorContains(t, err, "context canceled")
++	require.Empty(t, server.capturedRequests)
++}
++
+ type capturedRequest struct {
+ 	request     string
+ 	auth        string
+@@ -257,7 +297,9 @@ func (s *fakeSendgridServer) ServeHTTP(w http.ResponseWriter, req *http.Request)
+ 	body, err := io.ReadAll(req.Body)
+ 	require.NoError(s.t, err)
+ 	var payload sendgridPayload
+-	require.NoError(s.t, json.Unmarshal(body, &payload))
++	decoder := json.NewDecoder(bytes.NewReader(body))
++	decoder.DisallowUnknownFields()
++	require.NoError(s.t, decoder.Decode(&payload))
+ 	s.capturedRequests = append(s.capturedRequests, capturedRequest{
+ 		request:     req.Method + " " + req.URL.Path,
+ 		auth:        req.Header.Get("Authorization"),

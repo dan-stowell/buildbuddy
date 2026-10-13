@@ -1,0 +1,312 @@
+diff --git a/enterprise/server/hit_tracker_client/hit_tracker_client_test.go b/enterprise/server/hit_tracker_client/hit_tracker_client_test.go
+index ee728f0d6..806ac65b2 100644
+--- a/enterprise/server/hit_tracker_client/hit_tracker_client_test.go
++++ b/enterprise/server/hit_tracker_client/hit_tracker_client_test.go
+@@ -157,6 +157,7 @@ func (ht *testHitTracker) casDownloadExpectation(key string, expectation int64)
+ }
+ 
+ func setup(t testing.TB) (interfaces.Authenticator, *HitTrackerFactory, *testHitTracker) {
++	flags.Set(t, "cache_proxy.remote_hit_tracker.update_interval", 10*time.Millisecond)
+ 	return setupWithClock(t, nil)
+ }
+ 
+@@ -235,7 +236,7 @@ func TestACHitTracker_SkipRemote(t *testing.T) {
+ 	hitTracker.TrackUpload(cDigest).CloseWithBytesTransferred(3000, 4000, repb.Compressor_IDENTITY, "test")
+ 
+ 	expectation := hitTrackerService.acDownloadExpectation(anonKey, 1)
+-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond)
++	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond)
+ 	require.Equal(t, int64(2000), hitTrackerService.acBytesDownloaded[anonKey].Load())
+ 	require.Equal(t, int64(1), hitTrackerService.acUploads[anonKey].Load())
+ 	require.Equal(t, int64(4000), hitTrackerService.acBytesUploaded[anonKey].Load())
+@@ -252,7 +253,7 @@ func TestCASHitTracker(t *testing.T) {
+ 	hitTracker.TrackUpload(cDigest).CloseWithBytesTransferred(3000, 4000, repb.Compressor_IDENTITY, "test")
+ 
+ 	expectation := hitTrackerService.casDownloadExpectation(anonKey, 1)
+-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond)
++	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond)
+ 	require.Equal(t, int64(2000), hitTrackerService.casBytesDownloaded[anonKey].Load())
+ 	// By default, we don't expect CAS upload tracking
+ 	require.Equal(t, int64(0), hitTrackerService.casUploads[anonKey].Load())
+@@ -267,7 +268,7 @@ func TestCASHitTracker_SkipRemote(t *testing.T) {
+ 	hitTracker.TrackUpload(cDigest).CloseWithBytesTransferred(3000, 4000, repb.Compressor_IDENTITY, "test")
+ 
+ 	expectation := hitTrackerService.casDownloadExpectation(anonKey, 1)
+-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond)
++	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond)
+ 	require.Equal(t, int64(2000), hitTrackerService.casBytesDownloaded[anonKey].Load())
+ 	require.Equal(t, int64(1), hitTrackerService.casUploads[anonKey].Load(), "Expected 1 HitTracker.Track upload")
+ 	require.Equal(t, int64(4000), hitTrackerService.casBytesUploaded[anonKey].Load())
+@@ -281,7 +282,7 @@ func TestCASHitTracker_NoDeduplication(t *testing.T) {
+ 	hitTracker.TrackDownload(aDigest).CloseWithBytesTransferred(1000, 2000, repb.Compressor_IDENTITY, "test")
+ 
+ 	expectation := hitTrackerService.casDownloadExpectation(anonKey, 2)
+-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond)
++	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond)
+ 	require.Equal(t, int64(4000), hitTrackerService.casBytesDownloaded[anonKey].Load())
+ }
+ 
+@@ -322,22 +323,22 @@ func TestCASHitTracker_SplitsUpdates(t *testing.T) {
+ 
+ 	// Expect 10x [A, B, C, D, E] for ANON.
+ 	expectation := hitTrackerService.casDownloadExpectation(anonKey, 50)
+-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond, "Expected 50 updates for group ANON")
++	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond, "Expected 50 updates for group ANON")
+ 	require.Equal(t, int64(222_220), hitTrackerService.casBytesDownloaded[anonKey].Load())
+ 
+ 	// Group 1's update shouldn't be affected by ANON's batching
+ 	expectation = hitTrackerService.casDownloadExpectation(group1Key, 2)
+-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond, "Expected 2 external cache hits for group 1")
++	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond, "Expected 2 external cache hits for group 1")
+ 	require.Equal(t, int64(4_000_000), hitTrackerService.casBytesDownloaded[group1Key].Load())
+ 
+ 	// Group 1's update that claims to be 'internal' should be separate from its non-internal update.
+ 	expectation = hitTrackerService.casDownloadExpectation(group1InternalKey, 2)
+-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond, "Expected 2 internal cache hits for group 1")
++	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond, "Expected 2 internal cache hits for group 1")
+ 	require.Equal(t, int64(2_000_002), hitTrackerService.casBytesDownloaded[group1InternalKey].Load())
+ 
+ 	// Same for Group 1's update that claims to be 'bazel' and 'internal'.
+ 	expectation = hitTrackerService.casDownloadExpectation(group1InternalBazelKey, 1)
+-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond, "Expected 1 internal bazel cache hit for group 1")
++	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond, "Expected 1 internal bazel cache hit for group 1")
+ 	require.Equal(t, int64(2_030_000), hitTrackerService.casBytesDownloaded[group1InternalBazelKey].Load())
+ }
+ 
+@@ -370,12 +371,12 @@ func TestCASHitTracker_DropsUpdates(t *testing.T) {
+ 
+ 	// Expect A, B, C, D, E, A, B, C, D, E to be sent for ANON.
+ 	expectation := hitTrackerService.casDownloadExpectation(anonKey, 10)
+-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond, "Expected 10 updates for group ANON")
++	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond, "Expected 10 updates for group ANON")
+ 	require.Equal(t, int64(44_444), hitTrackerService.casBytesDownloaded[anonKey].Load())
+ 
+ 	// Even though group 1's second update came at the end, it should still be sent.
+ 	expectation = hitTrackerService.casDownloadExpectation(group1Key, 2)
+-	require.Eventually(t, expectation, 10*time.Second, 100*time.Millisecond, "Expected 2 cache hits for group 1")
++	require.Eventually(t, expectation, 10*time.Second, 10*time.Millisecond, "Expected 2 cache hits for group 1")
+ 	require.Equal(t, int64(4_000_000), hitTrackerService.casBytesDownloaded[group1Key].Load())
+ }
+ 
+@@ -427,8 +428,8 @@ func TestCASHitTracker_AcceptsHitsWhileSplitOverflowIsPending(t *testing.T) {
+ 	require.True(t, pendingHitsExpectation(hitTrackerFactory, anonKey, 20)(), "hits enqueued while the split overflow was pending were dropped")
+ 
+ 	resume()
+-	require.Eventually(t, hitTrackerService.casDownloadExpectation(anonKey, 30), 10*time.Second, 100*time.Millisecond, "Expected 30 updates for group ANON")
+-	require.Eventually(t, hitTrackerService.casDownloadExpectation(group1Key, 1), 10*time.Second, 100*time.Millisecond, "Expected 1 update for group 1")
++	require.Eventually(t, hitTrackerService.casDownloadExpectation(anonKey, 30), 10*time.Second, 10*time.Millisecond, "Expected 30 updates for group ANON")
++	require.Eventually(t, hitTrackerService.casDownloadExpectation(group1Key, 1), 10*time.Second, 10*time.Millisecond, "Expected 1 update for group 1")
+ }
+ 
+ // TestBatchAndSendAreSerialized exists for the race detector, which CI runs.
+diff --git a/enterprise/server/remote_execution/container/container_test.go b/enterprise/server/remote_execution/container/container_test.go
+index 4b77d6bfc..03ca284a9 100644
+--- a/enterprise/server/remote_execution/container/container_test.go
++++ b/enterprise/server/remote_execution/container/container_test.go
+@@ -3,6 +3,7 @@ package container_test
+ import (
+ 	"context"
+ 	"fmt"
++	"sync"
+ 	"syscall"
+ 	"testing"
+ 	"time"
+@@ -31,10 +32,20 @@ type FakeContainer struct {
+ 	RequiredPullCredentials oci.Credentials
+ 	PullCount               int
+ 	PullErr                 error
+-	pullDelay               time.Duration
++	pullAttempts            chan struct{}
++	pullStarted             chan struct{}
++	pullRelease             chan struct{}
+ }
+ 
+ func (c *FakeContainer) IsolationType() string {
++	// PullImageIfNecessary calls this before acquiring the image-pull mutex.
++	// Later calls for metrics must not block after the barrier is released.
++	if c.pullAttempts != nil {
++		select {
++		case c.pullAttempts <- struct{}{}:
++		default:
++		}
++	}
+ 	return "fake"
+ }
+ func (c *FakeContainer) Run(context.Context, *repb.Command, string, oci.Credentials) *interfaces.CommandResult {
+@@ -44,8 +55,13 @@ func (c *FakeContainer) IsImageCached(context.Context) (bool, error) {
+ 	return c.PullCount > 0, nil
+ }
+ func (c *FakeContainer) PullImage(ctx context.Context, creds oci.Credentials) error {
+-	if c.pullDelay > 0*time.Second {
+-		time.Sleep(c.pullDelay)
++	if c.pullRelease != nil {
++		c.pullStarted <- struct{}{}
++		select {
++		case <-c.pullRelease:
++		case <-ctx.Done():
++			return ctx.Err()
++		}
+ 	}
+ 	if c.PullErr != nil {
+ 		return c.PullErr
+@@ -250,13 +266,38 @@ func TestPullImageIfNecessary_ParallelCallsSerialized(t *testing.T) {
+ 	env.SetImageCacheAuthenticator(container.NewImageCacheAuthenticator(container.ImageCacheAuthenticatorOpts{}))
+ 	imageRef := "docker.io/some-org/some-image:v1.0.0"
+ 	ctx := userCtx(t, ta, "US1")
+-	c := &FakeContainer{pullDelay: time.Second}
++	c := &FakeContainer{
++		pullAttempts: make(chan struct{}, 20),
++		pullStarted:  make(chan struct{}, 20),
++		pullRelease:  make(chan struct{}),
++	}
++	var releaseOnce sync.Once
++	release := func() { releaseOnce.Do(func() { close(c.pullRelease) }) }
++	t.Cleanup(release)
++	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
++	defer cancel()
+ 
+ 	assert.Equal(t, 0, c.PullCount, "sanity check: pull count should be 0 initially")
+ 	eg := errgroup.Group{}
+ 	for range 20 {
+ 		eg.Go(func() error { return container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, imageRef, false) })
+ 	}
++	// Keep the first pull blocked until all 20 callers have entered the
++	// production pull path, so they contend for the same image-pull mutex.
++	for range 20 {
++		select {
++		case <-c.pullAttempts:
++		case <-ctx.Done():
++			t.Fatal("timed out waiting for all image-pull callers")
++		}
++	}
++	select {
++	case <-c.pullStarted:
++	case <-ctx.Done():
++		t.Fatal("timed out waiting for image pull to start")
++	}
++	// Release all pulls so a serialization regression cannot deadlock the test.
++	release()
+ 	require.NoError(t, eg.Wait())
+ 	assert.Equal(t, 1, c.PullCount, "image should only be pulled once")
+ }
+diff --git a/enterprise/server/test/integration/build_logs/build_logs_test.go b/enterprise/server/test/integration/build_logs/build_logs_test.go
+index efaf8e516..783d49434 100644
+--- a/enterprise/server/test/integration/build_logs/build_logs_test.go
++++ b/enterprise/server/test/integration/build_logs/build_logs_test.go
+@@ -134,7 +134,8 @@ func publishFinished(t *testing.T, bep *build_event_publisher.Publisher) {
+ }
+ 
+ func waitForInvocation(t *testing.T, ctx context.Context, bbClient bbspb.BuildBuddyServiceClient, invocationID string) {
+-	for delay := 1 * time.Microsecond; delay < time.Second; delay *= 2 {
++	deadline := time.Now().Add(2 * time.Second)
++	for delay := time.Microsecond; time.Now().Before(deadline); delay = min(2*delay, 10*time.Millisecond) {
+ 		_, err := bbClient.GetInvocation(ctx, &inpb.GetInvocationRequest{
+ 			Lookup: &inpb.InvocationLookup{InvocationId: invocationID},
+ 		})
+@@ -144,7 +145,7 @@ func waitForInvocation(t *testing.T, ctx context.Context, bbClient bbspb.BuildBu
+ 		if !status.IsNotFoundError(err) && !strings.Contains(err.Error(), "not found") {
+ 			require.FailNowf(t, "wait for invocation", "Error while waiting for invocation: %s", err)
+ 		}
+-		time.Sleep(delay)
++		time.Sleep(min(delay, time.Until(deadline)))
+ 	}
+ 	require.FailNowf(t, "timed out", "Timed out waiting for invocation %q to be created", invocationID)
+ }
+@@ -156,12 +157,13 @@ func getLogs(t *testing.T, ctx context.Context, log *invocationLog) string {
+ }
+ 
+ func waitForLogsToEqual(t *testing.T, ctx context.Context, log *invocationLog, expected string) {
+-	for delay := 1 * time.Microsecond; delay < time.Second; delay *= 2 {
++	deadline := time.Now().Add(2 * time.Second)
++	for delay := time.Microsecond; time.Now().Before(deadline); delay = min(2*delay, 10*time.Millisecond) {
+ 		logs := getLogs(t, ctx, log)
+ 		if logs == expected {
+ 			return
+ 		}
+-		time.Sleep(delay)
++		time.Sleep(min(delay, time.Until(deadline)))
+ 	}
+ 
+ 	// One last attempt, showing a nice diff if it fails.
+diff --git a/enterprise/server/workflow/service/service_test.go b/enterprise/server/workflow/service/service_test.go
+index ac39a20fb..9c4420281 100644
+--- a/enterprise/server/workflow/service/service_test.go
++++ b/enterprise/server/workflow/service/service_test.go
+@@ -1764,13 +1764,11 @@ actions:
+     bazel_commands: ["test //..."]
+ `)
+ 
+-	time.Sleep(1 * time.Second)
+-
+ 	var runs []*tables.ScheduledRun
+ 	require.Eventually(t, func() bool {
+ 		runs = listScheduledRuns(t, te, gid, repoURL)
+ 		return len(runs) == 1
+-	}, 1*time.Second, 100*time.Millisecond)
++	}, 1*time.Second, 10*time.Millisecond)
+ 	require.Equal(t, "Hourly", runs[0].ActionName)
+ 	require.Equal(t, "0 * * * *", runs[0].CronExpr)
+ 	require.Equal(t, threePM.Add(1*time.Hour).UnixMicro(), runs[0].NextRunUsec)
+@@ -1807,7 +1805,7 @@ actions:
+ 	require.Eventually(t, func() bool {
+ 		runs = listScheduledRuns(t, te, gid, repoURL)
+ 		return len(runs) == 4
+-	}, 1*time.Second, 100*time.Millisecond)
++	}, 1*time.Second, 10*time.Millisecond)
+ 
+ 	// Should be triggered daily at 4PM.
+ 	run1 := runs[0]
+@@ -1896,7 +1894,7 @@ actions:
+ 	require.Eventually(t, func() bool {
+ 		runs = listScheduledRuns(t, te, gid, repoURL)
+ 		return len(runs) == 1
+-	}, 1*time.Second, 100*time.Millisecond)
++	}, 1*time.Second, 10*time.Millisecond)
+ 	require.Equal(t, "Nightly", runs[0].ActionName)
+ 	require.Equal(t, "0 0 * * *", runs[0].CronExpr)
+ }
+@@ -1961,7 +1959,7 @@ actions:
+ 	require.Eventually(t, func() bool {
+ 		runs = listScheduledRuns(t, te, gid, repoURL)
+ 		return len(runs) == 2
+-	}, 1*time.Second, 100*time.Millisecond)
++	}, 1*time.Second, 10*time.Millisecond)
+ 
+ 	// Based on the most recent config push, there should be a scheduled run at 4PM.
+ 	run1 := runs[0]
+@@ -2029,7 +2027,7 @@ actions:
+ 	require.Eventually(t, func() bool {
+ 		runs = listScheduledRuns(t, te, gid, repoURL)
+ 		return len(runs) == 1
+-	}, 1*time.Second, 100*time.Millisecond)
++	}, 1*time.Second, 10*time.Millisecond)
+ 
+ 	run := runs[0]
+ 	require.Equal(t, "Schedule", run.ActionName)
+@@ -2091,7 +2089,7 @@ actions:
+ 	require.Eventually(t, func() bool {
+ 		runs = listScheduledRuns(t, te, gid, repoURL)
+ 		return len(runs) == 1
+-	}, 1*time.Second, 100*time.Millisecond)
++	}, 1*time.Second, 10*time.Millisecond)
+ 
+ 	run := runs[0]
+ 	require.Equal(t, "Schedule", run.ActionName)
+@@ -2121,7 +2119,7 @@ actions:
+ 	// Wait for scheduled runs to be created.
+ 	require.Eventually(t, func() bool {
+ 		return len(listScheduledRuns(t, te, gid, repoURL)) == 1
+-	}, 1*time.Second, 100*time.Millisecond)
++	}, 1*time.Second, 10*time.Millisecond)
+ 
+ 	// Simulate the user deleting their buildbuddy.yaml file.
+ 	provider.FileContents = map[string]string{}
+@@ -2142,7 +2140,7 @@ actions:
+ 	// The previously created scheduled run should be deleted.
+ 	require.Eventually(t, func() bool {
+ 		return len(listScheduledRuns(t, te, gid, repoURL)) == 0
+-	}, 1*time.Second, 100*time.Millisecond)
++	}, 1*time.Second, 10*time.Millisecond)
+ }
+ func TestScheduledWorkflows_ConfigValidation_InvalidCron(t *testing.T) {
+ 	ctx := context.Background()
