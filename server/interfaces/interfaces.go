@@ -15,6 +15,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
 	"github.com/buildbuddy-io/buildbuddy/server/usage/sku"
 	"github.com/buildbuddy-io/buildbuddy/server/util/clickhouse/schema"
+	"github.com/buildbuddy-io/buildbuddy/server/util/healthcheck/checker"
 	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
 	"github.com/golang-jwt/jwt/v4"
@@ -1470,17 +1471,8 @@ type RepoDownloader interface {
 	TestRepoAccess(ctx context.Context, repoURL, username, accessToken string) error
 }
 
-type Checker interface {
-	// Returns nil on success, error on failure. Returning an error will
-	// indicate to the health checker that this service is unhealthy and
-	// that the server is not ready to serve.
-	Check(ctx context.Context) error
-}
-type CheckerFunc func(ctx context.Context) error
-
-func (f CheckerFunc) Check(ctx context.Context) error {
-	return f(ctx)
-}
+type Checker = checker.Checker
+type CheckerFunc = checker.CheckerFunc
 
 type HealthChecker interface {
 	// AddHealthCheck adds a healthcheck -- the server's readiness is dependent on all
