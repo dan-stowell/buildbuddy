@@ -440,7 +440,8 @@ actions:
 }
 
 func TestCIRunner_RunsBashCommands_BazelWithOptions(t *testing.T) {
-	wsPath := testfs.MakeTempDir(t)
+	// Start the app once so each runner can use it as the BES backend.
+	app := buildbuddy.Run(t)
 
 	testCases := []struct {
 		name            string
@@ -464,6 +465,7 @@ func TestCIRunner_RunsBashCommands_BazelWithOptions(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			wsPath := testfs.MakeTempDir(t)
 			workspaceContents := map[string]string{
 				"BUILD": `load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 sh_binary(name = "print_args", srcs = ["print_args.sh"])`,
@@ -483,8 +485,6 @@ actions:
 				"--pushed_repo_url=file://" + repoPath,
 				"--pushed_branch=master",
 			}
-			// Start the app so the runner can use it as the BES backend.
-			app := buildbuddy.Run(t)
 			runnerFlags = append(runnerFlags, app.BESBazelFlags()...)
 
 			result := invokeRunner(t, runnerFlags, []string{}, wsPath)
@@ -1254,6 +1254,9 @@ func TestCIRunner_IgnoresInvalidFlags(t *testing.T) {
 }
 
 func TestRunAction_RespectsCommitSha(t *testing.T) {
+	// Start the app once so each runner can use it as the BES backend.
+	app := buildbuddy.Run(t)
+
 	testCases := []struct {
 		setBranchName bool
 	}{
@@ -1277,8 +1280,6 @@ func TestRunAction_RespectsCommitSha(t *testing.T) {
 				"--pushed_repo_url=file://" + repoPath,
 				"--target_repo_url=file://" + repoPath,
 			}
-			// Start the app so the runner can use it as the BES backend.
-			app := buildbuddy.Run(t)
 			baselineRunnerFlags = append(baselineRunnerFlags, app.BESBazelFlags()...)
 			if tc.setBranchName {
 				baselineRunnerFlags = append(baselineRunnerFlags, "--pushed_branch=master", "--target_branch=master")
