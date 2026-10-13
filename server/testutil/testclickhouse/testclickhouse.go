@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -20,6 +22,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/retry"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -77,7 +80,11 @@ func init() {
 
 // Configure starts ClickHouse and registers its database handle with env.
 func Configure(t testing.TB, env *real_environment.RealEnv) {
-	flags.Set(t, "olap_database.data_source", GetOrStart(t))
+	configure(t, env, GetOrStart(t))
+}
+
+func configure(t testing.TB, env *real_environment.RealEnv, target string) {
+	flags.Set(t, "olap_database.data_source", target)
 	// Cleanups run in reverse order. Finish OLAP shutdown hooks before Start's
 	// cleanup stops the server, even if testenv was created before Configure.
 	t.Cleanup(func() {
@@ -107,17 +114,99 @@ func GetOrStart(t testing.TB) string {
 
 // Start creates an isolated server which is stopped when the test completes.
 func Start(t testing.TB) string {
-	const dbName = "buildbuddy_test"
+	return createDatabase(t, startServer(t, t.TempDir(), t.Cleanup, 100*time.Millisecond), "buildbuddy_test", false)
+}
 
+// SharedServer owns one lazily started process for a test binary. Use Run in
+// TestMain to ensure the process is reaped, including when a test fails.
+// Configure gives each test its own database and runs the normal migrations.
+// Like Configure, it sets process-global flags and must not be used in parallel tests.
+// The zero value is ready to use.
+type SharedServer struct {
+	mu        sync.Mutex
+	target    string
+	databases map[testing.TB]string
+	nextDB    uint64
+	cleanups  []func()
+}
+
+// Run runs the tests and then stops the shared server. In TestMain, call
+// os.Exit(server.Run(m)) so cleanup happens before the process exits.
+func (s *SharedServer) Run(m *testing.M) int {
+	defer func() {
+		for _, cleanup := range slices.Backward(s.cleanups) {
+			cleanup()
+		}
+	}()
+	return m.Run()
+}
+
+// Configure registers a fresh database for t, reusing it on subsequent calls
+// for the same test. Shutdown hooks finish before the database is dropped.
+func (s *SharedServer) Configure(t testing.TB, env *real_environment.RealEnv) {
+	t.Helper()
+	configure(t, env, s.getOrCreateDatabase(t))
+}
+
+func (s *SharedServer) getOrCreateDatabase(t testing.TB) string {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if target := s.databases[t]; target != "" {
+		return target
+	}
+	if s.target == "" {
+		dir, err := os.MkdirTemp("", "testclickhouse-*")
+		require.NoError(t, err)
+		s.cleanups = append(s.cleanups, func() { os.RemoveAll(dir) })
+		s.target = startServer(t, dir, func(f func()) { s.cleanups = append(s.cleanups, f) }, 10*time.Millisecond)
+		s.databases = make(map[testing.TB]string)
+	}
+	s.nextDB++
+	target := createDatabase(t, s.target, fmt.Sprintf("buildbuddy_test_%d", s.nextDB), true)
+	s.databases[t] = target
+	t.Cleanup(func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		delete(s.databases, t)
+	})
+	return target
+}
+
+func createDatabase(t testing.TB, serverTarget, dbName string, drop bool) string {
+	t.Helper()
+	options, err := clickhouse.ParseDSN(serverTarget)
+	require.NoError(t, err)
+	conn, err := clickhouse.Open(options)
+	require.NoError(t, err)
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	require.NoError(t, conn.Exec(ctx, fmt.Sprintf("CREATE DATABASE `%s`", dbName)))
+	if drop {
+		t.Cleanup(func() {
+			conn, err := clickhouse.Open(options)
+			if !assert.NoError(t, err) {
+				return
+			}
+			defer conn.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			assert.NoError(t, conn.Exec(ctx, fmt.Sprintf("DROP DATABASE `%s` SYNC", dbName)))
+		})
+	}
+	return strings.TrimSuffix(serverTarget, "/default") + "/" + dbName
+}
+
+func startServer(t testing.TB, dir string, cleanup func(func()), pollInterval time.Duration) string {
 	port := testport.FindFree(t)
-	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.xml")
 	require.NoError(t, os.WriteFile(configPath, fmt.Appendf(nil, configXML, port), 0600))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "users.xml"), []byte(usersXML), 0600))
 	logPath := filepath.Join(dir, "server.log")
 	logFile, err := os.Create(logPath)
 	require.NoError(t, err)
-	t.Cleanup(func() { logFile.Close() })
+	cleanup(func() { logFile.Close() })
 
 	processCtx, stopProcess := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(processCtx, clickhouseBinaryPath, "server", "--config-file="+configPath)
@@ -137,7 +226,7 @@ func Start(t testing.TB) string {
 	require.NoError(t, err)
 	processDone := make(chan struct{})
 	var processErr error
-	t.Cleanup(func() {
+	cleanup(func() {
 		stopProcess()
 		// CommandContext sends SIGTERM, then WaitDelay kills the process if
 		// necessary. Reap it before the log file and temporary data are removed.
@@ -160,8 +249,8 @@ func Start(t testing.TB) string {
 	require.NoError(t, err)
 	defer conn.Close()
 	err = retry.DoVoid(startupCtx, &retry.Options{
-		InitialBackoff:        100 * time.Millisecond,
-		MaxBackoff:            100 * time.Millisecond,
+		InitialBackoff:        pollInterval,
+		MaxBackoff:            pollInterval,
 		Multiplier:            1,
 		MaxRetries:            math.MaxInt,
 		DontLogFailedAttempts: true,
@@ -170,9 +259,6 @@ func Start(t testing.TB) string {
 		defer cancel()
 		return conn.Ping(attemptCtx)
 	})
-	if err == nil {
-		err = conn.Exec(startupCtx, fmt.Sprintf("CREATE DATABASE `%s`", dbName))
-	}
 	if err != nil {
 		logs, readErr := os.ReadFile(logPath)
 		select {
@@ -182,5 +268,5 @@ func Start(t testing.TB) string {
 			t.Fatalf("ClickHouse did not become ready: %v (log read error: %v)\n%s", err, readErr, logs)
 		}
 	}
-	return fmt.Sprintf("clickhouse://default:@127.0.0.1:%d/%s", port, dbName)
+	return fmt.Sprintf("clickhouse://default:@127.0.0.1:%d/default", port)
 }

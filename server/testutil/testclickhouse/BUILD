@@ -1,4 +1,4 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "testclickhouse",
@@ -18,7 +18,18 @@ go_library(
         "//server/util/retry",
         "//server/util/testing/flags",
         "@com_github_clickhouse_clickhouse_go_v2//:clickhouse-go",
+        "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
         "@io_bazel_rules_go//go/runfiles",
+    ],
+)
+
+go_test(
+    name = "testclickhouse_test",
+    srcs = ["testclickhouse_test.go"],
+    embed = [":testclickhouse"],
+    deps = [
+        "@com_github_clickhouse_clickhouse_go_v2//:clickhouse-go",
+        "@com_github_stretchr_testify//require",
     ],
 )
