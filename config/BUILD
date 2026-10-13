@@ -1,5 +1,3 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
-
 # gazelle:default_visibility //visibility:public
 package(default_visibility = ["//visibility:public"])
 
@@ -11,14 +9,4 @@ filegroup(
         "//:release_build": ["buildbuddy.release.yaml"],
         "//conditions:default": glob(["**"]),
     }),
-)
-
-go_library(
-    name = "bundle",
-    srcs = ["bundle.go"],
-    embedsrcs = [":config_files"],  # keep
-    importpath = "github.com/buildbuddy-io/buildbuddy/config",
-    deps = [
-        "//server/util/fileresolver",
-    ],
 )
