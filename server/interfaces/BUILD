@@ -47,6 +47,7 @@ go_library(
         "//server/tables",
         "//server/usage/sku",
         "//server/util/clickhouse/schema",
+        "//server/util/healthcheck/checker",
         "//server/util/platform",
         "//server/util/proto",
         "@com_github_golang_jwt_jwt_v4//:jwt",

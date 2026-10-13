@@ -15,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
+	"github.com/buildbuddy-io/buildbuddy/server/util/healthcheck/checker"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/statusz"
@@ -50,12 +50,12 @@ type HealthChecker struct {
 	done          chan bool
 	quit          chan struct{}
 	checkersMu    sync.Mutex
-	checkers      map[string]interfaces.Checker
+	checkers      map[string]checker.Checker
 	lastStatus    []*serviceStatus
 	serverType    string
 	shutdownOnce  sync.Once
 	mu            sync.RWMutex // protects: shutdownFuncs, readyToServe, shuttingDown
-	shutdownFuncs []interfaces.CheckerFunc
+	shutdownFuncs []checker.CheckerFunc
 	readyToServe  bool
 	shuttingDown  bool
 	watchdogTimer *watchdog.Timer
@@ -66,10 +66,10 @@ func NewHealthChecker(serverType string) *HealthChecker {
 		serverType:    serverType,
 		done:          make(chan bool),
 		quit:          make(chan struct{}),
-		shutdownFuncs: make([]interfaces.CheckerFunc, 0),
+		shutdownFuncs: make([]checker.CheckerFunc, 0),
 		readyToServe:  true,
 		checkersMu:    sync.Mutex{},
-		checkers:      make(map[string]interfaces.Checker, 0),
+		checkers:      make(map[string]checker.Checker, 0),
 		lastStatus:    make([]*serviceStatus, 0),
 		watchdogTimer: watchdog.New(*maxUnreadyDuration),
 	}
@@ -201,13 +201,13 @@ func (h *HealthChecker) handleShutdownFuncs() {
 	close(h.done)
 }
 
-func (h *HealthChecker) RegisterShutdownFunction(f interfaces.CheckerFunc) {
+func (h *HealthChecker) RegisterShutdownFunction(f checker.CheckerFunc) {
 	h.mu.Lock()
 	h.shutdownFuncs = append(h.shutdownFuncs, f)
 	h.mu.Unlock()
 }
 
-func (h *HealthChecker) AddHealthCheck(name string, f interfaces.Checker) {
+func (h *HealthChecker) AddHealthCheck(name string, f checker.Checker) {
 	h.checkersMu.Lock()
 	h.checkers[name] = f
 	h.checkersMu.Unlock()
@@ -238,7 +238,7 @@ func (h *HealthChecker) runHealthChecks(ctx context.Context) {
 	statusDataMu := sync.Mutex{}
 
 	h.checkersMu.Lock()
-	checkers := make(map[string]interfaces.Checker, len(h.checkers))
+	checkers := make(map[string]checker.Checker, len(h.checkers))
 	maps.Copy(checkers, h.checkers)
 	h.checkersMu.Unlock()
 
