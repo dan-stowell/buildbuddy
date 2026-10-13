@@ -1,41 +1,9 @@
-load("@io_bazel_rules_docker//container:container.bzl", "container_image", "container_push")
 load("@rules_oci//oci:defs.bzl", "oci_image", "oci_push")
+load("@rules_pkg//pkg:mappings.bzl", "pkg_attributes", "pkg_files")
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 
-container_image(
-    name = "probers_image",
-    base = "@bazel_image_base//image",
-    entrypoint = [
-        "/cloudprober",
-        "--logtostderr",
-    ],
-    files = [
-        "//tools/probers/bazelcache",
-        "//tools/probers/bazelrbe",
-        "//tools/probers/remote_runner",
-        "@cloudprober",
-        "@net_busybox_busybox-linux-amd64//file:busybox",
-    ],
-    tags = ["manual"],
-    tars = [
-        "//server/util/bazel:bazel_binaries_tar",
-    ],
-    visibility = ["//visibility:public"],
-)
-
-container_push(
-    name = "push_probers_image",
-    format = "Docker",
-    image = ":probers_image",
-    registry = "gcr.io",
-    repository = "flame-build/probers",  # Note flame-build, not flame-public.
-    # Set the image tag with the bazel run flag "--//deployment:image_tag=TAG"
-    tag_file = "//deployment:image_tag_file",
-    tags = ["manual"],  # Don't include this target in wildcard patterns
-)
-
-pkg_tar(
-    name = "files_tar",
+pkg_files(
+    name = "image_files",
     srcs = [
         "//tools/probers/bazelcache",
         "//tools/probers/bazelrbe",
@@ -43,6 +11,13 @@ pkg_tar(
         "@cloudprober",
         "@net_busybox_busybox-linux-amd64//file:busybox",
     ],
+    # Match the read-only executable modes of the legacy container image.
+    attributes = pkg_attributes(mode = "0555"),
+)
+
+pkg_tar(
+    name = "files_tar",
+    srcs = [":image_files"],
 )
 
 oci_image(
