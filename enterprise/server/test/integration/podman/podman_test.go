@@ -363,10 +363,13 @@ func TestExec_Timeout(t *testing.T) {
 	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, props.ContainerImage, false)
 	require.NoError(t, err)
 
-	runCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	// Create the persistent container before timing out an exec within it.
+	require.NoError(t, c.Create(ctx, workDir))
+
+	execCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	t.Cleanup(cancel)
 
-	res := c.Run(runCtx, cmd, workDir, oci.Credentials{})
+	res := c.Exec(execCtx, cmd, &interfaces.Stdio{})
 
 	assert.True(
 		t, status.IsDeadlineExceededError(res.Error),
