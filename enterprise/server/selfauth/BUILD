@@ -1,4 +1,4 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 package(default_visibility = ["//enterprise:__subpackages__"])
 
@@ -12,9 +12,16 @@ go_library(
         "//server/http/interceptors",
         "//server/util/log",
         "//server/util/status",
-        "@com_github_lestrrat_go_jwx//jwa",
-        "@com_github_lestrrat_go_jwx//jwk",
-        "@com_github_lestrrat_go_jwx//jwt",
+        "@com_github_golang_jwt_jwt_v4//:jwt",
         "@org_golang_x_oauth2//:oauth2",
     ],
+)
+
+go_test(
+    name = "selfauth_test",
+    size = "small",
+    srcs = ["selfauth_test.go"],
+    data = ["testdata/jwks.json"],
+    embed = [":selfauth"],
+    deps = ["@com_github_golang_jwt_jwt_v4//:jwt"],
 )
