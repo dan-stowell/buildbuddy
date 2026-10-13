@@ -534,22 +534,16 @@ echo "Hello from sh_binary!"
 }
 
 func TestBuildRemotelyRunLocally_Runfiles(t *testing.T) {
-	tests := []struct {
-		name                      string
-		beforeRunfilesInitializer string
-		runfilePath               string
-		expectedOutput            string
-	}{
-		{
-			name:           "runs with runfiles",
-			runfilePath:    "_main/message.txt",
-			expectedOutput: "Hello from a runfile!",
-		},
-		// The CLI sets RUNFILES_DIR to point to the local downloaded runfiles directory.
-		// Even if that env var is unset, the executable should still be able to find the runfiles directory.
-		{
-			name: "runs even if RUNFILES_DIR is unset",
-			beforeRunfilesInitializer: `
+	t.Run("runs with runfiles", func(t *testing.T) {
+		runRunfilesTest(t, "", "_main/message.txt", "Hello from a runfile!")
+	})
+}
+
+func TestBuildRemotelyRunLocally_Runfiles_UnsetEnv(t *testing.T) {
+	// The CLI sets RUNFILES_DIR to point to the local downloaded runfiles directory.
+	// Even if that env var is unset, the executable should still be able to find the runfiles directory.
+	t.Run("runs even if RUNFILES_DIR is unset", func(t *testing.T) {
+		runRunfilesTest(t, `
 # Run the top-level executable without its runfiles environment to verify
 # that it can rediscover the downloaded runfiles directory. The marker prevents
 # this from looping.
@@ -557,24 +551,25 @@ if [[ -z "${RUNFILES_REEXECUTED:-}" ]]; then
   executable="${RUNFILES_DIR%.runfiles}"
   exec env -i PATH="$PATH" RUNFILES_REEXECUTED=1 "$executable"
 fi
-`,
-			runfilePath:    "_main/message.txt",
-			expectedOutput: "Hello from a runfile!",
-		},
-		{
-			name:           "resolves apparent Bzlmod repo name",
-			runfilePath:    "messages/external_message.txt",
-			expectedOutput: "Hello from an external runfile!",
-		},
-	}
+`, "_main/message.txt", "Hello from a runfile!")
+	})
+}
 
+func TestBuildRemotelyRunLocally_Runfiles_BzlmodRepoName(t *testing.T) {
+	t.Run("resolves apparent Bzlmod repo name", func(t *testing.T) {
+		runRunfilesTest(t, "", "messages/external_message.txt", "Hello from an external runfile!")
+	})
+}
+
+// Keep each independent scenario in a top-level test so Bazel can shard the
+// remote builds, rather than running all three builds serially on one shard.
+func runRunfilesTest(t *testing.T, beforeRunfilesInitializer, runfilePath, expectedOutput string) {
+	t.Helper()
 	// Run a server and executor locally to run remote bazel against.
 	env, bbServer, _ := runLocalServerAndExecutor(t, "", "", nil)
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			repoDir, _ := makeLocalGitRepo(t, map[string]string{
-				"BUILD": `
+	repoDir, _ := makeLocalGitRepo(t, map[string]string{
+		"BUILD": `
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 
 genrule(
@@ -601,28 +596,28 @@ sh_binary(
     deps = ["@rules_shell//shell/runfiles"],
 )
 `,
-				"main.sh": `#!/usr/bin/env bash
+		"main.sh": `#!/usr/bin/env bash
 set -euo pipefail
-` + test.beforeRunfilesInitializer + loadRunfilesLibrary + `
+` + beforeRunfilesInitializer + loadRunfilesLibrary + `
 # Look for the runfile message.txt. We should be able to successfully find it
 # on the local machine.
-message_path="$(rlocation "` + test.runfilePath + `" || true)"
+message_path="$(rlocation "` + runfilePath + `" || true)"
 if [[ -z "$message_path" ]]; then
-  echo >&2 "failed to find the runfile ` + test.runfilePath + `"
+  echo >&2 "failed to find the runfile ` + runfilePath + `"
   exit 1
 fi
 cat "$message_path"
 `,
-				"MODULE.bazel": `
+		"MODULE.bazel": `
 module(name = "runfiles_test")
 bazel_dep(name = "message_dep", version = "1.0", repo_name = "messages")
 local_path_override(module_name = "message_dep", path = "dep")
 `,
-				".bazelrc": "common --lockfile_mode=off\n",
-				"dep/MODULE.bazel": `
+		".bazelrc": "common --lockfile_mode=off\n",
+		"dep/MODULE.bazel": `
 module(name = "message_dep", version = "1.0")
 `,
-				"dep/BUILD": `
+		"dep/BUILD": `
 genrule(
     name = "generated_message",
     outs = ["external_message.txt"],
@@ -630,18 +625,16 @@ genrule(
     visibility = ["//visibility:public"],
 )
 `,
-			})
+	})
 
-			randomStr := fmt.Sprintf("%d", time.Now().UnixMilli())
-			output := runRemoteBazelInSeparateProcess(t, repoDir, bbServer.GRPCAddress(),
-				"--runner_exec_properties=instance_name="+randomStr,
-				"--run_remotely=0",
-				"run",
-				":main",
-				fmt.Sprintf("--remote_header=x-buildbuddy-api-key=%s", env.APIKey1))
-			require.Contains(t, output, test.expectedOutput)
-		})
-	}
+	randomStr := fmt.Sprintf("%d", time.Now().UnixMilli())
+	output := runRemoteBazelInSeparateProcess(t, repoDir, bbServer.GRPCAddress(),
+		"--runner_exec_properties=instance_name="+randomStr,
+		"--run_remotely=0",
+		"run",
+		":main",
+		fmt.Sprintf("--remote_header=x-buildbuddy-api-key=%s", env.APIKey1))
+	require.Contains(t, output, expectedOutput)
 }
 
 func TestBuildRemotelyRunLocally_ExecutableRunfile(t *testing.T) {
