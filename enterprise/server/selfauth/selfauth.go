@@ -17,9 +17,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/http/interceptors"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
-	"github.com/lestrrat-go/jwx/jwa"
-	"github.com/lestrrat-go/jwx/jwk"
-	"github.com/lestrrat-go/jwx/jwt"
+	"github.com/golang-jwt/jwt/v4"
 	"golang.org/x/oauth2"
 )
 
@@ -73,8 +71,8 @@ func Enabled() bool {
 }
 
 type selfAuth struct {
-	rsaPrivateKey jwk.RSAPrivateKey
-	rsaPublicKey  jwk.RSAPublicKey
+	rsaPrivateKey *rsa.PrivateKey
+	rsaPublicKey  *rsa.PublicKey
 }
 
 type configurationJSON struct {
@@ -126,26 +124,9 @@ func NewSelfAuth() (*selfAuth, error) {
 		Primes: []*big.Int{&p, &q},
 	}
 	privateKey.Precompute()
-	jwkKey, err := jwk.New(privateKey)
-	if err != nil {
-		return nil, status.InternalErrorf("Failed to create private key: %s\n", err)
-	}
-	jwkPrivateKey, ok := jwkKey.(jwk.RSAPrivateKey)
-	if !ok {
-		return nil, status.InternalErrorf("Expected jwk.RSAPrivateKey, got %T\n", jwkKey)
-	}
-
-	jwkKey, err = jwk.New(privateKey.PublicKey)
-	if err != nil {
-		return nil, status.InternalErrorf("Failed to create public key: %s\n", err)
-	}
-	jwkPublicKey, ok := jwkKey.(jwk.RSAPublicKey)
-	if !ok {
-		return nil, status.InternalErrorf("Expected jwk.RSAPublicKey, got %T\n", jwkKey)
-	}
 	return &selfAuth{
-		rsaPrivateKey: jwkPrivateKey,
-		rsaPublicKey:  jwkPublicKey,
+		rsaPrivateKey: privateKey,
+		rsaPublicKey:  &privateKey.PublicKey,
 	}, nil
 }
 
@@ -227,26 +208,21 @@ func (o *selfAuth) AccessToken(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	token := jwt.New()
-	token.Set(jwt.AudienceKey, "buildbuddy")
-	token.Set(jwt.ExpirationKey, time.Now().Add(time.Hour).Unix())
-	token.Set(jwt.JwtIDKey, base64.StdEncoding.EncodeToString(idKey))
-	token.Set(jwt.IssuedAtKey, time.Now().Unix())
-	token.Set(jwt.IssuerKey, o.IssuerURL().String())
-	token.Set(jwt.SubjectKey, "")
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
+		"aud":        []string{ClientID},
+		"exp":        time.Now().Add(time.Hour).Unix(),
+		"jti":        base64.StdEncoding.EncodeToString(idKey),
+		"iat":        time.Now().Unix(),
+		"iss":        o.IssuerURL().String(),
+		"sub":        "",
+		"email":      "buildbuddy@example.com",
+		"name":       "buildbuddy",
+		"given_name": "Default",
+		// Base64url-encoded first 16 bytes of SHA-256("AccessToken").
+		"at_hash": "LkjhI6Ijpj638f0mirBH2g",
+	})
 
-	token.Set("email", "buildbuddy@example.com")
-	token.Set("name", "buildbuddy")
-	token.Set("given_name", "Default")
-
-	// This value is a hash of the access token, so must match. It can be
-	// computed with the following python snippet:
-	//
-	// base64.b64encode(hashlib.sha256("AccessToken").digest()[:16]).rstrip("=")
-	//
-	token.Set("at_hash", "LkjhI6Ijpj638f0mirBH2g")
-
-	signed, err := jwt.Sign(token, jwa.RS256, o.rsaPrivateKey)
+	signed, err := token.SignedString(o.rsaPrivateKey)
 	if err != nil {
 		log.Errorf("Error signing token: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -256,13 +232,26 @@ func (o *selfAuth) AccessToken(w http.ResponseWriter, r *http.Request) {
 		AccessToken:  "AccessToken",
 		RefreshToken: "RefreshToken",
 		ExpiresIn:    3600,
-		IdToken:      string(signed),
+		IdToken:      signed,
 	})
 }
 
 // Jwks handles requests to /.well-known/jwks.json, returning the keyset for our oauth
 func (o *selfAuth) Jwks(w http.ResponseWriter, r *http.Request) {
-	set := jwk.NewSet()
-	set.Add(o.rsaPublicKey)
-	writeJSONResponse(w, r, set)
+	// Keep the field order and unpadded base64url encoding of the original
+	// JWKS response. The fixed key has no kid (nor alg or use metadata).
+	writeJSONResponse(w, r, struct {
+		Keys []rsaJWK `json:"keys"`
+	}{Keys: []rsaJWK{{
+		E:   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(o.rsaPublicKey.E)).Bytes()),
+		Kty: "RSA",
+		N:   base64.RawURLEncoding.EncodeToString(o.rsaPublicKey.N.Bytes()),
+	}}})
+}
+
+// rsaJWK contains only the public RSA parameters, in the original JSON order.
+type rsaJWK struct {
+	E   string `json:"e"`
+	Kty string `json:"kty"`
+	N   string `json:"n"`
 }
