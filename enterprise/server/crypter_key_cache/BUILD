@@ -16,7 +16,6 @@ go_library(
         "//server/util/status",
         "//third_party/singleflight",
         "@com_github_jonboulle_clockwork//:clockwork",
-        "@org_uber_go_atomic//:atomic",
     ],
 )
 

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/crypter"
@@ -15,7 +16,6 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/third_party/singleflight"
 	"github.com/jonboulle/clockwork"
-	"go.uber.org/atomic"
 
 	sgpb "github.com/buildbuddy-io/buildbuddy/proto/storage"
 )
@@ -128,9 +128,9 @@ func (c *KeyCache) checkCacheEntry(ck CacheKey, ce *cacheEntry) {
 		return
 	}
 
-	c.activeRefreshOps.Inc()
+	c.activeRefreshOps.Add(1)
 	go func() {
-		defer c.activeRefreshOps.Dec()
+		defer c.activeRefreshOps.Add(-1)
 		ctx, cancel := context.WithTimeout(c.env.GetServerContext(), keyRefreshDeadline)
 		defer cancel()
 		ce.mu.Lock()
