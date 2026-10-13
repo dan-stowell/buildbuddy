@@ -24,7 +24,6 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
-	"github.com/groob/plist"
 )
 
 const xcodeBundleID = "com.apple.dt.Xcode"
@@ -60,12 +59,6 @@ type xcodeVersion struct {
 	// can contain keys: "iPhoneSimulator" and "iPhoneSimulator18.2" pointing
 	// to the same underlying SDK.
 	sdks map[string]string
-}
-
-// The interesting bits to pull from Xcode's version plist.
-type xcodePlist struct {
-	CFBundleShortVersionString string `plist:"CFBundleShortVersionString"`
-	ProductBuildVersion        string `plist:"ProductBuildVersion"`
 }
 
 func NewXcodeLocator() *xcodeLocator {
@@ -210,15 +203,16 @@ func versionMap(urlRefs []C.CFURLRef) map[string]*xcodeVersion {
 }
 
 func xcodePlistForPath(path string) (*xcodePlist, error) {
-	var xcodePlist xcodePlist
 	versionFileReader, err := os.Open(path)
 	if err != nil {
 		return nil, status.InternalErrorf("Failed to open %s: %s", path, err.Error())
 	}
-	if err := plist.NewXMLDecoder(versionFileReader).Decode(&xcodePlist); err != nil {
+	defer versionFileReader.Close()
+	xcodePlist, err := decodeXcodePlist(versionFileReader)
+	if err != nil {
 		return nil, status.InternalErrorf("Failed to decode %s: %s", path, err.Error())
 	}
-	return &xcodePlist, nil
+	return xcodePlist, nil
 }
 
 func commandLineToolsVersion(developerDir string) *xcodeVersion {

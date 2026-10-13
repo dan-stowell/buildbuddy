@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "xcode.go",
         "xcode_darwin.go",
+        "xcode_plist.go",
     ],
     cgo = True,
     clinkopts = select({
@@ -21,7 +22,6 @@ go_library(
             "//server/util/flag",
             "//server/util/log",
             "//server/util/status",
-            "@com_github_groob_plist//:plist",
         ],
         "//conditions:default": [],
     }),
@@ -29,9 +29,11 @@ go_library(
 
 go_test(
     name = "xcode_test",
-    srcs = ["xcode_darwin_test.go"],
+    srcs = [
+        "xcode_darwin_test.go",
+        "xcode_plist_test.go",
+    ],
     embed = [":xcode"],
-    target_compatible_with = ["@platforms//os:macos"],
     deps = select({
         "@io_bazel_rules_go//go/platform:darwin": [
             "@com_github_stretchr_testify//require",
