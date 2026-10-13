@@ -72,13 +72,14 @@ type LRU[T Key] struct {
 
 	samplePool []*Sample[T]
 
-	mu              sync.Mutex
-	ctx             context.Context
-	cancelCtx       context.CancelFunc
-	globalSizeBytes int64
-	localSizeBytes  int64
-	lastRun         time.Time
-	lastEvicted     *Sample[T]
+	mu               sync.Mutex
+	ctx              context.Context
+	cancelCtx        context.CancelFunc
+	globalSizeBytes  int64
+	localSizeBytes   int64
+	lastRun          time.Time
+	lastEvicted      *Sample[T]
+	testingSweepDone chan struct{}
 
 	clock clockwork.Clock
 }
@@ -378,8 +379,15 @@ func (l *LRU[T]) evictor() {
 		case <-l.ctx.Done():
 			return
 		case <-ticker.C:
+			l.mu.Lock()
+			done := l.testingSweepDone
+			l.testingSweepDone = nil
+			l.mu.Unlock()
 			if err := l.ttl(); err != nil {
 				log.Warningf("could not evict: %s", err)
+			}
+			if done != nil {
+				close(done)
 			}
 		}
 	}
@@ -395,4 +403,21 @@ func (l *LRU[T]) LastEvicted() *Sample[T] {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.lastEvicted
+}
+
+// TestingWaitForSweep waits for a janitor sweep started after this call.
+// This includes sweeps that find the cache below its eviction threshold.
+func (l *LRU[T]) TestingWaitForSweep(ctx context.Context) error {
+	l.mu.Lock()
+	if l.testingSweepDone == nil {
+		l.testingSweepDone = make(chan struct{})
+	}
+	done := l.testingSweepDone
+	l.mu.Unlock()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

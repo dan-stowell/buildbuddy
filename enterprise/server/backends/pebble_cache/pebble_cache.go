@@ -2980,6 +2980,53 @@ func (p *PebbleCache) TestingWaitForGC(ctx context.Context) error {
 	return nil
 }
 
+// TestingWaitForEvictionSweep waits for size accounting to catch up, then for
+// a sweep started after setup. With sampling=true it observes a completed
+// sampling batch: entries below min_eviction_age never reach the LRU janitor,
+// which blocks waiting for eligible samples while over capacity.
+func (p *PebbleCache) TestingWaitForEvictionSweep(ctx context.Context, partitionID string, minSizeBytes int64, sampling bool) error {
+	p.statusMu.Lock()
+	var evictor *partitionEvictor
+	for _, e := range p.evictors {
+		if e.part.ID == partitionID {
+			evictor = e
+			break
+		}
+	}
+	p.statusMu.Unlock()
+	if evictor == nil {
+		return status.NotFoundError("partition not found")
+	}
+	for {
+		evictor.mu.Lock()
+		ready := evictor.sizeBytes >= minSizeBytes
+		evictor.mu.Unlock()
+		if ready {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if !sampling {
+		return evictor.lru.TestingWaitForSweep(ctx)
+	}
+	evictor.mu.Lock()
+	if evictor.testingSampleSweepDone == nil {
+		evictor.testingSampleSweepDone = make(chan struct{})
+	}
+	done := evictor.testingSampleSweepDone
+	evictor.mu.Unlock()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 type evictionKey struct {
 	bytes []byte
 }
@@ -3020,7 +3067,8 @@ type partitionEvictor struct {
 	samplesPerBatch          int
 	samplerIterRefreshPeriod time.Duration
 
-	numDeleteWorkers int
+	numDeleteWorkers       int
+	testingSampleSweepDone chan struct{}
 
 	includeMetadataSize bool
 
@@ -3158,6 +3206,7 @@ func (e *partitionEvictor) generateSamplesForEviction(quitChan chan struct{}) er
 	randomKeyBuf := make([]byte, 64)
 	start, end := keyRange([]byte(e.partitionKeyPrefix() + "/"))
 	leftInBatch := 0
+	var sweepDone chan struct{}
 	var iterCreatedAt time.Time
 	var iter pebble.Iterator
 	// We update the iter variable later on, so we need to wrap the Close call
@@ -3200,6 +3249,12 @@ func (e *partitionEvictor) generateSamplesForEviction(quitChan chan struct{}) er
 
 		// Refresh the iterator once a while
 		if leftInBatch <= 0 || time.Since(iterCreatedAt) > e.samplerIterRefreshPeriod {
+			e.mu.Lock()
+			if sweepDone == nil {
+				sweepDone = e.testingSampleSweepDone
+				e.testingSampleSweepDone = nil
+			}
+			e.mu.Unlock()
 			leftInBatch = e.samplesPerBatch
 			iterCreatedAt = time.Now()
 			// This iterator won't be positioned (Valid() will return false),
@@ -3261,6 +3316,10 @@ func (e *partitionEvictor) generateSamplesForEviction(quitChan chan struct{}) er
 
 		e.maybeAddToSampleChan(iter, &fileMetadataView, quitChan, timer)
 		iter.Next()
+		if sweepDone != nil && leftInBatch == 0 {
+			close(sweepDone)
+			sweepDone = nil
+		}
 	}
 }
 
