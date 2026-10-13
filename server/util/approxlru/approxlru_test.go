@@ -3,6 +3,7 @@ package approxlru_test
 import (
 	"context"
 	"math/rand"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -11,7 +12,6 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/approxlru"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/slices"
 )
 
 type entry struct {
