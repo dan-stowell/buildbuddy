@@ -15,9 +15,6 @@ type Translator interface {
 var (
 	translators = map[string]Translator{
 		".js": js.New(),
-		// TODO: this produces an undesired diff in our WORKSPACE file.
-		// Fix and re-enable.
-		// ".yaml":  yaml.New(),
 		".bazel": nil,
 		"":       nil,
 	}
