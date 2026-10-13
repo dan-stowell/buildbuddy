@@ -3,6 +3,8 @@ package memory_metrics_collector
 import (
 	"context"
 	"fmt"
+	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"sync"
 	"testing"
 	"time"
 
@@ -143,4 +145,93 @@ func TestListAppendAndTruncate(t *testing.T) {
 
 	// The list read before the truncation should be unchanged.
 	require.Equal(t, []string{"1", "2", "3"}, list)
+}
+
+func TestCapacityAndEviction(t *testing.T) {
+	ctx := t.Context()
+	mc, err := NewMemoryMetricsCollector()
+	require.NoError(t, err)
+	// Different value types all share the same entry-count capacity.
+	require.NoError(t, mc.IncrementCount(ctx, "counts", "field", 1))
+	require.NoError(t, mc.SetAdd(ctx, "set", "member"))
+	require.NoError(t, mc.ListAppend(ctx, "list", "value"))
+	for i := range maxNumEntries - 3 {
+		require.NoError(t, mc.Set(ctx, fmt.Sprint(i), "value", noExpiration))
+	}
+	require.Equal(t, maxNumEntries, mc.l.Len())
+	// Reads and updates refresh recency without increasing entry count.
+	_, err = mc.ReadCounts(ctx, "counts")
+	require.NoError(t, err)
+	require.NoError(t, mc.SetAdd(ctx, "set", "another"))
+	require.NoError(t, mc.Set(ctx, "overflow", "", noExpiration))
+	list, err := mc.ListRange(ctx, "list", 0, -1)
+	require.NoError(t, err)
+	require.Empty(t, list)
+	require.Equal(t, maxNumEntries, mc.l.Len())
+	require.NoError(t, mc.Set(ctx, "overflow2", "value", noExpiration))
+	_, err = mc.GetAll(ctx, "0")
+	require.True(t, status.IsNotFoundError(err))
+	counts, err := mc.ReadCounts(ctx, "counts")
+	require.NoError(t, err)
+	require.Equal(t, map[string]int64{"field": 1}, counts)
+	members, err := mc.SetGetMembers(ctx, "set")
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"member", "another"}, members)
+	require.NoError(t, mc.Delete(ctx, "overflow"))
+	require.NoError(t, mc.Set(ctx, "replacement", "value", noExpiration))
+	_, err = mc.GetAll(ctx, "1")
+	require.NoError(t, err)
+	require.Equal(t, maxNumEntries, mc.l.Len())
+}
+
+func TestConcurrentAccess(t *testing.T) {
+	ctx := t.Context()
+	mc, err := NewMemoryMetricsCollector()
+	require.NoError(t, err)
+	var wg sync.WaitGroup
+	for worker := range 16 {
+		wg.Go(func() {
+			key := fmt.Sprintf("worker-%d", worker)
+			for range 100 {
+				for _, err := range []error{
+					mc.IncrementCount(ctx, "counts", "single", 1),
+					mc.IncrementCounts(ctx, "counts", map[string]int64{"multiple": 1}),
+					mc.SetAdd(ctx, "set", key),
+					mc.Set(ctx, key, "value", noExpiration),
+					mc.ListAppend(ctx, "list", key),
+				} {
+					if err != nil {
+						t.Error(err)
+						return
+					}
+				}
+				if _, err := mc.ReadCounts(ctx, "counts"); err != nil {
+					t.Error(err)
+					return
+				}
+				if _, err := mc.SetGetMembers(ctx, "set"); err != nil {
+					t.Error(err)
+					return
+				}
+				if _, err := mc.GetAll(ctx, key); err != nil {
+					t.Error(err)
+					return
+				}
+				if err := mc.Delete(ctx, key); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	counts, err := mc.ReadCounts(ctx, "counts")
+	require.NoError(t, err)
+	require.Equal(t, map[string]int64{"single": 1600, "multiple": 1600}, counts)
+	members, err := mc.SetGetMembers(ctx, "set")
+	require.NoError(t, err)
+	require.Len(t, members, 16)
+	list, err := mc.ListRange(ctx, "list", 0, -1)
+	require.NoError(t, err)
+	require.Len(t, list, 1600)
 }

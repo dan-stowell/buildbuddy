@@ -6,9 +6,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/buildbuddy-io/buildbuddy/server/util/lru"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
-
-	lru "github.com/hashicorp/golang-lru"
 )
 
 const (
@@ -22,12 +21,17 @@ const (
 )
 
 type MemoryMetricsCollector struct {
-	l  *lru.Cache
+	// mu protects the LRU and compound operations on its values.
+	l  lru.LRU[any]
 	mu sync.Mutex
 }
 
 func NewMemoryMetricsCollector() (*MemoryMetricsCollector, error) {
-	l, err := lru.New(maxNumEntries)
+	l, err := lru.New(&lru.Config[any]{
+		MaxSize:       maxNumEntries,
+		SizeFn:        func(any) int64 { return 1 },
+		UpdateInPlace: true,
+	})
 	if err != nil {
 		return nil, err
 	}

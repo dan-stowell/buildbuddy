@@ -6,8 +6,8 @@ go_library(
     importpath = "github.com/buildbuddy-io/buildbuddy/server/backends/memory_metrics_collector",
     visibility = ["//visibility:public"],
     deps = [
+        "//server/util/lru",
         "//server/util/status",
-        "@com_github_hashicorp_golang_lru//:golang-lru",
     ],
 )
 
@@ -16,5 +16,8 @@ go_test(
     size = "small",
     srcs = ["memory_metrics_collector_test.go"],
     embed = [":memory_metrics_collector"],
-    deps = ["@com_github_stretchr_testify//require"],
+    deps = [
+        "//server/util/status",
+        "@com_github_stretchr_testify//require",
+    ],
 )
