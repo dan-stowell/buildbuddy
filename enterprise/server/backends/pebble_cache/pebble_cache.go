@@ -2980,6 +2980,43 @@ func (p *PebbleCache) TestingWaitForGC(ctx context.Context) error {
 	return nil
 }
 
+// TestingWaitForEvictionSweep waits for size accounting to catch up, then for
+// a janitor sweep started after setup to complete, even below the threshold.
+func (p *PebbleCache) TestingWaitForEvictionSweep(ctx context.Context, partitionID string, minSizeBytes int64) error {
+	p.statusMu.Lock()
+	var evictor *partitionEvictor
+	for _, e := range p.evictors {
+		if e.part.ID == partitionID {
+			evictor = e
+			break
+		}
+	}
+	p.statusMu.Unlock()
+	if evictor == nil {
+		return status.NotFoundError("partition not found")
+	}
+	for {
+		evictor.mu.Lock()
+		ready := evictor.sizeBytes >= minSizeBytes
+		evictor.mu.Unlock()
+		if ready {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
+	}
+	done := evictor.lru.TestingSweepDone()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 type evictionKey struct {
 	bytes []byte
 }

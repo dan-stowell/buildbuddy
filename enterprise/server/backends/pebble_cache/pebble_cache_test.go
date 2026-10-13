@@ -1689,8 +1689,10 @@ func TestPartitionJanitorCutoffThreshold(t *testing.T) {
 		// under the configured 1.0 cutoff.
 		resourceKeys := write(t, ctx, pc, 95)
 
-		// Give the janitor a chance to run, then verify nothing was evicted.
-		time.Sleep(3 * time.Second)
+		// Wait for a fresh janitor sweep after size accounting catches up.
+		sweepCtx, cancelSweep := context.WithTimeout(ctx, 30*time.Second)
+		defer cancelSweep()
+		require.NoError(t, pc.TestingWaitForEvictionSweep(sweepCtx, pebble_cache.DefaultPartitionID, 95_000))
 		for _, r := range resourceKeys {
 			exists, err := pc.Contains(ctx, r)
 			require.NoError(t, err)

@@ -176,3 +176,55 @@ func TestRefresh(t *testing.T) {
 	}
 	c.mu.Unlock()
 }
+
+func TestSweepWaitIgnoresRunningSweep(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	started := make(chan chan struct{}, 1)
+	l, err := approxlru.New(&approxlru.Opts[*entry]{
+		MaxSizeBytes: 1, SamplePoolSize: 1, SamplesPerEviction: 1,
+		OnEvict: func(context.Context, *approxlru.Sample[*entry]) error { t.Error("unexpected eviction"); return nil },
+		OnSample: func(context.Context, int) ([]*approxlru.Sample[*entry], error) {
+			release := make(chan struct{})
+			select {
+			case started <- release:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			return nil, status.InternalError("end controlled test sweep")
+		},
+	})
+	require.NoError(t, err)
+	l.UpdateSizeBytes(2)
+	l.Start()
+	defer l.Stop()
+	nextGate := func() chan struct{} {
+		select {
+		case gate := <-started:
+			return gate
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+			return nil
+		}
+	}
+	first := nextGate()
+	observation := l.TestingSweepDone()
+	close(first)
+	second := nextGate() // The old sweep finished; the observed sweep is blocked.
+	select {
+	case <-observation:
+		t.Fatal("already-running sweep satisfied newly registered wait")
+	default:
+	}
+	close(second)
+	select {
+	case <-observation:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
