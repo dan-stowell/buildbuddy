@@ -20,7 +20,7 @@ import (
 
 	espb "github.com/buildbuddy-io/buildbuddy/proto/execution_stats"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
-	ps "github.com/mitchellh/go-ps"
+	procutil "github.com/shirou/gopsutil/v3/process"
 )
 
 const (
@@ -348,16 +348,21 @@ func rusageCPUNanos(rusage *espb.Rusage) int64 {
 
 // ChildPids returns all *direct* child pids of a process identified by pid.
 func ChildPids(pid int) ([]int, error) {
-	procs, err := ps.Processes()
+	procs, err := procutil.Processes()
 	if err != nil {
 		return nil, err
 	}
 	var out []int
 	for _, proc := range procs {
-		if proc.PPid() != pid {
+		ppid, err := proc.Ppid()
+		if err != nil {
+			// Processes may exit or become inaccessible during enumeration.
 			continue
 		}
-		out = append(out, proc.Pid())
+		if int(ppid) != pid {
+			continue
+		}
+		out = append(out, int(proc.Pid))
 	}
 	return out, nil
 }

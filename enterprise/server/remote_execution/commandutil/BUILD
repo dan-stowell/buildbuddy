@@ -17,10 +17,9 @@ go_library(
         "//server/interfaces",
         "//server/util/log",
         "//server/util/status",
-        "@com_github_mitchellh_go_ps//:go-ps",
+        "@com_github_shirou_gopsutil_v3//process",
     ] + select({
         "@io_bazel_rules_go//go/platform:windows": [
-            "@com_github_shirou_gopsutil_v3//process",
             "@org_golang_x_sys//windows",
         ],
         "//conditions:default": [],
@@ -35,6 +34,7 @@ go_test(
         "commandutil_test.go",
         "commandutil_unix_test.go",
         "commandutil_windows_test.go",
+        "enumeration_linux_test.go",
     ],
     data = select({
         "@io_bazel_rules_go//go/platform:windows": [],

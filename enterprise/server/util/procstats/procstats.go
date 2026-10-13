@@ -6,7 +6,6 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/lib/set"
 
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
-	ps "github.com/mitchellh/go-ps"
 	procutil "github.com/shirou/gopsutil/v3/process"
 )
 
@@ -178,15 +177,20 @@ func statTree(pid int) (map[int]*repb.UsageStats, error) {
 // to use this process-tree accounting for resident memory; see
 // enterprise/server/remote_execution/commandutil/commandutil_windows.go.
 func pidsInTree(pid int) (set.Set[int], error) {
-	procs, err := ps.Processes()
+	procs, err := procutil.Processes()
 	if err != nil {
 		return nil, err
 	}
 	children := make(map[int][]int, len(procs))
 	for _, p := range procs {
-		ppid := p.PPid()
+		parentPid, err := p.Ppid()
+		if err != nil {
+			// Processes may exit or become inaccessible during enumeration.
+			continue
+		}
+		ppid := int(parentPid)
 		c := children[ppid]
-		c = append(c, p.Pid())
+		c = append(c, int(p.Pid))
 		children[ppid] = c
 	}
 	pidsVisited := make(set.Set[int])
