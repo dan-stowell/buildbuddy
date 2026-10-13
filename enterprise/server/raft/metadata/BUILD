@@ -51,6 +51,7 @@ go_test(
         "metadata_test.go",
     ],
     embed = [":metadata"],
+    shard_count = 4,
     exec_properties = {
         "test.EstimatedComputeUnits": "8",
         "test.EstimatedMemory": "8GB",
