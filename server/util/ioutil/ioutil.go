@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 
-	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/util/bytebufferpool"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 )
@@ -71,8 +70,20 @@ func LimitReadCloser(reader io.ReadCloser, limit int64) io.ReadCloser {
 type CloseFunc func() error
 type CommitFunc func(int64) error
 
+// Committer finalizes a write.
+type Committer interface {
+	Commit() error
+}
+
+// CommittedWriteCloser is a writer that can finalize a write and release resources.
+type CommittedWriteCloser interface {
+	io.Writer
+	io.Closer
+	Committer
+}
+
 type CustomCommitWriteCloser interface {
-	interfaces.CommittedWriteCloser
+	CommittedWriteCloser
 
 	SetCloseFn(CloseFunc)
 	SetCommitFn(CommitFunc)
@@ -109,7 +120,7 @@ func (c *customCommitWriteCloser) Commit() error {
 		c.committed = true
 	}()
 
-	if committer, ok := c.w.(interfaces.Committer); ok {
+	if committer, ok := c.w.(Committer); ok {
 		if err := committer.Commit(); err != nil {
 			return err
 		}
@@ -153,9 +164,9 @@ type customCommitWriteSeekCloser struct {
 	io.Seeker
 }
 
-// NewCustomCommitWriteCloser wraps an io.Writer/interfaces.CommittedWriteCloser
+// NewCustomCommitWriteCloser wraps an io.Writer or CommittedWriteCloser
 // and returns a customCommitWriteCloser, which implements
-// interfaces.CommittedWriteCloser but allows adding on custom logic that will
+// CommittedWriteCloser but allows adding on custom logic that will
 // be called when Commit or Close methods are called. If the wrapped writer
 // implements io.Seeker, the returned value will also implement io.Seeker.
 func NewCustomCommitWriteCloser(w io.Writer) CustomCommitWriteCloser {

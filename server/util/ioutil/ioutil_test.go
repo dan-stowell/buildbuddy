@@ -3,6 +3,7 @@ package ioutil_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -32,6 +33,63 @@ func TestCustomCommitWriteCloser_SecondCommitFails(t *testing.T) {
 
 	err = cwc.Close()
 	require.NoError(t, err)
+}
+
+type committingWriter struct {
+	bytes.Buffer
+	commitFn func() error
+	closeFn  func() error
+}
+
+func (w *committingWriter) Commit() error { return w.commitFn() }
+func (w *committingWriter) Close() error  { return w.closeFn() }
+
+func TestCustomCommitWriteCloser_UnderlyingCommitter(t *testing.T) {
+	for _, failCommit := range []bool{false, true} {
+		t.Run(fmt.Sprintf("failCommit=%t", failCommit), func(t *testing.T) {
+			var calls []string
+			commitErr := errors.New("underlying commit failed")
+			w := &committingWriter{
+				commitFn: func() error {
+					calls = append(calls, "underlying commit")
+					if failCommit {
+						return commitErr
+					}
+					return nil
+				},
+				closeFn: func() error {
+					calls = append(calls, "underlying close")
+					return nil
+				},
+			}
+			var underlying ioutil.CommittedWriteCloser = w
+			cwc := ioutil.NewCustomCommitWriteCloser(underlying)
+			cwc.SetCommitFn(func(n int64) error {
+				require.Equal(t, int64(3), n)
+				calls = append(calls, "custom commit")
+				return nil
+			})
+			cwc.SetCloseFn(func() error {
+				calls = append(calls, "custom close")
+				return nil
+			})
+			_, err := cwc.Write([]byte("abc"))
+			require.NoError(t, err)
+			if failCommit {
+				require.ErrorIs(t, cwc.Commit(), commitErr)
+			} else {
+				require.NoError(t, cwc.Commit())
+			}
+			require.Error(t, cwc.Commit())
+			require.NoError(t, cwc.Close())
+			want := []string{"underlying commit"}
+			if !failCommit {
+				want = append(want, "custom commit")
+			}
+			want = append(want, "underlying close", "custom close")
+			require.Equal(t, want, calls)
+		})
+	}
 }
 
 func TestReadAllLimited(t *testing.T) {
