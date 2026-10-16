@@ -18,6 +18,7 @@ go_test(
     srcs = ["httpclient_test.go"],
     embed = [":httpclient"],
     deps = [
+        "//server/testutil/testleak",
         "//server/util/testing/flags",
         "@com_github_stretchr_testify//require",
     ],
