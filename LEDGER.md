@@ -25,6 +25,10 @@ Branch convention: `leak/det-*` detector work, `leak/repro-*` reproducers (no fi
 ## Detector improvements
 | ID | Change | Branch | Validation (leak caught / clean accepted / bounded not flagged) | Status |
 |---|---|---|---|---|
+| D1-a | `Check`: settle loop up to 5s (goleak alone gives up ~430ms → async-exit flake risk); grouped-by-stack report w/ creator + 'started by test goroutine' marker | `leak/det-testleak-v2` 49c5a316 | caught / accepted (incl. exits 200ms–3s after close) / pre-existing+ignored not flagged; 20/20 runs | Claude-validated; independent adversarial review PENDING |
+| D1-b | `CheckFDs`: /proc/self/fd diff w/ targets (TCP addr+state, unix paths, pipe peers, files); netpoller warm-up so runtime epoll/eventfd never flagged (verified in fresh helper proc) | same | caught (unclosed grpc conn → both ESTABLISHED ends) / accepted / IgnoreFDs; 20/20 | same; trial-enabled on 5 existing users 5/5 green (not committed) |
+| D1-c | `CheckGrowth`: N-iteration accumulation w/ live owner, per-iteration growth samples | same | +20 FDs over 10 unclosed conns caught; bounded pool accepted | same |
+| D1-audit | Known limits of old/new detector: IgnoreCurrent hides pre-existing goroutines; whole-process (no t.Parallel); pending timers invisible; cleanup order matters | — | documented in results/d1 | — |
 
 ## False positives / non-leaks
 | ID | Observation | Why not a leak |
