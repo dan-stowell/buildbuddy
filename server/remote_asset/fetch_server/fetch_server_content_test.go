@@ -285,3 +285,59 @@ func TestFetchBlob_RandomizedChecksumIntegrity(t *testing.T) {
 		require.True(t, matched, "returned blob matches no requested checksum: %s", desc)
 	}
 }
+
+// An origin that closes the connection before sending the advertised
+// Content-Length must produce a prompt fetch failure (and allow falling back
+// to a later URI), rather than an upload that never completes.
+func TestFetchBlob_TruncatedKnownLengthBody(t *testing.T) {
+	for _, zstd := range []bool{false, true} {
+		for _, withFallback := range []bool{false, true} {
+			t.Run(fmt.Sprintf("zstd=%t/fallback=%t", zstd, withFallback), func(t *testing.T) {
+				flags.Set(t, "cache.zstd_transcoding_enabled", zstd)
+				flags.Set(t, "storage.tempdir", t.TempDir())
+				require.NoError(t, scratchspace.Init())
+				ctx := context.Background()
+				te := testenv.GetTestEnv(t)
+				conn := runFetchServer(ctx, t, te)
+				client := rapb.NewFetchClient(conn)
+
+				body := bytes.Repeat([]byte("0123456789abcdef"), 64)
+				origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/good" {
+						w.Write(body)
+						return
+					}
+					// Advertise the full length but send only half the body.
+					w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+					w.Write(body[:len(body)/2])
+				}))
+				defer origin.Close()
+				uris := []string{origin.URL + "/truncated"}
+				if withFallback {
+					uris = append(uris, origin.URL+"/good")
+				}
+				d, err := digest.Compute(bytes.NewReader(body), repb.DigestFunction_SHA256)
+				require.NoError(t, err)
+
+				rpcCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+				defer cancel()
+				start := time.Now()
+				resp, err := client.FetchBlob(rpcCtx, &rapb.FetchBlobRequest{
+					Uris: uris,
+					Qualifiers: []*rapb.Qualifier{{
+						Name:  fetch_server.ChecksumQualifier,
+						Value: checksumQualifierFromContent(t, d.GetHash(), repb.DigestFunction_SHA256),
+					}},
+					DigestFunction: repb.DigestFunction_SHA256,
+				})
+				require.NoError(t, err, "FetchBlob did not return within %s", time.Since(start))
+				if withFallback {
+					require.Equal(t, int32(gcodes.OK), resp.GetStatus().GetCode(), resp.GetStatus().GetMessage())
+					require.Equal(t, origin.URL+"/good", resp.GetUri())
+				} else {
+					require.NotEqual(t, int32(gcodes.OK), resp.GetStatus().GetCode())
+				}
+			})
+		}
+	}
+}
