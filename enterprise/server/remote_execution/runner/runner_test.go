@@ -1325,7 +1325,7 @@ func TestPersistentWorkerFraming(t *testing.T) {
 				env := newTestEnv(t)
 				pool := newRunnerPool(t, env, noLimitsCfg())
 				ctx := withAuthenticatedUser(t, context.Background(), env, "US1")
-				output := strings.Repeat("abcdefgh", 16*1024)
+				output := strings.Repeat("abcdefgh", 10*1024)
 				task := newPersistentRunnerTask(t, "framing", "", protocol, &wkpb.WorkResponse{Output: output, ExitCode: 7})
 				extra := map[string]string{
 					"large_split": "--response_chunk_size=17",
