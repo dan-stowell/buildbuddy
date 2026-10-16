@@ -205,10 +205,11 @@ func pidsInTree(pid int) (set.Set[int], error) {
 }
 
 func getProcessStats(pid int) (*repb.UsageStats, error) {
-	p, err := procutil.NewProcess(int32(pid))
-	if err != nil {
-		return nil, err
-	}
+	// Times and MemoryInfo only need the PID, and return an error if the
+	// process has exited. Don't use NewProcess: its existence check calls
+	// os.FindProcess and never releases the result, which on Linux leaves a
+	// pidfd open until the next GC for every process on every poll.
+	p := &procutil.Process{Pid: int32(pid)}
 	t, err := p.Times()
 	if err != nil {
 		return nil, err

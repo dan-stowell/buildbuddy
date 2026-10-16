@@ -16,10 +16,14 @@ go_library(
 
 go_test(
     name = "procstats_test",
-    srcs = ["procstats_test.go"],
+    srcs = [
+        "procstats_linux_test.go",
+        "procstats_test.go",
+    ],
     deps = [
         ":procstats",
         "//proto:remote_execution_go_proto",
+        "//server/testutil/testleak",
         "@com_github_stretchr_testify//require",
     ],
 )
