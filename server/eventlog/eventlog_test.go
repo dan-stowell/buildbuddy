@@ -568,3 +568,22 @@ func TestBuildLogsSplitUTF8(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "世\n", string(got))
 }
+
+func TestBuildLogsSplitCursorControl(t *testing.T) {
+	render := func(events []string) string {
+		blobs := mockstore.New()
+		w, err := eventlog.NewEventLogWriter(t.Context(), blobs, nil, nil, "", "ansi", 80, 4)
+		require.NoError(t, err)
+		for _, e := range events {
+			_, err := w.Write(t.Context(), []byte(e))
+			require.NoError(t, err)
+		}
+		require.NoError(t, w.Close(t.Context()))
+		data, err := io.ReadAll(chunkstore.New(blobs, &chunkstore.ChunkstoreOptions{}).Reader(t.Context(), "ansi"))
+		require.NoError(t, err)
+		return string(data)
+	}
+	whole := render([]string{"keep\n\x1b[K\n\n\n"})
+	split := render([]string{"keep\n\x1b[", "K\n\n\n"})
+	require.Equal(t, whole, split, "event boundaries must not change rendered logs")
+}
