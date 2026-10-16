@@ -23,6 +23,7 @@ func Soak(t testing.TB, warmup, batches int, op func(int)) {
 		t.Fatal("soak needs nonnegative warmup and at least three measured batches")
 	}
 	warmNetpoller()
+	examples := map[string]string{}
 	snapshot := func() map[string]int {
 		m := map[string]int{}
 		for _, g := range allGoroutines() {
@@ -60,6 +61,7 @@ func Soak(t testing.TB, warmup, batches int, op func(int)) {
 				k = digitsRegexp.ReplaceAllString(k, "#")
 			}
 			m["fd: "+k]++
+			examples["fd: "+k] = e.desc
 		}
 		return m
 	}
@@ -124,6 +126,9 @@ func Soak(t testing.TB, warmup, batches int, op func(int)) {
 			}
 		}
 		t.Logf("soak delta=%+d series=%v group=%s", delta(k), series, k)
+		if example, ok := examples[k]; ok {
+			t.Logf("  example FD target: %s", example)
+		}
 		if monotone && growing >= (2*batches+2)/3 && delta(k) >= batches {
 			t.Errorf("SOAK GROWTH candidate: %s series=%v", k, series)
 		}
