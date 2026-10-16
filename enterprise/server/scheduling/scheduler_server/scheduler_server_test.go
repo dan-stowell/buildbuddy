@@ -2757,3 +2757,100 @@ func TestWatchTaskLiveness_StopsWhenWatchersAreDone(t *testing.T) {
 	defer s.livenessMu.Unlock()
 	require.Empty(t, s.livenessWatches)
 }
+
+// Exercise real gRPC handler teardown while keeping the scheduler and its Redis
+// client alive. AskForMoreWork is a barrier: its reply proves registration was
+// processed, without relying on a sleep or the fake executor's timing.
+func TestExecutorRegistrationChurn(t *testing.T) {
+	for _, overlap := range []bool{false, true} {
+		for _, n := range []int{1, 10, 50} {
+			t.Run(fmt.Sprintf("overlap=%t/N=%d", overlap, n), func(t *testing.T) {
+				testleak.CheckFDs(t)
+				env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+				s := env.GetSchedulerService().(*SchedulerServer)
+				key := nodePoolKey{os: defaultOS, arch: defaultArch}
+				// Redis connections are pooled across executor lifetimes. Warm
+				// concurrent connections explicitly so lazy pool growth isn't
+				// mistaken for a per-stream FD leak (no FD allowance needed).
+				rdb, ok := s.rdb.(*redis.Client)
+				require.True(t, ok)
+				var conns []*redis.Conn
+				for range 4 {
+					conn := rdb.Conn(ctx)
+					require.NoError(t, conn.Ping(ctx).Err())
+					conns = append(conns, conn)
+				}
+				for _, conn := range conns {
+					require.NoError(t, conn.Close())
+				}
+				t.Logf("warmed Redis pool: %+v", rdb.PoolStats())
+				open := func(id string) (scpb.Scheduler_RegisterAndStreamWorkClient, context.CancelFunc) {
+					streamCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+					t.Cleanup(cancel)
+					stream, err := env.GetSchedulerClient().RegisterAndStreamWork(streamCtx)
+					require.NoError(t, err)
+					require.NoError(t, stream.Send(&scpb.RegisterAndStreamWorkRequest{RegisterExecutorRequest: &scpb.RegisterExecutorRequest{Node: &scpb.ExecutionNode{ExecutorId: id, Host: "churn-host", OsFamily: defaultOS, Arch: defaultArch}}}))
+					require.NoError(t, stream.Send(&scpb.RegisterAndStreamWorkRequest{AskForMoreWorkRequest: &scpb.AskForMoreWorkRequest{}}))
+					rsp, err := stream.Recv()
+					require.NoError(t, err)
+					require.NotNil(t, rsp.GetAskForMoreWorkResponse())
+					return stream, cancel
+				}
+				testleak.CheckGrowth(t, testleak.Growth{Iterations: n}, func(i int) {
+					id := fmt.Sprintf("churn-%d", i)
+					if overlap {
+						id = "same-id"
+					}
+					first, cancelFirst := open(id)
+					pool, ok := s.getPool(key)
+					require.True(t, ok)
+					oldNode := pool.FindConnectedExecutorByID(id)
+					require.NotNil(t, oldNode)
+					taskID := fmt.Sprintf("reservation-%d", i)
+					require.NoError(t, oldNode.handle.EnqueueTaskReservation(ctx, &scpb.EnqueueTaskReservationRequest{
+						TaskId: taskID, SchedulingMetadata: &scpb.SchedulingMetadata{},
+					}, false /* waitForResponse */))
+					reservation, err := first.Recv()
+					require.NoError(t, err)
+					require.Equal(t, taskID, reservation.GetEnqueueTaskReservationRequest().GetTaskId())
+					var second scpb.Scheduler_RegisterAndStreamWorkClient
+					var cancelSecond context.CancelFunc
+					if overlap {
+						second, cancelSecond = open(id)
+					}
+					if overlap {
+						// Clean half-close of the newer stream while the older one remains
+						// alive; then cancel the old stream as for a network disconnect.
+						require.NoError(t, second.CloseSend())
+						_, err := second.Recv()
+						require.ErrorIs(t, err, io.EOF)
+						cancelSecond()
+					}
+					cancelFirst()
+					_, err = first.Recv()
+					require.Error(t, err)
+					require.Eventually(t, func() bool { return oldNode.handle.getRegistration() == nil }, 5*time.Second, time.Millisecond)
+					require.Eventually(t, func() bool {
+						pool, ok := s.getPool(key)
+						if !ok {
+							return false
+						}
+						pool.mu.Lock()
+						defer pool.mu.Unlock()
+						return len(pool.connectedExecutors) == 0
+					}, 5*time.Second, time.Millisecond)
+					// Redis cleanup follows removal from the local pool.
+					require.Eventually(t, func() bool {
+						count, err := s.rdb.HLen(ctx, key.redisPoolKey()).Result()
+						return err == nil && count == 0
+					}, 5*time.Second, time.Millisecond)
+				})
+				s.mu.RLock()
+				pools := len(s.pools)
+				s.mu.RUnlock()
+				require.Equal(t, 1, pools, "executor churn must not create per-executor pools")
+				t.Logf("N=%d overlap=%t: connected=0 redis_nodes=0 pools=%d; Redis pool=%+v", n, overlap, pools, rdb.PoolStats())
+			})
+		}
+	}
+}
