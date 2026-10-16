@@ -2976,3 +2976,41 @@ func TestRedactCachedExecuteResponse(t *testing.T) {
 		})
 	}
 }
+
+// Keep scheduled tasks pending so this test does not depend on execution timing.
+type platformRoutingPendingScheduler struct {
+	*schedulerServerMock
+}
+
+func (s *platformRoutingPendingScheduler) ExistsTask(ctx context.Context, taskID string) (bool, error) {
+	return true, nil
+}
+
+func TestPlatformRoutingHeaderOverrideMergeSeparation(t *testing.T) {
+	env, conn, _ := setupEnv(t)
+	env.SetSchedulerService(&platformRoutingPendingScheduler{env.GetSchedulerService().(*schedulerServerMock)})
+	ta := env.GetAuthenticator().(*testauth.TestAuthenticator)
+	ctx, err := ta.WithAuthenticatedUser(t.Context(), "US1")
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	arn := uploadAction(ctx, t, env, "", repb.DigestFunction_SHA256, &repb.Action{})
+	ctx, err = prefix.AttachUserPrefixToContext(ctx, ta)
+	require.NoError(t, err)
+	client := repb.NewExecutionClient(conn)
+	start := func(pool string) string {
+		requestCtx := metadata.AppendToOutgoingContext(ctx, platform.OverrideHeaderPrefix+"pool", pool)
+		stream, err := client.Execute(requestCtx, &repb.ExecuteRequest{
+			InstanceName: arn.GetInstanceName(), ActionDigest: arn.GetDigest(),
+			DigestFunction: arn.GetDigestFunction(), SkipCacheLookup: true,
+		})
+		require.NoError(t, err)
+		op, err := stream.Recv()
+		require.NoError(t, err)
+		require.False(t, op.GetDone())
+		return op.GetName()
+	}
+	first := start("first-pool")
+	second := start("second-pool")
+	require.NotEqual(t, first, second, "requests selecting different executor pools must not merge")
+}
