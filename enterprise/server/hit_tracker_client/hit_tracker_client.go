@@ -73,12 +73,8 @@ func (h *NoOpHitTrackerFactory) NewRemoteCASHitTracker(ctx context.Context, requ
 }
 
 func newHitTrackerClient(ctx context.Context, env *real_environment.RealEnv, conn grpc.ClientConnInterface) *HitTrackerFactory {
-	// Senders' RPCs are cancelled if they're still running when shutdown
-	// gives up waiting for them.
-	ctx, cancelSenders := context.WithCancel(ctx)
 	factory := HitTrackerFactory{
 		authenticator:        env.GetAuthenticator(),
-		cancelSenders:        cancelSenders,
 		quit:                 make(chan struct{}, 1),
 		enqueueChan:          make(chan *enqueuedCacheHit, *enqueueChanSize),
 		maxPendingHitsPerKey: *maxPendingHitsPerKey,
@@ -86,12 +82,11 @@ func newHitTrackerClient(ctx context.Context, env *real_environment.RealEnv, con
 		hitsByCollection:     map[string]*cacheHits{},
 		client:               hitpb.NewHitTrackerServiceClient(conn),
 	}
-	factory.wg.Go(factory.batcher)
+	go factory.batcher()
 	for i := 0; i < *remoteHitTrackerWorkers; i++ {
 		factory.wg.Go(func() {
-			ticker := env.GetClock().NewTicker(*remoteHitTrackerPollInterval)
-			defer ticker.Stop()
-			factory.sender(ctx, ticker.Chan())
+			ticker := env.GetClock().NewTicker(*remoteHitTrackerPollInterval).Chan()
+			factory.sender(ctx, ticker)
 		})
 	}
 	env.GetHealthChecker().RegisterShutdownFunction(factory.shutdown)
@@ -117,9 +112,8 @@ type enqueuedCacheHit struct {
 type HitTrackerFactory struct {
 	authenticator interfaces.Authenticator
 
-	quit          chan struct{}
-	wg            sync.WaitGroup
-	cancelSenders context.CancelFunc
+	quit chan struct{}
+	wg   sync.WaitGroup
 
 	enqueueChan chan *enqueuedCacheHit
 
@@ -438,20 +432,7 @@ func (h *HitTrackerFactory) sendTrackRequest(ctx context.Context) int {
 
 func (h *HitTrackerFactory) shutdown(ctx context.Context) error {
 	close(h.quit)
-	// Let in-flight Track RPCs finish while the shutdown deadline allows,
-	// then cancel them so that a hung RPC can't block shutdown forever.
-	sendersDone := make(chan struct{})
-	go func() {
-		h.wg.Wait()
-		close(sendersDone)
-	}()
-	select {
-	case <-sendersDone:
-	case <-ctx.Done():
-		h.cancelSenders()
-		<-sendersDone
-	}
-	h.cancelSenders()
+	h.wg.Wait()
 
 	// Make a best-effort attempt to flush pending updates.
 	// TODO(iain): we could do something fancier here if necessary, like
