@@ -2529,6 +2529,12 @@ func (s *SchedulerServer) LeaseTask(stream scpb.Scheduler_LeaseTaskServer) error
 			if err == nil {
 				claimed = false
 				log.CtxDebugf(ctx, "LeaseTask task %q successfully finalized by %q", taskID, executorID)
+			} else if status.IsPermissionDeniedError(err) {
+				// The task was re-claimed under a different lease (e.g. the
+				// executor reconnected on a new stream). This stream no longer
+				// owns it, so it must not re-enqueue or fail it on exit.
+				claimed = false
+				log.CtxInfof(ctx, "LeaseTask task %q is already claimed by another lease; not finalizing", taskID)
 			} else {
 				log.CtxWarningf(ctx, "Could not delete claimed task %q: %s", taskID, err)
 			}
