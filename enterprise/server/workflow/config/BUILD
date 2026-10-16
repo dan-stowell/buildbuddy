@@ -16,12 +16,16 @@ go_library(
 go_test(
     name = "config_test",
     size = "small",
-    srcs = ["config_test.go"],
+    srcs = [
+        "config_test.go",
+        "unknown_fields_test.go",
+    ],
     deps = [
         ":config",
         "//enterprise/server/workflow/config/test_data",
         "//proto:runner_go_proto",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
+        "@in_gopkg_yaml_v2//:yaml_v2",
     ],
 )

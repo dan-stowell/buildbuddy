@@ -45,11 +45,15 @@ go_library(
 go_test(
     name = "githubapp_test",
     size = "small",
-    srcs = ["githubapp_test.go"],
+    srcs = [
+        "githubapp_test.go",
+        "redelivery_test.go",
+    ],
     embed = [":githubapp"],
     deps = [
         "//enterprise/server/testutil/enterprise_testenv",
         "//proto:github_go_proto",
+        "//server/interfaces",
         "//server/tables",
         "//server/testutil/testauth",
         "//server/testutil/testenv",
@@ -57,6 +61,7 @@ go_test(
         "//server/util/ioutil",
         "//server/util/status",
         "@com_github_google_go_github_v59//github",
+        "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
     ],
 )
