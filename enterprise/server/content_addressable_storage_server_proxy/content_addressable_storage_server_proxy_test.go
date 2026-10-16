@@ -105,6 +105,7 @@ func runCASProxy(ctx context.Context, clientConn *grpc.ClientConn, env *testenv.
 	env.SetLocalCASServer(cas)
 	casServer, err := New(env)
 	require.NoError(t, err)
+	env.SetCASServer(casServer)
 	bsServer, err := byte_stream_server_proxy.New(env)
 	require.NoError(t, err)
 	grpcServer, runFunc, lis := testenv.RegisterLocalGRPCServer(t, env)
@@ -1072,6 +1073,7 @@ func TestFindMissingBlobs_QuorumBypassesPresenceCache(t *testing.T) {
 
 // A presence check must keep a hot blob ahead of cold blobs in the backing LRU.
 func TestPresenceLifetime_ProxyRefreshBeforeEviction(t *testing.T) {
+	flags.Set(t, "cache_proxy.find_missing_blobs_refresh_interval", time.Second)
 	for _, ttl := range []time.Duration{0, time.Minute} {
 		t.Run(ttl.String(), func(t *testing.T) {
 			flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", ttl)

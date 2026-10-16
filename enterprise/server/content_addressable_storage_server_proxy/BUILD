@@ -59,6 +59,7 @@ go_test(
         "//server/util/cdc",
         "//server/util/findmissing",
         "//server/util/prefix",
+        "//server/util/proto",
         "//server/util/testing/flags",
         "//server/util/uuid",
         "@com_github_jonboulle_clockwork//:clockwork",
