@@ -2803,3 +2803,163 @@ func getExecutionAuxiliaryMetadata(t testing.TB, execRes *repb.ExecuteResponse) 
 	require.True(t, ok)
 	return auxMeta
 }
+
+// --- repro-sched: executor shutdown hand-back vs. tasks claimed elsewhere ---
+
+// handBackEnv sets up a single app with a controllable task router and
+// single-task executor "execB" kept busy by a real running blocker command,
+// so that later reservations sit in execB's queue.
+func handBackEnv(t *testing.T) (*rbetest.Env, *fixedNodeTaskRouter, *rbetest.Executor, *rbetest.ControlledCommand) {
+	rbe := rbetest.NewRBETestEnv(t)
+	router := newFixedNodeTaskRouter([]string{"execB"})
+	t.Cleanup(router.Unblock)
+	rbe.AddBuildBuddyServerWithOptions(&rbetest.BuildBuddyServerOptions{EnvModifier: func(env *testenv.TestEnv) {
+		env.SetTaskRouter(router)
+	}})
+	b := rbe.AddSingleTaskExecutorWithOptions(t, &rbetest.ExecutorOptions{Name: "execB"})
+	blockerB := rbe.ExecuteControlledCommand("blockerB", &rbetest.ExecuteControlledOpts{})
+	blockerB.WaitStarted()
+	return rbe, router, b, blockerB
+}
+
+func noRetryProps() []*repb.Platform_Property {
+	return []*repb.Platform_Property{{Name: platform.RetryPropertyName, Value: "false"}}
+}
+
+func asyncResult(cmd *rbetest.ControlledCommand) <-chan *rbetest.CommandResult {
+	ch := make(chan *rbetest.CommandResult, 1)
+	go func() { ch <- cmd.Result() }()
+	return ch
+}
+
+// A retryable task runs on execA while a stale reservation for it sits in
+// execB's queue. execB then shuts down gracefully. The task must not be
+// started a second time.
+func TestReproSched_HandBackDoesNotDuplicateRunningTask(t *testing.T) {
+	rbe, router, b, blockerB := handBackEnv(t)
+	rbe.AddSingleTaskExecutorWithOptions(t, &rbetest.ExecutorOptions{Name: "execA"})
+	router.UpdateSubset([]string{"execA", "execB"})
+
+	target := rbe.ExecuteControlledCommand("target", &rbetest.ExecuteControlledOpts{})
+	target.WaitStarted() // running on execA (execB is busy)
+	require.Eventually(t, func() bool { return b.QueueLength() == 1 }, 10*time.Second, 10*time.Millisecond,
+		"target's reservation should be queued on busy execB")
+
+	// A fresh, idle executor joins (e.g. autoscaling during a rollout).
+	rbe.AddSingleTaskExecutorWithOptions(t, &rbetest.ExecutorOptions{Name: "execC"})
+	router.UpdateSubset([]string{"execA", "execC"})
+
+	// execB gets SIGTERM: hands back its queued reservation for target.
+	b.BeginShutdown()
+
+	dup := assert.Never(t, func() bool { return rbe.CommandStartCount("target") > 1 }, 8*time.Second, 50*time.Millisecond,
+		"target was started a second time while still running on execA")
+	t.Logf("target start count after execB shutdown: %d", rbe.CommandStartCount("target"))
+
+	resCh := asyncResult(target)
+	if !dup {
+		// Let the second (latest) instance finish first and see what the
+		// client and the original instance on execA experience.
+		target.Exit(0)
+		res := <-resCh
+		t.Logf("client result: executor=%q exit=%d err=%v", res.ActionResult.GetExecutionMetadata().GetExecutorId(), res.ExitCode, res.Err)
+		killed := target.WaitInstanceDisconnected(0, 25*time.Second)
+		t.Logf("original instance on execA disconnected (killed) within 25s after the duplicate finished: %t", killed)
+		target.ExitAll(0)
+	} else {
+		target.Exit(0)
+		res := <-resCh
+		t.Logf("client result: executor=%q exit=%d err=%v", res.ActionResult.GetExecutionMetadata().GetExecutorId(), res.ExitCode, res.Err)
+		assert.NoError(t, res.Err)
+		assert.Equal(t, "execA", res.ActionResult.GetExecutionMetadata().GetExecutorId())
+	}
+
+	blockerB.Exit(0)
+	blockerB.Wait()
+	b.WaitForShutdown()
+	rbe.DisconnectExecutor(b)
+}
+
+// Same as above but with retries disabled: the running task must not be
+// failed just because another executor holding a stale reservation for it
+// shut down.
+func TestReproSched_HandBackDoesNotFailRunningNoRetryTask(t *testing.T) {
+	rbe, router, b, blockerB := handBackEnv(t)
+	rbe.AddSingleTaskExecutorWithOptions(t, &rbetest.ExecutorOptions{Name: "execA"})
+	router.UpdateSubset([]string{"execA", "execB"})
+
+	target := rbe.ExecuteControlledCommand("target", &rbetest.ExecuteControlledOpts{Properties: noRetryProps()})
+	target.WaitStarted()
+	require.Eventually(t, func() bool { return b.QueueLength() == 1 }, 10*time.Second, 10*time.Millisecond)
+
+	resCh := asyncResult(target)
+	b.BeginShutdown()
+
+	var early *rbetest.CommandResult
+	select {
+	case early = <-resCh:
+	case <-time.After(8 * time.Second):
+	}
+	if early != nil {
+		t.Errorf("client got a result while target was still running on execA: exit=%d err=%v", early.ExitCode, early.Err)
+		killed := target.WaitInstanceDisconnected(0, 25*time.Second)
+		t.Logf("instance on execA disconnected (killed) within 25s: %t", killed)
+		target.ExitAll(0)
+	} else {
+		target.Exit(0)
+		res := <-resCh
+		t.Logf("client result: executor=%q exit=%d err=%v", res.ActionResult.GetExecutionMetadata().GetExecutorId(), res.ExitCode, res.Err)
+		assert.NoError(t, res.Err)
+		assert.Equal(t, 0, res.ExitCode)
+	}
+	t.Logf("target start count: %d", rbe.CommandStartCount("target"))
+
+	blockerB.Exit(0)
+	blockerB.Wait()
+	b.WaitForShutdown()
+	rbe.DisconnectExecutor(b)
+}
+
+// A retry=false task that has not started anywhere is queued on both execA and
+// execB (both busy). execB shuts down. The task should still run once execA
+// frees up, rather than fail.
+func TestReproSched_HandBackDoesNotFailQueuedNoRetryTask(t *testing.T) {
+	rbe, router, b, blockerB := handBackEnv(t)
+	a := rbe.AddSingleTaskExecutorWithOptions(t, &rbetest.ExecutorOptions{Name: "execA"})
+	router.UpdateSubset([]string{"execA"})
+	blockerA := rbe.ExecuteControlledCommand("blockerA", &rbetest.ExecuteControlledOpts{})
+	blockerA.WaitStarted()
+	router.UpdateSubset([]string{"execA", "execB"})
+
+	target := rbe.ExecuteControlledCommand("target", &rbetest.ExecuteControlledOpts{Properties: noRetryProps()})
+	require.Eventually(t, func() bool { return a.QueueLength() == 1 && b.QueueLength() == 1 }, 10*time.Second, 10*time.Millisecond)
+
+	resCh := asyncResult(target)
+	b.BeginShutdown()
+
+	var early *rbetest.CommandResult
+	select {
+	case early = <-resCh:
+	case <-time.After(5 * time.Second):
+	}
+	if early != nil {
+		t.Errorf("never-started retry=false task failed after execB shutdown: exit=%d err=%v", early.ExitCode, early.Err)
+	} else {
+		blockerA.Exit(0)
+		blockerA.Wait()
+		target.WaitStarted()
+		target.Exit(0)
+		res := <-resCh
+		t.Logf("client result: executor=%q exit=%d err=%v", res.ActionResult.GetExecutionMetadata().GetExecutorId(), res.ExitCode, res.Err)
+		assert.NoError(t, res.Err)
+		assert.Equal(t, "execA", res.ActionResult.GetExecutionMetadata().GetExecutorId())
+	}
+	if early != nil {
+		blockerA.Exit(0)
+		blockerA.Wait()
+	}
+	blockerB.Exit(0)
+	blockerB.Wait()
+	b.WaitForShutdown()
+	rbe.DisconnectExecutor(b)
+}
