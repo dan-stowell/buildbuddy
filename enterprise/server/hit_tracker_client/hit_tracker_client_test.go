@@ -10,11 +10,13 @@ import (
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/proxy_util"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/bazel_request"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/buildbuddy-io/buildbuddy/server/util/usageutil"
 	"github.com/jonboulle/clockwork"
@@ -78,6 +80,9 @@ type testHitTracker struct {
 	acBytesDownloaded  map[string]*atomic.Int64
 	acUploads          map[string]*atomic.Int64
 	acBytesUploaded    map[string]*atomic.Int64
+	// failures is the number of upcoming Track RPCs to fail with Unavailable
+	// without recording their hits.
+	failures atomic.Int32
 }
 
 func newTestHitTracker(t testing.TB, authenticator interfaces.Authenticator) *testHitTracker {
@@ -108,6 +113,10 @@ func newTestHitTracker(t testing.TB, authenticator interfaces.Authenticator) *te
 
 func (ht *testHitTracker) Track(ctx context.Context, req *hitpb.TrackRequest) (*hitpb.TrackResponse, error) {
 	ht.wg.Wait()
+	if ht.failures.Add(-1) >= 0 {
+		return nil, status.UnavailableError("injected transient failure")
+	}
+	ht.failures.Store(0)
 
 	key := usageutil.EncodeCollection(usageutil.CollectionFromRPCContext(ctx))
 
@@ -163,6 +172,13 @@ func setup(t testing.TB) (interfaces.Authenticator, *HitTrackerFactory, *testHit
 // setupWithClock is like setup, but installs the given clock in the test env
 // so that tests control when the hit-tracker-client sender ticks.
 func setupWithClock(t testing.TB, clock clockwork.Clock) (interfaces.Authenticator, *HitTrackerFactory, *testHitTracker) {
+	_, authenticator, factory, service := setupWithEnv(t, clock)
+	return authenticator, factory, service
+}
+
+// setupWithEnv is like setupWithClock, but also returns the test env so that
+// tests can drive its health checker (and with it the factory's shutdown).
+func setupWithEnv(t testing.TB, clock clockwork.Clock) (*real_environment.RealEnv, interfaces.Authenticator, *HitTrackerFactory, *testHitTracker) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	te := testenv.GetTestEnv(t)
@@ -178,7 +194,7 @@ func setupWithClock(t testing.TB, clock clockwork.Clock) (interfaces.Authenticat
 	conn, err := testenv.LocalGRPCConn(t, ctx, lis)
 	require.NoError(t, err)
 	t.Cleanup(func() { conn.Close() })
-	return authenticator, newHitTrackerClient(ctx, te, conn), hitTrackerService
+	return te, authenticator, newHitTrackerClient(ctx, te, conn), hitTrackerService
 }
 
 func authenticatedContext(user string, authenticator interfaces.Authenticator) context.Context {
@@ -454,6 +470,55 @@ func TestBatchAndSendAreSerialized(t *testing.T) {
 		hitTrackerFactory.sendTrackRequest(ctx)
 		return hitTrackerService.casDownloads[anonKey].Load() == hits
 	}, 10*time.Second, 10*time.Millisecond, "Expected every hit to be sent exactly once")
+}
+
+// Hits that were accepted (enqueued) before shutdown must still be reported,
+// even if the batcher had not yet moved them out of the enqueue channel.
+func TestShutdownSendsHitsStillInEnqueueChannel(t *testing.T) {
+	clock := clockwork.NewFakeClock()
+	te, _, hitTrackerFactory, hitTrackerService := setupWithEnv(t, clock)
+	anonTracker := hitTrackerFactory.NewCASHitTracker(context.Background(), &repb.RequestMetadata{})
+
+	// Hold the factory lock so that the batcher falls behind and the hits
+	// below wait in the enqueue channel, as they do under load.
+	hitTrackerFactory.mu.Lock()
+	const hits = 50
+	for range hits {
+		anonTracker.TrackDownload(aDigest).CloseWithBytesTransferred(1, 2, repb.Compressor_IDENTITY, "test")
+	}
+	require.Eventually(t, func() bool { return len(hitTrackerFactory.enqueueChan) == hits-1 }, 10*time.Second, time.Millisecond,
+		"expected the batcher to hold one hit and the rest to be queued")
+
+	te.GetHealthChecker().Shutdown()
+	require.Eventually(t, hitTrackerFactory.shouldFlushSynchronously, 10*time.Second, time.Millisecond)
+	hitTrackerFactory.mu.Unlock()
+	te.GetHealthChecker().WaitForGracefulShutdown()
+
+	require.Eventually(t, hitTrackerService.casDownloadExpectation(anonKey, hits), 5*time.Second, 50*time.Millisecond,
+		"hits accepted before shutdown were not reported")
+}
+
+// A transient Track RPC failure should not silently discard the whole batch.
+func TestTransientTrackFailureDoesNotLoseHits(t *testing.T) {
+	clock := clockwork.NewFakeClock()
+	_, hitTrackerFactory, hitTrackerService := setupWithClock(t, clock)
+	ctx := context.Background()
+	anonTracker := hitTrackerFactory.NewCASHitTracker(ctx, &repb.RequestMetadata{})
+
+	const hits = 10
+	for range hits {
+		anonTracker.TrackDownload(aDigest).CloseWithBytesTransferred(1, 2, repb.Compressor_IDENTITY, "test")
+	}
+	require.Eventually(t, pendingHitsExpectation(hitTrackerFactory, anonKey, hits), 10*time.Second, 10*time.Millisecond)
+
+	// The first Track RPC fails with a retryable error; later ones succeed.
+	hitTrackerService.failures.Store(1)
+	for range 5 {
+		clock.BlockUntil(1)
+		clock.Advance(*remoteHitTrackerPollInterval)
+	}
+	require.Eventually(t, hitTrackerService.casDownloadExpectation(anonKey, hits), 5*time.Second, 50*time.Millisecond,
+		"hits from a batch whose Track RPC failed transiently were never reported")
 }
 
 func BenchmarkEnqueue(b *testing.B) {
