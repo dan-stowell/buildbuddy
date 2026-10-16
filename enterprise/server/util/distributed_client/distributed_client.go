@@ -877,14 +877,21 @@ func (c *Proxy) remoteRead(ctx context.Context, peer string, r *rspb.ResourceNam
 		Limit:    limit,
 		Resource: r,
 	}
+	// The reader owns this RPC. CloseSend only half-closes a server-streaming
+	// RPC, so cancel it when the reader is closed to release the peer's reader
+	// even if the caller has not consumed all response messages.
+	ctx, cancel := context.WithCancel(ctx)
 	stream, err := client.Read(ctx, req)
 	if err != nil {
+		cancel()
 		return nil, nil, err
 	}
 	rc, err := newDistributedCacheReader(stream, r.GetDigest().GetSizeBytes() == offset)
 	if err != nil {
+		cancel()
 		return nil, nil, err
 	}
+	rc.cancel = cancel
 
 	if rc.rsp.GetReference() != nil {
 		// Fetching more messages from the stream or closing it returns the
@@ -955,6 +962,7 @@ func (c *Proxy) dereference(ctx context.Context, peer string, ref *refpb.Referen
 }
 
 type distributedCacheReader struct {
+	cancel context.CancelFunc
 	stream dcpb.DistributedCache_ReadClient
 	rsp    *dcpb.ReadResponse
 	// offset into rsp.Data so we don't muck with rsp.Data
@@ -977,6 +985,7 @@ func newDistributedCacheReader(stream dcpb.DistributedCache_ReadClient, expectEO
 	if r.err == nil || (r.err == io.EOF && expectEOF) {
 		return r, nil
 	}
+	r.rsp.ReturnToVTPool()
 	return nil, r.err
 }
 
@@ -1023,6 +1032,7 @@ func (r *distributedCacheReader) WriteTo(w io.Writer) (int64, error) {
 }
 
 func (r *distributedCacheReader) Close() error {
+	r.cancel()
 	r.rsp.ReturnToVTPool()
 	return r.stream.CloseSend()
 }
