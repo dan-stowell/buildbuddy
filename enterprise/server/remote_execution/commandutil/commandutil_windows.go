@@ -53,7 +53,6 @@ type process struct {
 	cmd         *exec.Cmd
 	terminated  chan struct{}
 	cleanupDone chan struct{}
-	drainOutput func() error
 
 	jobMu     sync.Mutex
 	jobHandle windows.Handle
@@ -260,7 +259,7 @@ func (p *process) wait() (*espb.Rusage, error) {
 	}); err != nil {
 		_ = p.cleanup()
 		_ = p.killRootProcess()
-		_ = p.waitCommand()
+		_ = p.cmd.Wait()
 		return nil, fmt.Errorf("wait for root process: %w", err)
 	}
 	// Cmd.Wait also waits for stdout/stderr copying. Terminate descendants
@@ -283,7 +282,7 @@ func (p *process) wait() (*espb.Rusage, error) {
 	} else {
 		p.inactive = true
 	}
-	err := p.waitCommand()
+	err := p.cmd.Wait()
 	if cleanupErr != nil {
 		return nil, fmt.Errorf("wait for job processes: %w", cleanupErr)
 	}
