@@ -103,6 +103,16 @@ func TestWorkerStop_UnreadOutputAfterInvalidResponse(t *testing.T) {
 	require.NoError(t, w.Stop())
 }
 
+type exitTrackingContainer struct {
+	container.CommandContainer
+	exited chan struct{}
+}
+
+func (c *exitTrackingContainer) Exec(ctx context.Context, cmd *repb.Command, stdio *interfaces.Stdio) *interfaces.CommandResult {
+	defer close(c.exited)
+	return c.CommandContainer.Exec(ctx, cmd, stdio)
+}
+
 // A worker that has started an incomplete response must be killed when the
 // request expires, even though its process has a longer-lived context.
 func TestWorkerExec_StalledResponseHonorsContext(t *testing.T) {
@@ -110,7 +120,7 @@ func TestWorkerExec_StalledResponseHonorsContext(t *testing.T) {
 	testleak.CheckFDs(t)
 	for i := 0; i < 10; i++ {
 		ctx := context.Background()
-		ctr := bare.NewBareCommandContainer(&bare.Opts{})
+		ctr := &exitTrackingContainer{CommandContainer: bare.NewBareCommandContainer(&bare.Opts{}), exited: make(chan struct{})}
 		require.NoError(t, ctr.Create(ctx, t.TempDir()))
 		// Announce a 100-byte proto response, send one byte, then wait on stdin.
 		// There are no timers or child processes in the stalled shell.
@@ -130,7 +140,14 @@ func TestWorkerExec_StalledResponseHonorsContext(t *testing.T) {
 			t.Fatal("Exec remained blocked after request deadline")
 		}
 		cancel()
-		// Exec must have stopped the process itself, before explicit cleanup.
+		// The underlying Exec has waited for and reaped the process.
+		select {
+		case <-ctr.exited:
+		default:
+			_ = w.Stop()
+			t.Fatal("Exec returned before stopping the worker process")
+		}
+		// Repeated Stop remains safe after cancellation.
 		require.NoError(t, w.Stop())
 	}
 }
