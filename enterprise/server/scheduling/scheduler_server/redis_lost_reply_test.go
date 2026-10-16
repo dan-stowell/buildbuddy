@@ -314,8 +314,8 @@ func forEachClientMode(t *testing.T, f func(t *testing.T, ring bool, numDrops in
 	}
 }
 
-// The reply to the task HSET is lost after Redis applied it, and the client
-// library transparently re-sends the HSET.
+// The reply to the insert script is lost after Redis applied it, and the
+// client library transparently re-sends the script.
 func TestRedisLostReply_ScheduleTask(t *testing.T) {
 	forEachClientMode(t, func(t *testing.T, ring bool, numDrops int) {
 		env, ctx, injector := newLostReplyEnv(t, ring)
@@ -327,7 +327,12 @@ func TestRedisLostReply_ScheduleTask(t *testing.T) {
 		taskID := req.GetTaskId()
 		taskKey := s.redisKeyForTask(taskID)
 		injector.arm(numDrops, func(args []string) bool {
-			return len(args) >= 2 && strings.EqualFold(args[0], "hset") && args[1] == taskKey
+			if len(args) < 4 || args[3] != taskKey {
+				return false
+			}
+			cmd := strings.ToLower(args[0])
+			return (cmd == "evalsha" && args[1] == redisInsertTask.Hash()) ||
+				(cmd == "eval" && strings.Contains(args[1], `"insertToken"`))
 		})
 
 		_, scheduleErr := s.ScheduleTask(ctx, req)
@@ -337,8 +342,8 @@ func TestRedisLostReply_ScheduleTask(t *testing.T) {
 		}
 		t.Logf("ScheduleTask error: %v; task key TTL: %v (err: %v)", scheduleErr, ttl, ttlErr)
 
-		require.Equal(t, numDrops, injector.Dropped(), "unexpected number of lost HSET replies")
-		require.NoError(t, scheduleErr, "ScheduleTask should succeed when only the HSET reply was lost")
+		require.Equal(t, numDrops, injector.Dropped(), "unexpected number of lost insert script replies")
+		require.NoError(t, scheduleErr, "ScheduleTask should succeed when only the insert script reply was lost")
 		require.NoError(t, ttlErr)
 		require.Greater(t, ttl, time.Duration(0), "task key should have a TTL")
 		fe.WaitForTask(taskID)
