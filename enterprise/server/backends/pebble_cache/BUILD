@@ -57,6 +57,7 @@ go_test(
     size = "medium",
     srcs = [
         "pebble_cache_internal_test.go",
+        "pebble_cache_delete_repro_test.go",
         "pebble_cache_test.go",
     ],
     embed = [":pebble_cache"],
