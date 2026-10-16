@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"slices"
 	"sort"
 	"sync"
@@ -2762,6 +2763,7 @@ func TestWatchTaskLiveness_StopsWhenWatchersAreDone(t *testing.T) {
 // client alive. AskForMoreWork is a barrier: its reply proves registration was
 // processed, without relying on a sleep or the fake executor's timing.
 func TestExecutorRegistrationChurn(t *testing.T) {
+	flags.Set(t, "grpc_server_worker_multiplier", 0)
 	for _, overlap := range []bool{false, true} {
 		for _, n := range []int{1, 10, 50} {
 			t.Run(fmt.Sprintf("overlap=%t/N=%d", overlap, n), func(t *testing.T) {
@@ -2853,4 +2855,70 @@ func TestExecutorRegistrationChurn(t *testing.T) {
 			})
 		}
 	}
+}
+
+// TestRevalWorkerProbe is an opt-in detector calibration. With workers=2 the
+// deliberately blocked handlers are invisible; workers=0 must fail Check.
+// Release happens after measurement, so this probe leaves no actual leak.
+func TestRevalWorkerProbe(t *testing.T) {
+	mode := os.Getenv("REVAL_WORKERS")
+	if mode == "" {
+		t.Skip("set REVAL_WORKERS=2 or 0 to calibrate detector")
+	}
+	workers := 2
+	if mode == "0" {
+		workers = 0
+	}
+	flags.Set(t, "grpc_server_worker_multiplier", workers)
+	env := testenv.GetTestEnv(t)
+	srv, run, lis := testenv.RegisterLocalGRPCServer(t, env)
+	releases := make(chan chan struct{}, 8)
+	started := make(chan struct{}, 8)
+	srv.RegisterService(&grpc.ServiceDesc{ServiceName: "reval.Probe", HandlerType: (*any)(nil), Streams: []grpc.StreamDesc{{StreamName: "Block", ServerStreams: true, ClientStreams: true, Handler: func(_ any, stream grpc.ServerStream) error {
+		release := <-releases
+		started <- struct{}{}
+		<-release
+		return nil
+	}}}}, struct{}{})
+	go run()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := testenv.LocalGRPCConn(t, ctx, lis)
+	require.NoError(t, err)
+	// Warm the connection before the snapshot. Warmup handlers finish normally.
+	var blocked []chan struct{}
+	defer func() {
+		for _, c := range blocked {
+			close(c)
+		}
+	}()
+	op := func(i int) {
+		release := make(chan struct{})
+		releases <- release
+		rpcCtx, rpcCancel := context.WithCancel(ctx)
+		stream, err := conn.NewStream(rpcCtx, &grpc.StreamDesc{ServerStreams: true, ClientStreams: true}, "/reval.Probe/Block")
+		require.NoError(t, err)
+		require.NoError(t, stream.CloseSend())
+		select {
+		case <-started:
+		case <-ctx.Done():
+			t.Fatal("handler did not start")
+		}
+		if i == 0 {
+			close(release)
+		} else {
+			blocked = append(blocked, release)
+			rpcCancel()
+		}
+		require.Error(t, stream.RecvMsg(new(any)))
+		rpcCancel()
+	}
+	op(0)
+	t.Run("snapshot", func(t *testing.T) {
+		testleak.Check(t)
+		for i := range 3 {
+			op(i + 1)
+		}
+	})
+	t.Logf("workers=%d deliberately blocked handlers=%d", workers, len(blocked))
 }
