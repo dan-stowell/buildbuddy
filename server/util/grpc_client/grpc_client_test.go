@@ -201,6 +201,7 @@ const (
 
 func newConnCache(t *testing.T) (*grpc_client.ConnCache, *clockwork.FakeClock) {
 	testleak.Check(t)
+	testleak.CheckFDs(t)
 	env := testenv.GetTestEnv(t)
 	clock := clockwork.NewFakeClock()
 	c, err := grpc_client.NewConnCache(env, grpc_client.ConnCacheOpts{
