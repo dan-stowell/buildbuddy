@@ -2757,3 +2757,29 @@ func TestWatchTaskLiveness_StopsWhenWatchersAreDone(t *testing.T) {
 	defer s.livenessMu.Unlock()
 	require.Empty(t, s.livenessWatches)
 }
+
+func TestPlatformRoutingNoMatchingExecutor(t *testing.T) {
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+	executor := newFakeExecutorWithId(ctx, t, "linux-amd64", env.GetSchedulerClient())
+	executor.node.SupportedIsolationTypes = []string{"oci"}
+	executor.Register()
+	for _, dimension := range []string{"os", "arch", "pool", "group"} {
+		t.Run(dimension, func(t *testing.T) {
+			req := newScheduleRequest(ctx, t, env, scheduleOpts{})
+			switch dimension {
+			case "os":
+				req.Metadata.Os = "darwin"
+			case "arch":
+				req.Metadata.Arch = "arm64"
+			case "pool":
+				req.Metadata.Pool = "missing"
+			case "group":
+				req.Metadata.ExecutorGroupId = "other-group"
+			}
+			_, err := env.GetSchedulerService().ScheduleTask(ctx, req)
+			require.True(t, status.IsUnavailableError(err), "expected Unavailable, got %v", err)
+			require.Contains(t, err.Error(), "No registered executors")
+			executor.EnsureTaskNotReceived(req.GetTaskId())
+		})
+	}
+}
