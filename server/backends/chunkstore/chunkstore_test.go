@@ -515,3 +515,16 @@ func TestWriteAfterWriteLoopShutsDown(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "hello, world", string(blob))
 }
+func TestBuildLogsLastChunkIndexAfterClose(t *testing.T) {
+	ctx := t.Context()
+	c := New(mockstore.New(), &ChunkstoreOptions{WriteBlockSize: 16})
+	w := c.Writer(ctx, "log", &ChunkstoreWriterOptions{})
+	_, err := w.Write(ctx, []byte("tail"))
+	require.NoError(t, err)
+	require.NoError(t, w.Close(ctx))
+	// Close persisted chunk zero; clients use this index as the last chunk ID.
+	data, err := c.ReadChunk(ctx, "log", 0)
+	require.NoError(t, err)
+	require.Equal(t, "tail", string(data))
+	require.Equal(t, uint16(0), w.GetLastChunkIndex(ctx))
+}
