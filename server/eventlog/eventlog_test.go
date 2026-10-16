@@ -552,3 +552,19 @@ func TestBuildLogsEventPartitionInvariant(t *testing.T) {
 		})
 	}
 }
+
+// UTF-8 decoder state must survive event boundaries just like ANSI state.
+func TestBuildLogsSplitUTF8(t *testing.T) {
+	ctx := t.Context()
+	blobs := mockstore.New()
+	w, err := eventlog.NewEventLogWriter(ctx, blobs, nil, nil, "", "utf8", 80, 4)
+	require.NoError(t, err)
+	for _, event := range [][]byte{{0xe4}, {0xb8, 0x96, '\n'}} {
+		_, err := w.Write(ctx, event)
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Close(ctx))
+	got, err := io.ReadAll(chunkstore.New(blobs, &chunkstore.ChunkstoreOptions{}).Reader(ctx, "utf8"))
+	require.NoError(t, err)
+	require.Equal(t, "世\n", string(got))
+}
