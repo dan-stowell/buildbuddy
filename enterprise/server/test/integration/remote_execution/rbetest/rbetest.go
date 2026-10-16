@@ -255,11 +255,15 @@ func NewRBETestEnv(t *testing.T) *Env {
 type EnvOptions struct {
 	// ShardedRedis indicates whether to use a sharded redis setup.
 	ShardedRedis bool
+	// RedisClient, if set, is used instead of starting a new Redis server.
+	RedisClient redis.UniversalClient
 }
 
 func NewRBETestEnvWithOptions(t *testing.T, opts *EnvOptions) *Env {
 	envOpts := &enterprise_testenv.Options{}
-	if opts.ShardedRedis {
+	if opts.RedisClient != nil {
+		envOpts.RedisClient = opts.RedisClient
+	} else if opts.ShardedRedis {
 		ring := testredis.StartSharded(t, 0 /*use default shard count*/)
 		envOpts.RedisClient = ring.Client()
 	} else {
