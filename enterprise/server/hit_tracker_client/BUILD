@@ -45,6 +45,8 @@ go_test(
         "//server/real_environment",
         "//server/testutil/testauth",
         "//server/testutil/testenv",
+        "//server/testutil/testhealthcheck",
+        "//server/testutil/testleak",
         "//server/util/authutil",
         "//server/util/bazel_request",
         "//server/util/log",
