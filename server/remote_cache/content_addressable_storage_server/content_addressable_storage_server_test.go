@@ -1632,3 +1632,47 @@ func TestStreamingChunkMappingRPCsUnimplemented(t *testing.T) {
 	_, err = registerStream.CloseAndRecv()
 	require.Equal(t, gcodes.Unimplemented, gstatus.Code(err))
 }
+
+func TestDigestFunctionCASIsolation(t *testing.T) {
+	for _, source := range []repb.DigestFunction_Value{repb.DigestFunction_SHA256, repb.DigestFunction_BLAKE3} {
+		t.Run(source.String(), func(t *testing.T) {
+			te := testenv.GetTestEnv(t)
+			ctx, err := prefix.AttachUserPrefixToContext(context.Background(), te.GetAuthenticator())
+			require.NoError(t, err)
+			conn := runCASServer(ctx, t, te)
+			bs := bspb.NewByteStreamClient(conn)
+			cas := repb.NewContentAddressableStorageClient(conn)
+			root := &repb.Directory{Symlinks: []*repb.SymlinkNode{{Name: "link", Target: "target"}}}
+			d, err := cachetools.UploadProto(ctx, bs, "", source, root)
+			require.NoError(t, err)
+			other := repb.DigestFunction_BLAKE3
+			if source == other {
+				other = repb.DigestFunction_SHA256
+			}
+			for _, df := range []repb.DigestFunction_Value{source, other} {
+				t.Run(df.String(), func(t *testing.T) {
+					wantFound := df == source
+					missing, err := cas.FindMissingBlobs(ctx, &repb.FindMissingBlobsRequest{BlobDigests: []*repb.Digest{d}, DigestFunction: df})
+					require.NoError(t, err)
+					assert.Equal(t, !wantFound, len(missing.GetMissingBlobDigests()) == 1, "FindMissingBlobs isolation")
+					batch, err := cas.BatchReadBlobs(ctx, &repb.BatchReadBlobsRequest{Digests: []*repb.Digest{d}, DigestFunction: df})
+					require.NoError(t, err)
+					require.Len(t, batch.GetResponses(), 1)
+					wantCode := gcodes.NotFound
+					if wantFound {
+						wantCode = gcodes.OK
+					}
+					assert.Equal(t, int32(wantCode), batch.GetResponses()[0].GetStatus().GetCode(), "BatchRead isolation")
+					stream, err := bs.Read(ctx, &bspb.ReadRequest{ResourceName: digest.NewCASResourceName(d, "", df).DownloadString()})
+					require.NoError(t, err)
+					_, err = stream.Recv()
+					assert.Equal(t, wantCode, gstatus.Code(err), "ByteStream isolation")
+					tree, err := cas.GetTree(ctx, &repb.GetTreeRequest{RootDigest: d, DigestFunction: df})
+					require.NoError(t, err)
+					_, err = tree.Recv()
+					assert.Equal(t, wantCode, gstatus.Code(err), "GetTree isolation")
+				})
+			}
+		})
+	}
+}
