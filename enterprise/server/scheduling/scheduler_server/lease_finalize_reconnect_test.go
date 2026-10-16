@@ -215,9 +215,14 @@ func TestLeaseClose_RenewalAfterAppShutdown_ReconnectsAndFinalizes(t *testing.T)
 	lease, err := s.leaser.Lease(s.ctx, taskID)
 	require.NoError(t, err)
 
-	s.shutDownApp1()
-	// Let at least one renewal happen (and reconnect to app2).
-	time.Sleep(2500 * time.Millisecond)
+	// Begin app1's shutdown, but let a renewal reach it (and reconnect to
+	// app2) before the hard stop.
+	s.router.setTarget(s.app2.GetSchedulerClient())
+	s.app1.GetHealthChecker().Shutdown()
+	s.app1.GetHealthChecker().WaitForGracefulShutdown()
+	time.Sleep(1500 * time.Millisecond)
+	s.app1.GetGRPCServer().Stop()
+	time.Sleep(1000 * time.Millisecond)
 	require.NoError(t, lease.Context().Err(), "lease should have survived the app1 shutdown")
 
 	lease.Close(s.ctx, nil /*=taskErr*/, false /*=retry*/)
