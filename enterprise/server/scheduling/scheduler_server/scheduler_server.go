@@ -2029,6 +2029,14 @@ func (s *SchedulerServer) insertTask(ctx context.Context, taskID string, metadat
 func (s *SchedulerServer) deleteTask(ctx context.Context, taskID string) (bool, error) {
 	key := s.redisKeyForTask(taskID)
 	n, err := s.rdb.Del(ctx, key).Result()
+	if err == nil && n == 1 {
+		// The task is gone, so it can no longer be merged against. Remove its
+		// action-merging state; otherwise identical requests keep finding it
+		// and wait for it to appear in the scheduler until the state expires.
+		if err := action_merger.DeletePendingExecution(ctx, s.rdb, taskID); err != nil {
+			log.CtxWarningf(ctx, "Could not delete pending execution for deleted task %q: %s", taskID, err)
+		}
+	}
 	return n == 1, err
 }
 
