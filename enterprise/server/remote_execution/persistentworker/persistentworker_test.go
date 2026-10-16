@@ -88,3 +88,20 @@ func TestKeyPreservesArgumentBoundaries(t *testing.T) {
 	require.True(t, ok)
 	require.NotEqual(t, a, b, "different startup argv must not share a worker")
 }
+
+func TestKeyIsolationControls(t *testing.T) {
+	props := &platform.Properties{PersistentWorker: true}
+	key := func(args ...string) string {
+		k, ok := persistentworker.Key(props, args)
+		require.True(t, ok)
+		return k
+	}
+	require.Equal(t, key("tool", "--mode=a", "@one"), key("tool", "--mode=a", "@two"))
+	require.Equal(t, key("tool", "--mode=a", "@one"), key("tool", "--mode=a", "--flagfile=two"))
+	require.NotEqual(t, key("tool-a", "@one"), key("tool-b", "@one"))
+	require.NotEqual(t, key("tool", "--mode=a", "@one"), key("tool", "--mode=b", "@one"))
+	props.PersistentWorkerKey = "explicit-a"
+	a := key("tool", "@one")
+	props.PersistentWorkerKey = "explicit-b"
+	require.NotEqual(t, a, key("tool", "@one"))
+}
