@@ -97,8 +97,10 @@ Branch convention: `leak/det-*` detector work, `leak/repro-*` reproducers (no fi
 | byte_stream_server_proxy, cas_server_proxy cancelled lifecycle | Check+CheckFDs | 30/30 | from I1 audit |
 | commandutil RepeatedLifecycle, runner lifecycle | Check+CheckFDs | 30/30 | from I4/I5 |
 | priority_task_scheduler shutdown | DROPPED (2/30) | — | flake → real bug lead I10 |
+| **Round 3 (E3 Codex → V21 Claude review)**: dirtools cancel ×3 (own target), snaploader/COW incl. mmap count, MCP tool disconnect, protolet bridge disconnect, /file/download disconnect, OCI exec/cancel w/ real crun | CheckGrowth + custom counts | 30/30 each --config=remote; mutations caught (writer Close, uploader Close, Unmap, HTTP ctx detach, OCI bundle removal) | `leak/pr-enforce3` 4db2aeb5 → PR after V21 |
 
 ## Process notes
+- 2026-10-16: lk-w3 VM deleted after E3 (branches pushed).
 - 2026-10-16: lk-w2 VM deleted after I27 (idle; coverage broad, diminishing returns). Status page: https://claude.ai/artifact/QZy2hqsJY74mF3GvrqSJFd
 - 2026-10-16: user requirement — all bb remote builds/tests pass `--config=remote`. Open PR branches being re-verified with it (~/coord/reverify). Codex tasks E2/I18/I19 started before the rule; their outputs are re-verified with the flag before PRs.
 
