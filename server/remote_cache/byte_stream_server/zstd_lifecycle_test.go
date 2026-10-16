@@ -20,7 +20,9 @@ import (
 // Use the real server and testenv cache, with deterministic transport failures.
 // Returning Canceled from Recv after the first request ensures the server has
 // actually acquired its decoder before cancellation; an RPC Send alone doesn't.
+// Handlers are called synchronously below: no gRPC worker pool can hide them.
 func TestZstdServerLifecycleGrowth(t *testing.T) {
+	flags.Set(t, "grpc_server_worker_multiplier", 0)
 	for _, passthrough := range []bool{false, true} {
 		t.Run(fmt.Sprintf("cache_zstd=%t", passthrough), func(t *testing.T) {
 			testleak.Check(t)
