@@ -28,6 +28,12 @@
 // child-process resources or work that starts after a passing snapshot. Shut
 // down the owner (including scheduled callbacks) before cleanup checks run.
 //
+// A file descriptor that is only closed by the garbage collector (an *os.File,
+// net.Conn or *os.Process dropped without Close/Release, closed later by its
+// finalizer or cleanup) is a leak. CheckFDs and CheckGrowth hold the garbage
+// collector while they measure, so that such leaks are reported whether or not
+// a GC would have happened to run; see CheckFDs and AllowGC.
+//
 // Goroutine pools started before a check hide work stuck on them. In
 // particular, gRPC servers built with grpc_server's options run handlers on a
 // pool of GOMAXPROCS*grpc_server_worker_multiplier worker goroutines that is
@@ -84,7 +90,9 @@ func Check(t testing.TB, opts ...goleak.Option) {
 }
 
 func checkGoroutines(t testing.TB, settle time.Duration, opts ...goleak.Option) {
-	opts = append(slices.Clip(opts), goleak.IgnoreCurrent())
+	// The finalizer goroutine shows up as a user goroutine while CheckFDs
+	// holds it.
+	opts = append(slices.Clip(opts), goleak.IgnoreCurrent(), goleak.IgnoreAnyFunction(gcGateFinalizerName))
 	testGoroutine := currentGoroutineID()
 	t.Cleanup(func() {
 		start := time.Now()
@@ -247,6 +255,10 @@ func isTestingGoroutine(g goroutine) bool {
 	switch g.topFunction {
 	case "testing.RunTests", "testing.(*T).Run", "testing.(*T).Parallel", "testing.runFuzzing", "testing.runFuzzTests":
 		return strings.HasPrefix(g.state, "chan receive")
+	}
+	if slices.Contains(g.functions, gcGateFinalizerName) {
+		// The finalizer goroutine, held by CheckFDs or CheckGrowth.
+		return true
 	}
 	return g.topFunction == "os/signal.signal_recv" || g.topFunction == "os/signal.loop" || slices.Contains(g.functions, "runtime.ensureSigM")
 }
