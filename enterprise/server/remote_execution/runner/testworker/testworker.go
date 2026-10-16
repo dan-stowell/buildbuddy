@@ -10,11 +10,13 @@ import (
 	"flag"
 	"io"
 	"os"
+	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 )
 
 var (
+	gate             = flag.String("response_gate", "", "Wait for this file before responding; create .ready after reading the request.")
 	persistentWorker = flag.Bool("persistent_worker", false, "Persistent worker flag.")
 
 	protocol       = flag.String("protocol", "proto", "Serialization protocol: 'json' or 'proto'.")
@@ -63,6 +65,17 @@ func main() {
 		}
 
 		log.Info("[worker] Got request! Sending response...")
+		if *gate != "" {
+			if err := os.WriteFile(*gate+".ready", nil, 0600); err != nil {
+				panic(err)
+			}
+			for {
+				if _, err := os.Stat(*gate); err == nil {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}
 
 		_, err = os.Stdout.Write(resBytes)
 		if err != nil {

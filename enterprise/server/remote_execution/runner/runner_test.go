@@ -1315,3 +1315,42 @@ func TestTransientErrorExitCodes(t *testing.T) {
 		})
 	}
 }
+
+func TestPersistentWorkerCancellation(t *testing.T) {
+	for _, protocol := range []string{"proto", "json"} {
+		t.Run(protocol, func(t *testing.T) {
+			env := newTestEnv(t)
+			pool := newRunnerPool(t, env, noLimitsCfg())
+			ctx := withAuthenticatedUser(t, context.Background(), env, "US1")
+			gate := path.Join(t.TempDir(), "release")
+			task := newPersistentRunnerTask(t, "cancel", "--response_gate="+gate, protocol, &wkpb.WorkResponse{Output: "late response"})
+			r, err := pool.Get(ctx, task)
+			require.NoError(t, err)
+			requestCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			done := make(chan *interfaces.CommandResult, 1)
+			go func() { done <- r.Run(requestCtx, &repb.IOStats{}) }()
+			// Release the worker even on assertion failure, so cleanup never hangs.
+			defer func() { _ = os.WriteFile(gate, nil, 0600) }()
+			require.NoError(t, disk.WaitUntilExists(ctx, gate+".ready", disk.WaitOpts{Timeout: 10 * time.Second}))
+			cancel()
+			select {
+			case res := <-done:
+				require.Error(t, res.Error)
+				pool.TryRecycle(ctx, r, true)
+				require.Equal(t, 0, pool.PausedRunnerCount())
+			case <-time.After(2 * time.Second):
+				// Recover the stuck call before failing; verify what it returned
+				// after cancellation, too.
+				require.NoError(t, os.WriteFile(gate, nil, 0600))
+				select {
+				case res := <-done:
+					pool.TryRecycle(ctx, r, true)
+					t.Errorf("request ignored cancellation; after release: error=%v output=%q paused=%d", res.Error, res.Stderr, pool.PausedRunnerCount())
+				case <-time.After(10 * time.Second):
+					t.Error("request did not return even after worker release")
+				}
+			}
+		})
+	}
+}
