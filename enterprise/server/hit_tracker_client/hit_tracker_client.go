@@ -19,6 +19,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/usageutil"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	capb "github.com/buildbuddy-io/buildbuddy/proto/cache"
@@ -82,7 +83,7 @@ func newHitTrackerClient(ctx context.Context, env *real_environment.RealEnv, con
 		hitsByCollection:     map[string]*cacheHits{},
 		client:               hitpb.NewHitTrackerServiceClient(conn),
 	}
-	go factory.batcher()
+	factory.wg.Go(factory.batcher)
 	for i := 0; i < *remoteHitTrackerWorkers; i++ {
 		factory.wg.Go(func() {
 			ticker := env.GetClock().NewTicker(*remoteHitTrackerPollInterval).Chan()
@@ -113,7 +114,7 @@ type HitTrackerFactory struct {
 	authenticator interfaces.Authenticator
 
 	quit chan struct{}
-	wg   sync.WaitGroup
+	wg   sync.WaitGroup // The batcher and the senders.
 
 	enqueueChan chan *enqueuedCacheHit
 
@@ -376,8 +377,14 @@ func (h *HitTrackerFactory) shouldFlushSynchronously() bool {
 }
 
 // Sends the oldest pending batch of hits from the queue. This function sends
-// one RPC and returns the number of updates sent.
+// one RPC and returns the number of updates sent. If the RPC fails in a way
+// that means the batch can be sent again (see canRetry), the batch is put back
+// for the next tick and 0 is returned, so that the caller stops flushing.
 func (h *HitTrackerFactory) sendTrackRequest(ctx context.Context) int {
+	return h.sendBatch(ctx, true /*=retryLater*/)
+}
+
+func (h *HitTrackerFactory) sendBatch(ctx context.Context, retryLater bool) int {
 	h.mu.Lock()
 	if len(h.hitsQueue) == 0 {
 		h.mu.Unlock()
@@ -426,18 +433,70 @@ func (h *HitTrackerFactory) sendTrackRequest(ctx context.Context) int {
 	).Observe(float64(hitCount))
 	if err != nil {
 		log.CtxWarningf(ctx, "Error sending Track request to record cache hit-tracking state group %s: %v", groupID, err)
+		if retryLater && canRetry(err) {
+			h.requeue(hitsToSend, groupID)
+			return 0
+		}
 	}
 	return hitCount
+}
+
+// canRetry returns true if a batch whose Track RPC failed with err can be
+// sent again without double counting. HitTrackerService.Track records hits
+// one at a time, so after most errors (including DeadlineExceeded) the app
+// may already have recorded some or all of them. Unavailable is returned when
+// the proxy cannot reach the app at all, for example while an app replica is
+// restarting, so the batch has almost always not been recorded. The exception
+// is a connection that breaks while the app is handling the RPC.
+func canRetry(err error) bool {
+	return gstatus.Code(err) == codes.Unavailable
+}
+
+// requeue puts back a batch that failed to send, merging it with any hits
+// batched for the same collection since. Like batch(), it keeps at most
+// maxPendingHitsPerKey hits per collection and drops the rest.
+func (h *HitTrackerFactory) requeue(failed *cacheHits, groupID string) {
+	h.mu.Lock()
+	pending, ok := h.hitsByCollection[failed.encodedCollection]
+	if !ok {
+		pending = &cacheHits{encodedCollection: failed.encodedCollection, authHeaders: failed.authHeaders}
+		h.hitsByCollection[failed.encodedCollection] = pending
+		h.hitsQueue = append(h.hitsQueue, pending)
+	}
+	hits := append(failed.hits, pending.hits...)
+	dropped := max(0, len(hits)-h.maxPendingHitsPerKey)
+	pending.hits = hits[:len(hits)-dropped]
+	h.mu.Unlock()
+
+	if dropped > 0 {
+		metrics.RemoteHitTrackerUpdates.WithLabelValues(
+			groupID,
+			"dropped_too_many_updates",
+		).Add(float64(dropped))
+	}
 }
 
 func (h *HitTrackerFactory) shutdown(ctx context.Context) error {
 	close(h.quit)
 	h.wg.Wait()
 
-	// Make a best-effort attempt to flush pending updates.
+	// The batcher stops as soon as it sees quit, so batch any hits still
+	// waiting in the channel before flushing.
+drain:
+	for ctx.Err() == nil {
+		select {
+		case update := <-h.enqueueChan:
+			h.batch(update)
+		default:
+			break drain
+		}
+	}
+
+	// Make a best-effort attempt to flush pending updates. There is no later
+	// attempt, so don't put back batches that fail to send.
 	// TODO(iain): we could do something fancier here if necessary, like
 	// fire-and-forget these RPCs with a rate-limiter. Let's try this for now.
-	for h.sendTrackRequest(ctx) > 0 {
+	for ctx.Err() == nil && h.sendBatch(ctx, false /*=retryLater*/) > 0 {
 	}
 
 	return nil
