@@ -1236,3 +1236,16 @@ func TestWorkspaceRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+// Git quotes non-ASCII paths in ls-files output by default. Patch generation
+// must still accept the actual untracked filename.
+func TestUntrackedUnicodePatch(t *testing.T) {
+	old, err := os.Getwd()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.Chdir(old)) })
+	repo, base := testgit.MakeTempRepo(t, map[string]string{"tracked": "base\n"})
+	require.NoError(t, os.Chdir(repo))
+	require.NoError(t, os.WriteFile("café", []byte("new\n"), 0644))
+	_, err = generatePatches(base)
+	require.NoError(t, err, "an untracked Unicode filename must be mirrored")
+}
