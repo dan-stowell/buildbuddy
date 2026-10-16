@@ -1591,3 +1591,22 @@ func TestCompressionConcurrentWrites(t *testing.T) {
 	require.NoError(t, cachetools.GetBlob(ctx, client, digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256), &out))
 	require.True(t, bytes.Equal(blob, out.Bytes()))
 }
+
+func TestCompressionReadLimitMustBeRejected(t *testing.T) {
+	flags.Set(t, "cache.zstd_transcoding_enabled", true)
+	ctx := context.Background()
+	te := testenv.GetTestEnv(t)
+	client := bspb.NewByteStreamClient(runByteStreamServer(ctx, t, te))
+	blob := []byte("compressed read limits must be rejected")
+	d, err := digest.Compute(bytes.NewReader(blob), repb.DigestFunction_SHA256)
+	require.NoError(t, err)
+	rn := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256)
+	_, _, err = cachetools.UploadFromReader(ctx, client, rn, bytes.NewReader(blob))
+	require.NoError(t, err)
+	rn.SetCompressor(repb.Compressor_ZSTD)
+	stream, err := client.Read(ctx, &bspb.ReadRequest{ResourceName: rn.DownloadString(), ReadLimit: 1})
+	require.NoError(t, err)
+	_, err = stream.Recv()
+	// remote_execution.proto requires INVALID_ARGUMENT for compressed read_limit != 0.
+	require.Equal(t, codes.InvalidArgument, gstatus.Code(err))
+}

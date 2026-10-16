@@ -3731,3 +3731,32 @@ func TestCompressionProxyClientFlags(t *testing.T) {
 		})
 	}
 }
+
+func TestCompressionProxyReadLimitMustBeRejected(t *testing.T) {
+	flags.Set(t, "cache.zstd_transcoding_enabled", true)
+	for _, warm := range []bool{false, true} {
+		t.Run(fmt.Sprintf("warm=%t", warm), func(t *testing.T) {
+			ctx := testContext()
+			remoteEnv := testenv.GetTestEnv(t)
+			proxyEnv := testenv.GetTestEnv(t)
+			remote, _, _, _ := runRemoteServices(ctx, remoteEnv, t)
+			proxy := runBSProxy(ctx, remote, proxyEnv, t)
+			blob := []byte("compressed proxy limit")
+			d, err := cachetools.UploadBlob(ctx, remote, "", repb.DigestFunction_SHA256, bytes.NewReader(blob))
+			require.NoError(t, err)
+			rn := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256)
+			rn.SetCompressor(repb.Compressor_ZSTD)
+			if warm {
+				var out bytes.Buffer
+				require.NoError(t, cachetools.GetBlob(ctx, proxy, rn, &out))
+				cacheCtx, err := prefix.AttachUserPrefixToContext(ctx, proxyEnv.GetAuthenticator())
+				require.NoError(t, err)
+				require.NoError(t, waitContains(cacheCtx, proxyEnv, rn.ToProto()))
+			}
+			rs, err := proxy.Read(ctx, &bspb.ReadRequest{ResourceName: rn.DownloadString(), ReadLimit: 1})
+			require.NoError(t, err)
+			_, err = rs.Recv()
+			require.Equal(t, "InvalidArgument", gstatus.Code(err).String())
+		})
+	}
+}
