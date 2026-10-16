@@ -764,10 +764,6 @@ func TestRunnerLeavesStaleSubmoduleContent(t *testing.T) {
 	remote, fetchURL, pushURL := setupRunnerRemote(t)
 	_ = remote
 
-	// Allow file:// for the test's own submodule operations (simulating the
-	// user's workflow steps). ci_runner never runs submodule commands itself.
-	gitEnv := `export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.file.allow GIT_CONFIG_VALUE_0=always`
-
 	// Submodule repo with two versions: "A" then "B".
 	subDir := t.TempDir()
 	testshell.Run(t, subDir, `
@@ -784,9 +780,12 @@ func TestRunnerLeavesStaleSubmoduleContent(t *testing.T) {
 	//   commit1: submodule "sub" -> A
 	//   commit2: submodule "sub" -> B (pointer change)
 	//   commit3: submodule removed
+	// ci_runner never runs submodule commands itself; these `-c
+	// protocol.file.allow=always` invocations simulate the user's workflow
+	// steps against a local file:// submodule.
 	sourceDir, _ := testgit.MakeTempRepo(t, map[string]string{"root.txt": "root"})
-	commit1 := testshell.Run(t, sourceDir, gitEnv+fmt.Sprintf(`
-		git submodule add %q sub >/dev/null 2>&1
+	commit1 := testshell.Run(t, sourceDir, fmt.Sprintf(`
+		git -c protocol.file.allow=always submodule add %q sub
 		cd sub && git checkout -q %s && cd ..
 		git add sub .gitmodules && git commit -qm "c1 sub@A"
 		git rev-parse HEAD
@@ -800,13 +799,13 @@ func TestRunnerLeavesStaleSubmoduleContent(t *testing.T) {
 	// submodule (ci_runner does not do this itself). ---
 	runRunnerSync(t, ws, fetchURL, "master")
 	require.Equal(t, commit1, gitOut(t, "rev-parse", "HEAD"))
-	testshell.Run(t, checkoutDir, gitEnv+`
-		git submodule update --init >/dev/null 2>&1
+	testshell.Run(t, checkoutDir, `
+		git -c protocol.file.allow=always submodule update --init
 	`)
 	require.Equal(t, "A", strings.TrimSpace(testshell.Run(t, checkoutDir, `cat sub/sub.txt`)))
 
 	// commit2: change the submodule pointer to B, re-push.
-	commit2 := testshell.Run(t, sourceDir, gitEnv+fmt.Sprintf(`
+	commit2 := testshell.Run(t, sourceDir, fmt.Sprintf(`
 		cd sub && git checkout -q %s && cd ..
 		git add sub && git commit -qm "c2 sub@B"
 		git rev-parse HEAD
@@ -824,7 +823,7 @@ func TestRunnerLeavesStaleSubmoduleContent(t *testing.T) {
 		"submodule content is stale after a pointer-changing commit")
 
 	// commit3: remove the submodule entirely, re-push.
-	commit3 := testshell.Run(t, sourceDir, gitEnv+`
+	commit3 := testshell.Run(t, sourceDir, `
 		git rm -q sub
 		rm -f .gitmodules
 		git add -A && git commit -qm "c3 remove sub"
