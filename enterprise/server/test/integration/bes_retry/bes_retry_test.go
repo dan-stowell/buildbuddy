@@ -262,7 +262,7 @@ func TestRealBazelBESDisconnectRetry_CacheStats(t *testing.T) {
 		}
 		t.Log(line)
 	}
-	for _, l := range strings.Split(cut.stderr, "\n") {
+	for l := range strings.SplitSeq(cut.stderr, "\n") {
 		if strings.Contains(strings.ToLower(l), "build event") || strings.Contains(l, "BES") || strings.Contains(strings.ToLower(l), "retry") {
 			t.Logf("bazel: %s", l)
 		}
