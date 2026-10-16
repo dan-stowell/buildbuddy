@@ -558,3 +558,14 @@ func TestBughuntGlobDoesNotOverlap(t *testing.T) {
 	assert.False(t, config.MatchesAnyTrigger(a, "push", "abc", "", "", false))
 	assert.True(t, config.MatchesAnyTrigger(a, "push", "abbc", "", "", false))
 }
+
+func TestBughuntBrokenConfigReportsUnknownFields(t *testing.T) {
+	for _, input := range []string{
+		"actons: [{name: test}]",
+		"actions: [{name: test, triggers: {pussh: {branches: [main]}}}]",
+	} {
+		// Both typos currently turn a configured workflow into a silent no-op.
+		_, err := config.NewConfig(strings.NewReader(input))
+		assert.Error(t, err, "broken config should explain the unknown field: %s", input)
+	}
+}
