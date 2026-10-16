@@ -88,5 +88,8 @@ Branch convention: `leak/det-*` detector work, `leak/repro-*` reproducers (no fi
 ## Process notes
 - 2026-10-16: user requirement — all bb remote builds/tests pass `--config=remote`. Open PR branches being re-verified with it (~/coord/reverify). Codex tasks E2/I18/I19 started before the rule; their outputs are re-verified with the flag before PRs.
 
+## --config=remote re-verification of open PRs (2026-10-16)
+13/15 pass (3 runs each). **#66** enforcement: operation_test (publisher cancel, +1 server transport goroutine, constant) and runner_test flaked 1/3 → V16 fixing/dropping. **#76**: upstream TestFetchBlobSingleflightCacheSetupFailure flaked 1/3 (likely pre-existing) → V16 checking master. PR comments posted. Results: ~/coord/reverify/results.txt.
+
 ## Revalidation queue (V5-a blind spot)
 Negative audits that observed server handlers: I1 proxy audit (had independent remote-active counter), I7 BES RPC (stack-frame polling — likely OK), I8 Execute (CheckGrowth + Redis XREAD count), I11 scheduler (CheckGrowth + map/Redis introspection), I9 ByteStream part, I5 lease/publisher (server stream counters). Re-run each with grpc_server_worker_multiplier=0. Status: **DONE** (Codex lk-w3, R1). Blind spot confirmed by injected stuck-handler probe in 4 harnesses (bsproxy, BES RPC, execsvc, schedreg: workers=2 → 0/1 caught; workers=0 → 1/1 caught). zstd (direct calls) and task_leaser/publisher (plain grpc.NewServer) not exposed. All 6 audits re-pass 3/3 with workers=0 → **no new findings; negative audits stand**. Branches `leak/reval-*`. Enforcement tests on live common-option servers to set multiplier 0 (routed to V7).
