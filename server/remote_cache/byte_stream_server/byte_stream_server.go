@@ -245,6 +245,9 @@ func (s *ByteStreamServer) ReadCASResource(ctx context.Context, r *digest.CASRes
 		if err == io.EOF {
 			break
 		}
+		if err == io.ErrUnexpectedEOF {
+			return status.DataLossErrorf("unexpected EOF reading %q", r.DownloadString())
+		}
 		if err != nil {
 			return err
 		}
@@ -257,6 +260,20 @@ func (s *ByteStreamServer) ReadCASResource(ctx context.Context, r *digest.CASRes
 	bytesFromCache := int64(bytesTransferredToClient)
 	if counter != nil {
 		bytesFromCache = counter.Count()
+	}
+
+	// Unless the cache passed through compressed bytes (whose decompressed
+	// size we don't know here), make sure we served exactly the number of
+	// (uncompressed) bytes the client asked for. Never return OK for a
+	// truncated blob.
+	if !passthroughCompressionEnabled || r.GetCompressor() == repb.Compressor_IDENTITY {
+		expectedBytes := max(r.GetDigest().GetSizeBytes()-offset, 0)
+		if limit > 0 {
+			expectedBytes = min(expectedBytes, limit)
+		}
+		if bytesFromCache != expectedBytes {
+			return status.DataLossErrorf("read %d bytes for %q (offset %d, limit %d), expected %d", bytesFromCache, r.DownloadString(), offset, limit, expectedBytes)
+		}
 	}
 
 	if err := downloadTracker.CloseWithBytesTransferred(bytesFromCache, int64(bytesTransferredToClient), r.GetCompressor(), "byte_stream_server"); err != nil {
