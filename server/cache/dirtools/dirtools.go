@@ -1345,6 +1345,34 @@ func (ff *BatchFileFetcher) bytestreamReadToFilecache(ctx context.Context, bsCli
 		defer release()
 		fp0 := fps[0]
 
+		if ff.shouldDownloadChunked(fp0.FileNode) {
+			// Chunk assembly needs a seekable file. Stage privately in the cache
+			// filesystem and share only after all writes have completed.
+			fc := ff.env.GetFileCache()
+			f, err := os.CreateTemp(fc.TempDir(), "download-*")
+			if err != nil {
+				return nil, err
+			}
+			path := f.Name()
+			defer os.Remove(path)
+			if err := f.Close(); err != nil {
+				return nil, err
+			}
+			mode := os.FileMode(0644)
+			if fp0.FileNode.GetIsExecutable() {
+				mode = 0755
+			}
+			if err := os.Chmod(path, mode); err != nil {
+				return nil, err
+			}
+			if err := ff.downloadBlobToFile(ctx, bsClient, fp0.FileNode, path, mode); err != nil {
+				return nil, err
+			}
+			if err := fc.AddReadOnly(ctx, fp0.FileNode, path); err != nil {
+				return nil, err
+			}
+			return fp0, nil
+		}
 		w, err := ff.env.GetFileCache().Writer(ctx, fp0.FileNode, ff.digestFunction)
 		if err != nil {
 			return nil, status.WrapError(err, "could not create filecache writer")

@@ -490,7 +490,7 @@ func (c *fileCache) scanDir() {
 		if !isValidScannedCachePath(c.rootDir, path, keyPrefix, node) {
 			return nil
 		}
-		if err := c.addFileWithKeyPrefix(keyPrefix, node, path); err != nil {
+		if err := c.addFileWithKeyPrefix(keyPrefix, node, path, admitReadOnly); err != nil {
 			if status.IsInvalidArgumentError(err) {
 				return nil
 			}
@@ -728,23 +728,25 @@ func (c *fileCache) Open(ctx context.Context, node *repb.FileNode) (f *os.File, 
 	return os.Open(filecachePath(c.rootDir, key))
 }
 
-func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, existingFilePath string, modes ...string) error {
-	mode := "writable"
-	if len(modes) > 0 {
-		mode = modes[0]
+type admissionMode int
+
+const (
+	admitWritable admissionMode = iota
+	admitReadOnly
+	admitOwned
+)
+
+func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, existingFilePath string, mode admissionMode) error {
+	if c.checkClosed() {
+		return nil
 	}
-	k0, err := namespacedKey(keyPrefix, node)
+	k, err := namespacedKey(keyPrefix, node)
 	if err != nil {
 		return err
 	}
-	if c.containsWithStatFallback(k0) {
+	if c.containsWithStatFallback(k) {
 		return nil
 	}
-	// Remove any existing entry. We can't update in-place because if we
-	// overwrite an existing link with different contents, all pointers
-	// to the old link would suddenly change to point to the new content,
-	// which is not good.
-
 	info, err := os.Stat(existingFilePath)
 	if err != nil {
 		return wrapOSError(err, "stat")
@@ -754,10 +756,6 @@ func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, 
 		return wrapOSError(err, "estimate disk usage")
 	}
 
-	k, err := namespacedKey(keyPrefix, node)
-	if err != nil {
-		return err
-	}
 	fp := filecachePath(c.rootDir, k)
 	existingFileIsInPlace := samePath(fp, existingFilePath)
 
@@ -786,9 +784,9 @@ func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, 
 		defer os.Remove(stagedPath)
 		start := time.Now()
 		transfer := fastcopy.CloneOrCopy
-		if mode == "owned" {
+		if mode == admitOwned {
 			transfer = os.Rename
-		} else if (mode == "readonly" || *unsafeWorkspaceHardlinks) && !*alwaysClone {
+		} else if (mode == admitReadOnly || *unsafeWorkspaceHardlinks) && !*alwaysClone {
 			transfer = fastcopy.FastCopy
 		}
 		if err := transfer(existingFilePath, stagedPath); err != nil {
@@ -806,16 +804,8 @@ func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, 
 	if c.l.Contains(k) {
 		return nil
 	}
-	if existingFileIsInPlace {
-		if c.l.Contains(k) {
-			return nil
-		}
-	} else {
-		// If the file being added is not already at the path where we expect it
-		// (i.e. it's being added from some action workspace), then remove and
-		// unlink any existing entry, then publish the completed clone.
-		c.l.Remove(k)
-
+	if !existingFileIsInPlace {
+		// Publish a complete inode atomically, never overwrite cached bytes.
 		if err := os.Rename(stagedPath, fp); err != nil {
 			return err
 		}
@@ -850,7 +840,7 @@ func (c *fileCache) AddReadOnly(ctx context.Context, node *repb.FileNode, path s
 	if c.checkClosed() {
 		return nil
 	}
-	return c.addFileWithKeyPrefix(keyPrefixFromContext(ctx), node, path, "readonly")
+	return c.addFileWithKeyPrefix(keyPrefixFromContext(ctx), node, path, admitReadOnly)
 }
 
 func (c *fileCache) AddFile(ctx context.Context, node *repb.FileNode, existingFilePath string) error {
@@ -862,7 +852,7 @@ func (c *fileCache) AddFile(ctx context.Context, node *repb.FileNode, existingFi
 	start := time.Now()
 	keyPrefix := keyPrefixFromContext(ctx)
 	// Locking happens in addFileWithKeyPrefix().
-	err := c.addFileWithKeyPrefix(keyPrefix, node, existingFilePath)
+	err := c.addFileWithKeyPrefix(keyPrefix, node, existingFilePath, admitWritable)
 	if err != nil {
 		return err
 	}
@@ -1056,7 +1046,7 @@ func (c *fileCache) Write(ctx context.Context, node *repb.FileNode, b []byte) (n
 	if err := os.WriteFile(tmp, b, 0o666); err != nil {
 		return 0, status.InternalErrorf("filecache temp file write failed: %s", err)
 	}
-	if err := c.addFileWithKeyPrefix(keyPrefixFromContext(ctx), node, tmp, "owned"); err != nil {
+	if err := c.addFileWithKeyPrefix(keyPrefixFromContext(ctx), node, tmp, admitOwned); err != nil {
 		return 0, err
 	}
 	return len(b), nil
@@ -1131,7 +1121,7 @@ func (v *verifiedWriter) Commit() error {
 		return status.DataLossErrorf("data checksum %q does not match expected checksum %q", hashStr, v.node.GetDigest().GetHash())
 	}
 	defer v.Close()
-	return v.fc.addFileWithKeyPrefix(keyPrefixFromContext(v.ctx), v.node, v.file.Name(), "owned")
+	return v.fc.addFileWithKeyPrefix(keyPrefixFromContext(v.ctx), v.node, v.file.Name(), admitOwned)
 }
 
 func (v *verifiedWriter) Close() error {
