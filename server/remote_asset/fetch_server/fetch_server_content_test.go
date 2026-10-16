@@ -162,7 +162,7 @@ func TestFetchBlob_RandomizedChecksumIntegrity(t *testing.T) {
 	}
 
 	var contents [][]byte
-	for i := 0; i < 6; i++ {
+	for range 6 {
 		b := make([]byte, rng.Intn(300))
 		rng.Read(b)
 		contents = append(contents, b)
@@ -193,7 +193,7 @@ func TestFetchBlob_RandomizedChecksumIntegrity(t *testing.T) {
 	defer origin.Close()
 
 	const trials = 300
-	for trial := 0; trial < trials; trial++ {
+	for trial := range trials {
 		instance := fmt.Sprintf("trial-%d", trial)
 		storage := funcs[rng.Intn(len(funcs))]
 		reqFunc := storage
