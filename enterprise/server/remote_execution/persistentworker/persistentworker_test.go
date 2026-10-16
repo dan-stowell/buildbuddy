@@ -118,7 +118,7 @@ func (c *exitTrackingContainer) Exec(ctx context.Context, cmd *repb.Command, std
 func TestWorkerExec_StalledResponseHonorsContext(t *testing.T) {
 	testleak.Check(t)
 	testleak.CheckFDs(t)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		ctx := context.Background()
 		ctr := &exitTrackingContainer{CommandContainer: bare.NewBareCommandContainer(&bare.Opts{}), exited: make(chan struct{})}
 		require.NoError(t, ctr.Create(ctx, t.TempDir()))
