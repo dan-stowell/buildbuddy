@@ -1490,6 +1490,28 @@ func TestWorkSchedulingOnNewExecutor(t *testing.T) {
 	cmd2.Wait()
 }
 
+// An unknown but syntactically valid operation must not leave clients waiting
+// forever. Keep the default scheduler liveness configuration in this test.
+func TestWaitExecution_UnknownOperation(t *testing.T) {
+	rbe := rbetest.NewRBETestEnv(t)
+	rbe.AddBuildBuddyServer()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := rbe.GetRemoteExecutionClient().WaitExecution(ctx, &repb.WaitExecutionRequest{
+		Name: "uploads/00000000-0000-0000-0000-000000000001/blobs/" + strings.Repeat("a", 64) + "/1",
+	})
+	require.NoError(t, err)
+	op, err := stream.Recv()
+	if err != nil {
+		require.True(t, status.IsNotFoundError(err), "unknown operation must return NotFound promptly; got %v", err)
+		return
+	}
+	require.True(t, op.GetDone(), "unknown operation must return a terminal response")
+	response := &repb.ExecuteResponse{}
+	require.NoError(t, op.GetResponse().UnmarshalTo(response))
+	require.Equal(t, int32(5), response.GetStatus().GetCode(), "unknown operation must report NotFound")
+}
+
 // Test WaitExecution across different severs.
 func TestWaitExecution(t *testing.T) {
 	rbe := rbetest.NewRBETestEnv(t)
