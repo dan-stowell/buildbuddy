@@ -465,6 +465,9 @@ func (g *GCSBlobStore) Reader(ctx context.Context, blobName string, offset, limi
 	if g.compress {
 		rc, err := util.NewCompressReader(reader)
 		if err != nil {
+			// The caller gets nothing to close, so release the object reader
+			// (and its HTTP body or gRPC stream) here.
+			gcsReader.Close()
 			util.RecordReadMetrics(g.metricLabel, start, 0, err)
 			return nil, err
 		}
