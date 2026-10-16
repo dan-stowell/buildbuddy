@@ -58,6 +58,7 @@ Branch convention: `leak/det-*` detector work, `leak/repro-*` reproducers (no fi
 | I2-fp2 | testregistry.Run servers left running in tests | test fixture lifetime, not fetch cleanup |
 | HARNESS-1 | testify assert.Eventually runs condition in extra goroutine → NumGoroutine over-counts by 1 (hit I1 and I5) | harness artifact; use synchronous polling / CheckGrowth |
 | HARNESS-2 | Lazy shared-pool expansion (Redis/gRPC) mid-measurement → flat +1 FD step in CheckGrowth (I11, I8) | pre-warm pools before baseline; still-owned shared pool |
+| HARNESS-3 | gRPC worker-pool masking (see V5-a) | set grpc_server_worker_multiplier=0 before env creation |
 | I5-fp1 | runner pool Wait() before Shutdown hangs | pendingRemovals counts cached runners — intentional reuse |
 | I1-fp1 | 1 extra goroutine in count polling | testify `Eventually` spawns predicate goroutine — harness artifact; use synchronous polling |
 
@@ -72,4 +73,4 @@ Branch convention: `leak/det-*` detector work, `leak/repro-*` reproducers (no fi
 | priority_task_scheduler shutdown | DROPPED (2/30) | — | flake → real bug lead I10 |
 
 ## Revalidation queue (V5-a blind spot)
-Negative audits that observed server handlers: I1 proxy audit (had independent remote-active counter), I7 BES RPC (stack-frame polling — likely OK), I8 Execute (CheckGrowth + Redis XREAD count), I11 scheduler (CheckGrowth + map/Redis introspection), I9 ByteStream part, I5 lease/publisher (server stream counters). Re-run each with grpc_server_worker_multiplier=0. Status: IN PROGRESS (Codex lk-w3, task R1).
+Negative audits that observed server handlers: I1 proxy audit (had independent remote-active counter), I7 BES RPC (stack-frame polling — likely OK), I8 Execute (CheckGrowth + Redis XREAD count), I11 scheduler (CheckGrowth + map/Redis introspection), I9 ByteStream part, I5 lease/publisher (server stream counters). Re-run each with grpc_server_worker_multiplier=0. Status: **DONE** (Codex lk-w3, R1). Blind spot confirmed by injected stuck-handler probe in 4 harnesses (bsproxy, BES RPC, execsvc, schedreg: workers=2 → 0/1 caught; workers=0 → 1/1 caught). zstd (direct calls) and task_leaser/publisher (plain grpc.NewServer) not exposed. All 6 audits re-pass 3/3 with workers=0 → **no new findings; negative audits stand**. Branches `leak/reval-*`. Enforcement tests on live common-option servers to set multiplier 0 (routed to V7).
