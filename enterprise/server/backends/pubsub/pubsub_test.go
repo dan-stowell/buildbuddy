@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -439,4 +440,35 @@ func requireError(t *testing.T, subscriber *StreamSubscription) error {
 		assert.FailNow(t, "expected to receive an error but none received")
 	}
 	return nil
+}
+
+// Closing an idle subscription must stop its blocking Redis read, even if no
+// further execution update is ever published to that stream.
+func TestIdleStreamSubscriptionGrowth(t *testing.T) {
+	for _, n := range []int{10, 50} {
+		t.Run(fmt.Sprintf("N=%d", n), func(t *testing.T) {
+			rdb := testredis.Start(t).Client()
+			defer rdb.Close()
+			ps := NewStreamPubSub(rdb)
+			testleak.CheckGrowth(t, testleak.Growth{Iterations: n}, func(i int) {
+				channel := ps.UnmonitoredChannel(fmt.Sprintf("idle-%d", i))
+				sub := ps.SubscribeHead(t.Context(), channel)
+				// Wait until Redis has accepted the blocking read. A separate Redis
+				// connection can inspect the blocked command without publishing a message.
+				deadline := time.Now().Add(10 * time.Second)
+				for {
+					clients, err := rdb.ClientList(t.Context()).Result()
+					require.NoError(t, err)
+					if strings.Contains(clients, "cmd=xread") {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("subscription did not start reading")
+					}
+					time.Sleep(time.Millisecond)
+				}
+				require.NoError(t, sub.Close())
+			})
+		})
+	}
 }
