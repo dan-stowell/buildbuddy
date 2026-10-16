@@ -9,6 +9,11 @@ import (
 	"time"
 )
 
+const (
+	allGoroutinesGroup = "goroutines: all"
+	allFDsGroup        = "fds: all"
+)
+
 // Soak runs op for warmup batches, then for the given number of measured
 // batches, sampling the process's goroutines and file descriptors once things
 // have settled after each measured batch (and once before the first). It fails
@@ -23,10 +28,23 @@ import (
 // CheckGrowth, the owners stay alive, so a flagged group is a candidate that
 // needs ownership investigation, not proof of a leak.
 //
-// Goroutines are grouped by stack (function names, without arguments, offsets
-// or goroutine IDs) and creator function, and file descriptors by class
-// (socket protocol, pipe, anon_inode type, or the first two directories of a
-// file's path, with digits ignored). See soakGrowing for the limitations.
+// Groups are nested, so that a leak is caught even if its resources don't all
+// look the same:
+//
+//   - goroutines with the same stack (function names, without arguments,
+//     offsets or goroutine IDs) and creator function,
+//   - within those, goroutines with the same creator and entry function,
+//   - all goroutines;
+//   - file descriptors of the same class (socket protocol, pipe, anon_inode
+//     type, or the first two directories of a file's path, with digits
+//     ignored),
+//   - all file descriptors.
+//
+// A group is only reported if none of the groups nested in it is, so a leak is
+// reported once, at the most specific level at which it is visible. The
+// coarse groups also add up unrelated changes, so a leak can be hidden by an
+// unrelated group shrinking at the same time; see soakGrowing for other
+// limitations.
 //
 // Each sample is taken when three consecutive observations, 100ms apart, are
 // identical, or after DefaultSettle; periodic background work can delay that.
@@ -40,15 +58,28 @@ func Soak(t testing.TB, warmup, batches int, op func(batch int)) {
 	if checkFDs {
 		warmNetpoller()
 	}
+	parents := map[string]string{}
 	examples := map[string]string{}
 	snapshot := func() map[string]int {
 		counts := map[string]int{}
+		add := func(chain ...string) {
+			for i, k := range chain {
+				counts[k]++
+				if i+1 < len(chain) {
+					parents[k] = chain[i+1]
+				}
+			}
+		}
 		for _, g := range allGoroutines() {
 			if isTestingGoroutine(g) {
 				continue
 			}
-			creator, _, _ := strings.Cut(g.creator, " in goroutine ")
-			counts["goroutine stack:\n  "+strings.Join(g.functions, "\n  ")+"\n  "+creator]++
+			k := g.replacementKey()
+			kind := "goroutines: " + k.creator
+			if k.entry != "" {
+				kind += " running " + k.entry
+			}
+			add("goroutine stack:\n  "+strings.Join(g.functions, "\n  ")+"\n  "+k.creator, kind, allGoroutinesGroup)
 		}
 		if !checkFDs {
 			return counts
@@ -64,7 +95,7 @@ func Soak(t testing.TB, warmup, batches int, op func(batch int)) {
 		resolveFDs(entries)
 		for _, e := range entries {
 			k := "fds: " + soakFDClass(e)
-			counts[k]++
+			add(k, allFDsGroup)
 			examples[k] = e.desc
 		}
 		return counts
@@ -109,6 +140,15 @@ func Soak(t testing.TB, warmup, batches int, op func(batch int)) {
 			series[k] = append(series[k], s[k])
 		}
 	}
+	// A group is covered if a group nested in it is flagged, or covered.
+	covered := map[string]bool{}
+	for k, s := range series {
+		if soakGrowing(s) {
+			for p, ok := parents[k]; ok; p, ok = parents[p] {
+				covered[p] = true
+			}
+		}
+	}
 	delta := func(k string) int { s := series[k]; return s[len(s)-1] - s[0] }
 	keys := slices.Collect(maps.Keys(series))
 	slices.SortFunc(keys, func(a, b string) int {
@@ -131,7 +171,7 @@ func Soak(t testing.TB, warmup, batches int, op func(batch int)) {
 	}
 	t.Logf("testleak.Soak: %d resource groups over %d measured batches, %d of them constant", len(keys), batches, constant)
 	for _, k := range keys {
-		if soakGrowing(series[k]) {
+		if soakGrowing(series[k]) && !covered[k] {
 			msg := "testleak.Soak: resources grew steadily over %d batches: series=%v group=%s"
 			if example, ok := examples[k]; ok {
 				msg += "\n  example: " + example

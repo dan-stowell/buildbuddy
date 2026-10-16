@@ -40,9 +40,26 @@ func TestSoakGrowing(t *testing.T) {
 	}
 }
 
+// blockedA and blockedB are the same kind of goroutine (started by the same
+// function, running splitWorker), stuck in different places.
+//
+//go:noinline
+func blockedA(stop <-chan struct{}) { <-stop }
+
+//go:noinline
+func blockedB(stop <-chan struct{}) { <-stop }
+
+func splitWorker(i int, stop <-chan struct{}) {
+	if i%2 == 0 {
+		blockedA(stop)
+	} else {
+		blockedB(stop)
+	}
+}
+
 const soakBatches = 6
 
-func TestSoak_Leak_Caught(t *testing.T) {
+func TestSoak_Leak_ReportsEachLeakedGroupOnce(t *testing.T) {
 	skipIfNoFDs(t)
 	dogfood(t)
 	stop := make(chan struct{})
@@ -69,9 +86,25 @@ func TestSoak_Leak_Caught(t *testing.T) {
 
 	errs := f.allErrors()
 	t.Logf("report (expected):\n%s", errs)
-	require.Len(t, f.errors, 2, "expected only the leaked goroutines and FDs")
+	require.Len(t, f.errors, 2, "expected only the leaked goroutines and FDs, at their most specific level")
 	require.Contains(t, errs, "series=[3 6 9 12 15 18 21] group=goroutine stack:\n  github.com/buildbuddy-io/buildbuddy/server/testutil/testleak.leakyWorker")
 	require.Contains(t, errs, "group=fds: file /dev\n  example: /dev/null")
+}
+
+func TestSoak_LeakSplitAcrossStacks_Caught(t *testing.T) {
+	dogfood(t)
+	stop := make(chan struct{})
+	defer close(stop)
+
+	f := newFakeTB(t)
+	Soak(f, 1, soakBatches, func(i int) {
+		// One leak per batch, alternating between two stacks: neither stack
+		// grows by one per batch on its own.
+		go splitWorker(i, stop)
+	})
+
+	msg := f.requireOneError(t)
+	require.Contains(t, msg, "series=[1 2 3 4 5 6 7] group=goroutines: created by github.com/buildbuddy-io/buildbuddy/server/testutil/testleak.TestSoak_LeakSplitAcrossStacks_Caught.func1")
 }
 
 func TestSoak_NoisyLeak_Caught(t *testing.T) {
