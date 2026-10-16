@@ -70,7 +70,7 @@ go_library(
 go_test(
     name = "execution_server_test",
     size = "small",
-    srcs = ["execution_server_test.go"],
+    srcs = ["execution_server_test.go", "review_hedge_test.go"],
     deps = [
         ":execution_server",
         "//enterprise/server/backends/redis_execution_collector",
