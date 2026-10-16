@@ -206,3 +206,41 @@ func startExecService(t *testing.T) vmxpb.ExecClient {
 	client := vmxpb.NewExecClient(conn)
 	return client
 }
+
+// The command's main process exits 0 right away, leaving a background child
+// (exits on its own after 20s) that holds the inherited stdout/stderr. With a
+// short timeout, Execute should return around the timeout and not report
+// success afterwards.
+func TestExecStreamed_BackgroundChildHoldsStdout_Timeout(t *testing.T) {
+	const timeout = 2 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	client := startExecService(t)
+	cmd := &repb.Command{
+		Arguments: []string{"bash", "-c", `sleep 20 & echo hi`},
+	}
+
+	start := time.Now()
+	res := vmexec_client.Execute(ctx, client, cmd, ".", "" /*=user*/, nil /*=statsListener*/, nil /*=stdio*/)
+	elapsed := time.Since(start)
+	t.Logf("elapsed=%s exitCode=%d err=%v stdout=%q", elapsed, res.ExitCode, res.Error, res.Stdout)
+
+	assert.Less(t, elapsed, timeout+5*time.Second)
+	if elapsed > timeout {
+		assert.Error(t, res.Error, "returned after the deadline; should not report success")
+	}
+}
+
+// Same, without a timeout: documents how long Execute blocks after the main
+// process exits.
+func TestExecStreamed_BackgroundChildHoldsStdout_NoTimeout(t *testing.T) {
+	client := startExecService(t)
+	cmd := &repb.Command{
+		Arguments: []string{"bash", "-c", `sleep 5 & echo hi`},
+	}
+	start := time.Now()
+	res := vmexec_client.Execute(context.Background(), client, cmd, ".", "" /*=user*/, nil /*=statsListener*/, nil /*=stdio*/)
+	elapsed := time.Since(start)
+	t.Logf("elapsed=%s exitCode=%d err=%v stdout=%q", elapsed, res.ExitCode, res.Error, res.Stdout)
+	require.NoError(t, res.Error)
+}
