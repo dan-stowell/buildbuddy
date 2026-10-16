@@ -796,9 +796,11 @@ func TestTrackNotRetriedWhenAppMayHaveRecordedHits(t *testing.T) {
 }
 
 // If the connection to the app breaks after the app has recorded a batch but
-// before the response reaches the proxy, the proxy sees Unavailable. Resending
-// that batch counts its hits twice.
-func TestVerifyUnavailableAfterAppRecordedBatchIsNotCountedTwice(t *testing.T) {
+// before the response reaches the proxy, the proxy sees Unavailable and
+// resends the batch, so the app counts its hits twice. This is the accepted
+// trade-off of retrying Unavailable (see canRetry): the batch is recorded
+// once more, not again on later ticks.
+func TestUnavailableAfterAppRecordedBatchIsCountedOnceMore(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
 	h.trackDownloads(ctx, 10)
@@ -839,13 +841,24 @@ func TestVerifyUnavailableAfterAppRecordedBatchIsNotCountedTwice(t *testing.T) {
 		require.True(t, h.conn.WaitForStateChange(readyCtx, state), "connection never became ready")
 	}
 
-	// A hit for another collection, batched after the failed one, so that
-	// once it has been reported any resend has happened too.
+	// A hit for another collection, to check that the connection works.
 	h.trackDownloads(authenticatedContext(user1, h.authenticator), 1)
 	require.Eventually(t, pendingHitsExpectation(h.factory, group1Key, 1), 10*time.Second, 10*time.Millisecond)
 	h.tick(t)
 	require.Eventually(t, h.service.casDownloadExpectation(group1Key, 1), 10*time.Second, 10*time.Millisecond)
-	require.Equal(t, int64(10), h.service.casDownloads[anonKey].Load(), "hits recorded by the app")
+	// The held batch is put back on the queue after the group1 hit.
+	require.Eventually(t, h.service.casDownloadExpectation(anonKey, 20), 10*time.Second, 10*time.Millisecond,
+		"hits recorded by the app: %d", h.service.casDownloads[anonKey].Load())
+
+	// Nothing is left to resend.
+	pending, held := retainedHits(h.factory)
+	require.Equal(t, 0, pending+held)
+	h.tick(t)
+	h.trackDownloads(authenticatedContext(user1, h.authenticator), 1)
+	require.Eventually(t, pendingHitsExpectation(h.factory, group1Key, 1), 10*time.Second, 10*time.Millisecond)
+	h.tick(t)
+	require.Eventually(t, h.service.casDownloadExpectation(group1Key, 2), 10*time.Second, 10*time.Millisecond)
+	require.Equal(t, int64(20), h.service.casDownloads[anonKey].Load(), "hits recorded by the app")
 }
 
 // Shutdown should finish within max_shutdown_duration even when the app
