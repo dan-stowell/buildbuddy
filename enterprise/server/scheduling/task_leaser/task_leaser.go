@@ -102,9 +102,46 @@ func (t *TaskLease) Task() *repb.ExecutionTask {
 
 func (t *TaskLease) sendRequest(req *scpb.LeaseTaskRequest) (*scpb.LeaseTaskResponse, error) {
 	if err := t.stream.Send(req); err != nil {
+		if err == io.EOF {
+			// The stream was terminated (e.g. the server hard-stopped); the
+			// actual status is only available from Recv.
+			if _, recvErr := t.stream.Recv(); recvErr != nil && recvErr != io.EOF {
+				return nil, recvErr
+			}
+		}
 		return nil, err
 	}
 	return t.stream.Recv()
+}
+
+// reconnectForClose re-establishes the lease on a new stream (using the
+// reconnect token) so that the final Finalize/ReEnqueue message can be sent
+// after the original stream broke.
+func (t *TaskLease) reconnectForClose(ctx context.Context) error {
+	if !*enableReconnect || t.reconnectToken == "" {
+		return status.UnavailableError("lease reconnect not supported")
+	}
+	stream, err := t.env.GetSchedulerClient().LeaseTask(ctx)
+	if err != nil {
+		return err
+	}
+	t.stream = stream
+	req := &scpb.LeaseTaskRequest{
+		ExecutorId:              t.executorID,
+		ExecutorHostname:        t.executorHostname,
+		TaskId:                  t.taskID,
+		SupportsReconnect:       true,
+		ReconnectToken:          t.reconnectToken,
+		SupportsExperimentFlags: t.supportsExperimentFlags,
+	}
+	rsp, err := t.sendRequest(req)
+	if err != nil {
+		return err
+	}
+	if rsp.GetLeaseId() != "" {
+		t.leaseID = rsp.GetLeaseId()
+	}
+	return nil
 }
 
 func (t *TaskLease) pingServer(ctx context.Context) (b []byte, err error) {
@@ -244,8 +281,14 @@ func (t *TaskLease) Close(ctx context.Context, taskErr error, retry bool) {
 		s, _ := gstatus.FromError(taskErr)
 		req.ReEnqueueReason = s.Proto()
 	}
-	if err := t.stream.Send(req); err != nil {
-		log.CtxWarningf(ctx, "Failed to send final message on task lease stream: %s", err)
+	sendErr := t.stream.Send(req)
+	if sendErr != nil {
+		log.CtxWarningf(ctx, "Failed to send final message on task lease stream: %s", sendErr)
+		if err := t.reconnectForClose(ctx); err != nil {
+			log.CtxWarningf(ctx, "Failed to reconnect lease to send final message: %s", err)
+		} else if err := t.stream.Send(req); err != nil {
+			log.CtxWarningf(ctx, "Failed to send final message on reconnected task lease stream: %s", err)
+		}
 	}
 	closedCleanly := false
 	for {
