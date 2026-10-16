@@ -157,3 +157,17 @@ func TestStreamFinalizationSummary(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) { checkStreamFinalization(t, tc.order, tc.terminal, tc.cancel, tc.exit) })
 	}
 }
+
+// A rejected sequence still closes the RPC. Without a retry it must not leave
+// the primary DB saying the invocation is running indefinitely.
+func TestStreamFinalizationRejectedSequence(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		order []int
+	}{
+		{"gap", []int{1, 3}},
+		{"duplicate", []int{1, 2, 2, 3}},
+	} {
+		t.Run(tc.name, func(t *testing.T) { checkStreamFinalization(t, tc.order, io.EOF, false, 0) })
+	}
+}
