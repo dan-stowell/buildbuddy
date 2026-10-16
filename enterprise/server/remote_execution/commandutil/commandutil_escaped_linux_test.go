@@ -3,6 +3,7 @@
 package commandutil_test
 
 import (
+	"bytes"
 	"context"
 	"os/exec"
 	"testing"
@@ -88,4 +89,24 @@ func TestRun_ReviewCancellationOrderings(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Both descriptors must share the cancellation-bounded drain even when a child
+// escapes the original process group and holds the pipe after the root exits.
+func TestRun_SharedOutputEscapedSessionDeadline(t *testing.T) {
+	require.FileExists(t, "/usr/bin/setsid")
+	flags.Set(t, "executor.output_drain_timeout", 100*time.Millisecond)
+	var output bytes.Buffer
+	cmd := exec.Command("sh", "-c", `/usr/bin/setsid sh -c 'echo ready > ready; exec sleep 6' & while [ ! -f ready ]; do sleep 0.01; done; echo out; echo err >&2`)
+	cmd.Dir = t.TempDir()
+	cmd.Stdout, cmd.Stderr = &output, &output
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := commandutil.RunWithProcessTreeCleanup(ctx, cmd, nil)
+	elapsed := time.Since(start)
+	t.Logf("deterministic script; elapsed=%s deadline=2s grace=100ms child-lifetime=6s error=%v", elapsed, err)
+	require.ErrorContains(t, err, "stdout/stderr may be truncated")
+	assert.Equal(t, "out\nerr\n", output.String())
+	assert.Less(t, elapsed, 4*time.Second)
 }
