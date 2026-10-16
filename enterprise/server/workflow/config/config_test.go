@@ -550,3 +550,11 @@ actions:
 		assert.Error(t, err, "input: %s", input)
 	}
 }
+
+func TestBughuntGlobDoesNotOverlap(t *testing.T) {
+	// A '*' can match zero or more characters, but cannot consume a negative
+	// number of characters by overlapping the literal prefix and suffix.
+	a := &config.Action{Triggers: &config.Triggers{Push: &config.PushTrigger{Branches: []string{"ab*bc"}}}}
+	assert.False(t, config.MatchesAnyTrigger(a, "push", "abc", "", "", false))
+	assert.True(t, config.MatchesAnyTrigger(a, "push", "abbc", "", "", false))
+}
