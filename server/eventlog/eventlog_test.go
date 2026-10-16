@@ -587,3 +587,18 @@ func TestBuildLogsSplitCursorControl(t *testing.T) {
 	split := render([]string{"keep\n\x1b[", "K\n\n\n"})
 	require.Equal(t, whole, split, "event boundaries must not change rendered logs")
 }
+
+// This checks the task's literal byte-preservation property. Terminal rendering
+// intentionally overwrites progress lines, so this is a contract mismatch.
+func TestBuildLogsRawCarriageReturn(t *testing.T) {
+	ctx := t.Context()
+	blobs := mockstore.New()
+	w, err := eventlog.NewEventLogWriter(ctx, blobs, nil, nil, "", "raw", 80, 4)
+	require.NoError(t, err)
+	_, err = w.Write(ctx, []byte("old\rnew\n"))
+	require.NoError(t, err)
+	require.NoError(t, w.Close(ctx))
+	got, err := io.ReadAll(chunkstore.New(blobs, &chunkstore.ChunkstoreOptions{}).Reader(ctx, "raw"))
+	require.NoError(t, err)
+	require.Equal(t, "old\rnew\n", string(got))
+}
