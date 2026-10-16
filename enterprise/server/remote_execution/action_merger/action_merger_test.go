@@ -40,19 +40,12 @@ func testHedgeLimit(t *testing.T, overlapping bool) {
 	id1, decision1 := GetOrCreateExecutionID(ctx, rdb, scheduler, action, false)
 	require.Equal(t, canonical, id1)
 	require.Equal(t, Hedge, decision1)
-	if !overlapping {
-		require.NoError(t, RecordHedgedExecution(ctx, rdb, action, ""))
-	}
-	// A valid concurrent interleaving: both requests decide before either
-	// records its hedge, exactly as Execute's separate calls allow.
+	// A request arriving before the first hedge dispatch still sees the
+	// reservation made by the first decision.
 	id2, decision2 := GetOrCreateExecutionID(ctx, rdb, scheduler, action, false)
 	require.Equal(t, canonical, id2)
-	if overlapping {
-		require.NoError(t, RecordHedgedExecution(ctx, rdb, action, ""))
-	}
 	dispatched := 1
 	if decision2 == Hedge {
-		require.NoError(t, RecordHedgedExecution(ctx, rdb, action, ""))
 		dispatched++
 	}
 	t.Logf("hedge_count=1; decisions=(%v,%v); dispatched=%d; overlapping=%v", decision1, decision2, dispatched, overlapping)

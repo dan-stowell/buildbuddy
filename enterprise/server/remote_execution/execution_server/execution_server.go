@@ -1241,7 +1241,6 @@ func (s *ExecutionServer) execute(req *repb.ExecuteRequest, stream streamLike) e
 		if op == action_merger.Hedge {
 			// If the action_merger said to hedge this action, run another execution
 			// in the background.
-			action_merger.RecordHedgedExecution(ctx, s.rdb, adInstanceDigest, s.getGroupIDForMetrics(ctx))
 			hedgedExecutionID := adInstanceDigest.NewUploadString()
 			if err := action_merger.RegisterCopy(ctx, s.rdb, executionID, hedgedExecutionID); err == nil {
 				if err := s.dispatchHedge(ctx, req, action, hedgedExecutionID); err != nil {

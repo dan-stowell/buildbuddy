@@ -146,20 +146,6 @@ func RecordClaimedExecution(ctx context.Context, rdb redis.UniversalClient, exec
 	return err
 }
 
-// This function records a hedged execution in Redis.
-func RecordHedgedExecution(ctx context.Context, rdb redis.UniversalClient, adResource *digest.CASResourceName, groupIdForMetrics string) error {
-	key, err := redisKeyForPendingExecutionID(ctx, adResource)
-	if err != nil {
-		return err
-	}
-
-	pipe := rdb.TxPipeline()
-	pipe.HIncrBy(ctx, key, hedgedExecutionCountKey, 1)
-	pipe.HSet(ctx, key, lastExecutionSubmitTimeKey, strconv.FormatInt(time.Now().UnixMicro(), 36))
-	_, err = pipe.Exec(ctx)
-	return err
-}
-
 // CheckMerged returns true if the specified action has been merged against.
 func CheckMerged(ctx context.Context, rdb redis.UniversalClient, adResource *digest.CASResourceName) (bool, error) {
 	key, err := redisKeyForPendingExecutionID(ctx, adResource)
@@ -393,10 +379,20 @@ func GetOrCreateExecutionID(ctx context.Context, rdb redis.UniversalClient, sche
 	}
 
 	if shouldHedge(hash) {
-		return executionID, Hedge
-	} else {
-		return executionID, Merge
+		// Reserve the budget at the decision point. Two overlapping Execute
+		// requests must not both consume the same remaining hedge slot.
+		reserved, err := rdb.Eval(ctx, `
+        if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
+        if tonumber(redis.call('HGET', KEYS[1], ARGV[3]) or '0') >= tonumber(ARGV[4]) then return 0 end
+        if redis.call('HGET', KEYS[1], ARGV[5]) ~= ARGV[6] then return 0 end
+        redis.call('HINCRBY', KEYS[1], ARGV[3], 1)
+        redis.call('HSET', KEYS[1], ARGV[5], ARGV[7])
+        return 1`, []string{forwardKey}, executionIDKey, executionID, hedgedExecutionCountKey, *hedgedActionCount, lastExecutionSubmitTimeKey, hash[lastExecutionSubmitTimeKey], strconv.FormatInt(time.Now().UnixMicro(), 36)).Int()
+		if err == nil && reserved == 1 {
+			return executionID, Hedge
+		}
 	}
+	return executionID, Merge
 }
 
 // Returns true if a hedged execution should be run given the provided
