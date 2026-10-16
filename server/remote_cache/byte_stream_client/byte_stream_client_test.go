@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -246,5 +247,33 @@ func TestV4ReachablePermittedTargets(t *testing.T) {
 			t.Logf("N=%d sockets_after_owner_close=%d", n, len(v4SocketTargets(t))-len(before))
 
 		})
+	}
+}
+
+func TestV4ConcurrentPoolSweepAndRelease(t *testing.T) {
+	testleak.Check(t)
+	env := real_environment.NewRealEnv(nil)
+	clock := clockwork.NewFakeClock()
+	env.SetClock(clock)
+	p := NewPooledByteStreamClient(env)
+	t.Cleanup(func() { p.close(context.Background()) })
+	flags.Set(t, "app.restrict_bytestream_dialing", true)
+	flags.Set(t, "app.cache_api_url", url.URL{Scheme: "grpcs", Host: "cache.example.com"})
+	flags.Set(t, "grpc_client.pool_cache_idle_timeout", time.Nanosecond)
+	var workers sync.WaitGroup
+	for worker := range 4 {
+		workers.Go(func() {
+			for i := range 10 {
+				clock.Advance(time.Minute)
+				u := &url.URL{Scheme: "bytestream", Host: fmt.Sprintf("localhost:%d", worker+1), User: url.User(fmt.Sprint("synthetic-", i))}
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				_ = p.StreamBytestreamFile(ctx, u, io.Discard)
+			}
+		})
+	}
+	workers.Wait()
+	for _, cp := range p.connPoolMap {
+		require.Zero(t, cp.inFlight)
 	}
 }
