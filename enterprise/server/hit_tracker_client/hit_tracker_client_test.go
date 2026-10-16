@@ -543,6 +543,10 @@ func TestRegister(t *testing.T) {
 			require.NoError(t, Register(te))
 			_, isNoOp := te.GetHitTrackerFactory().(*NoOpHitTrackerFactory)
 			require.Equal(t, tc.expectNoOp, isNoOp)
+			if f, ok := te.GetHitTrackerFactory().(*HitTrackerFactory); ok {
+				// In production the pool lives until the process exits.
+				t.Cleanup(func() { f.closeConn() })
+			}
 		})
 	}
 }
@@ -1164,4 +1168,42 @@ func TestExpiredShutdownDoesNotSendQueuedBatches(t *testing.T) {
 	cancel()
 	require.NoError(t, h.shutdown(ctx))
 	require.Empty(t, conn.entered, "no additional RPC should start after shutdown context expires")
+}
+
+type countingTrackService struct {
+	hits atomic.Int64
+}
+
+func (s *countingTrackService) Track(ctx context.Context, req *hitpb.TrackRequest) (*hitpb.TrackResponse, error) {
+	s.hits.Add(int64(len(req.GetHits())))
+	return &hitpb.TrackResponse{}, nil
+}
+
+// The factory's shutdown runs concurrently with the gRPC server's graceful
+// stop, so requests that are still being served can record hits after the
+// factory has shut down. Those are sent synchronously on the pool that
+// Register dialed, and must still reach the app.
+func TestHitEnqueuedAfterShutdownIsSent(t *testing.T) {
+	testleak.Check(t)
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	srv := grpc.NewServer()
+	service := &countingTrackService{}
+	hitpb.RegisterHitTrackerServiceServer(srv, service)
+	go srv.Serve(lis)
+	t.Cleanup(srv.Stop)
+	flags.Set(t, "cache_proxy.remote_cache", "grpc://"+lis.Addr().String())
+	flags.Set(t, "cache_proxy.remote_hit_tracker.workers", 1)
+	env := real_environment.NewRealEnv(testhealthcheck.NewTestingHealthChecker())
+	require.NoError(t, Register(env))
+	f := env.GetHitTrackerFactory().(*HitTrackerFactory)
+	// In production the pool lives until the process exits.
+	t.Cleanup(func() { f.closeConn() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, f.shutdown(ctx))
+	tracker := f.NewCASHitTracker(ctx, &repb.RequestMetadata{})
+	require.NoError(t, tracker.TrackDownload(aDigest).CloseWithBytesTransferred(1, 2, repb.Compressor_IDENTITY, "test"))
+	require.Equal(t, int64(1), service.hits.Load(), "hits recorded after shutdown that reached the app")
 }

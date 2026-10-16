@@ -53,6 +53,9 @@ func Register(env *real_environment.RealEnv) error {
 		return err
 	}
 	h := newHitTrackerClient(env.GetServerContext(), env, conn)
+	// The pool is not closed at shutdown: hits recorded by requests that are
+	// still being served while the server drains are sent synchronously on
+	// it (see enqueue). It lives until the process exits.
 	h.closeConn = conn.Close
 	env.SetHitTrackerFactory(h)
 	return nil
@@ -138,7 +141,8 @@ type HitTrackerFactory struct {
 	quit        chan struct{}
 	wg          sync.WaitGroup // The batcher and the senders.
 	cancelSends context.CancelFunc
-	// Set only by Register, which owns the dialed pool. Injected connections remain caller-owned.
+	// Closes the pool dialed by Register; nil for injected connections.
+	// Only tests call it, see Register.
 	closeConn func() error
 
 	enqueueChan chan *enqueuedCacheHit
@@ -560,9 +564,6 @@ func (h *HitTrackerFactory) requeue(failed *cacheHits, groupID string) {
 }
 
 func (h *HitTrackerFactory) shutdown(ctx context.Context) error {
-	if h.closeConn != nil {
-		defer h.closeConn()
-	}
 	// Senders don't use ctx, so cancel their Track RPCs if ctx expires
 	// before they return.
 	stop := context.AfterFunc(ctx, h.cancelSends)
