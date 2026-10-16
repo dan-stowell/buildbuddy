@@ -45,7 +45,10 @@ go_library(
 go_test(
     name = "byte_stream_server_test",
     size = "small",
-    srcs = ["byte_stream_server_test.go"],
+    srcs = [
+        "byte_stream_server_test.go",
+        "repro_cas_integrity_test.go",
+    ],
     embed = [":byte_stream_server"],
     deps = [
         "//proto:remote_execution_go_proto",
