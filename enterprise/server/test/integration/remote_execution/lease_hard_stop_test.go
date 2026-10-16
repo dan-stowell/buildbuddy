@@ -215,12 +215,6 @@ func TestLeaseHardStop_RunsPastRenewal_RetryFalse(t *testing.T) {
 }
 
 func TestLeaseHardStop_RunsPastRenewal_RetryDefault(t *testing.T) {
-	// TODO: the stopping replica holds the task for its executor to reconnect
-	// for only lease_reconnect_grace_period (1s) after the hard stop, then
-	// offers it to other executors as a new attempt. The executor only
-	// notices the broken stream at its next renewal (~1.6s after the hard
-	// stop here), when the task has already been claimed by a new attempt.
-	t.Skip("known gap: reconnect grace period is shorter than the time until the executor's next renewal")
 	checkSuccess(t, runHardStopScenario(t, hardStopScenario{finishAfter: 5 * time.Second}))
 }
 
@@ -240,9 +234,5 @@ func TestLeaseHardStop_FinishAfterReconnectGrace_RetryFalse(t *testing.T) {
 }
 
 func TestLeaseHardStop_FinishAfterReconnectGrace_RetryDefault(t *testing.T) {
-	// TODO: same gap as TestLeaseHardStop_RunsPastRenewal_RetryDefault: the
-	// task is offered to other executors once the 1s reconnect grace period
-	// has run out, before its executor finishes it and reconnects.
-	t.Skip("known gap: reconnect grace period is shorter than the time until the executor's next renewal")
 	checkSuccess(t, runHardStopScenario(t, hardStopScenario{finishAfter: 3500 * time.Millisecond, leaseDuration: 5 * time.Second}))
 }
