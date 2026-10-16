@@ -2828,9 +2828,31 @@ func (p *PebbleCache) newWrappedWriter(ctx context.Context, fileRecord *sgpb.Fil
 	if err != nil {
 		return nil, err
 	}
-	return p.wrapWriter(ctx, fileRecord, wcm, shouldCompress, encryptionMetadata, db.Close, func(md *sgpb.FileMetadata) error {
+	localFile := wcm.Metadata().GetFileMetadata() != nil
+	wc, err := p.wrapWriter(ctx, fileRecord, wcm, shouldCompress, encryptionMetadata, db.Close, func(md *sgpb.FileMetadata) error {
+		if localFile {
+			return p.writeMetadataLocked(ctx, db, key, md)
+		}
 		return p.writeMetadata(ctx, db, key, md)
 	})
+	if err != nil {
+		return nil, err
+	}
+	if localFile {
+		wc = &lockedCommitWriter{CommittedWriteCloser: wc, lock: func() func() { return p.locker.Lock(key.LockID()) }}
+	}
+	return wc, nil
+}
+
+type lockedCommitWriter struct {
+	interfaces.CommittedWriteCloser
+	lock func() func()
+}
+
+func (w *lockedCommitWriter) Commit() error {
+	unlock := w.lock()
+	defer unlock()
+	return w.CommittedWriteCloser.Commit()
 }
 
 // wrapWriter wraps wcm in the storage-independent layers of the write path:
@@ -2883,6 +2905,12 @@ func (p *PebbleCache) wrapWriter(ctx context.Context, fileRecord *sgpb.FileRecor
 }
 
 func (p *PebbleCache) writeMetadata(ctx context.Context, db pebble.IPebbleDB, key filestore.PebbleKey, md *sgpb.FileMetadata) error {
+	unlockFn := p.locker.Lock(key.LockID())
+	defer unlockFn()
+	return p.writeMetadataLocked(ctx, db, key, md)
+}
+
+func (p *PebbleCache) writeMetadataLocked(ctx context.Context, db pebble.IPebbleDB, key filestore.PebbleKey, md *sgpb.FileMetadata) error {
 	ctx, spn := tracing.StartSpan(ctx)
 	defer spn.End()
 
@@ -2895,9 +2923,6 @@ func (p *PebbleCache) writeMetadata(ctx context.Context, db pebble.IPebbleDB, ke
 		p.metrics.compressedBlobSizeWrite.Add(float64(md.GetStoredSizeBytes()))
 		p.metrics.decompressedBlobSizeWrite.Add(float64(md.GetFileRecord().GetDigest().GetSizeBytes()))
 	}
-
-	unlockFn := p.locker.Lock(key.LockID())
-	defer unlockFn()
 
 	oldMD := sgpb.FileMetadataFromVTPool()
 	defer oldMD.ReturnToVTPool()
