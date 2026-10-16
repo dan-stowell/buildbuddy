@@ -2947,9 +2947,10 @@ func TestLostRedisReplyDuringClaim_CommandStillCompletes(t *testing.T) {
 	// claims are a single EVALSHA.
 	rbe.ExecuteCustomCommand("sh", "-c", "echo warmup").Wait()
 
-	// Lose the reply to the next task claim: the first EVALSHA on a task key.
+	// Lose the reply to the next task claim: the claim script is the only
+	// script run on a task key with one key and four arguments.
 	proxy.dropNextReply(func(b []byte) bool {
-		return bytes.Contains(b, []byte("evalsha")) && bytes.Contains(b, []byte("task/"))
+		return bytes.HasPrefix(b, []byte("*7\r\n$7\r\nevalsha\r\n")) && bytes.Contains(b, []byte("task/"))
 	})
 	cmd := rbe.ExecuteCustomCommand("sh", "-c", "echo hello")
 
