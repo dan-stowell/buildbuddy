@@ -557,24 +557,25 @@ func boolInt(b bool) int {
 	return 0
 }
 
-// HasPendingCopy distinguishes loss of the canonical task from loss of all work.
-func HasPendingCopy(ctx context.Context, rdb redis.UniversalClient, canonical string) (bool, error) {
+// CopyState is only consulted when the scheduler reports the canonical task
+// lost. Ordinary Execute and WaitExecution perform no copy-state lookups.
+func CopyState(ctx context.Context, rdb redis.UniversalClient, canonical string) ([]byte, bool, error) {
 	if *hedgedActionCount == 0 {
-		return false, nil
+		return nil, false, nil
 	}
 	fields, err := rdb.HGetAll(ctx, copyKey(canonical)).Result()
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	if fields["winner"] != "" {
-		return false, nil
+		return []byte(fields["operation"]), false, nil
 	}
 	for key, value := range fields {
 		if strings.HasPrefix(key, "copy:") && key != "copy:"+canonical && value == "pending" {
-			return true, nil
+			return nil, true, nil
 		}
 	}
-	return false, nil
+	return nil, false, nil
 }
 
 // CopyShouldStop closes the race between registration and scheduling: a winner
@@ -598,18 +599,4 @@ func CopyShouldStop(ctx context.Context, rdb redis.UniversalClient, id string) (
 		return false, err
 	}
 	return winner != "" && winner != id, nil
-}
-
-// CompletedOperation is stored with the winner election, so reconnecting
-// waiters can recover the canonical terminal operation even if publication is
-// interrupted or a late progress update arrives from a losing copy.
-func CompletedOperation(ctx context.Context, rdb redis.UniversalClient, canonical string) ([]byte, error) {
-	if *hedgedActionCount == 0 {
-		return nil, nil
-	}
-	data, err := rdb.HGet(ctx, copyKey(canonical), "operation").Bytes()
-	if err == redis.Nil {
-		return nil, nil
-	}
-	return data, err
 }

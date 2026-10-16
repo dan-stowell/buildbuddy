@@ -1357,21 +1357,6 @@ func (s *ExecutionServer) waitExecution(ctx context.Context, req *repb.WaitExecu
 	defer subscriber.Close()
 	streamPubSubChan := subscriber.Chan()
 
-	if !opts.isExecuteRequest {
-		if data, err := action_merger.CompletedOperation(ctx, s.rdb, req.GetName()); err != nil {
-			return err
-		} else if len(data) > 0 {
-			op := new(longrunningpb.Operation)
-			if err := proto.Unmarshal(data, op); err != nil {
-				return err
-			}
-			op.Name = req.GetName()
-			_, err := e.processOpUpdate(ctx, op)
-			return err
-		}
-
-	}
-
 	if opts.isExecuteRequest {
 		// Send a best-effort initial "in progress" update to client.
 		// Once Bazel receives the initial update, it will use WaitExecution to handle retry on error instead of
@@ -1402,19 +1387,17 @@ func (s *ExecutionServer) waitExecution(ctx context.Context, req *repb.WaitExecu
 		case msg, ok = <-streamPubSubChan:
 		case <-taskLost:
 			// A hedge may remove the canonical task before its publication is read.
-			if data, err := action_merger.CompletedOperation(ctx, s.rdb, req.GetName()); err != nil {
+			data, pending, err := action_merger.CopyState(ctx, s.rdb, req.GetName())
+			if err != nil {
 				return err
-			} else if len(data) > 0 {
+			}
+			if len(data) > 0 {
 				op := new(longrunningpb.Operation)
 				if err := proto.Unmarshal(data, op); err != nil {
 					return err
 				}
 				op.Name = req.GetName()
 				_, err := e.processOpUpdate(ctx, op)
-				return err
-			}
-			pending, err := action_merger.HasPendingCopy(ctx, s.rdb, req.GetName())
-			if err != nil {
 				return err
 			}
 			if pending {

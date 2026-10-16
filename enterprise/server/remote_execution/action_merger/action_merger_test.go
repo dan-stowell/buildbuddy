@@ -79,7 +79,7 @@ func TestHedgeRegistrationCompletionOrdering(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, canonical, id)
 			require.False(t, publish)
-			data, err := CompletedOperation(ctx, rdb, canonical)
+			data, _, err := CopyState(ctx, rdb, canonical)
 			require.NoError(t, err)
 			require.Equal(t, "terminal", string(data))
 		})
