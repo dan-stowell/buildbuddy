@@ -1068,3 +1068,47 @@ func TestFindMissingBlobs_QuorumBypassesPresenceCache(t *testing.T) {
 		require.Equal(t, i, requestCount.Load())
 	}
 }
+
+type delayedPresenceClient struct {
+	repb.ContentAddressableStorageClient
+	beforePresenceResponse func()
+	calls                  int
+}
+
+func (c *delayedPresenceClient) FindMissingBlobs(ctx context.Context, req *repb.FindMissingBlobsRequest, opts ...grpc.CallOption) (*repb.FindMissingBlobsResponse, error) {
+	c.calls++
+	if c.calls == 1 {
+		c.beforePresenceResponse()
+		return &repb.FindMissingBlobsResponse{}, nil // Snapshot taken before eviction.
+	}
+	return &repb.FindMissingBlobsResponse{MissingBlobDigests: req.GetBlobDigests()}, nil
+}
+
+func (c *delayedPresenceClient) BatchReadBlobs(ctx context.Context, req *repb.BatchReadBlobsRequest, opts ...grpc.CallOption) (*repb.BatchReadBlobsResponse, error) {
+	return nil, status.Error(codes.NotFound, "blob evicted after presence snapshot")
+}
+
+// A lagging replica (or an upstream presence cache) can answer from a snapshot
+// older than a completed read miss, even when the presence RPC starts later.
+func TestPresenceInvalidation_LaterLookupWithStaleBackendSnapshot(t *testing.T) {
+	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+	ctx := testContext()
+	env := testenv.GetTestEnv(t)
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+	remote := &delayedPresenceClient{beforePresenceResponse: func() {}}
+	env.SetContentAddressableStorageClient(remote)
+	proxy, err := New(env)
+	require.NoError(t, err)
+	d := digestProto(fooDigest, 3)
+	// No FindMissing RPC is active when this authoritative read fails.
+	_, err = proxy.batchReadBlobsRemote(ctx, readBlobsRequest([]*repb.Digest{d}))
+	require.Equal(t, codes.NotFound, status.Code(err))
+	// The first presence response is stale. The backend has converged by the
+	// second request; the proxy should not extend the stale answer for an hour.
+	_, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+	require.NoError(t, err)
+	rsp, err := proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+	require.NoError(t, err)
+	require.Equal(t, []*repb.Digest{d}, rsp.GetMissingBlobDigests(), "post-invalidation stale snapshot was cached for the configured TTL")
+}
