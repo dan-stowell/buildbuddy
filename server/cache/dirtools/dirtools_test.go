@@ -2100,6 +2100,13 @@ func (c *countingFileCache) AddFile(ctx context.Context, node *repb.FileNode, ex
 	return c.FileCache.AddFile(ctx, node, existingFilePath)
 }
 
+func (c *countingFileCache) AddReadOnly(ctx context.Context, node *repb.FileNode, path string) error {
+	c.mu.Lock()
+	c.adds[fileNodeKey(node)]++
+	c.mu.Unlock()
+	return c.FileCache.AddReadOnly(ctx, node, path)
+}
+
 func (c *countingFileCache) Open(ctx context.Context, node *repb.FileNode) (*os.File, error) {
 	c.mu.Lock()
 	c.opens[fileNodeKey(node)]++
