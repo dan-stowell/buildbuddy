@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -503,4 +504,34 @@ func TestParse_ExecrootPath(t *testing.T) {
 	platformProps, err := ParseProperties(&repb.ExecutionTask{Command: &repb.Command{Platform: plat}})
 	require.NoError(t, err)
 	assert.Equal(t, "", platformProps.ExecrootPath)
+}
+
+// The scheduler and executor use both parsed properties and individual lookups.
+// Conflicting entries must either be rejected or resolve identically.
+func TestPlatformRoutingDuplicateLookupConsistency(t *testing.T) {
+	for _, name := range []string{"Pool", "OSFamily", "Arch", "workload-isolation-type", "container-image", "workflow-id"} {
+		for _, secondName := range []string{name, strings.ToUpper(name)} {
+			for _, override := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/override=%t", name, secondName, override), func(t *testing.T) {
+					p := &repb.Platform{Properties: []*repb.Platform_Property{
+						{Name: name, Value: "first"}, {Name: secondName, Value: "second"},
+					}}
+					task := &repb.ExecutionTask{Action: &repb.Action{Platform: p}}
+					if override {
+						task.Action.Platform = &repb.Platform{}
+						task.PlatformOverrides = p
+					}
+					parsed, err := ParseProperties(task)
+					if status.IsInvalidArgumentError(err) {
+						return // Rejecting ambiguous input is also consistent.
+					}
+					require.NoError(t, err)
+					values := map[string]string{"Pool": parsed.Pool, "OSFamily": parsed.OS,
+						"Arch": parsed.Arch, "workload-isolation-type": parsed.WorkloadIsolationType,
+						"container-image": parsed.ContainerImage, "workflow-id": parsed.WorkflowID}
+					assert.Equal(t, values[name], FindEffectiveValue(task, name))
+				})
+			}
+		}
+	}
 }
