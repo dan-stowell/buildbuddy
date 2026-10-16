@@ -2770,3 +2770,22 @@ func TestSizing_RejectGPURequestAbovePoolCapacity(t *testing.T) {
 	_, err := env.GetSchedulerService().ScheduleTask(ctx, req)
 	require.Error(t, err, "accepted GPU request that no registered executor can run")
 }
+
+func TestSizing_DynamicEstimatePreservesGPURequest(t *testing.T) {
+	for _, source := range []string{"measured", "predicted"} {
+		t.Run(source, func(t *testing.T) {
+			h := &executorHandle{}
+			h.registration = &scpb.ExecutionNode{AssignableMemoryBytes: 1 << 30, AssignableMilliCpu: 1000, AssignableGpuMemoryBytes: 8 << 30}
+			requested := &scpb.TaskSize{EstimatedGpuMemoryBytes: 4 << 30}
+			md := &scpb.SchedulingMetadata{TaskSize: &scpb.TaskSize{EstimatedMemoryBytes: 400_000_000, EstimatedMilliCpu: 600, EstimatedGpuMemoryBytes: 4 << 30}, RequestedTaskSize: requested}
+			estimate := &scpb.TaskSize{EstimatedMemoryBytes: 100_000_000, EstimatedMilliCpu: 250}
+			if source == "measured" {
+				md.MeasuredTaskSize = estimate
+			} else {
+				md.PredictedTaskSize = estimate
+			}
+			got := h.getMostAccurateTaskSize(&scpb.EnqueueTaskReservationRequest{SchedulingMetadata: md})
+			require.Equal(t, requested.GetEstimatedGpuMemoryBytes(), got.GetEstimatedGpuMemoryBytes(), "dynamic sizing dropped the GPU reservation")
+		})
+	}
+}
