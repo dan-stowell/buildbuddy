@@ -97,3 +97,41 @@ func TestShutdown_CallbackReceivesDeadline(t *testing.T) {
 	hc.WaitForGracefulShutdown()
 	require.ErrorIs(t, <-expired, context.DeadlineExceeded)
 }
+
+func TestShutdown_DeadlineBoundsUncooperativeCallback(t *testing.T) {
+	setShutdownFlag(t, "max_shutdown_duration", "50ms")
+	setShutdownFlag(t, "shutdown_lameduck_duration", "0s")
+	hc := healthcheck.NewHealthChecker("test")
+	release := make(chan struct{})
+	expired := make(chan struct{})
+	hc.RegisterShutdownFunction(func(ctx context.Context) error {
+		<-ctx.Done()
+		close(expired)
+		// Model a dependency whose Stop/Close does not accept the shutdown
+		// context (for example, the invocation batch inserter's stop function).
+		<-release
+		return nil
+	})
+	done := make(chan struct{})
+	hc.Shutdown()
+	go func() {
+		hc.WaitForGracefulShutdown()
+		close(done)
+	}()
+	// Always release the fake dependency and join shutdown, even on failure.
+	defer func() {
+		close(release)
+		<-done
+	}()
+	select {
+	case <-expired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown callback never observed its deadline")
+	}
+	// Allow ample scheduling slack AFTER observing the actual deadline.
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown is still blocked on a dependency one second after max_shutdown_duration expired")
+	}
+}
