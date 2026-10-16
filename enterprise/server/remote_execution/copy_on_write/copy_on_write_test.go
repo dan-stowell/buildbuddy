@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -25,6 +26,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/resources"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testmetrics"
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
@@ -1049,4 +1051,40 @@ func concatBytes(chunks ...[]byte) []byte {
 		out = append(out, c...)
 	}
 	return out
+}
+
+func TestPrivateLRULifecycleGrowth(t *testing.T) {
+	for _, n := range []int{10, 50} {
+		t.Run(fmt.Sprintf("N=%d", n), func(t *testing.T) {
+			env := testenv.GetTestEnv(t)
+			root := t.TempDir()
+			testleak.CheckGrowth(t, testleak.Growth{Iterations: n}, func(i int) {
+				dir, err := os.MkdirTemp(root, "cow-")
+				require.NoError(t, err)
+				cow, err := copy_on_write.NewCOWStore(t.Context(), env, "disk", nil, copy_on_write.COWOptions{
+					ChunkSizeBytes: 4096, TotalSizeBytes: 4096 * 16, DataDir: dir, MaxMmappedChunks: 2,
+				})
+				require.NoError(t, err)
+				for offset := int64(0); offset < 4096*16; offset += 4096 {
+					_, err := cow.WriteAt([]byte{1}, offset)
+					require.NoError(t, err)
+				}
+				require.NoError(t, cow.Sync())
+				require.NoError(t, cow.Close())
+				data, err := os.ReadFile("/proc/self/maps")
+				require.NoError(t, err)
+				count := 0
+				for line := range strings.SplitSeq(string(data), "\n") {
+					if strings.Contains(line, root+"/") {
+						count++
+					}
+				}
+				require.Zero(t, count)
+				require.NoError(t, os.RemoveAll(dir))
+				if i == 0 || i == n {
+					t.Logf("cycles=%d chunk_mappings=%d", i, count)
+				}
+			})
+		})
+	}
 }

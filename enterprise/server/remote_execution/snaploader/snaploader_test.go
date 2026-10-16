@@ -8,7 +8,9 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/backends/pebble_cache"
@@ -23,6 +25,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testcache"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
@@ -1184,4 +1187,112 @@ func mustReadStore(t *testing.T, store *copy_on_write.COWStore) []byte {
 	b, err := io.ReadAll(r)
 	require.NoError(t, err)
 	return b
+}
+
+// TestSnapshotLifecycleGrowth keeps the caches, RPC server, and shared mmap LRU
+// alive while repeatedly closing their per-VM stores.
+func TestSnapshotLifecycleGrowth(t *testing.T) {
+	for _, mode := range []string{"local", "remote", "missing", "cancelled", "save-error"} {
+		for _, iterations := range []int{10, 50} {
+			t.Run(fmt.Sprintf("%s/N=%d", mode, iterations), func(t *testing.T) {
+				flags.Set(t, "grpc_server_worker_multiplier", 0)
+				flags.Set(t, "executor.enable_remote_snapshot_sharing", true)
+				env := setupEnv(t)
+				t.Cleanup(func() { require.NoError(t, env.GetFileCache().(interface{ Close() error }).Close()) })
+				loader, err := snaploader.New(env)
+				require.NoError(t, err)
+				ctx := t.Context()
+				keys := keysWithInstanceName(t, ctx, loader, "")
+				root := t.TempDir()
+				mapCount := func() int {
+					data, err := os.ReadFile("/proc/self/maps")
+					require.NoError(t, err)
+					count := 0
+					for line := range strings.SplitSeq(string(data), "\n") {
+						if strings.Contains(line, root+"/") {
+							count++
+						}
+					}
+					return count
+				}
+				var baseG, baseFD int
+				testleak.CheckGrowth(t, testleak.Growth{Iterations: iterations}, func(i int) {
+					work, err := os.MkdirTemp(root, "vm-")
+					require.NoError(t, err)
+					source := makeRandomFile(t, work, "image", 3*4096)
+					cow, err := copy_on_write.ConvertFileToCOW(ctx, env, source, 4096, work, "", true, 2)
+					require.NoError(t, err)
+					_, err = cow.WriteAt([]byte("dirty"), 0)
+					require.NoError(t, err)
+					opts := makeFakeSnapshot(t, work, true, map[string]*copy_on_write.COWStore{"scratchfs": cow}, "")
+					require.NoError(t, loader.CacheSnapshot(ctx, keys.GetBranchKey(), opts))
+					require.NoError(t, cow.Close())
+					snap, err := loader.GetSnapshot(ctx, keys, &snaploader.GetSnapshotOptions{
+						SupportsRemoteChunks: true, SupportsRemoteManifest: true,
+						ReadPolicy: platform.AlwaysReadNewestSnapshot,
+					})
+					require.NoError(t, err)
+					if mode != "local" {
+						for _, cf := range snap.GetChunkedFiles() {
+							for _, c := range cf.GetChunks() {
+								env.GetFileCache().DeleteFile(ctx, &repb.FileNode{Digest: c.GetDigest()})
+							}
+						}
+					}
+					readCtx, cancel := context.WithCancel(ctx)
+					// A missing digest must reach the lazy fetch path (not manifest validation).
+					if mode == "missing" {
+						snap.GetChunkedFiles()[0].Chunks[0].Digest = &repb.Digest{Hash: strings.Repeat("a", 64), SizeBytes: 4096}
+					}
+					out := filepath.Join(work, "unpacked")
+					require.NoError(t, os.Mkdir(out, 0755))
+					unpacked, err := loader.UnpackSnapshot(readCtx, snap, out)
+					require.NoError(t, err)
+					fork := unpacked.ChunkedFiles["scratchfs"]
+					if mode == "cancelled" {
+						cancel()
+					}
+					_, err = fork.ReadAt(make([]byte, 4096), 0)
+					if mode == "missing" || mode == "cancelled" {
+						require.Error(t, err)
+					} else {
+						require.NoError(t, err)
+						require.Positive(t, mapCount(), "ensure mapping check observes active chunks")
+						if mode == "remote" {
+							require.Equal(t, snaputil.ChunkSourceRemoteCache, fork.SortedChunks()[0].Source())
+						}
+						_, err = fork.WriteAt([]byte("fork"), 0)
+						require.NoError(t, err)
+						if mode == "save-error" {
+							original := env.GetByteStreamClient()
+							env.SetByteStreamClient(failingWriteByteStreamClient{ByteStreamClient: original})
+							opts.ChunkedFiles = unpacked.ChunkedFiles
+							err = loader.CacheSnapshot(ctx, keys.GetBranchKey(), opts)
+							env.SetByteStreamClient(original)
+							require.Error(t, err)
+						}
+					}
+					for _, c := range unpacked.ChunkedFiles {
+						require.NoError(t, c.Close())
+					}
+					cancel()
+					require.Zero(t, mapCount(), "Close must unmap all chunks, including error paths")
+					// Chunk files are persistent artifacts owned by the VM directory, not
+					// by Close. Mirror runner directory teardown explicitly.
+					require.NoError(t, os.RemoveAll(work))
+					entries, err := os.ReadDir(root)
+					require.NoError(t, err)
+					require.Empty(t, entries)
+					fds, err := os.ReadDir("/proc/self/fd")
+					require.NoError(t, err)
+					if i == 0 {
+						baseG, baseFD = runtime.NumGoroutine(), len(fds)
+					}
+					if i == 0 || i == iterations {
+						t.Logf("cycles=%d goroutines=%d fds=%d maps=%d (warmup g=%d fd=%d)", i, runtime.NumGoroutine(), len(fds), mapCount(), baseG, baseFD)
+					}
+				})
+			})
+		}
+	}
 }
