@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"math/rand"
 	"os"
 	"path"
@@ -1311,6 +1312,45 @@ func TestTransientErrorExitCodes(t *testing.T) {
 				require.True(t, status.IsUnavailableError(res.Error), "want Unavailable, got %+#v", res.Error)
 			} else {
 				require.Nil(t, res.Error)
+			}
+		})
+	}
+}
+
+func TestRunnerLifecycleResources(t *testing.T) {
+	for _, n := range []int{10} {
+		t.Run(fmt.Sprintf("N=%d", n), func(t *testing.T) {
+			testleak.Check(t)
+			testleak.CheckFDs(t)
+			env := newTestEnv(t)
+			p := newRunnerPool(t, env, &RunnerPoolOptions{MaxRunnerCount: 2, MaxRunnerDiskSizeBytes: unlimited, MaxRunnerMemoryUsageBytes: unlimited})
+			ctx := withAuthenticatedUser(t, context.Background(), env, "US1")
+			// Keep every runner workspace path so shutdown cleanup is checked directly.
+			var paths []string
+			warm, err := get(ctx, p, newTask())
+			require.NoError(t, err)
+			warmCtx, warmCancel := context.WithCancel(ctx)
+			warmResult := warm.Run(warmCtx, &repb.IOStats{})
+			warmCancel()
+			require.NoError(t, warmResult.Error)
+			p.TryRecycle(ctx, warm, true)
+			paths = append(paths, warm.Workspace.Path())
+			for range n {
+				r, err := get(ctx, p, newTask())
+				require.NoError(t, err)
+				taskCtx, cancel := context.WithCancel(ctx)
+				res := r.Run(taskCtx, &repb.IOStats{})
+				cancel()
+				require.NoError(t, res.Error)
+				paths = append(paths, r.Workspace.Path())
+				p.TryRecycle(ctx, r, true)
+			}
+			require.LessOrEqual(t, p.RunnerCount(), 2, "runner cache must stay bounded")
+			require.NoError(t, p.Shutdown(ctx))
+			p.Wait()
+			for _, path := range paths {
+				_, err := os.Stat(path)
+				require.True(t, os.IsNotExist(err), "workspace remains: %s (%v)", path, err)
 			}
 		})
 	}
