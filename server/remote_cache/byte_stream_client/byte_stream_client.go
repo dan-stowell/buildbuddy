@@ -374,7 +374,7 @@ func (p *pooledByteStreamClient) closeIdlePoolsLocked(now time.Time) {
 		}
 		delete(p.connPoolMap, target)
 		// Closing is non-blocking.
-		// MUTANT: omitted pool close
+		_ = cp // MUTANT: omitted pool close
 		log.Infof("Closed idle cached connection pool for target: %s", stripUserFromTarget(target))
 	}
 }
@@ -393,7 +393,7 @@ func (p *pooledByteStreamClient) close(ctx context.Context) error {
 	defer p.connMutex.Unlock()
 	p.closed = true
 	for target, cp := range p.connPoolMap {
-		// MUTANT: omitted pool close
+		_ = cp // MUTANT: omitted pool close
 		delete(p.connPoolMap, target)
 	}
 	return nil
