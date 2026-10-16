@@ -2832,3 +2832,32 @@ func TestExecutorShutdown_HandBackDoesNotFailClaimedTaskWithRetriesDisabled(t *t
 	require.NoError(t, lease.Renew(), "lease renewal for running task failed")
 	require.NoError(t, lease.Finalize())
 }
+
+// A task with retries disabled that is merely queued (not yet claimed by any
+// executor) must not be failed just because one of the executors that has it
+// queued shuts down and hands the reservation back.
+func TestExecutorShutdown_HandBackDoesNotFailQueuedTaskWithRetriesDisabled(t *testing.T) {
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+
+	executor1 := newFakeExecutorWithId(ctx, t, "n1", env.GetSchedulerClient())
+	executor1.Register()
+	executor2 := newFakeExecutorWithId(ctx, t, "n2", env.GetSchedulerClient())
+	executor2.Register()
+
+	taskID := scheduleTask(ctx, t, env, map[string]string{platform.RetryPropertyName: "false"})
+	nextReservation(t, executor1, taskID)
+	nextReservation(t, executor2, taskID)
+
+	// executor1 shuts down before anyone has started the task.
+	executor1.Send(&scpb.RegisterAndStreamWorkRequest{
+		ShuttingDownRequest: &scpb.ShuttingDownRequest{TaskId: []string{taskID}},
+	})
+	time.Sleep(1 * time.Second)
+
+	exists, err := env.GetSchedulerService().ExistsTask(ctx, taskID)
+	require.NoError(t, err)
+	require.True(t, exists, "queued task %q was deleted after a hand-back", taskID)
+	// executor2 can still run the task from its own reservation.
+	lease := executor2.Claim(taskID)
+	require.NoError(t, lease.Finalize())
+}
