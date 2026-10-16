@@ -50,6 +50,8 @@ go_test(
     shard_count = 1,
     tags = ["block-network"],
     deps = [
+        "//enterprise/server/backends/pebble_cache",
+        "//server/testutil/testfs",
         "//enterprise/server/experiments",
         "//proto:reference_go_proto",
         "//proto:remote_execution_go_proto",

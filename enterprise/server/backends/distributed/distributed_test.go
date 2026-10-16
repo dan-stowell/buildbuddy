@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/backends/pebble_cache"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/experiments"
 	"github.com/buildbuddy-io/buildbuddy/server/backends/memory_cache"
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
@@ -21,6 +22,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testcompression"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testdigest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testmetrics"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testport"
 	"github.com/buildbuddy-io/buildbuddy/server/util/compression"
@@ -5010,4 +5012,39 @@ func TestFindMissing_Quorum_IgnoresNonReplicaCopies(t *testing.T) {
 	caches[nonReplica].mu.Lock()
 	require.Zero(t, caches[nonReplica].lookups[rn.GetDigest().GetHash()])
 	caches[nonReplica].mu.Unlock()
+}
+
+func TestDigestFunctionDistributedIsolation(t *testing.T) {
+	env, _, ctx := getEnvAuthAndCtx(t)
+	peer := fmt.Sprintf("localhost:%d", testport.FindFree(t))
+	base, err := pebble_cache.NewPebbleCache(env, &pebble_cache.Options{RootDirectory: testfs.MakeTempDir(t), MaxSizeBytes: 1_000_000_000})
+	require.NoError(t, err)
+	require.NoError(t, base.Start())
+	t.Cleanup(func() { base.Stop() })
+	dc := startNewDCache(t, env, Options{ReplicationFactor: 1, Nodes: []string{peer}, ListenAddr: peer, DisableLocalLookup: true}, base)
+	waitForReady(t, peer)
+	for _, cacheType := range []rspb.CacheType{rspb.CacheType_CAS, rspb.CacheType_AC} {
+		t.Run(cacheType.String(), func(t *testing.T) {
+			data := []byte("distributed deterministic isolation")
+			d, err := digest.Compute(bytes.NewReader(data), repb.DigestFunction_SHA256)
+			require.NoError(t, err)
+			sha := digest.NewResourceName(d, "instance", cacheType, repb.DigestFunction_SHA256).ToProto()
+			blake := digest.NewResourceName(d, "instance", cacheType, repb.DigestFunction_BLAKE3).ToProto()
+			require.NoError(t, dc.Set(ctx, sha, data))
+			got, err := dc.Get(ctx, sha)
+			require.NoError(t, err)
+			require.Equal(t, data, got)
+			_, err = dc.Get(ctx, blake)
+			require.True(t, status.IsNotFoundError(err), "cross-function Get: %v", err)
+			// A distinct payload makes incorrect forwarding on writes observable.
+			otherData := []byte("distinct data under BLAKE3")
+			require.NoError(t, dc.Set(ctx, blake, otherData))
+			got, err = dc.Get(ctx, blake)
+			require.NoError(t, err)
+			require.Equal(t, otherData, got)
+			got, err = dc.Get(ctx, sha)
+			require.NoError(t, err)
+			require.Equal(t, data, got)
+		})
+	}
 }
