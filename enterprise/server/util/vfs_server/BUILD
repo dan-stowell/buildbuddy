@@ -95,3 +95,28 @@ go_test(
         "@org_golang_google_protobuf//testing/protocmp",
     ],
 )
+
+go_test(
+    name = "vfs_server_lifecycle_test",
+    size = "small",
+    srcs = ["vfs_server_lifecycle_test.go"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":vfs_server",
+        "//enterprise/server/remote_execution/filecache",
+        "//server/remote_cache/byte_stream_server",
+        "//server/remote_cache/digest",
+        "//server/util/prefix",
+        "@org_golang_google_genproto_googleapis_bytestream//:bytestream",
+        "//enterprise/server/remote_execution/container",
+        "//enterprise/server/util/vfscommon",
+        "//proto:remote_execution_go_proto",
+        "//proto:vfs_go_proto",
+        "//server/testutil/testenv",
+        "//server/testutil/testleak",
+        "//server/util/testing/flags",
+        "@com_github_stretchr_testify//require",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//credentials/insecure",
+    ],
+)
