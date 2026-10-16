@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"testing"
 	"time"
 
@@ -37,6 +38,8 @@ import (
 // not cover OCI/podman/firecracker isolation, VFS, cgroups, or the pebble and
 // distributed caches.
 //
+// Set --test_env=SOAK_BATCHES=40 for a longer run (default 10).
+//
 // To check that the soak catches leaks, --test_env=SOAK_INJECT_LEAK=1 leaks a
 // goroutine and a file descriptor per ordinary action, which must fail the
 // test with exactly those two groups.
@@ -65,7 +68,14 @@ func TestResourceSoak(t *testing.T) {
 	injectLeak := os.Getenv("SOAK_INJECT_LEAK") == "1"
 	stop := make(chan struct{})
 	defer close(stop)
-	testleak.Soak(t, 2, 10, func(batch int) {
+	batches := 10
+	if value := os.Getenv("SOAK_BATCHES"); value != "" {
+		var err error
+		batches, err = strconv.Atoi(value)
+		require.NoError(t, err, "SOAK_BATCHES must be an integer")
+		require.GreaterOrEqual(t, batches, 4)
+	}
+	testleak.Soak(t, 2, batches, func(batch int) {
 		cacheHits := 0
 		for i := range 17 {
 			script := "cp blob out"

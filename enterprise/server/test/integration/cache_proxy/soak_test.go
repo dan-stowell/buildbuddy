@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -40,6 +41,8 @@ import (
 // is tagged manual:
 //
 //	bb remote test --config=remote //enterprise/server/test/integration/cache_proxy:soak_test --test_output=all --test_arg=-test.v
+//
+// Set --test_env=SOAK_BATCHES=40 for a longer run (default 10).
 //
 // --test_env=SOAK_INJECT_LEAK=1 leaks a goroutine and a file descriptor per
 // batch, which must fail the test with exactly those two groups.
@@ -94,7 +97,14 @@ func TestCacheProxyResourceSoak(t *testing.T) {
 	injectLeak := os.Getenv("SOAK_INJECT_LEAK") == "1"
 	stop := make(chan struct{})
 	defer close(stop)
-	testleak.Soak(t, 2, 10, func(batch int) {
+	batches := 10
+	if value := os.Getenv("SOAK_BATCHES"); value != "" {
+		var err error
+		batches, err = strconv.Atoi(value)
+		require.NoError(t, err, "SOAK_BATCHES must be an integer")
+		require.GreaterOrEqual(t, batches, 4)
+	}
+	testleak.Soak(t, 2, batches, func(batch int) {
 		instance := fmt.Sprintf("soak/%d", batch)
 		small := []byte(fmt.Sprintf("small-%d", batch))
 		d, err := digest.Compute(bytes.NewReader(small), repb.DigestFunction_SHA256)

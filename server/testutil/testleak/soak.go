@@ -163,6 +163,19 @@ func Soak(t testing.TB, warmup, batches int, op func(batch int)) {
 		}
 		return strings.Compare(a, b)
 	})
+	// Always report the largest absolute warm-sample-to-final deltas,
+	// including slow growth below the flagging threshold.
+	abs := func(n int) int { return max(n, -n) }
+	top := slices.Clone(keys)
+	slices.SortFunc(top, func(a, b string) int {
+		if d := abs(delta(b)) - abs(delta(a)); d != 0 {
+			return d
+		}
+		return strings.Compare(a, b)
+	})
+	for _, k := range top[:min(15, len(top))] {
+		t.Logf("testleak.Soak: top absolute delta=%+d series=%v group=%s", delta(k), series[k], k)
+	}
 	constant := 0
 	for _, k := range keys {
 		s := series[k]
