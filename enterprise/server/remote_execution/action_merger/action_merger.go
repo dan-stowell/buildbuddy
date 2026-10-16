@@ -491,6 +491,8 @@ func RegisterHedge(ctx context.Context, rdb redis.UniversalClient, canonical, id
 
 // CompleteCopy atomically elects the first success. Failures are withheld until
 // every registered copy has failed. Replays by the winner are safe to publish.
+// A non-nil copy list means this function owns pending-state cleanup; an empty
+// list means the execution was unpaired and its pending state is already removed.
 func CompleteCopy(ctx context.Context, rdb redis.UniversalClient, id string, success bool, serializedOperation ...[]byte) (string, bool, []string, error) {
 	if *hedgedActionCount == 0 {
 		return id, true, nil, nil
@@ -500,7 +502,7 @@ func CompleteCopy(ctx context.Context, rdb redis.UniversalClient, id string, suc
 	reverseKey := redisKeyForPendingExecutionDigest(id)
 	mapping, err := rdb.Get(ctx, reverseKey).Result()
 	if err == redis.Nil {
-		return id, true, nil, nil
+		return id, true, []string{}, nil
 	}
 	if err != nil {
 		return "", false, nil, err
