@@ -59,7 +59,10 @@ go_library(
 go_test(
     name = "scheduler_server_test",
     size = "medium",
-    srcs = ["scheduler_server_test.go"],
+    srcs = [
+        "executor_reconnect_test.go",
+        "scheduler_server_test.go",
+    ],
     embed = [":scheduler_server"],
     deps = [
         "//enterprise/server/backends/redis_execution_collector",
