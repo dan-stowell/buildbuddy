@@ -1137,7 +1137,7 @@ func TestWorkspaceRoundTrip(t *testing.T) {
 		{"delete", "rm file"},
 		{"rename", "git mv file renamed"},
 		{"executable", "chmod +x file"},
-		{"symlink_add", "ln -s file link"},
+		{"symlink_add", "ln -s file newlink"},
 		{"symlink_change", "rm link; ln -s other link"},
 		{"binary_add", "printf '\\000\\001' > added"},
 		{"binary_modify", "printf '\\000\\002' > file"},
@@ -1153,7 +1153,8 @@ func TestWorkspaceRoundTrip(t *testing.T) {
 		{"unpublished_branch", "git checkout -b local; printf committed > file; git add file; git commit -m local"},
 		{"no_upstream", "git branch --unset-upstream; printf changed > file"},
 		{"detached", "git checkout --detach; printf changed > file"},
-		{"behind", "git checkout -b future; printf future > file; git add file; git commit -m future; git update-ref refs/remotes/origin/master HEAD; git checkout master"},
+		{"behind", "git reset --hard HEAD^"},
+		{"submodule_dirty", "printf dirty > module/child"},
 		{"merge_conflict", "git checkout -b side; printf side > file; git add file; git commit -m side; git checkout master; printf main > file; git add file; git commit -m main; git merge side || test -f .git/MERGE_HEAD"},
 	}
 	for _, tc := range cases {
@@ -1163,13 +1164,26 @@ func TestWorkspaceRoundTrip(t *testing.T) {
 			t.Cleanup(func() { require.NoError(t, os.Chdir(old)) })
 			remote, _ := testgit.MakeTempRepo(t, map[string]string{"file": "original\n", "other": "other\n", ".gitignore": "ignored\n"})
 			testshell.Run(t, remote, "ln -s file link; git add link; git commit -m symlink")
+			if tc.name == "behind" {
+				testgit.CommitFiles(t, remote, map[string]string{"file": "future\n"})
+			}
+			if tc.name == "submodule_dirty" {
+				child, _ := testgit.MakeTempRepo(t, map[string]string{"child": "original\n"})
+				testshell.Run(t, remote, fmt.Sprintf("git -c protocol.file.allow=always submodule add %q module; git commit -am submodule", child))
+			}
 			local := testgit.MakeTempRepoClone(t, remote)
 			require.NoError(t, os.Chdir(local))
 			resetRepoRootPathForTest(t)
+			if tc.name == "submodule_dirty" {
+				testshell.Run(t, local, "git -c protocol.file.allow=always submodule update --init")
+			}
 			testshell.Run(t, local, tc.script)
 			config, err := Config()
 			require.NoError(t, err)
 			runner := testgit.MakeTempRepoClone(t, remote)
+			if tc.name == "submodule_dirty" {
+				testshell.Run(t, runner, "git -c protocol.file.allow=always submodule update --init")
+			}
 			// The selected commit must actually be available from the remote.
 			testshell.Run(t, runner, "git checkout --detach "+config.CommitSHA)
 			for i, patch := range config.Patches {
@@ -1187,8 +1201,11 @@ func TestWorkspaceRoundTrip(t *testing.T) {
 					if err != nil {
 						return err
 					}
-					if rel == ".git" {
-						return filepath.SkipDir
+					if entry.Name() == ".git" {
+						if entry.IsDir() {
+							return filepath.SkipDir
+						}
+						return nil
 					}
 					if entry.IsDir() || rel == "ignored" {
 						return nil
