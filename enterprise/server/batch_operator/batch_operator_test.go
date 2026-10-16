@@ -754,9 +754,7 @@ func TestEnqueue_ConcurrentFlushLosesDigestsAndLeaksGroupBudget(t *testing.T) {
 
 		done := make(chan struct{})
 		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for {
 				select {
 				case <-done:
@@ -765,7 +763,7 @@ func TestEnqueue_ConcurrentFlushLosesDigestsAndLeaksGroupBudget(t *testing.T) {
 					updater.ForceFlushBatchesForTesting(t.Context())
 				}
 			}
-		}()
+		})
 		updater.ForceBatchingForTesting()
 		close(done)
 		wg.Wait()
@@ -797,4 +795,63 @@ func TestEnqueue_ConcurrentFlushLosesDigestsAndLeaksGroupBudget(t *testing.T) {
 	drain()
 	require.Equal(t, perRound, len(cas.getUpdates()), "group budget leaked: only %d of %d digests were sent after all batches drained", len(cas.getUpdates()), perRound)
 	require.Equal(t, 0, lost, "digests enqueued while a flush was running were never sent")
+}
+
+// Production-shaped variant: the pebble cache enqueues one digest per atime
+// update, and the operator's own batcher/sender goroutines run concurrently.
+func TestEnqueue_SingleDigestEnqueuesWithRunningSenderLoseDigests(t *testing.T) {
+	const total = 20000
+	authenticator, updater, cas, clock := setup(t, batch_operator.BatchDigestOperatorConfig{
+		QueueSize:          total,
+		MaxDigestsPerGroup: 200_000,
+		MaxDigestsPerBatch: 10_000,
+		MaxBatchesPerGroup: 50,
+		BatchInterval:      time.Second,
+	})
+	updater.Start(&testhealthcheck.TestingHealthChecker{})
+	ctx := authenticatedContext(t.Context(), user1, authenticator)
+
+	ds := make([]*repb.Digest, 0, total)
+	for i := range total {
+		ds = append(ds, digestProto(fmt.Sprintf("%064x", i+1), 3))
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				clock.Advance(time.Second)
+				time.Sleep(50 * time.Microsecond)
+			}
+		}
+	})
+	for _, d := range ds {
+		require.True(t, updater.Enqueue(ctx, "instance-1", []*repb.Digest{d}, repb.DigestFunction_SHA256))
+	}
+	// Let the batcher and sender drain everything.
+	deadline := time.Now().Add(10 * time.Second)
+	last, stableSince := -1, time.Now()
+	for time.Now().Before(deadline) {
+		n := len(cas.getUpdates())
+		if n == total {
+			break
+		}
+		if n != last {
+			last, stableSince = n, time.Now()
+		} else if time.Since(stableSince) > 2*time.Second {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(stop)
+	wg.Wait()
+	sent := map[digest.Key]struct{}{}
+	for _, u := range cas.getUpdates() {
+		sent[u.key] = struct{}{}
+	}
+	t.Logf("sent %d of %d single-digest enqueues", len(sent), total)
+	require.Equal(t, total, len(sent), "%d single-digest atime updates were enqueued successfully but never sent", total-len(sent))
 }
