@@ -218,7 +218,7 @@ func TestInputFingerprintStatCost(t *testing.T) {
 		require.NoError(t, os.WriteFile(paths[i], nil, 0644))
 	}
 	for _, n := range []int{1000, 10000} {
-		for pass := 0; pass < 3; pass++ {
+		for pass := range 3 {
 			start := time.Now()
 			for _, path := range paths[:n] {
 				info, err := os.Stat(path)
