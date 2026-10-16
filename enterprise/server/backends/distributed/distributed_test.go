@@ -5011,3 +5011,45 @@ func TestFindMissing_Quorum_IgnoresNonReplicaCopies(t *testing.T) {
 	require.Zero(t, caches[nonReplica].lookups[rn.GetDigest().GetHash()])
 	caches[nonReplica].mu.Unlock()
 }
+
+// A presence response should refresh each replica that can serve subsequent reads.
+func TestPresenceLifetime_FindMissingRefreshesReplicas(t *testing.T) {
+	for _, quorum := range []bool{false, true} {
+		t.Run(fmt.Sprintf("quorum=%t", quorum), func(t *testing.T) {
+			env, _, ctx := getEnvAuthAndCtx(t)
+			peers := make([]string, 3)
+			for i := range peers {
+				peers[i] = fmt.Sprintf("localhost:%d", testport.FindFree(t))
+			}
+			caches := make([]*quorumTestCache, len(peers))
+			var dc *Cache
+			for i, peer := range peers {
+				caches[i] = &quorumTestCache{Cache: newMemoryCache(t, 1000000), lookups: make(map[string]int)}
+				dc = startNewDCache(t, env, Options{ListenAddr: peer, Nodes: slices.Clone(peers), ReplicationFactor: 3, DisableLocalLookup: true}, caches[i])
+				waitForReady(t, peer)
+			}
+			buf := []byte("presence-lifetime")
+			d, err := digest.Compute(bytes.NewReader(buf), repb.DigestFunction_SHA256)
+			require.NoError(t, err)
+			rn := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256).ToProto()
+			for _, c := range caches {
+				require.NoError(t, c.Cache.Set(ctx, rn, buf))
+			}
+			if quorum {
+				ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(findmissing.RequireQuorumHeader, "true"))
+			}
+			missing, err := dc.FindMissing(ctx, []*rspb.ResourceName{rn})
+			require.NoError(t, err)
+			require.Empty(t, missing)
+			refreshed := 0
+			for _, c := range caches {
+				c.mu.Lock()
+				if c.lookups[d.GetHash()] > 0 {
+					refreshed++
+				}
+				c.mu.Unlock()
+			}
+			require.Equal(t, len(peers), refreshed, "present response must reach all serving replicas to refresh their atime")
+		})
+	}
+}
