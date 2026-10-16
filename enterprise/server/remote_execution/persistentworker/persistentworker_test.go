@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/container"
@@ -100,4 +101,36 @@ func TestWorkerStop_UnreadOutputAfterInvalidResponse(t *testing.T) {
 	require.ErrorContains(t, res.Error, "invalid character")
 
 	require.NoError(t, w.Stop())
+}
+
+// A worker that has started an incomplete response must be killed when the
+// request expires, even though its process has a longer-lived context.
+func TestWorkerExec_StalledResponseHonorsContext(t *testing.T) {
+	testleak.Check(t)
+	testleak.CheckFDs(t)
+	for i := 0; i < 10; i++ {
+		ctx := context.Background()
+		ctr := bare.NewBareCommandContainer(&bare.Opts{})
+		require.NoError(t, ctr.Create(ctx, t.TempDir()))
+		// Announce a 100-byte proto response, send one byte, then wait on stdin.
+		// There are no timers or child processes in the stalled shell.
+		cmd := &repb.Command{Arguments: []string{"sh", "-c", "head -c 1 >/dev/null; printf '\\144x'; read ignored"}}
+		w, err := persistentworker.Start(ctx, &workspace.Workspace{}, ctr, "proto", cmd)
+		require.NoError(t, err)
+		runCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		done := make(chan *interfaces.CommandResult, 1)
+		go func() { done <- w.Exec(runCtx, cmd) }()
+		select {
+		case res := <-done:
+			require.Error(t, res.Error)
+		case <-time.After(5 * time.Second):
+			cancel()
+			require.NoError(t, w.Stop())
+			<-done
+			t.Fatal("Exec remained blocked after request deadline")
+		}
+		cancel()
+		// Exec must have stopped the process itself, before explicit cleanup.
+		require.NoError(t, w.Stop())
+	}
 }
