@@ -3520,3 +3520,77 @@ func TestTaskCPUControllerDisabled(t *testing.T) {
 		})
 	}
 }
+
+// Background-child-holding-stdout cases. Every background process exits on
+// its own after at most 30s.
+func TestBackgroundChildHoldsStdout(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		exec    bool // Create+Exec instead of Run
+		tini    bool
+		timeout time.Duration
+		script  string
+	}{
+		{name: "Run/BgChild/NoTimeout", script: `sleep 20 & echo hi`},
+		{name: "Run/BgChild/Timeout", timeout: 3 * time.Second, script: `sleep 20 & echo hi`},
+		{name: "Run/Tini/BgChild/Timeout", tini: true, timeout: 3 * time.Second, script: `sleep 20 & echo hi`},
+		{name: "Run/OrphanGrandchild/Timeout", timeout: 3 * time.Second, script: `( sleep 20 & ) ; echo hi ; sleep 30`},
+		{name: "Exec/BgChild/NoTimeout", exec: true, script: `sleep 20 & echo hi`},
+		{name: "Exec/BgChild/Timeout", exec: true, timeout: 3 * time.Second, script: `sleep 20 & echo hi`},
+		{name: "Exec/OrphanGrandchild/Timeout", exec: true, timeout: 3 * time.Second, script: `( sleep 20 & ) ; echo hi ; sleep 30`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupNetworking(t)
+			image := busyboxImage(t)
+			ctx := context.Background()
+			env := testenv.GetTestEnv(t)
+			installLeaserInEnv(t, env)
+			installFileCacheInEnv(t, env)
+			flags.Set(t, "executor.oci.runtime_root", testfs.MakeTempDir(t))
+			buildRoot := testfs.MakeTempDir(t)
+			provider, err := ociruntime.NewProvider(env, buildRoot, testfs.MakeTempDir(t))
+			require.NoError(t, err)
+			wd := testfs.MakeDirAll(t, buildRoot, "work")
+			c, err := provider.New(ctx, &container.Init{Props: &platform.Properties{
+				ContainerImage: image,
+				DockerInit:     tc.tini,
+			}})
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				require.NoError(t, c.Remove(context.Background()))
+			})
+			cmd := &repb.Command{Arguments: []string{"sh", "-c", tc.script}}
+			runCtx := ctx
+			if tc.timeout > 0 {
+				var cancel context.CancelFunc
+				runCtx, cancel = context.WithTimeout(ctx, tc.timeout)
+				defer cancel()
+			}
+			var res *interfaces.CommandResult
+			var elapsed time.Duration
+			if tc.exec {
+				require.NoError(t, c.PullImage(ctx, oci.Credentials{}))
+				require.NoError(t, c.Create(ctx, wd))
+				start := time.Now()
+				res = c.Exec(runCtx, cmd, &interfaces.Stdio{})
+				elapsed = time.Since(start)
+				// See what's still running in the container afterwards.
+				ps := c.Exec(ctx, &repb.Command{Arguments: []string{"ps", "-o", "pid,ppid,args"}}, &interfaces.Stdio{})
+				t.Logf("ps after exec: %s", ps.Stdout)
+			} else {
+				start := time.Now()
+				res = c.Run(runCtx, cmd, wd, oci.Credentials{})
+				elapsed = time.Since(start)
+			}
+			t.Logf("elapsed=%s exitCode=%d err=%v stdout=%q stderr=%q", elapsed, res.ExitCode, res.Error, res.Stdout, res.Stderr)
+			limit := 10 * time.Second
+			if tc.timeout > 0 {
+				limit = tc.timeout + 5*time.Second
+			}
+			assert.Less(t, elapsed, limit)
+			if tc.timeout > 0 && elapsed > tc.timeout {
+				assert.Error(t, res.Error, "returned after the deadline; should not report success")
+			}
+		})
+	}
+}

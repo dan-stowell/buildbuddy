@@ -3,6 +3,7 @@
 package commandutil
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"os/user"
@@ -18,8 +19,9 @@ import (
 )
 
 type process struct {
-	cmd        *exec.Cmd
-	terminated chan struct{}
+	cmd         *exec.Cmd
+	terminated  chan struct{}
+	cleanupDone chan struct{}
 }
 
 func (p *process) preStart() error {
@@ -100,15 +102,26 @@ func (p *process) killProcessTree() error {
 	// chance to become stale if the pid forks a new child just after we list
 	// processes but before we send SIGKILL.
 
-	pidsToExplore := []int{p.cmd.Process.Pid}
+	// Signal the root through os.Process, which tracks whether Wait has reaped
+	// it (and uses a pidfd on supported Linux kernels). A raw kill(rootPID)
+	// here could stop or kill an unrelated process after PID reuse.
+	rootErr := p.cmd.Process.Signal(syscall.SIGSTOP)
+	pidsToExplore := []int{}
+	if rootErr == nil {
+		pidsToExplore = append(pidsToExplore, p.cmd.Process.Pid)
+	} else if !errors.Is(rootErr, os.ErrProcessDone) {
+		lastErr = rootErr
+	}
 	pidsToKill := []int{}
 	for len(pidsToExplore) > 0 {
 		pid := pidsToExplore[0]
 		pidsToExplore = pidsToExplore[1:]
-		if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
-			lastErr = err
-			// If we fail to SIGSTOP, proceed anyway; the more we can clean up,
-			// the better.
+		if pid != p.cmd.Process.Pid {
+			if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
+				lastErr = err
+				// If we fail to SIGSTOP, proceed anyway; the more we can clean up,
+				// the better.
+			}
 		}
 		pidsToKill = append(pidsToKill, pid)
 
@@ -120,7 +133,21 @@ func (p *process) killProcessTree() error {
 		pidsToExplore = append(pidsToExplore, childPids...)
 	}
 	for _, pid := range pidsToKill {
-		if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		var err error
+		if pid == p.cmd.Process.Pid {
+			err = p.cmd.Process.Kill()
+		} else {
+			err = syscall.Kill(pid, syscall.SIGKILL)
+		}
+		if err != nil && !errors.Is(err, os.ErrProcessDone) && !errors.Is(err, syscall.ESRCH) {
+			lastErr = err
+		}
+	}
+	// The tree walk cannot find children reparented after their parent exits.
+	// Our own process group still includes these orphans. Only signal a group
+	// we created, never the caller's group or an explicitly supplied group.
+	if attr := p.cmd.SysProcAttr; attr != nil && attr.Setpgid && attr.Pgid == 0 {
+		if err := p.signal(syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
 			lastErr = err
 		}
 	}

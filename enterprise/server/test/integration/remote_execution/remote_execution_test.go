@@ -3022,3 +3022,53 @@ func TestPersistentWorker_UnresponsiveWorker_InvocationCancellation(t *testing.T
 	assert.True(t, status.IsCanceledError(res.Err), "expected Canceled, got %v", res.Err)
 	assert.Less(t, runAfterCancel, 6*time.Second, "executor should stop running a cancelled task promptly")
 }
+
+// The action's main process exits 0 right away but leaves a background child
+// (bounded: exits on its own after 20s) holding the inherited stdout/stderr.
+// With a 2s action timeout, the execution should finish around the timeout
+// and should not be reported as a success after the deadline has passed.
+func TestBackgroundChildHoldingStdout_RespectsActionTimeout(t *testing.T) {
+	rbe := rbetest.NewRBETestEnv(t)
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutor(t)
+
+	platform := &repb.Platform{
+		Properties: []*repb.Platform_Property{
+			{Name: "OSFamily", Value: runtime.GOOS},
+			{Name: "Arch", Value: runtime.GOARCH},
+		},
+	}
+	const actionTimeout = 2 * time.Second
+	start := time.Now()
+	cmd := rbe.Execute(
+		&repb.Command{
+			Arguments: []string{"sh", "-c", "sleep 20 & echo hi"},
+			Platform:  platform,
+		},
+		&rbetest.ExecuteOpts{ActionTimeout: actionTimeout},
+	)
+	var res *rbeclient.CommandResult
+	deadline := time.After(60 * time.Second)
+	for res == nil {
+		select {
+		case r, ok := <-cmd.StatusChannel():
+			require.True(t, ok, "status channel closed without result")
+			if r.Stage == repb.ExecutionStage_COMPLETED {
+				res = r
+			}
+		case <-deadline:
+			require.FailNow(t, "command did not complete within 60s")
+		}
+	}
+	elapsed := time.Since(start)
+	stdout := ""
+	if res.ActionResult != nil {
+		stdout, _, _ = rbe.GetStdoutAndStderr(context.Background(), res.ActionResult, res.InstanceName)
+	}
+	t.Logf("elapsed=%s err=%v exitCode=%d stdout=%q", elapsed, res.Err, res.ExitCode, stdout)
+
+	assert.Less(t, elapsed, actionTimeout+8*time.Second, "execution should end shortly after the action timeout, not when the background child exits")
+	if elapsed > actionTimeout {
+		assert.Error(t, res.Err, "execution ran past its timeout; it should not be reported as successful")
+	}
+}

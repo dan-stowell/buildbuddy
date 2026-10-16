@@ -807,3 +807,26 @@ func TestExecuteTaskAndStreamResults_LateSuccessIsDeadlineExceeded(t *testing.T)
 	require.Equal(t, int32(commandutil.NoExitCode), completed.ExecuteResponse.GetResult().GetExitCode())
 	require.Equal(t, 0, counter.countFinishedCleanly)
 }
+
+// Runners must not turn a timeout into success just because the main process
+// had exit code zero before its inherited output pipes finished draining.
+func TestExecuteTaskAndStreamResults_DeadlineOverridesSuccessfulRunner(t *testing.T) {
+	ctx := t.Context()
+	task := getTask()
+	task.GetExecutionTask().GetAction().Timeout = durationpb.New(50 * time.Millisecond)
+	runOverride := func(ctx context.Context, original rbetest.RunFunc) *interfaces.CommandResult {
+		<-ctx.Done()
+		return &interfaces.CommandResult{ExitCode: 0, Stdout: []byte("partial\n")}
+	}
+	exec, _, execClient, mockServer, _ := getExecutor(t, runOverride)
+	publisher, err := operation.Publish(ctx, execClient, task.GetExecutionTask().GetExecutionId())
+	require.NoError(t, err)
+	retry, err := exec.ExecuteTaskAndStreamResults(ctx, task, publisher)
+	require.NoError(t, err)
+	require.False(t, retry)
+	<-mockServer.finished
+	ops := mockServer.getOperations()
+	rsp, err := rexec.UnpackOperation(ops[len(ops)-1])
+	require.NoError(t, err)
+	require.Equal(t, int32(codes.DeadlineExceeded), rsp.ExecuteResponse.GetStatus().GetCode())
+}
