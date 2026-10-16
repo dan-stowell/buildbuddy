@@ -42,9 +42,16 @@ go_test(
     },
     deps = [
         "//proto:zip_go_proto",
+        "//server/real_environment",
+        "//server/testutil/testleak",
         "//server/util/proto",
+        "//server/util/testing/flags",
+        "@com_github_jonboulle_clockwork//:clockwork",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
         "@io_bazel_rules_go//go/runfiles",
+        "@org_golang_google_genproto_googleapis_bytestream//:bytestream",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//credentials",
     ],
 )
