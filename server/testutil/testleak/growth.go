@@ -43,8 +43,8 @@ type Growth struct {
 }
 
 // CheckGrowth runs op Warmup+Iterations times, and then fails the test if the
-// number of goroutines or file descriptors that were created after the
-// warmup and are still around once things have settled exceeds MaxGoroutines
+// net increase in live goroutines or file descriptors after the
+// warmup, once things have settled, exceeds MaxGoroutines
 // or MaxFDs. op is called with the iteration number, starting from 0
 // (including warmup iterations).
 //
@@ -80,8 +80,13 @@ func CheckGrowth(t testing.TB, g Growth, op func(i int)) {
 	}
 
 	baseGoroutines := map[int]bool{}
+	eligible := func(gr goroutine) bool {
+		return !isTestingGoroutine(gr) && !slices.ContainsFunc(g.IgnoreFunctions, func(f string) bool { return slices.Contains(gr.functions, f) })
+	}
 	for _, gr := range allGoroutines() {
-		baseGoroutines[gr.id] = true
+		if eligible(gr) {
+			baseGoroutines[gr.id] = true
+		}
 	}
 	var baseFDs map[int]string
 	if checkFDs {
@@ -94,19 +99,27 @@ func CheckGrowth(t testing.TB, g Growth, op func(i int)) {
 
 	measure := func() ([]goroutine, []fdEntry) {
 		var gs []goroutine
+		remainingBaseline := 0
 		for _, gr := range allGoroutines() {
-			if baseGoroutines[gr.id] || isTestingGoroutine(gr) {
+			if !eligible(gr) {
 				continue
 			}
-			if slices.ContainsFunc(g.IgnoreFunctions, func(f string) bool { return slices.Contains(gr.functions, f) }) {
-				continue
+			if baseGoroutines[gr.id] {
+				remainingBaseline++
+			} else {
+				gs = append(gs, gr)
 			}
-			gs = append(gs, gr)
 		}
+		// Retired baseline resources offset replacements. Keep new stacks
+		// for diagnostics, but count only net accumulation.
+		gs = gs[:max(0, len(gs)-(len(baseGoroutines)-remainingBaseline))]
 		var fds []fdEntry
 		if checkFDs {
 			if after, err := readFDs(); err == nil {
 				fds = newFDs(baseFDs, after)
+				fds = fds[:max(0, len(after)-len(baseFDs))]
+			} else {
+				t.Errorf("testleak: read file descriptors: %s", err)
 			}
 		}
 		return gs, fds
