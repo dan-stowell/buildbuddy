@@ -38,7 +38,7 @@ go_library(
 go_test(
     name = "priority_task_scheduler_test",
     size = "small",
-    srcs = ["priority_task_scheduler_test.go"],
+    srcs = ["priority_task_scheduler_test.go", "v8_experiment_test.go"],
     embed = [":priority_task_scheduler"],
     deps = [
         "//proto:experiments_go_proto",
