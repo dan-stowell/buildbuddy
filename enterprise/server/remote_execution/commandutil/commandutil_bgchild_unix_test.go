@@ -117,13 +117,13 @@ func TestRun_BackgroundChildHoldsStdout_NoTimeout(t *testing.T) {
 	res := commandutil.Run(context.Background(), cmd, wd, nil /*=statsListener*/, &interfaces.Stdio{})
 	elapsed := time.Since(start)
 	t.Logf("elapsed=%s exitCode=%d err=%v stdout=%q", elapsed, res.ExitCode, res.Error, res.Stdout)
-	assert.Less(t, elapsed, 2*time.Second, "successful root must not wait for background child")
+	assert.GreaterOrEqual(t, elapsed, 5*time.Second, "wait for inherited output streams to reach EOF")
 	assert.Equal(t, "hi\n", string(res.Stdout))
 	assert.Equal(t, 0, res.ExitCode)
-	// Successful bare commands retain background processes for compatibility
-	// with callers intentionally keeping daemons between actions.
+	// Waiting for EOF does not kill background processes; here the child
+	// closes the streams by exiting on its own.
 	pid := readPid(t, pidFile)
-	assert.True(t, pidAlive(pid), "successful commands should not kill background processes")
+	assert.False(t, pidAlive(pid), "pipe-holding child should have exited before EOF")
 	require.NoError(t, res.Error)
 }
 
@@ -214,9 +214,10 @@ func TestRun_MainLargeOutputWithBackgroundPipe(t *testing.T) {
 // Synchronize the first Write with the shell so the remaining output is in
 // the OS pipe when the main process exits, rather than relying on scheduling.
 type exitSynchronizedWriter struct {
-	dir   string
-	first bool
-	buf   bytes.Buffer
+	dir    string
+	first  bool
+	onExit func()
+	buf    bytes.Buffer
 }
 
 func (w *exitSynchronizedWriter) Write(p []byte) (int, error) {
@@ -235,6 +236,9 @@ func (w *exitSynchronizedWriter) Write(p []byte) (int, error) {
 			}
 			time.Sleep(time.Millisecond)
 		}
+		if w.onExit != nil {
+			w.onExit()
+		}
 		time.Sleep(500 * time.Millisecond)
 	}
 	return w.buf.Write(p)
@@ -252,4 +256,45 @@ func TestRun_MainOutputSlowConsumer(t *testing.T) {
 	require.Equal(t, 0, res.ExitCode)
 	t.Logf("captured=%d expected=4097 exitCode=%d", writer.buf.Len(), res.ExitCode)
 	require.Equal(t, 4097, writer.buf.Len(), "all output written by main process must be captured")
+}
+
+// Cancellation during a slow drain must preserve bytes already written, on
+// both streams, even when the root has exited and a child still holds the pipe.
+func TestRun_SlowDrainCancellationPreservesOutput(t *testing.T) {
+	for _, stream := range []string{"stdout", "stderr"} {
+		t.Run(stream, func(t *testing.T) {
+			wd := testfs.MakeTempDir(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			writer := &exitSynchronizedWriter{dir: wd, onExit: cancel}
+			stdio := &interfaces.Stdio{Stdout: writer}
+			redirect := ""
+			if stream == "stderr" {
+				stdio = &interfaces.Stdio{Stderr: writer}
+				redirect = " >&2"
+			}
+			pidFile := filepath.Join(wd, "bg.pid")
+			killOnCleanup(t, pidFile)
+			res := commandutil.Run(ctx, &repb.Command{Arguments: []string{"sh", "-c",
+				"sh -c 'echo $$ > bg.pid; exec sleep 20' & printf a" + redirect +
+					"; while [ ! -f reader-ready ] || [ ! -f bg.pid ]; do sleep 0.01; done; printf '%s' " +
+					strings.Repeat("x", 4096) + redirect + "; : > root-exiting"}}, wd, nil, stdio)
+			require.True(t, status.IsCanceledError(res.Error), "%v", res.Error)
+			require.Equal(t, "a"+strings.Repeat("x", 4096), writer.buf.String())
+			require.False(t, pidAlive(readPid(t, pidFile)))
+		})
+	}
+}
+
+func TestRun_RedirectedDaemonSurvivesSuccess(t *testing.T) {
+	wd := testfs.MakeTempDir(t)
+	pidFile := filepath.Join(wd, "bg.pid")
+	killOnCleanup(t, pidFile)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res := commandutil.Run(ctx, &repb.Command{Arguments: []string{"sh", "-c",
+		"sh -c 'echo $$ > bg.pid; exec sleep 20' </dev/null >/dev/null 2>&1 & echo hi"}}, wd, nil, &interfaces.Stdio{})
+	require.NoError(t, res.Error)
+	require.Equal(t, "hi\n", string(res.Stdout))
+	require.True(t, pidAlive(readPid(t, pidFile)), "successful actions must retain redirected daemons")
 }

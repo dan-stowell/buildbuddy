@@ -315,9 +315,6 @@ func TestRun_ExitedRootWithOpenPipe_Deadline(t *testing.T) {
 		cmd := exec.Command("sh", "-c", "sleep 30 & echo $! > child.pid; echo partial; echo diagnostic >&2; exit 0")
 		cmd.Dir = wd
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		// Keep the drain open past the deadline to exercise cancellation after
-		// the root was reaped, independently of the short default drain limit.
-		cmd.WaitDelay = 5 * time.Second
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
 		_, err := commandutil.RunWithProcessTreeCleanup(ctx, cmd, nil)
@@ -387,4 +384,19 @@ func TestRun_OrphanedGrandchild_Deadline(t *testing.T) {
 			t.Fatal("Run did not return after orphan cleanup")
 		}
 	}
+}
+
+// Callers opting into bounded drains must receive an explicit truncation error.
+func TestRunWithProcessTreeCleanup_ExplicitWaitDelay(t *testing.T) {
+	wd := testfs.MakeTempDir(t)
+	writer := &exitSynchronizedWriter{dir: wd}
+	cmd := exec.Command("sh", "-c", "printf a; while [ ! -f reader-ready ]; do sleep 0.01; done; printf '%s' "+strings.Repeat("x", 4096)+"; : > root-exiting")
+	cmd.Dir = wd
+	cmd.Stdout = writer
+	cmd.WaitDelay = 100 * time.Millisecond
+	_, err := commandutil.RunWithProcessTreeCleanup(context.Background(), cmd, nil)
+	require.ErrorIs(t, err, exec.ErrWaitDelay)
+	code, err := commandutil.ExitCode(context.Background(), cmd, err)
+	require.Error(t, err)
+	require.NotEqual(t, 0, code, "truncated output must not be reported as success")
 }
