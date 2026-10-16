@@ -8,6 +8,7 @@ import (
 
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/build_event_handler"
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/build_event_server"
+	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
@@ -174,5 +175,73 @@ func TestStreamFinalizationRejectedSequence(t *testing.T) {
 		{"duplicate", []int{1, 2, 2, 3}},
 	} {
 		t.Run(tc.name, func(t *testing.T) { checkStreamFinalization(t, tc.order, io.EOF, false, 0) })
+	}
+}
+
+func TestInvocationFinalizationParentChildIsolation(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
+	te.SetAuthenticator(auth)
+	olap := testolapdb.NewHandle()
+	te.SetOLAPDBHandle(olap)
+	handler := build_event_handler.NewBuildEventHandler(te)
+	ctx := auth.AuthContextFromAPIKey(context.Background(), "USER1")
+	ids := []string{"00000000-0000-0000-0000-000000000111", "00000000-0000-0000-0000-000000000222"}
+	channels := make([]interfaces.BuildEventChannel, 2)
+	for i, id := range ids {
+		ch, err := handler.OpenChannel(ctx, id)
+		require.NoError(t, err)
+		defer ch.Close()
+		channels[i] = ch
+		start := &bspb.BuildEvent{}
+		require.NoError(t, startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'").UnmarshalTo(start))
+		start.GetStarted().StartTimeMillis = 1700000000000
+		start.GetStarted().Command = []string{"run", "test"}[i]
+		event, err := anypb.New(start)
+		require.NoError(t, err)
+		require.NoError(t, ch.HandleEvent(streamRequest(event, id, 1)))
+		metadata := map[string]string{"RUN_ID": ids[i]}
+		if i == 1 {
+			metadata["PARENT_RUN_ID"] = ids[0]
+		}
+		require.NoError(t, ch.HandleEvent(streamRequest(buildMetadataEvent(metadata), id, 2)))
+	}
+	// Child completes first, then the parent fails. Neither finalization should
+	// replace the other invocation's summary or parent/run metadata.
+	for _, i := range []int{1, 0} {
+		finish := &bspb.BuildEvent{}
+		require.NoError(t, finishedEvent().UnmarshalTo(finish))
+		finish.GetFinished().FinishTimeMillis = 1700000000000 + int64(i+1)*1000
+		finish.GetFinished().ExitCode.Code = int32(1 - i)
+		finish.GetFinished().ExitCode.Name = []string{"BUILD_FAILURE", "SUCCESS"}[i]
+		event, err := anypb.New(finish)
+		require.NoError(t, err)
+		require.NoError(t, channels[i].HandleEvent(streamRequest(event, ids[i], 3)))
+		require.NoError(t, channels[i].FinalizeInvocation(ids[i]))
+	}
+	children, err := te.GetInvocationDB().LookupChildInvocations(ctx, ids[0])
+	require.NoError(t, err)
+	assert.Equal(t, []string{ids[1]}, children)
+	for i, id := range ids {
+		row, err := te.GetInvocationDB().LookupInvocation(ctx, id)
+		require.NoError(t, err)
+		inv, err := build_event_handler.LookupInvocation(te, ctx, id)
+		require.NoError(t, err)
+		assert.Equal(t, inspb.InvocationStatus_COMPLETE_INVOCATION_STATUS, inv.InvocationStatus)
+		assert.Equal(t, []string{"run", "test"}[i], row.Command)
+		assert.Equal(t, row.Command, inv.Command)
+		assert.Equal(t, i == 1, row.Success)
+		assert.Equal(t, row.Success, inv.Success)
+		assert.Equal(t, int64(i+1)*1000000, row.DurationUsec)
+		assert.Equal(t, row.DurationUsec, inv.DurationUsec)
+		assert.Equal(t, id, inv.RunId)
+		if i == 1 {
+			assert.Equal(t, ids[0], inv.ParentRunId)
+		}
+		var analytics *tables.Invocation
+		require.Eventually(t, func() bool { analytics = olap.GetFlushedInvocation(id); return analytics != nil }, 30*time.Second, 10*time.Millisecond)
+		assert.Equal(t, row.Command, analytics.Command)
+		assert.Equal(t, row.Success, analytics.Success)
+		assert.Equal(t, row.DurationUsec, analytics.DurationUsec)
 	}
 }
