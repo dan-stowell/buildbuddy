@@ -2829,9 +2829,22 @@ func (p *PebbleCache) newWrappedWriter(ctx context.Context, fileRecord *sgpb.Fil
 		return nil, err
 	}
 	return p.wrapWriter(ctx, fileRecord, wcm, shouldCompress, encryptionMetadata, db.Close, func(md *sgpb.FileMetadata) error {
+		// Test-only barrier: lets a test deterministically run in the window
+		// after the blob's backing data has been published to storage but
+		// before its metadata is written under the per-key lock. nil (and
+		// therefore a no-op) in production.
+		if beforeWriteMetadataHook != nil {
+			beforeWriteMetadataHook(key)
+		}
 		return p.writeMetadata(ctx, db, key, md)
 	})
 }
+
+// beforeWriteMetadataHook, if non-nil, is invoked inside the blob write commit
+// path after the backing data has been published to storage but before the
+// metadata record is written under the per-key lock. It exists only so tests
+// can interleave eviction into that window; it is nil in production.
+var beforeWriteMetadataHook func(key filestore.PebbleKey)
 
 // wrapWriter wraps wcm in the storage-independent layers of the write path:
 // a commit hook that assembles the written blob's metadata and hands it to
