@@ -125,6 +125,13 @@ func (p *process) killProcessTree() error {
 		}
 	}
 
+	// The root may already have exited and been reaped by exec.Cmd.Wait while
+	// Wait is still draining output pipes inherited by background children.
+	// Such children have been reparented and cannot be discovered by the BFS.
+	// Kill the original process group as well, to release their pipe handles.
+	if err := p.signal(syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+		lastErr = err
+	}
 	return lastErr
 }
 

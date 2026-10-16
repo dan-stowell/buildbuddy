@@ -335,6 +335,8 @@ func forwardSignals(ctx context.Context, process *process, ch <-chan syscall.Sig
 			if err := process.signal(s); err != nil {
 				log.CtxWarningf(ctx, "Failed to send signal %q: %s", s, err)
 			}
+		case <-process.terminated:
+			return
 		case <-ctx.Done():
 			return
 		}
