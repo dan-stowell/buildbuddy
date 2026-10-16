@@ -1416,3 +1416,62 @@ func TestPresenceTombstone_BoundedLRU(t *testing.T) {
 	require.NotContains(t, sh.tombstones, keys[1])
 	require.Empty(t, sh.lookups)
 }
+
+func TestPresenceLookupTracking_OnlyMisses(t *testing.T) {
+	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+	ctx := testContext()
+	env := testenv.GetTestEnv(t)
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+	remote := &delayedPresenceClient{beforePresenceResponse: func() {}}
+	env.SetContentAddressableStorageClient(remote)
+	proxy, err := New(env)
+	require.NoError(t, err)
+	hit := digestProto(fooDigest, 3)
+	miss := digestProto(barDigest, 3)
+	_, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{hit}))
+	require.NoError(t, err)
+	remote.calls = 0
+	remote.beforePresenceResponse = func() {
+		hitKey := proxy.findMissingBlobsCacheKey("GR1", findMissingBlobsRequest(nil), hit)
+		missKey := proxy.findMissingBlobsCacheKey("GR1", findMissingBlobsRequest(nil), miss)
+		require.NotContains(t, proxy.presenceShard(hitKey).lookups, hitKey)
+		require.Contains(t, proxy.presenceShard(missKey).lookups, missKey)
+		count := 0
+		for i := range proxy.presenceShards {
+			count += len(proxy.presenceShards[i].lookups)
+		}
+		require.Equal(t, 1, count)
+	}
+	_, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{hit, miss, hit, miss}))
+	require.NoError(t, err)
+	for i := range proxy.presenceShards {
+		require.Empty(t, proxy.presenceShards[i].lookups)
+	}
+}
+
+// Expiring tombstones must not weaken the sequence guard for an older RPC.
+func TestPresenceInvalidation_OverlapOutlivesTombstone(t *testing.T) {
+	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+	flags.Set(t, "cache_proxy.find_missing_blobs_tombstone_ttl", time.Minute)
+	ctx := testContext()
+	env := testenv.GetTestEnv(t)
+	clock := clockwork.NewFakeClock()
+	env.SetClock(clock)
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+	remote := &delayedPresenceClient{}
+	env.SetContentAddressableStorageClient(remote)
+	proxy, err := New(env)
+	require.NoError(t, err)
+	d := digestProto(fooDigest, 3)
+	remote.beforePresenceResponse = func() {
+		proxy.InvalidatePresence(ctx, digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256))
+		clock.Advance(2 * time.Minute)
+	}
+	_, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+	require.NoError(t, err)
+	rsp, err := proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+	require.NoError(t, err)
+	require.Equal(t, []*repb.Digest{d}, rsp.GetMissingBlobDigests())
+}
