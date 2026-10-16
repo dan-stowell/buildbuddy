@@ -92,7 +92,7 @@ func handleStreamsIDs() string {
 	buf := make([]byte, 1<<20)
 	buf = buf[:runtime.Stack(buf, true)]
 	var ids []string
-	for _, blk := range strings.Split(string(buf), "\n\n") {
+	for blk := range strings.SplitSeq(string(buf), "\n\n") {
 		if strings.Contains(blk, "HandleStreams") || strings.Contains(blk, "http2Client).reader") {
 			h, _, _ := strings.Cut(blk, "\n")
 			kind := "srv"
