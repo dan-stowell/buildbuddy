@@ -3199,20 +3199,13 @@ func TestActionMerging_HedgeResultReachesWaitingClients(t *testing.T) {
 
 	// Claim A: clients already waiting should receive the hedge's result
 	// promptly (allow 10s after the hedge result was available).
-	waitBy := time.After(time.Until(hedgeDone.Add(10 * time.Second)))
+	waitDeadline := hedgeDone.Add(10 * time.Second)
 	got := map[string]bool{}
 	for _, w := range []*hedgeWatcher{w1, w2} {
 		select {
 		case <-w.done:
 			got[w.name] = true
-		case <-waitBy:
-		}
-	}
-	for _, w := range []*hedgeWatcher{w1, w2} {
-		select {
-		case <-w.done:
-			got[w.name] = true
-		default:
+		case <-time.After(time.Until(waitDeadline)):
 		}
 	}
 	// For the report: wait for the canonical execution to finish and record
