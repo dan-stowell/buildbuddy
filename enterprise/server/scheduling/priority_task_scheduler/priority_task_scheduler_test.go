@@ -1354,10 +1354,12 @@ func TestCancelTaskReservationStopsRunningCopy(t *testing.T) {
 	other := &scpb.EnqueueTaskReservationRequest{TaskId: "other"}
 	q.trackTask(running, &cancel)
 	q.trackTask(other, &otherCancel)
-	q.CancelTaskReservation(t.Context(), "loser")
+	q.CancelTaskReservation(t.Context(), "loser", false)
+	require.NoError(t, ctx.Err(), "normal completion must not interrupt the winning executor's cleanup")
+	q.CancelTaskReservation(t.Context(), "loser", true)
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
 	require.NoError(t, otherCtx.Err(), "cancellation must only stop the named copy")
 	q.untrackTask(running, &cancel)
 	q.untrackTask(other, &otherCancel)
-	q.CancelTaskReservation(t.Context(), "loser") // idempotent after cleanup
+	q.CancelTaskReservation(t.Context(), "loser", true) // idempotent after cleanup
 }

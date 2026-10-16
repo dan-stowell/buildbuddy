@@ -485,6 +485,9 @@ message EnqueueTaskReservationResponse {
 message CancelTaskReservationRequest {
   // The ID of the task to cancel.
   string task_id = 1;
+  // Also stop a running copy when cancelling shared work or a losing hedge.
+  // Normal task completion only removes queued reservations.
+  bool cancel_running = 2;
 }
 
 message RegisterExecutorRequest {
@@ -546,6 +549,7 @@ message RegisterAndStreamWorkResponse {
 message CancelTaskReservationsRequest {
   string task_id = 1;
   string executor_id = 2;
+  bool cancel_running = 3;
 }
 message CancelTaskReservationsResponse {}
 

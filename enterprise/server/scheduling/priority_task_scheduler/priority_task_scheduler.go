@@ -599,7 +599,7 @@ func (q *PriorityTaskScheduler) EnqueueTaskReservation(ctx context.Context, req 
 	return &scpb.EnqueueTaskReservationResponse{}, nil
 }
 
-func (q *PriorityTaskScheduler) CancelTaskReservation(ctx context.Context, taskID string) {
+func (q *PriorityTaskScheduler) CancelTaskReservation(ctx context.Context, taskID string, cancelRunning bool) {
 	ctx = q.enrichContext(ctx)
 	ctx = log.EnrichContext(ctx, log.ExecutionIDKey, taskID)
 	q.mu.Lock()
@@ -610,7 +610,7 @@ func (q *PriorityTaskScheduler) CancelTaskReservation(ctx context.Context, taskI
 		removed = true
 	}
 	q.mu.Unlock()
-	if cancel != nil {
+	if cancelRunning && cancel != nil {
 		cancel()
 	}
 	if removed {

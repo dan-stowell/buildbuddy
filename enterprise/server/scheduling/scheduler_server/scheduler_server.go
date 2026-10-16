@@ -667,7 +667,7 @@ func (h *executorHandle) setMoreWorkDelay(d time.Duration) {
 
 // sendProactiveCancellation sends a cancellation request for the given task ID
 // to the executor. This is a best-effort operation - errors are not returned.
-func (h *executorHandle) sendProactiveCancellation(ctx context.Context, taskID string) {
+func (h *executorHandle) sendProactiveCancellation(ctx context.Context, taskID string, cancelRunning bool) {
 	if !h.getRegistration().GetSupportsProactiveCancellation() {
 		// This should never happen since we only add executors to the list of
 		// sent probes if they claimed to support proactive cancellation when
@@ -676,7 +676,8 @@ func (h *executorHandle) sendProactiveCancellation(ctx context.Context, taskID s
 	}
 	msg := &scpb.RegisterAndStreamWorkResponse{
 		CancelTaskReservationRequest: &scpb.CancelTaskReservationRequest{
-			TaskId: taskID,
+			TaskId:        taskID,
+			CancelRunning: cancelRunning,
 		},
 	}
 	select {
@@ -1957,7 +1958,7 @@ func (s *SchedulerServer) recordProbeForProactiveCancellation(ctx context.Contex
 // sendCancellationRequests sends CancelTaskReservationRequest to all
 // executors that have received a task reservation for the given task, then
 // deletes the Redis tracking set.
-func (s *SchedulerServer) sendCancellationRequests(ctx context.Context, taskID string) error {
+func (s *SchedulerServer) sendCancellationRequests(ctx context.Context, taskID string, cancelRunning bool) error {
 	key := s.redisKeyForTaskReservations(taskID)
 	executorIDs, err := s.rdb.SMembers(ctx, key).Result()
 	if err != nil && err != redis.Nil {
@@ -1988,14 +1989,14 @@ func (s *SchedulerServer) sendCancellationRequests(ctx context.Context, taskID s
 			if err != nil {
 				return err
 			}
-			if _, err := client.rpcClient.CancelTaskReservations(ctx, &scpb.CancelTaskReservationsRequest{TaskId: taskID, ExecutorId: executorID}); err != nil {
+			if _, err := client.rpcClient.CancelTaskReservations(ctx, &scpb.CancelTaskReservationsRequest{TaskId: taskID, ExecutorId: executorID, CancelRunning: cancelRunning}); err != nil {
 				return err
 			}
 			continue
 		}
 		for _, pool := range pools {
 			if node := pool.FindConnectedExecutorByID(executorID); node != nil && node.handle != nil {
-				node.handle.sendProactiveCancellation(ctx, taskID)
+				node.handle.sendProactiveCancellation(ctx, taskID, cancelRunning)
 				break
 			}
 		}
@@ -2062,7 +2063,7 @@ func (s *SchedulerServer) deleteClaimedTask(ctx context.Context, taskID string) 
 
 	// Send cancellation requests to executors that have the task queued.
 	if *proactiveCancellationEnabled {
-		if err := s.sendCancellationRequests(ctx, taskID); err != nil {
+		if err := s.sendCancellationRequests(ctx, taskID, false); err != nil {
 			log.CtxWarningf(ctx, "Failed to cancel task reservations for task %q: %s", taskID, err)
 		}
 	}
@@ -3058,7 +3059,7 @@ func (s *SchedulerServer) CancelTask(ctx context.Context, taskID string) (bool, 
 	if err != nil {
 		return deleted, err
 	}
-	if err := s.sendCancellationRequests(ctx, taskID); err != nil {
+	if err := s.sendCancellationRequests(ctx, taskID, true); err != nil {
 		return deleted, err
 	}
 	return deleted, nil
@@ -3558,7 +3559,7 @@ func (s *SchedulerServer) CancelTaskReservations(ctx context.Context, req *scpb.
 	defer s.mu.RUnlock()
 	for _, pool := range s.pools {
 		if node := pool.FindConnectedExecutorByID(req.GetExecutorId()); node != nil && node.handle != nil {
-			node.handle.sendProactiveCancellation(ctx, req.GetTaskId())
+			node.handle.sendProactiveCancellation(ctx, req.GetTaskId(), req.GetCancelRunning())
 			break
 		}
 	}
