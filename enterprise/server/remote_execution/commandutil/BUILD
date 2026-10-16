@@ -35,6 +35,7 @@ go_test(
         "commandutil_test.go",
         "commandutil_unix_test.go",
         "commandutil_windows_test.go",
+        "v3_repro_test.go",
     ],
     data = select({
         "@io_bazel_rules_go//go/platform:windows": [],
