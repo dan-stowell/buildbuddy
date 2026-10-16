@@ -4,6 +4,7 @@ package chunking
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -40,7 +41,7 @@ var (
 const (
 	chunkedManifestPrefix        = "_bb_chunked_manifest_v3_/"
 	chunkOutputFilePrefix        = "chunk_"
-	sharedValidationMarkerDomain = "cas-validation-marker-v1"
+	sharedValidationMarkerDomain = "cas-validation-marker-v2"
 
 	// Default max blob size eligible for chunked writes. Values <= 0 mean no maximum.
 	defaultMaxChunkedWriteSizeBytes = -1
@@ -299,6 +300,9 @@ func (cm *Manifest) ChunkResourceNames() []*rspb.ResourceName {
 func (cm *Manifest) Store(ctx context.Context, cache interfaces.Cache) error {
 	if len(cm.ChunkDigests) == 0 {
 		return status.InvalidArgumentError("chunked manifest must have at least one chunk")
+	}
+	if err := cm.checkChunkSizes(); err != nil {
+		return err
 	}
 
 	// Run validations concurrently so we can fail fast if chunks are missing,
@@ -594,6 +598,8 @@ func (cm *Manifest) verifyChunks(ctx context.Context, cache interfaces.Cache) er
 					return status.InvalidArgumentErrorf("invalid manifest: chunk %v decompressed to %d bytes, expected %d bytes for blob %v", r.GetDigest().GetHash(), len(decompressedData), chunkSize, cm.BlobDigest.GetHash())
 				}
 				chunkData = decompressedData
+			} else if int64(len(chunkData)) != r.GetDigest().GetSizeBytes() {
+				return status.InvalidArgumentErrorf("invalid manifest: chunk %v has %d bytes, expected %d bytes for blob %v", r.GetDigest().GetHash(), len(chunkData), r.GetDigest().GetSizeBytes(), cm.BlobDigest.GetHash())
 			}
 			_, err := hasher.Write(chunkData)
 			if err != nil {
@@ -624,8 +630,8 @@ func (cm *Manifest) verifyChunks(ctx context.Context, cache interfaces.Cache) er
 // To keep the CAS entry constant-size (32 bytes) regardless of blob size, the
 // marker uses a double-hash scheme:
 //
-//	content = H(domain || salt || blob_hash || chunk_hashes...)   [32 bytes]
-//	CAS key = H(content)                                          [32 bytes]
+//	content = H(domain || salt || blob_hash || blob_size || (chunk_hash || chunk_size)...)   [32 bytes]
+//	CAS key = H(content)   [32 bytes]
 //
 // This avoids writing O(numChunks * digestSize) bytes to the CAS for large blobs.
 func sharedValidationResourceName(cm *Manifest) (*rspb.ResourceName, []byte, error) {
@@ -643,12 +649,14 @@ func sharedValidationResourceName(cm *Manifest) (*rspb.ResourceName, []byte, err
 		return nil, nil, status.InvalidArgumentErrorf("compute shared validation key: malformed blob digest %q: %s", cm.BlobDigest.GetHash(), err)
 	}
 	inner.Write(blobHashBytes)
+	inner.Write(binary.BigEndian.AppendUint64(nil, uint64(cm.BlobDigest.GetSizeBytes())))
 	for i, d := range cm.ChunkDigests {
 		chunkHashBytes, err := hex.DecodeString(d.GetHash())
 		if err != nil {
 			return nil, nil, status.InvalidArgumentErrorf("compute shared validation key: malformed chunk digest at index %d %q: %s", i, d.GetHash(), err)
 		}
 		inner.Write(chunkHashBytes)
+		inner.Write(binary.BigEndian.AppendUint64(nil, uint64(d.GetSizeBytes())))
 	}
 
 	content := inner.Sum(nil)
