@@ -1412,3 +1412,148 @@ func TestReadChunked_UsesParallelReads(t *testing.T) {
 		})
 	}
 }
+
+// faultyReader returns data, then tailErr. If oneShot, tailErr is returned
+// once and io.EOF afterwards; otherwise tailErr is returned forever.
+type faultyReader struct {
+	data     []byte
+	tailErr  error
+	oneShot  bool
+	reported bool
+}
+
+func (r *faultyReader) Read(p []byte) (int, error) {
+	if len(r.data) > 0 {
+		n := copy(p, r.data)
+		r.data = r.data[n:]
+		return n, nil
+	}
+	if r.oneShot && r.reported {
+		return 0, io.EOF
+	}
+	r.reported = true
+	return 0, r.tailErr
+}
+
+// TestReadFailsOnShortOrFailedCacheRead checks that ByteStream.Read never
+// returns OK unless it served the whole blob, and that it doesn't spin
+// sending empty responses when the cache reader keeps failing.
+func TestReadFailsOnShortOrFailedCacheRead(t *testing.T) {
+	r := rand.New(rand.NewSource(1))
+	blob := make([]byte, 1_000_000)
+	for i := range blob {
+		// Compressible but non-trivial.
+		blob[i] = byte('a' + r.Intn(4))
+	}
+	d, err := digest.Compute(bytes.NewReader(blob), repb.DigestFunction_SHA256)
+	require.NoError(t, err)
+	compressed := compression.CompressZstd(nil, blob)
+
+	for _, tc := range []struct {
+		name      string
+		newReader func() io.Reader
+		wantCode  codes.Code
+	}{
+		{
+			name: "partial_then_plain_EOF",
+			newReader: func() io.Reader {
+				return &faultyReader{data: blob[:5000], tailErr: io.EOF}
+			},
+			wantCode: codes.DataLoss,
+		},
+		{
+			name: "partial_then_ErrUnexpectedEOF_once",
+			newReader: func() io.Reader {
+				return &faultyReader{data: blob[:5000], tailErr: io.ErrUnexpectedEOF, oneShot: true}
+			},
+			wantCode: codes.DataLoss,
+		},
+		{
+			name: "partial_then_ErrUnexpectedEOF_forever",
+			newReader: func() io.Reader {
+				return &faultyReader{data: blob[:300_000], tailErr: io.ErrUnexpectedEOF}
+			},
+			wantCode: codes.DataLoss,
+		},
+		{
+			name: "zero_bytes_ErrUnexpectedEOF_forever",
+			newReader: func() io.Reader {
+				return &faultyReader{tailErr: io.ErrUnexpectedEOF}
+			},
+			wantCode: codes.DataLoss,
+		},
+		{
+			name: "truncated_stored_zstd",
+			newReader: func() io.Reader {
+				dr, err := compression.NewZstdDecompressingReader(io.NopCloser(bytes.NewReader(compressed[:len(compressed)/2])))
+				require.NoError(t, err)
+				return dr
+			},
+			wantCode: codes.DataLoss,
+		},
+		{
+			name: "partial_then_other_error",
+			newReader: func() io.Reader {
+				return &faultyReader{data: blob[:5000], tailErr: status.UnavailableError("peer went away")}
+			},
+			wantCode: codes.Unavailable,
+		},
+		{
+			name: "full_blob",
+			newReader: func() io.Reader {
+				return bytes.NewReader(blob)
+			},
+			wantCode: codes.OK,
+		},
+	} {
+		for _, compressor := range []repb.Compressor_Value{repb.Compressor_IDENTITY, repb.Compressor_ZSTD} {
+			t.Run(tc.name+"/"+compressor.String(), func(t *testing.T) {
+				ctx := context.Background()
+				te := testenv.GetTestEnv(t)
+				ctx, err := prefix.AttachUserPrefixToContext(ctx, te.GetAuthenticator())
+				require.NoError(t, err)
+				te.SetCache(&readerFuncCache{
+					Cache: te.GetCache(),
+					reader: func(ctx context.Context, r *rspb.ResourceName, offset, limit int64) (io.ReadCloser, error) {
+						return io.NopCloser(tc.newReader()), nil
+					},
+				})
+				conn := runByteStreamServer(ctx, t, te)
+				client := bspb.NewByteStreamClient(conn)
+
+				rn := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256)
+				rn.SetCompressor(compressor)
+				ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				stream, err := client.Read(ctx, &bspb.ReadRequest{ResourceName: rn.DownloadString()})
+				require.NoError(t, err)
+				var got bytes.Buffer
+				emptyMsgs := 0
+				for {
+					var rsp *bspb.ReadResponse
+					rsp, err = stream.Recv()
+					if err != nil {
+						break
+					}
+					if len(rsp.GetData()) == 0 {
+						emptyMsgs++
+					}
+					got.Write(rsp.GetData())
+				}
+				if err == io.EOF {
+					err = nil
+				}
+				assert.LessOrEqual(t, emptyMsgs, 1, "server sent empty ReadResponses")
+				require.Equal(t, tc.wantCode, gstatus.Code(err), "err: %v (read %d bytes)", err, got.Len())
+				if tc.wantCode == codes.OK {
+					data := got.Bytes()
+					if compressor == repb.Compressor_ZSTD {
+						data, err = compression.DecompressZstd(nil, data)
+						require.NoError(t, err)
+					}
+					require.Equal(t, blob, data)
+				}
+			})
+		}
+	}
+}
