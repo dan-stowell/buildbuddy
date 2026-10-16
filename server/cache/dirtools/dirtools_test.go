@@ -2003,7 +2003,7 @@ func TestUploadTree_AddsOnlyFilesToFileCache(t *testing.T) {
 	require.Equal(t, fileCount, fileCache.totalAddCount())
 }
 
-func testEnv(t *testing.T) (*testenv.TestEnv, context.Context) {
+func testEnv(t *testing.T, wrapCache ...func(interfaces.Cache) interfaces.Cache) (*testenv.TestEnv, context.Context) {
 	env := testenv.GetTestEnv(t)
 
 	// wrap the cache so we can add artificial delays to operations
@@ -2012,6 +2012,9 @@ func testEnv(t *testing.T) (*testenv.TestEnv, context.Context) {
 		readerDelay: make(map[digest.Key]chan struct{}),
 	}
 	env.SetCache(cc)
+	for _, wrap := range wrapCache {
+		env.SetCache(wrap(env.GetCache()))
+	}
 
 	ctx := context.Background()
 	ctx, err := prefix.AttachUserPrefixToContext(ctx, env.GetAuthenticator())

@@ -50,10 +50,11 @@ go_library(
 
 go_test(
     name = "dirtools_test",
-    size = "small",
+    size = "medium",
     srcs = [
         "dirtools_linux_test.go",
         "dirtools_test.go",
+        "lifecycle_test.go",
     ],
     embed = [":dirtools"],
     deps = [
@@ -68,6 +69,7 @@ go_test(
         "//server/testutil/testdigest",
         "//server/testutil/testenv",
         "//server/testutil/testfs",
+        "//server/testutil/testleak",
         "//server/util/fspath",
         "//server/util/hash",
         "//server/util/log",
