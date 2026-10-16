@@ -1,6 +1,7 @@
 package filecache_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -2016,4 +2018,87 @@ func TestFilecache_ConcurrentDirectoryEvictionAndLocking(t *testing.T) {
 
 	err = eg.Wait()
 	require.NoError(t, err)
+}
+
+// An action may retain a writable descriptor while its output is admitted.
+// Admission must snapshot bytes independently of writes through that descriptor.
+func TestReviewAdmissionOpenDescriptorIsolation(t *testing.T) {
+	flags.Set(t, "executor.enable_fastcopy_reflinking", false)
+	ctx := claims.AuthContextWithJWT(context.Background(), &claims.Claims{GroupID: "GR_REVIEW"}, nil)
+	fc, err := filecache.NewFileCache(testfs.MakeTempDir(t), 1<<20, false)
+	require.NoError(t, err)
+	defer fc.Close()
+	fc.WaitForDirectoryScanToComplete()
+	dir := testfs.MakeTempDir(t)
+	src := writeFileContent(t, dir, "source", "original", false)
+	f, err := os.OpenFile(src, os.O_RDWR, 0)
+	require.NoError(t, err)
+	defer f.Close()
+	node := nodeFromString("original", false)
+	require.NoError(t, fc.AddFile(ctx, node, src))
+	_, err = f.WriteAt([]byte("MUTATION"), 0)
+	require.NoError(t, err)
+	dst := filepath.Join(dir, "later")
+	require.True(t, fc.FastLinkFile(ctx, node, dst))
+	data, err := os.ReadFile(dst)
+	require.NoError(t, err)
+	require.Equal(t, "original", string(data))
+}
+
+// Measure the public cache API, excluding population and cleanup. Logical bytes
+// are reported separately from Linux /proc/self/io write_bytes (storage writes).
+func TestReviewMaterializationCost(t *testing.T) {
+	flags.Set(t, "executor.enable_fastcopy_reflinking", false)
+	ctx := claims.AuthContextWithJWT(context.Background(), &claims.Claims{GroupID: "GR_REVIEW"}, nil)
+	for _, tc := range []struct {
+		name        string
+		count, size int
+	}{
+		{"small", 10000, 128}, {"large", 3, 100 << 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fc, err := filecache.NewFileCache(testfs.MakeTempDir(t), 2<<30, false)
+			require.NoError(t, err)
+			defer fc.Close()
+			fc.WaitForDirectoryScanToComplete()
+			srcDir := testfs.MakeTempDir(t)
+			data := make([]byte, tc.size)
+			for i := range data {
+				data[i] = byte(i % 251)
+			}
+			nodes := make([]*repb.FileNode, tc.count)
+			for i := range nodes {
+				copy(data, fmt.Sprintf("file-%08d", i))
+				src := filepath.Join(srcDir, strconv.Itoa(i))
+				require.NoError(t, os.WriteFile(src, data, 0644))
+				d, err := digest.Compute(bytes.NewReader(data), repb.DigestFunction_SHA256)
+				require.NoError(t, err)
+				nodes[i] = &repb.FileNode{Digest: d}
+				require.NoError(t, fc.AddFile(ctx, nodes[i], src))
+			}
+			written := func() int64 {
+				b, err := os.ReadFile("/proc/self/io")
+				require.NoError(t, err)
+				for _, line := range strings.Split(string(b), "\n") {
+					var n int64
+					if _, err := fmt.Sscanf(line, "write_bytes: %d", &n); err == nil {
+						return n
+					}
+				}
+				t.Fatal("write_bytes missing")
+				return 0
+			}
+			for pass := 0; pass < 3; pass++ {
+				dst := testfs.MakeTempDir(t)
+				before := written()
+				start := time.Now()
+				for i, node := range nodes {
+					require.True(t, fc.FastLinkFile(ctx, node, filepath.Join(dst, strconv.Itoa(i))))
+				}
+				elapsed := time.Since(start)
+				t.Logf("REVIEW files=%d logical_bytes=%d pass=%d wall=%s write_bytes=%d", tc.count, int64(tc.count)*int64(tc.size), pass, elapsed, written()-before)
+				require.NoError(t, os.RemoveAll(dst))
+			}
+		})
+	}
 }
