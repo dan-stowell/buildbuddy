@@ -4,7 +4,7 @@ Resource accumulation soak
 Run explicitly (the target is tagged manual):
 
 ```
-bb remote test //enterprise/server/test/integration/remote_execution:soak_test --test_arg=-test.v --test_output=all --runs_per_test=3
+bb remote test //enterprise/server/test/integration/remote_execution:soak_test --test_arg=-test.v --test_output=all --experimental_ui_max_stdouterr_bytes=8388608 --runs_per_test=3
 ```
 
 The test keeps one app and executor alive, warms them with two batches, then
@@ -17,7 +17,7 @@ To validate detection, deliberately retain one goroutine and one FD after each
 of the seventeen ordinary actions per batch:
 
 ```
-bb remote test //enterprise/server/test/integration/remote_execution:soak_test --test_env=SOAK_INJECT_LEAK=1 --test_arg=-test.v --test_output=all
+bb remote test //enterprise/server/test/integration/remote_execution:soak_test --test_env=SOAK_INJECT_LEAK=1 --test_arg=-test.v --test_output=all --experimental_ui_max_stdouterr_bytes=8388608
 ```
 
 This command **must fail** with `SOAK GROWTH candidate` and series increasing by
@@ -35,7 +35,7 @@ flagged. No goroutine functions or FD classes are ignored.
 A flag needs ownership investigation before being called a leak. This is a
 process-local, Linux-only integration workload: Redis runs in a subprocess,
 the OLAP handle is a fake, and the default test runner executes bare commands.
-It does not exercise OCI, VFS, Pebble/distributed cache, production connection
+The cache backend is Redis; OLAP is a fake handle. It does not exercise OCI, VFS, Pebble/distributed cache, production connection
 pool sizes, or resources inside Redis/action subprocesses. Existing service
 workers remain alive during samples. The finite warmup and settling windows
 cannot establish long-term boundedness. Oscillating groups, sparse growth, and

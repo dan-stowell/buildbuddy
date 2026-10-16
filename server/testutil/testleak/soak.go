@@ -39,7 +39,7 @@ func Soak(t testing.TB, warmup, batches int, op func(int)) {
 		}
 		entries := []fdEntry{}
 		for fd, target := range fds {
-			entries = append(entries, fdEntry{fd: fd, target: target})
+			entries = append(entries, fdEntry{fd: fd, target: target, desc: target})
 		}
 		resolveFDs(entries)
 		for _, e := range entries {
