@@ -12,6 +12,7 @@ Branch convention: `leak/det-*` detector work, `leak/repro-*` reproducers (no fi
 ## Investigations
 | ID | Subsystem / lifecycle | Hypothesis | Agent(s) | Detector | Repro | Prod rel. | Baseline meas. | Fixed meas. | Candidate fix | Regression test | Indep. verify | Human review |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
+| I11-neg | App scheduler executor registration churn: distinct IDs, same-ID overlapping streams, w/ reservation delivery; N=1/10/50 | per-executor leak across deploys | Codex lk-w3 | CheckGrowth(0) + map/Redis/pool introspection + Check/CheckFDs | **No leak** (576 stream lifetimes) | High | +0 | — | — | `leak/repro-schedreg-audit` c3549acf (enforcement candidate) | — | — |
 | I8-neg | App Execute/WaitExecution: cancel/reconnect (monitoring on/off), 4 merged Execute + 1 Wait w/ partial cancel, scheduler task lost, Redis state lost; N=1/10/50 | per-stream leak | Codex lk-w2 | CheckGrowth + Check/CheckFDs + Redis CLIENT LIST blocked XREAD count | **No leak** | High | 0 blocked readers, 0 goroutines | — | — | `leak/fix-execsvc-hostid` audit tests (enforcement candidate) | — | — |
 | I8b | `server/hostid.getOrCreateHostId` opens file w/o Close (create + read paths) | FD held until GC finalizer | Codex lk-w2 | CheckFDs | 3/3 create, 2/3 read; forced-GC control passes | **Low** (sync.Once → ≤1 FD/process) — but causes CheckFDs flakes where hostid first used | 1 FD | 0 | `leak/fix-execsvc-hostid` 705d0ab1 (2 defers) | `leak/repro-execsvc-hostid` c413d327 | not yet | — |
 | I9-neg | zstd compression wrappers (decompressing/compressing readers, pipe decoder, DecodeAll, committing writer) EOF/partial/corrupt/src err/sink err/abort; app ByteStream corrupt upload / upload cancel / read cancel × 2 cache types | per-op leak | Codex lk-w3 | CheckGrowth (0 allowance, N=10/50/200) + Check/CheckFDs | **No leak** (16.6k ops × 3 runs) | High | +0 | — | — | `leak/repro-zstd-audit` 33f13dae (enforcement candidate) | — | — |
@@ -48,6 +49,7 @@ Branch convention: `leak/det-*` detector work, `leak/repro-*` reproducers (no fi
 | I2-fp1 | ocifetcher_server_proxy upstream stream w/o explicit cancel on early return | singleflight cancels shared ctx when final waiter exits |
 | I2-fp2 | testregistry.Run servers left running in tests | test fixture lifetime, not fetch cleanup |
 | HARNESS-1 | testify assert.Eventually runs condition in extra goroutine → NumGoroutine over-counts by 1 (hit I1 and I5) | harness artifact; use synchronous polling / CheckGrowth |
+| HARNESS-2 | Lazy shared-pool expansion (Redis/gRPC) mid-measurement → flat +1 FD step in CheckGrowth (I11, I8) | pre-warm pools before baseline; still-owned shared pool |
 | I5-fp1 | runner pool Wait() before Shutdown hangs | pendingRemovals counts cached runners — intentional reuse |
 | I1-fp1 | 1 extra goroutine in count polling | testify `Eventually` spawns predicate goroutine — harness artifact; use synchronous polling |
 
