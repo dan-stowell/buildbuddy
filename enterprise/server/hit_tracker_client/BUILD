@@ -24,6 +24,7 @@ go_library(
         "//server/util/status",
         "//server/util/usageutil",
         "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//status",
         "@org_golang_google_protobuf//types/known/durationpb",
     ],
