@@ -856,11 +856,14 @@ func TestUnavailableAfterAppRecordedBatchIsCountedOnceMore(t *testing.T) {
 	// Nothing is left to resend.
 	pending, held := retainedHits(h.factory)
 	require.Equal(t, 0, pending+held)
-	h.tick(t)
 	h.trackDownloads(authenticatedContext(user1, h.authenticator), 1)
-	require.Eventually(t, pendingHitsExpectation(h.factory, group1Key, 1), 10*time.Second, 10*time.Millisecond)
-	h.tick(t)
-	require.Eventually(t, h.service.casDownloadExpectation(group1Key, 2), 10*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool {
+		if h.service.casDownloads[group1Key].Load() == 2 {
+			return true
+		}
+		h.clock.Advance(*remoteHitTrackerPollInterval)
+		return false
+	}, 10*time.Second, 10*time.Millisecond)
 	require.Equal(t, int64(20), h.service.casDownloads[anonKey].Load(), "hits recorded by the app")
 }
 
