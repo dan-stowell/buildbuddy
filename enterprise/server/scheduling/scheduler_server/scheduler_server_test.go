@@ -66,8 +66,6 @@ const (
 
 type fakeTaskRouter struct {
 	preferredExecutors []string
-	// If set, use this Redis target instead of starting a new Redis server.
-	redisTarget string
 }
 
 type fakeRankedNode struct {
@@ -114,6 +112,8 @@ type schedulerOpts struct {
 	userOwnedEnabled   bool
 	groupOwnedEnabled  bool
 	preferredExecutors []string
+	// If set, use this Redis target instead of starting a new Redis server.
+	redisTarget string
 }
 
 func getEnv(t *testing.T, opts *schedulerOpts, user string) (*testenv.TestEnv, context.Context) {
