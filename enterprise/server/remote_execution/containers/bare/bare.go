@@ -162,6 +162,16 @@ func (c *bareCommandContainer) exec(ctx context.Context, cmd *repb.Command, work
 		}
 	}
 
+	// Discard signals sent while no command was running (e.g. a graceful
+	// termination signal sent to a previous task after its command exited),
+	// so that they aren't delivered to this command.
+	for drained := false; !drained; {
+		select {
+		case <-c.signal:
+		default:
+			drained = true
+		}
+	}
 	result = commandutil.RunWithOpts(ctx, cmd, &commandutil.RunOpts{
 		Dir:           filepath.Join(workDir, cmd.GetWorkingDirectory()),
 		StatsListener: statsListener,
