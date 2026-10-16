@@ -236,6 +236,12 @@ func TestGeneratedDailyTrends(t *testing.T) {
 			rows = append(rows, olaptables.Invocation{GroupID: "GR1", InvocationUUID: fmt.Sprintf("%032x", n+2), UpdatedAtUsec: start.Add(time.Duration(n) * time.Hour).UnixMicro(), DurationUsec: int64(n+2) * 100, ActionCacheHits: int64(n + 2), ActionCacheMisses: 2, ActionCacheUploads: 3, CasCacheHits: 4, CasCacheMisses: 5, CasCacheUploads: 6, TotalDownloadSizeBytes: int64(n+2) * 17, TotalUploadSizeBytes: int64(n+2) * 19, User: fmt.Sprintf("user%d", (n+2)%2), Host: fmt.Sprintf("host%d", (n+2)%3), Success: true, InvocationStatus: 1})
 		}
 		require.NoError(t, te.GetOLAPDBHandle().GORM(ctx, "generated_rows").Create(rows).Error)
+		executions := make([]olaptables.Execution, 0, len(rows))
+		for n, r := range rows {
+			executions = append(executions, olaptables.Execution{GroupID: r.GroupID, InvocationUUID: r.InvocationUUID, ExecutionUUID: fmt.Sprintf("00000000-0000-0000-0000-%012x", n+1), UpdatedAtUsec: r.UpdatedAtUsec, User: r.User, Host: r.Host, QueuedTimestampUsec: 1000000, WorkerStartTimestampUsec: 1000000 + r.DurationUsec, WorkerCompletedTimestampUsec: 1000000 + 2*r.DurationUsec})
+		}
+		require.NoError(t, te.GetOLAPDBHandle().GORM(ctx, "generated_executions").Create(executions).Error)
+
 		for _, zone := range []string{"UTC", "America/New_York", "Australia/Lord_Howe", "Asia/Kathmandu"} {
 			for _, filters := range []struct{ user, host string }{{"", ""}, {"user0", ""}, {"", "host1"}, {"user0", "host1"}, {"absent", ""}} {
 				t.Run(window+"/"+zone+"/"+filters.user+"/"+filters.host, func(t *testing.T) {
@@ -258,6 +264,11 @@ func TestGeneratedDailyTrends(t *testing.T) {
 							want[key] = &statspb.TrendStat{}
 						}
 						w := want[key]
+						e := executionByBucket[key]
+						require.NotNil(t, e)
+						require.Equal(t, g.TotalBuildTimeUsec, e.GetTotalBuildTimeUsec())
+						require.Equal(t, []float64{g.BuildTimeUsecP50, g.BuildTimeUsecP75, g.BuildTimeUsecP90, g.BuildTimeUsecP95, g.BuildTimeUsecP99}, []float64{e.GetQueueDurationUsecP50(), e.GetQueueDurationUsecP75(), e.GetQueueDurationUsecP90(), e.GetQueueDurationUsecP95(), e.GetQueueDurationUsecP99()})
+
 						w.TotalNumBuilds++
 						w.TotalBuildTimeUsec += r.DurationUsec
 						w.ActionCacheHits += r.ActionCacheHits
@@ -271,9 +282,22 @@ func TestGeneratedDailyTrends(t *testing.T) {
 						durations[key] = append(durations[key], r.DurationUsec)
 					}
 					require.Len(t, got, len(want))
+					executionGot, err := iss.getExecutionTrend(ctx, &statspb.GetTrendRequest{RequestContext: rc, Query: q}, iss.getTrendTimeSettings(q, zone))
+					require.NoError(t, err)
+					require.Len(t, executionGot, len(got))
+					executionByBucket := map[int64]*statspb.ExecutionStat{}
+					for _, e := range executionGot {
+						executionByBucket[e.GetBucketStartTimeMicros()] = e
+					}
+
 					for _, g := range got {
 						key := g.GetBucketStartTimeMicros()
 						w := want[key]
+						e := executionByBucket[key]
+						require.NotNil(t, e)
+						require.Equal(t, g.TotalBuildTimeUsec, e.GetTotalBuildTimeUsec())
+						require.Equal(t, []float64{g.BuildTimeUsecP50, g.BuildTimeUsecP75, g.BuildTimeUsecP90, g.BuildTimeUsecP95, g.BuildTimeUsecP99}, []float64{e.GetQueueDurationUsecP50(), e.GetQueueDurationUsecP75(), e.GetQueueDurationUsecP90(), e.GetQueueDurationUsecP95(), e.GetQueueDurationUsecP99()})
+
 						require.NotNil(t, w, "unexpected bucket %v", time.UnixMicro(key))
 						require.Equal(t, []int64{w.TotalNumBuilds, w.TotalBuildTimeUsec, w.ActionCacheHits, w.ActionCacheMisses, w.ActionCacheUploads, w.CasCacheHits, w.CasCacheMisses, w.CasCacheUploads, w.TotalDownloadSizeBytes, w.TotalUploadSizeBytes}, []int64{g.TotalNumBuilds, g.TotalBuildTimeUsec, g.ActionCacheHits, g.ActionCacheMisses, g.ActionCacheUploads, g.CasCacheHits, g.CasCacheMisses, g.CasCacheUploads, g.TotalDownloadSizeBytes, g.TotalUploadSizeBytes})
 						ds := durations[key]
@@ -348,7 +372,7 @@ func TestGeneratedTrendFilters(t *testing.T) {
 	require.NoError(t, err)
 	start := time.Date(2024, 12, 31, 12, 0, 0, 0, time.UTC)
 	rows := make([]olaptables.Invocation, 0, 1024)
-	for n := 0; n < 1024; n++ {
+	for n := range 1024 {
 		val := func(bit int) string { return fmt.Sprint((n >> bit) & 1) }
 		rows = append(rows, olaptables.Invocation{GroupID: "GR1", InvocationUUID: fmt.Sprintf("%032x", n+1), UpdatedAtUsec: start.Add(time.Duration(n) * time.Microsecond).UnixMicro(), DurationUsec: int64(n + 1), User: "user" + val(0), Host: "host" + val(1), RepoURL: "https://example.com/repo" + val(2), BranchName: "branch" + val(3), CommitSHA: "commit" + val(4), Command: "command" + val(5), Role: "role" + val(6), Pattern: "//pattern" + val(7), Tags: []string{"tag" + val(8), "common"}, Success: (n & 512) == 0, InvocationStatus: 1})
 	}

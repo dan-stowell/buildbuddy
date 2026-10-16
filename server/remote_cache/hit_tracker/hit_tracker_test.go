@@ -435,9 +435,9 @@ func TestGeneratedCacheEventAccounting(t *testing.T) {
 	want := map[string]*capb.ScoreCard_Result{}
 	var download, upload, downloadTransferred, uploadTransferred int64
 	counts := [2][3]int64{}
-	for cache := 0; cache < 2; cache++ {
-		for event := 0; event < 3; event++ {
-			for n := 0; n < event+2; n++ {
+	for cache := range 2 {
+		for event := range 3 {
+			for n := range event + 2 {
 				id := strings.Repeat(string(rune('a'+cache*3+event)), 63) + string(rune('0'+n))
 				md := &repb.RequestMetadata{ToolInvocationId: iid, ActionId: id, ActionMnemonic: "Compile", TargetId: "//generated:target"}
 				var ht interfaces.HitTracker
