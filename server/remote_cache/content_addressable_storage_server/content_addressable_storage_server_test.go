@@ -1632,3 +1632,98 @@ func TestStreamingChunkMappingRPCsUnimplemented(t *testing.T) {
 	_, err = registerStream.CloseAndRecv()
 	require.Equal(t, gcodes.Unimplemented, gstatus.Code(err))
 }
+
+// TestSpliceBlobRejectsWrongChunkSizesAfterValidSplice checks that once a
+// manifest was validated (and the shared validation marker written), a
+// SpliceBlob for the same chunk hashes but wrong chunk sizes is still
+// rejected, and that ByteStream reads never return OK with wrong content.
+func TestSpliceBlobRejectsWrongChunkSizesAfterValidSplice(t *testing.T) {
+	for _, useCompressionCache := range []bool{false, true} {
+		for _, tc := range []struct {
+			name           string
+			delta0, delta1 int64
+		}{
+			{name: "grow_last_chunk", delta1: +1},
+			{name: "shrink_last_chunk", delta1: -1},
+			{name: "move_byte_c0_to_c1", delta0: -1, delta1: +1},
+			{name: "move_byte_c1_to_c0", delta0: +1, delta1: -1},
+		} {
+			t.Run(fmt.Sprintf("%s/compression_cache=%t", tc.name, useCompressionCache), func(t *testing.T) {
+				flags.Set(t, "cache.chunking.ac_key_salt", "test-salt")
+				flags.Set(t, "cache.min_chunked_read_fallback_size_bytes", 1024)
+				ctx := context.Background()
+				te := testenv.GetTestEnv(t)
+				if useCompressionCache {
+					flags.Set(t, "cache.zstd_transcoding_enabled", true)
+					te.SetCache(&casCompressionCache{Cache: te.GetCache()})
+				}
+				ctx, err := prefix.AttachUserPrefixToContext(ctx, te.GetAuthenticator())
+				require.NoError(t, err)
+				clientConn := runCASServer(ctx, t, te)
+				casClient := repb.NewContentAddressableStorageClient(clientConn)
+				bsClient := bspb.NewByteStreamClient(clientConn)
+				cache := te.GetCache()
+
+				chunk0RN, chunk0 := testdigest.RandomCASResourceBuf(t, 25000)
+				chunk1RN, chunk1 := testdigest.RandomCASResourceBuf(t, 15000)
+				require.NoError(t, cache.Set(ctx, chunk0RN, chunk0))
+				require.NoError(t, cache.Set(ctx, chunk1RN, chunk1))
+				blob := append(append([]byte{}, chunk0...), chunk1...)
+				blobDigest, err := digest.Compute(bytes.NewReader(blob), repb.DigestFunction_SHA256)
+				require.NoError(t, err)
+
+				readIdentity := func() ([]byte, error) {
+					ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+					defer cancel()
+					rn := digest.NewCASResourceName(blobDigest, "", repb.DigestFunction_SHA256)
+					stream, err := bsClient.Read(ctx, &bspb.ReadRequest{ResourceName: rn.DownloadString()})
+					if err != nil {
+						return nil, err
+					}
+					var buf bytes.Buffer
+					for {
+						rsp, err := stream.Recv()
+						if err == io.EOF {
+							return buf.Bytes(), nil
+						}
+						if err != nil {
+							return buf.Bytes(), err
+						}
+						buf.Write(rsp.GetData())
+					}
+				}
+
+				_, err = casClient.SpliceBlob(ctx, &repb.SpliceBlobRequest{
+					BlobDigest:     blobDigest,
+					ChunkDigests:   []*repb.Digest{chunk0RN.GetDigest(), chunk1RN.GetDigest()},
+					DigestFunction: repb.DigestFunction_SHA256,
+				})
+				require.NoError(t, err)
+				got, err := readIdentity()
+				require.NoError(t, err)
+				require.True(t, bytes.Equal(blob, got), "valid splice read back %d bytes, want %d", len(got), len(blob))
+
+				_, err = casClient.SpliceBlob(ctx, &repb.SpliceBlobRequest{
+					BlobDigest: blobDigest,
+					ChunkDigests: []*repb.Digest{
+						{Hash: chunk0RN.GetDigest().GetHash(), SizeBytes: chunk0RN.GetDigest().GetSizeBytes() + tc.delta0},
+						{Hash: chunk1RN.GetDigest().GetHash(), SizeBytes: chunk1RN.GetDigest().GetSizeBytes() + tc.delta1},
+					},
+					DigestFunction: repb.DigestFunction_SHA256,
+				})
+				assert.Error(t, err, "SpliceBlob with wrong chunk sizes was accepted")
+				if !useCompressionCache {
+					// (The test compression cache can surface a different error
+					// when asked for a chunk with a mismatched size.)
+					assert.True(t, status.IsInvalidArgumentError(err), "SpliceBlob with wrong chunk sizes: want InvalidArgument, got %v", err)
+				}
+
+				got, err = readIdentity()
+				if err == nil {
+					require.True(t, bytes.Equal(blob, got), "ByteStream.Read returned OK with wrong content (%d bytes, want %d)", len(got), len(blob))
+				}
+				require.NoError(t, err)
+			})
+		}
+	}
+}
