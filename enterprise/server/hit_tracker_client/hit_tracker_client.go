@@ -73,8 +73,12 @@ func (h *NoOpHitTrackerFactory) NewRemoteCASHitTracker(ctx context.Context, requ
 }
 
 func newHitTrackerClient(ctx context.Context, env *real_environment.RealEnv, conn grpc.ClientConnInterface) *HitTrackerFactory {
+	// Senders' RPCs are cancelled if they're still running when shutdown
+	// gives up waiting for them.
+	ctx, cancelSenders := context.WithCancel(ctx)
 	factory := HitTrackerFactory{
 		authenticator:        env.GetAuthenticator(),
+		cancelSenders:        cancelSenders,
 		quit:                 make(chan struct{}, 1),
 		enqueueChan:          make(chan *enqueuedCacheHit, *enqueueChanSize),
 		maxPendingHitsPerKey: *maxPendingHitsPerKey,
@@ -112,8 +116,9 @@ type enqueuedCacheHit struct {
 type HitTrackerFactory struct {
 	authenticator interfaces.Authenticator
 
-	quit chan struct{}
-	wg   sync.WaitGroup
+	quit          chan struct{}
+	wg            sync.WaitGroup
+	cancelSenders context.CancelFunc
 
 	enqueueChan chan *enqueuedCacheHit
 
@@ -432,7 +437,20 @@ func (h *HitTrackerFactory) sendTrackRequest(ctx context.Context) int {
 
 func (h *HitTrackerFactory) shutdown(ctx context.Context) error {
 	close(h.quit)
-	h.wg.Wait()
+	// Let in-flight Track RPCs finish while the shutdown deadline allows,
+	// then cancel them so that a hung RPC can't block shutdown forever.
+	sendersDone := make(chan struct{})
+	go func() {
+		h.wg.Wait()
+		close(sendersDone)
+	}()
+	select {
+	case <-sendersDone:
+	case <-ctx.Done():
+		h.cancelSenders()
+		<-sendersDone
+	}
+	h.cancelSenders()
 
 	// Make a best-effort attempt to flush pending updates.
 	// TODO(iain): we could do something fancier here if necessary, like
