@@ -5,11 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"slices"
 	"sort"
 	"sync"
- "sync/atomic"
- "net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -115,8 +114,8 @@ type schedulerOpts struct {
 	preferredExecutors []string
 	// If set, returns the Redis client used by the scheduler instead of a
 	// client for a fresh test Redis. It is called after leak checking starts.
-	redisClient redis.UniversalClient
- redisClientFactory func(t *testing.T) redis.UniversalClient
+	redisClient        redis.UniversalClient
+	redisClientFactory func(t *testing.T) redis.UniversalClient
 	// Known goroutine leaks to ignore.
 	leakOptions []goleak.Option
 }
@@ -127,8 +126,8 @@ func getEnv(t *testing.T, opts *schedulerOpts, user string) (*testenv.TestEnv, c
 	if opts.redisClientFactory != nil {
 		envOpts.RedisClient = opts.redisClientFactory(t)
 	} else if opts.redisClient != nil {
- envOpts.RedisClient = opts.redisClient
- } else {
+		envOpts.RedisClient = opts.redisClient
+	} else {
 		envOpts.RedisTarget = testredis.Start(t).Target
 	}
 	env := enterprise_testenv.GetCustomTestEnv(t, envOpts)
