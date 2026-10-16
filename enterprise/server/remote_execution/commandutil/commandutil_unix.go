@@ -22,6 +22,7 @@ type process struct {
 	cmd         *exec.Cmd
 	terminated  chan struct{}
 	cleanupDone chan struct{}
+	drainOutput func() error
 }
 
 func (p *process) preStart() error {
@@ -53,7 +54,7 @@ func isKilledExitCode(exitCode int, err error) bool {
 
 func (p *process) wait() (*espb.Rusage, error) {
 	defer close(p.terminated)
-	err := p.cmd.Wait()
+	err := p.waitCommand()
 	if p.cmd.ProcessState == nil {
 		return nil, err
 	}
