@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -652,5 +654,56 @@ func TestGrowth_BoundedReplacement_Accepted(t *testing.T) {
 		file, err = os.CreateTemp(t.TempDir(), "replacement")
 		require.NoError(t, err)
 	})
+	f.requireNoErrors(t)
+}
+
+func TestAudit_ReusedFDWithDifferentTarget_Caught(t *testing.T) {
+	skipIfNoFDs(t)
+	dogfood(t)
+	fd, err := syscall.Open(filepath.Join(t.TempDir(), "before"), syscall.O_CREAT|syscall.O_RDWR, 0600)
+	require.NoError(t, err)
+	defer func() { syscall.Close(fd) }()
+	f := newFakeTB(t)
+	CheckFDs(f, FDSettle(failingSettle))
+	other := filepath.Join(t.TempDir(), "after")
+	replacement, err := syscall.Open(other, syscall.O_CREAT|syscall.O_RDWR, 0600)
+	require.NoError(t, err)
+	require.NoError(t, syscall.Dup2(replacement, fd))
+	require.NoError(t, syscall.Close(replacement))
+	f.runCleanups()
+	require.Contains(t, f.requireOneError(t), other)
+}
+
+func TestAudit_HTTPIdleConnectionsClosed_Accepted(t *testing.T) {
+	dogfood(t)
+	f := newFakeTB(t)
+	Check(f)
+	CheckFDs(f)
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })}
+	go server.Serve(lis)
+	f.Cleanup(func() { server.Close() })
+	transport := &http.Transport{}
+	f.Cleanup(transport.CloseIdleConnections)
+	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
+	for range 10 {
+		response, err := client.Get("http://" + lis.Addr().String())
+		require.NoError(t, err)
+		require.NoError(t, response.Body.Close())
+	}
+	f.runCleanups()
+	f.requireNoErrors(t)
+}
+
+func TestAudit_SignalNotifyStopped_Accepted(t *testing.T) {
+	dogfood(t)
+	f := newFakeTB(t)
+	Check(f)
+	CheckFDs(f)
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGUSR1)
+	signal.Stop(ch)
+	f.runCleanups()
 	f.requireNoErrors(t)
 }
