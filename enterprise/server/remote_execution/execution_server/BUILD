@@ -70,7 +70,10 @@ go_library(
 go_test(
     name = "execution_server_test",
     size = "small",
-    srcs = ["execution_server_test.go"],
+    srcs = [
+        "execution_server_test.go",
+        "wait_execution_repro_test.go",
+    ],
     deps = [
         ":execution_server",
         "//enterprise/server/backends/redis_execution_collector",
@@ -118,6 +121,7 @@ go_test(
         "@com_github_open_feature_go_sdk_contrib_providers_flagd//pkg",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
+        "@com_google_cloud_go_longrunning//autogen/longrunningpb",
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//metadata",
