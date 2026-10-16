@@ -4,13 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/mcp/jsonrpc"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/stretchr/testify/require"
@@ -270,4 +274,79 @@ func callJSONRPC[T any](t *testing.T, baseURL, apiKey, method string, params any
 func unmarshalJSON(t *testing.T, data []byte, out any) {
 	t.Helper()
 	require.NoError(t, json.Unmarshal(data, out))
+}
+
+// TestMCPClientChurn keeps the server alive across cancelled tool calls.
+func TestMCPClientChurn(t *testing.T) {
+	testleak.Check(t)
+	testleak.CheckFDs(t)
+	var calls atomic.Int64
+	var disconnect atomic.Bool
+	started, finished := make(chan struct{}, 1), make(chan struct{}, 1)
+	teardown := make(chan struct{})
+	server := newTestServer(t, testServerOptions{
+		users:       testUsers(testUser("developer-key", "GROUP1", []cappb.Capability{cappb.Capability_CACHE_WRITE})),
+		allowedRPCs: []string{apiServicePrefix + "GetInvocation"},
+		apiService: &fakeAPIService{getInvocation: func(ctx context.Context, _ *apipb.GetInvocationRequest) (*apipb.GetInvocationResponse, error) {
+			calls.Add(1)
+			if !disconnect.Load() {
+				return &apipb.GetInvocationResponse{}, nil
+			}
+			started <- struct{}{}
+			select {
+			case <-ctx.Done():
+			case <-teardown:
+				return nil, context.Canceled
+			}
+			finished <- struct{}{}
+			return nil, ctx.Err()
+		}},
+	})
+	// Release the fake upstream on failed assertions before the HTTP server closes.
+	t.Cleanup(func() { close(teardown) })
+	transport := &http.Transport{DisableKeepAlives: true}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+	operation := func(int) {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, "POST", server.URL+mcpPath, bytes.NewBufferString(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_invocation","arguments":{}}}`))
+		require.NoError(t, err)
+		req.Header.Set(authutil.APIKeyHeader, "developer-key")
+		req.Header.Set("Content-Type", "application/json")
+		if !disconnect.Load() {
+			rsp, err := client.Do(req)
+			require.NoError(t, err)
+			_, err = io.Copy(io.Discard, rsp.Body)
+			require.NoError(t, err)
+			require.NoError(t, rsp.Body.Close())
+			require.Equal(t, http.StatusOK, rsp.StatusCode)
+			return
+		}
+		done := make(chan error, 1)
+		go func() {
+			rsp, err := client.Do(req)
+			if rsp != nil {
+				rsp.Body.Close()
+			}
+			done <- err
+		}()
+		select {
+		case <-started:
+		case <-ctx.Done():
+			t.Fatal("tool did not start")
+		}
+		cancel()
+		select {
+		case <-finished:
+		case <-time.After(testleak.DefaultSettle):
+			t.Fatal("tool context not cancelled after disconnect")
+		}
+		require.Error(t, <-done)
+	}
+	// Complete a tool call before measuring client disconnections.
+	operation(0)
+	disconnect.Store(true)
+	testleak.CheckGrowth(t, testleak.Growth{Iterations: 10}, operation)
+	require.EqualValues(t, 12, calls.Load())
 }
