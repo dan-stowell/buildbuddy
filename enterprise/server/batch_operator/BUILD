@@ -22,7 +22,10 @@ go_library(
 go_test(
     name = "batch_operator_test",
     size = "small",
-    srcs = ["batch_operator_test.go"],
+    srcs = [
+        "batch_operator_test.go",
+        "v1_repro_test.go",
+    ],
     deps = [
         ":batch_operator",
         "//proto:remote_execution_go_proto",
@@ -30,7 +33,9 @@ go_test(
         "//server/remote_cache/digest",
         "//server/testutil/testauth",
         "//server/testutil/testenv",
+        "//server/real_environment",
         "//server/testutil/testhealthcheck",
+        "//server/testutil/testleak",
         "//server/util/authutil",
         "//server/util/log",
         "//server/util/status",
