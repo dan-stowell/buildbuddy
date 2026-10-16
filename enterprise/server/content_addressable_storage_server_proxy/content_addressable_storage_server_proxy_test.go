@@ -15,6 +15,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/byte_stream_server_proxy"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/experiments"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/proxy_util"
+	"github.com/buildbuddy-io/buildbuddy/server/backends/memory_cache"
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/byte_stream_server"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
@@ -1066,5 +1067,47 @@ func TestFindMissingBlobs_QuorumBypassesPresenceCache(t *testing.T) {
 	for i := int32(2); i <= 4; i++ {
 		findMissing(findmissing.WithQuorum(ctx), proxy, []*repb.Digest{d}, nil, t)
 		require.Equal(t, i, requestCount.Load())
+	}
+}
+
+// A presence check must keep a hot blob ahead of cold blobs in the backing LRU.
+func TestPresenceLifetime_ProxyRefreshBeforeEviction(t *testing.T) {
+	for _, ttl := range []time.Duration{0, time.Minute} {
+		t.Run(ttl.String(), func(t *testing.T) {
+			flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", ttl)
+			ctx := testContext()
+			remoteEnv := testenv.GetTestEnv(t)
+			backing, err := memory_cache.NewMemoryCache(6) // two three-byte blobs
+			require.NoError(t, err)
+			remoteEnv.SetCache(backing)
+			conn, _, _ := runRemoteCASS(ctx, remoteEnv, t)
+			remote := repb.NewContentAddressableStorageClient(conn)
+			proxyEnv := testenv.GetTestEnv(t)
+			clock := clockwork.NewFakeClockAt(time.Unix(1700000000, 0))
+			proxyEnv.SetClock(clock)
+			proxyEnv.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+			proxyEnv.SetContentAddressableStorageClient(remote)
+			require.NoError(t, atime_updater.Register(proxyEnv))
+			proxy := repb.NewContentAddressableStorageClient(runCASProxy(ctx, conn, proxyEnv, t))
+			ctx = metadata.AppendToOutgoingContext(ctx, authutil.APIKeyHeader, "US1")
+			hot := digestProto(fooDigest, 3)
+			cold := digestProto(barDigest, 3)
+			next := digestProto(bazDigest, 3)
+			// Write remotely so no local data copy can mask a backing-cache miss.
+			update(ctx, remote, map[*repb.Digest]string{hot: "foo"}, t)
+			findMissing(ctx, proxy, []*repb.Digest{hot}, nil, t)
+			update(ctx, remote, map[*repb.Digest]string{cold: "bar"}, t)
+			clock.Advance(time.Second)
+			findMissing(ctx, proxy, []*repb.Digest{hot}, nil, t)
+			// With a real refresh, cold is now LRU. A skipped refresh evicts hot.
+			update(ctx, remote, map[*repb.Digest]string{next: "baz"}, t)
+			findMissing(ctx, proxy, []*repb.Digest{hot}, nil, t)
+			rsp, err := remote.BatchReadBlobs(ctx, readBlobsRequest([]*repb.Digest{hot}))
+			require.NoError(t, err)
+			require.Len(t, rsp.GetResponses(), 1)
+			require.Equal(t, int32(codes.OK), rsp.GetResponses()[0].GetStatus().GetCode(),
+				"proxy reported present immediately before backend read; TTL=%s", ttl)
+			require.Equal(t, []byte("foo"), rsp.GetResponses()[0].GetData())
+		})
 	}
 }
