@@ -30,6 +30,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testcache"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testmetrics"
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
 	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
@@ -1312,6 +1313,62 @@ func TestTransientErrorExitCodes(t *testing.T) {
 			} else {
 				require.Nil(t, res.Error)
 			}
+		})
+	}
+}
+
+func TestRunnerLifecycleResources(t *testing.T) {
+	for _, n := range []int{1, 10, 50} {
+		t.Run(fmt.Sprintf("N=%d", n), func(t *testing.T) {
+			testleak.Check(t)
+			env := newTestEnv(t)
+			p := newRunnerPool(t, env, &RunnerPoolOptions{MaxRunnerCount: 2, MaxRunnerDiskSizeBytes: unlimited, MaxRunnerMemoryUsageBytes: unlimited})
+			ctx := withAuthenticatedUser(t, context.Background(), env, "US1")
+			// Keep every runner workspace path so shutdown cleanup is checked directly.
+			var paths []string
+			fdCount := func() int { es, err := os.ReadDir("/proc/self/fd"); require.NoError(t, err); return len(es) }
+			warm, err := get(ctx, p, newTask())
+			require.NoError(t, err)
+			warmCtx, warmCancel := context.WithCancel(ctx)
+			warmResult := warm.Run(warmCtx, &repb.IOStats{})
+			warmCancel()
+			require.NoError(t, warmResult.Error)
+			p.TryRecycle(ctx, warm, true)
+			paths = append(paths, warm.Workspace.Path())
+			beforeFD, beforeG := fdCount(), runtime.NumGoroutine()
+			for range n {
+				r, err := get(ctx, p, newTask())
+				require.NoError(t, err)
+				taskCtx, cancel := context.WithCancel(ctx)
+				res := r.Run(taskCtx, &repb.IOStats{})
+				cancel()
+				require.NoError(t, res.Error)
+				paths = append(paths, r.Workspace.Path())
+				p.TryRecycle(ctx, r, true)
+			}
+			require.LessOrEqual(t, p.RunnerCount(), 2, "runner cache must stay bounded")
+			require.NoError(t, p.Shutdown(ctx))
+			p.Wait()
+			for _, path := range paths {
+				_, err := os.Stat(path)
+				require.True(t, os.IsNotExist(err), "workspace remains: %s (%v)", path, err)
+			}
+			deadline := time.Now().Add(3 * time.Second)
+			for (fdCount() > beforeFD || runtime.NumGoroutine() > beforeG) && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			ok := fdCount() <= beforeFD && runtime.NumGoroutine() <= beforeG
+			if !ok {
+				t.Error("runner resources did not settle")
+				entries, _ := os.ReadDir("/proc/self/fd")
+				for _, e := range entries {
+					target, _ := os.Readlink("/proc/self/fd/" + e.Name())
+					t.Logf("FD %s -> %s", e.Name(), target)
+				}
+				stacks := make([]byte, 256*1024)
+				t.Logf("stacks: %s", stacks[:runtime.Stack(stacks, true)])
+			}
+			t.Logf("N=%d runners_after_shutdown=%d workspaces_remaining=0 FDs=%d->%d goroutines=%d->%d", n, p.RunnerCount(), beforeFD, fdCount(), beforeG, runtime.NumGoroutine())
 		})
 	}
 }

@@ -1,4 +1,4 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 package(default_visibility = ["//enterprise:__subpackages__"])
 
@@ -17,6 +17,21 @@ go_library(
         "//server/util/proto",
         "//server/util/retry",
         "//server/util/status",
+        "@org_golang_google_grpc//status",
+    ],
+)
+
+go_test(
+    name = "lifecycle_test",
+    srcs = ["lifecycle_test.go"],
+    deps = [
+        ":task_leaser",
+        "//proto:scheduler_go_proto",
+        "//server/real_environment",
+        "//server/testutil/testleak",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//credentials/insecure",
+        "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//status",
     ],
 )
