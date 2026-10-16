@@ -4675,3 +4675,81 @@ func TestWriteReference(t *testing.T) {
 		require.True(t, status.IsFailedPreconditionError(err), "expected FailedPreconditionError, got %s", err)
 	})
 }
+
+// Advance old entries into eligibility while concurrent rewrites get a full
+// protection interval. Freeze time during each round so a post-write miss
+// cannot be explained by ordinary expiration of the protection interval.
+func TestSeededEvictionConcurrentRefresh(t *testing.T) {
+	for _, seed := range []int64{1, 17, 20261016} {
+		t.Run(fmt.Sprint(seed), func(t *testing.T) {
+			t.Logf("seed=%d", seed)
+			te := testenv.GetTestEnv(t)
+			te.SetAuthenticator(testauth.NewTestAuthenticator(t, emptyUserMap))
+			ctx := getAnonContext(t, te)
+			clock := clockwork.NewFakeClock()
+			pc, err := pebble_cache.NewPebbleCache(te, &pebble_cache.Options{
+				RootDirectory: t.TempDir(), MaxSizeBytes: 40_000,
+				Clock: clock, MinEvictionAge: new(time.Hour),
+				MaxInlineFileSizeBytes:      1024,
+				MinBytesAutoZstdCompression: new(int64(math.MaxInt64)),
+				AtimeUpdateThreshold:        new(time.Duration(0)),
+				SamplesPerBatch:             new(50), SampleBufferSize: new(10),
+			})
+			require.NoError(t, err)
+			require.NoError(t, pc.Start())
+			defer pc.Stop()
+			gen := digest.UniformRandomGenerator(seed)
+			resources := make([]*rspb.ResourceName, 80)
+			contents := make([][]byte, 80)
+			for i := range resources {
+				size := int64(128)
+				if i%2 == 0 {
+					size = 4096
+				}
+				d, buf, err := gen.RandomDigestBuf(size)
+				require.NoError(t, err)
+				resources[i] = digest.NewResourceName(d, "", rspb.CacheType_CAS, repb.DigestFunction_SHA256).ToProto()
+				contents[i] = buf
+			}
+			for round := range 10 {
+				for i, r := range resources {
+					require.NoError(t, pc.Set(ctx, r, contents[i]))
+				}
+				clock.Advance(2 * time.Hour)
+				var eg errgroup.Group
+				for worker := range 4 {
+					eg.Go(func() error {
+						for i := worker; i < len(resources); i += 4 {
+							r := resources[i]
+							if err := pc.Set(ctx, r, contents[i]); err != nil {
+								return err
+							}
+							got, err := pc.Get(ctx, r)
+							if err != nil {
+								return fmt.Errorf("round=%d key=%d successful rewrite unreadable: %w", round, i, err)
+							}
+							if !bytes.Equal(got, contents[i]) {
+								return fmt.Errorf("round=%d key=%d data mismatch", round, i)
+							}
+						}
+						return nil
+					})
+				}
+				require.NoError(t, eg.Wait())
+				// Let the real eviction workers process queued samples; fake time stays fixed.
+				time.Sleep(100 * time.Millisecond)
+				for i, r := range resources {
+					present, err := pc.Contains(ctx, r)
+					require.NoError(t, err)
+					require.True(t, present, "round=%d key=%d younger than min age", round, i)
+					missing, err := pc.FindMissing(ctx, []*rspb.ResourceName{r})
+					require.NoError(t, err)
+					require.Empty(t, missing)
+					got, err := pc.Get(ctx, r)
+					require.NoError(t, err)
+					require.Equal(t, contents[i], got)
+				}
+			}
+		})
+	}
+}
