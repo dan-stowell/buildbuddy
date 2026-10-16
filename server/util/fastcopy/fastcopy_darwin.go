@@ -5,6 +5,7 @@ package fastcopy
 import (
 	"errors"
 	"flag"
+	"os"
 
 	"golang.org/x/sys/unix"
 )
@@ -26,4 +27,15 @@ func FastCopy(source, destination string) error {
 		return nil
 	}
 	return Clone(source, destination)
+}
+
+// CloneOrCopy creates an independent inode, using the platform's native clone
+// implementation when possible and copying otherwise.
+func CloneOrCopy(source, destination string) error {
+	if err := Clone(source, destination); err == nil {
+		return nil
+	} else if os.IsExist(err) {
+		return err
+	}
+	return copyFile(source, destination)
 }

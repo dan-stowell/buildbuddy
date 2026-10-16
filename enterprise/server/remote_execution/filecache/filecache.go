@@ -71,7 +71,7 @@ const (
 type sharedDirectoryContextKey struct{}
 
 var (
-	enableAlwaysClone                = flag.Bool("executor.local_cache_always_clone", false, "If true, files from the filecache will always be cloned instead of hardlinked")
+	_                                = flag.Bool("executor.local_cache_always_clone", false, "File cache transfers always use independent inodes.", flag.Deprecated("File cache transfers always use independent inodes."))
 	includeSubdirPrefix              = flag.Bool("executor.include_subdir_prefix", true, "If true, store files under subdirs named by a short prefix of the file digest. This can help improve throughput on systems with high core counts. The prefix length is controlled by subdir_prefix_length.")
 	subdirPrefixLength               = flag.Int("executor.subdir_prefix_length", 2, "The length of the subdir prefix to use if include_subdir_prefix is true.")
 	enableDiskFallbackOnStartup      = flag.Bool("executor.local_cache_enable_disk_fallback_during_startup_scan", true, "If true, fallback to disk lookups while initial local cache scan is in progress.", flag.Internal)
@@ -703,7 +703,7 @@ func (c *fileCache) FastLinkFile(ctx context.Context, node *repb.FileNode, outpu
 		return false
 	}
 	start := time.Now()
-	if err := cloneOrLink(keyPrefix, filecachePath(c.rootDir, key), outputPath); err != nil {
+	if err := fastcopy.CloneOrCopy(filecachePath(c.rootDir, key), outputPath); err != nil {
 		log.Warningf("Failed to link file from cache: %s", err)
 		return false
 	}
@@ -782,7 +782,7 @@ func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, 
 		c.l.Remove(k)
 
 		start := time.Now()
-		if err := cloneIndependent(existingFilePath, fp); err != nil {
+		if err := fastcopy.CloneOrCopy(existingFilePath, fp); err != nil {
 			return err
 		}
 		c.linkIntoFileCacheLatency.Observe(float64(time.Since(start).Microseconds()))
@@ -1136,44 +1136,6 @@ func (c *fileCache) tempPath(name string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(c.TempDir(), fmt.Sprintf("%s.%s.tmp", name, randStr)), nil
-}
-
-// cloneIndependent publishes a private inode. AddFile sources may belong to a
-// preserved workspace and remain writable after the action has completed.
-// Clone is a reflink where supported, but on Linux it may silently hardlink,
-// so check inode identity before accepting the result.
-func cloneIndependent(source, destination string) error {
-	if err := fastcopy.Clone(source, destination); err != nil {
-		return err
-	}
-	srcInfo, err := os.Stat(source)
-	if err != nil {
-		return err
-	}
-	dstInfo, err := os.Stat(destination)
-	if err != nil {
-		return err
-	}
-	if !os.SameFile(srcInfo, dstInfo) {
-		return nil
-	}
-	if err := os.Remove(destination); err != nil {
-		return err
-	}
-	return disk.CopyViaTmpSibling(source, destination)
-}
-
-func cloneOrLink(keyPrefix, source, destination string) error {
-	if keyPrefix == interfaces.AuthAnonymousUser || *enableAlwaysClone {
-		if err := fastcopy.Clone(source, destination); err != nil {
-			return wrapOSError(err, "clone")
-		}
-	} else {
-		if err := fastcopy.FastCopy(source, destination); err != nil {
-			return wrapOSError(err, "fastcopy")
-		}
-	}
-	return nil
 }
 
 // containsWithStatFallback checks if the given key is in the cache. If the

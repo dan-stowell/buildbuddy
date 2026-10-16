@@ -724,7 +724,9 @@ func copyFile(src *FilePointer, dest *FilePointer, opts *DownloadTreeOpts) error
 	if err := removeExisting(dest, opts); err != nil {
 		return err
 	}
-	return fastcopy.FastCopy(src.FullPath, dest.FullPath)
+	// A deduplicated download can be shared by concurrent actions. Keep each
+	// workspace independent even when reflinking is unavailable.
+	return fastcopy.CloneOrCopy(src.FullPath, dest.FullPath)
 }
 
 // linkFileFromFileCache attempts to link the given file path from the local
