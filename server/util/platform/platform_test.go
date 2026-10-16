@@ -584,3 +584,34 @@ func TestPlatformRoutingHeaderPrecedence(t *testing.T) {
 		}
 	}
 }
+
+func TestPlatformRoutingPoolTypeAndWorkflowOverrides(t *testing.T) {
+	for _, value := range []string{"true", "TRUE", "false", "FALSE"} {
+		for _, override := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/override=%t", value, override), func(t *testing.T) {
+				p := &repb.Platform{Properties: []*repb.Platform_Property{
+					{Name: "use-self-hosted-executors", Value: value},
+					{Name: "workflow-id", Value: "workflow-request"},
+					{Name: "Pool", Value: "workflow-pool"},
+				}}
+				task := &repb.ExecutionTask{Action: &repb.Action{Platform: p}}
+				if override {
+					task.Action.Platform = &repb.Platform{Properties: []*repb.Platform_Property{
+						{Name: "workflow-id", Value: "old"},
+						{Name: "use-self-hosted-executors", Value: "false"},
+					}}
+					task.PlatformOverrides = p
+				}
+				props, err := ParseProperties(task)
+				require.NoError(t, err)
+				wantType := PoolTypeShared
+				if strings.EqualFold(value, "true") {
+					wantType = PoolTypeSelfHosted
+				}
+				require.Equal(t, wantType, props.PoolType)
+				require.Equal(t, "workflow-request", props.WorkflowID)
+				require.Equal(t, "workflow-pool", props.Pool)
+			})
+		}
+	}
+}

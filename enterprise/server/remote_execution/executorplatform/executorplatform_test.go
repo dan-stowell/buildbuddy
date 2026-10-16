@@ -654,3 +654,33 @@ func TestPlatformRoutingGeneratedExecutionConsistency(t *testing.T) {
 		}
 	}
 }
+
+func TestPlatformRoutingIsolationValidationAndDefaults(t *testing.T) {
+	for _, isolation := range []string{"unknown", "DOCKER", "firecracker"} {
+		t.Run(isolation, func(t *testing.T) {
+			props, err := platform.ParseProperties(&repb.ExecutionTask{Action: &repb.Action{Platform: &repb.Platform{
+				Properties: []*repb.Platform_Property{{Name: "workload-isolation-type", Value: isolation}},
+			}}})
+			require.NoError(t, err)
+			err = ApplyOverrides(t.Context(), testenv.GetTestEnv(t), docker, props, &repb.Command{})
+			require.True(t, status.IsInvalidArgumentError(err), "expected InvalidArgument, got %v", err)
+		})
+	}
+	for _, executor := range []*ExecutorProperties{bare, docker} {
+		t.Run(string(executor.SupportedIsolationTypes[0]), func(t *testing.T) {
+			props, err := platform.ParseProperties(&repb.ExecutionTask{})
+			require.NoError(t, err)
+			require.Equal(t, "linux", props.OS)
+			require.Equal(t, "amd64", props.Arch)
+			require.Empty(t, props.Pool)
+			require.Empty(t, props.WorkloadIsolationType)
+			require.NoError(t, ApplyOverrides(t.Context(), testenv.GetTestEnv(t), executor, props, &repb.Command{}))
+			require.Equal(t, string(executor.SupportedIsolationTypes[0]), props.WorkloadIsolationType)
+			if executor == bare {
+				require.Empty(t, props.ContainerImage)
+			} else {
+				require.Equal(t, *defaultImage, props.ContainerImage)
+			}
+		})
+	}
+}
