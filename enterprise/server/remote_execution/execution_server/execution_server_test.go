@@ -27,11 +27,13 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testcache"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testclickhouse"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testusage"
 	"github.com/buildbuddy-io/buildbuddy/server/usage/sku"
 	"github.com/buildbuddy-io/buildbuddy/server/util/bazel_request"
+	"github.com/buildbuddy-io/buildbuddy/server/util/clickhouse/schema"
 	"github.com/buildbuddy-io/buildbuddy/server/util/clientip"
 	"github.com/buildbuddy-io/buildbuddy/server/util/db"
 	"github.com/buildbuddy-io/buildbuddy/server/util/perms"
@@ -61,6 +63,7 @@ import (
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 	rspb "github.com/buildbuddy-io/buildbuddy/proto/resource"
 	scpb "github.com/buildbuddy-io/buildbuddy/proto/scheduler"
+	sipb "github.com/buildbuddy-io/buildbuddy/proto/stored_invocation"
 	flagd "github.com/open-feature/go-sdk-contrib/providers/flagd/pkg"
 	gstatus "google.golang.org/grpc/status"
 	tspb "google.golang.org/protobuf/types/known/timestamppb"
@@ -3032,4 +3035,66 @@ func (c *failOnceAppendCollector) AppendExecution(ctx context.Context, invocatio
 // A transient collector outage must not make the final row unrecoverable.
 func TestExecutionOLAP_TransientHandoffFailure(t *testing.T) {
 	testExecutionOLAPHandoff(t, true)
+}
+
+// Model two requesters sharing an execution, both finishing before the executor.
+// The shared-execution links are installed explicitly to isolate finalization
+// from action-merger scheduling. ClickHouse stores one row per invocation link.
+func TestExecutionOLAP_CompletedMergedInvocations(t *testing.T) {
+	testExecutionOLAPCompletedInvocations(t, false)
+}
+
+func testExecutionOLAPCompletedInvocations(t *testing.T, failFirstInsert bool) {
+	t.Helper()
+	flags.Set(t, "app.enable_write_executions_to_olap_db", true)
+	flags.Set(t, "remote_execution.write_execution_progress_state_to_redis", true)
+	env, _, _ := setupEnv(t)
+	testclickhouse.Configure(t, env)
+	sink := &failOnceExecutionOLAP{OLAPDBHandle: env.GetOLAPDBHandle(), failNext: failFirstInsert}
+	env.SetOLAPDBHandle(sink)
+	s, err := execution_server.NewExecutionServer(env)
+	require.NoError(t, err)
+	const iid1 = "10243d8a-a329-4f46-abfb-bfbceed12baa"
+	const iid2 = "20243d8a-a329-4f46-abfb-bfbceed12baa"
+	ctx := withIncomingMetadata(t, context.Background(), &repb.RequestMetadata{ToolInvocationId: iid1})
+	ctx, err = env.GetAuthenticator().(*testauth.TestAuthenticator).WithAuthenticatedUser(ctx, "US1")
+	require.NoError(t, err)
+	ctx, err = prefix.AttachUserPrefixToContext(ctx, env.GetAuthenticator())
+	require.NoError(t, err)
+	action := &repb.Action{}
+	arn := uploadAction(ctx, t, env, "", repb.DigestFunction_SHA256, action)
+	taskID := arn.NewUploadString()
+	require.NoError(t, s.Dispatch(ctx, &repb.ExecuteRequest{ActionDigest: arn.GetDigest()}, action, taskID))
+	collector := env.GetExecutionCollector()
+	require.NoError(t, collector.AddExecutionInvocationLink(ctx, &sipb.StoredInvocationLink{
+		InvocationId: iid2, ExecutionId: taskID, Type: sipb.StoredInvocationLink_MERGED,
+	}, true))
+	for _, iid := range []string{iid1, iid2} {
+		require.NoError(t, collector.AddInvocation(ctx, &sipb.StoredInvocation{InvocationId: iid}))
+	}
+	for range 2 {
+		err := s.MarkExecutionFailed(ctx, taskID, status.UnavailableError("executor lost"))
+		t.Logf("MarkExecutionFailed returned: %v", err)
+	}
+	rows := getExecutions(t, env)
+	require.Len(t, rows, 1)
+	assert.Equal(t, int64(repb.ExecutionStage_COMPLETED), rows[0].Stage)
+	for _, iid := range []string{iid1, iid2} {
+		var rows []schema.Execution
+		require.NoError(t, sink.GORM(ctx, "check_late_execution").Where("invocation_uuid = ?", strings.ReplaceAll(iid, "-", "")).Find(&rows).Error)
+		assert.Len(t, rows, 1, "each completed invocation must retain exactly one final execution: %s", iid)
+	}
+}
+
+type failOnceExecutionOLAP struct {
+	interfaces.OLAPDBHandle
+	failNext bool
+}
+
+func (h *failOnceExecutionOLAP) FlushExecutionStats(ctx context.Context, inv *sipb.StoredInvocation, executions []*repb.StoredExecution) error {
+	if h.failNext {
+		h.failNext = false
+		return status.UnavailableError("injected transient OLAP insert failure")
+	}
+	return h.OLAPDBHandle.FlushExecutionStats(ctx, inv, executions)
 }
