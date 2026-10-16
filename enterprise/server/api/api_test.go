@@ -1240,3 +1240,24 @@ func (p *fakePromQuerier) FetchFederatedMetrics(ctx context.Context, w io.Writer
 	_, err := w.Write([]byte(`buildbuddy_remote_execution_tasks_executing{job="mac-executor",group_id="GR1"} 1`))
 	return err
 }
+
+func TestPaginationMalformedTokensRejected(t *testing.T) {
+	const iid = "00000000-0000-0000-0000-000000000001"
+	env, ctx := getEnvAndCtx(t, "user1")
+	streamBuild(t, env, iid)
+	s := NewAPIServer(env)
+	for _, endpoint := range []string{"GetInvocation", "GetTarget", "GetAction"} {
+		t.Run(endpoint, func(t *testing.T) {
+			var err error
+			switch endpoint {
+			case "GetInvocation":
+				_, err = s.GetInvocation(ctx, &apipb.GetInvocationRequest{Selector: &apipb.InvocationSelector{InvocationId: iid}, PageToken: "not-a-page-token!"})
+			case "GetTarget":
+				_, err = s.GetTarget(ctx, &apipb.GetTargetRequest{Selector: &apipb.TargetSelector{InvocationId: iid}, PageToken: "not-a-page-token!"})
+			case "GetAction":
+				_, err = s.GetAction(ctx, &apipb.GetActionRequest{Selector: &apipb.ActionSelector{InvocationId: iid}, PageToken: "not-a-page-token!"})
+			}
+			require.True(t, status.IsInvalidArgumentError(err), "malformed page token must return InvalidArgument; got %v", err)
+		})
+	}
+}
