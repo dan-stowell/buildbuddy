@@ -555,13 +555,13 @@ func TestFileCacheOverwrite(t *testing.T) {
 				require.Equal(t, "file1-content", file1Link2Content)
 			}
 			{
-				// Overwrite again, this time the contents don't match the
-				// digest (filecache supports this, similar to AC).
+				// A duplicate digest is immutable: skip admission even if the
+				// new source bytes differ.
 				writeFileContent(t, tempDir, "file2", "file2-content", test.Executable)
 				err = fc.AddFile(ctx, node, filepath.Join(tempDir, "file2"))
 				require.NoError(t, err)
 				linked := fc.FastLinkFile(ctx, node, filepath.Join(tempDir, "file2-link1"))
-				require.True(t, linked, "expected cache hit after overwriting file with different digest")
+				require.True(t, linked, "expected cache hit after duplicate admission")
 				// Verify all file contents
 				file1Content := testfs.ReadFileAsString(t, tempDir, "file1")
 				file1Link1Content := testfs.ReadFileAsString(t, tempDir, "file1-link1")
@@ -572,7 +572,7 @@ func TestFileCacheOverwrite(t *testing.T) {
 				require.Equal(t, "file1-content", file1Link1Content)
 				require.Equal(t, "file1-content", file1Link2Content)
 				require.Equal(t, "file2-content", file2Content)
-				require.Equal(t, "file2-content", file2Link1Content)
+				require.Equal(t, "file1-content", file2Link1Content)
 			}
 
 			// No evictions should have occurred.

@@ -492,6 +492,7 @@ func TestFindMissingBlobs_AppliesCASRPCTimeout(t *testing.T) {
 }
 
 type fakeFilecache struct {
+	interfaces.FileCache
 	mu         sync.Mutex
 	files      map[string][]byte
 	readCount  int
