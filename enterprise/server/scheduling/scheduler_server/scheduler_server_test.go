@@ -2874,3 +2874,32 @@ func TestExecutorRegistration_Lifecycle(t *testing.T) {
 	require.Equal(t, int64(2000), nodes[0].GetAssignableMilliCpu())
 	require.Same(t, newHandle, newPool.FindConnectedExecutorByID("executor").handle)
 }
+
+func TestExecutorRegistration_ReconnectReplacesRoutingHandle(t *testing.T) {
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+	ctx, cancel := context.WithCancel(ctx)
+	t.Cleanup(cancel)
+	s := env.GetSchedulerService().(*SchedulerServer)
+	oldNode := &scpb.ExecutionNode{ExecutorId: "reused-id", ExecutorHostId: "old-host", Host: "old", OsFamily: defaultOS, Arch: defaultArch, AssignableMilliCpu: 32000}
+	oldHandle := newExecutorHandle(env, s, false, &fakeExecutorStream{ctx: ctx, sent: make(chan *scpb.RegisterAndStreamWorkResponse, 10)})
+	require.NoError(t, s.AddConnectedExecutor(ctx, oldHandle, oldNode))
+	t.Cleanup(func() { s.RemoveConnectedExecutor(ctx, oldHandle, oldNode) })
+	newNode := proto.Clone(oldNode).(*scpb.ExecutionNode)
+	newNode.ExecutorHostId = "replacement-host"
+	newNode.Host = "replacement"
+	newNode.AssignableMilliCpu = 1000
+	newHandle := newExecutorHandle(env, s, false, &fakeExecutorStream{ctx: ctx, sent: make(chan *scpb.RegisterAndStreamWorkResponse, 10)})
+	require.NoError(t, s.AddConnectedExecutor(ctx, newHandle, newNode))
+	pool := s.getOrCreatePool(newHandle.nodePoolKey(newNode))
+	// Redis routes using the new capacity and host, so the local route must
+	// use the same registration and its new stream, even before old cleanup.
+	nodes, err := pool.fetchExecutionNodes(ctx)
+	require.NoError(t, err)
+	require.Len(t, nodes, 1)
+	require.Equal(t, int64(1000), nodes[0].GetAssignableMilliCpu())
+	connected := pool.FindConnectedExecutorByID(newNode.GetExecutorId())
+	require.NotNil(t, connected)
+	require.Equal(t, "replacement-host", connected.GetExecutorHostId(), "local routing still points at the previous executor incarnation")
+	require.Same(t, newHandle, connected.handle)
+	require.Equal(t, int64(1000), connected.GetAssignableMilliCpu())
+}
