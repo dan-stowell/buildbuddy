@@ -316,7 +316,7 @@ func (t *TaskLease) sendFinalRequest(req *scpb.LeaseTaskRequest) (closedCleanly 
 			return closedCleanly, nil
 		}
 		if err != nil {
-			return false, err
+			return closedCleanly, err
 		}
 		closedCleanly = rsp.GetClosedCleanly()
 	}
