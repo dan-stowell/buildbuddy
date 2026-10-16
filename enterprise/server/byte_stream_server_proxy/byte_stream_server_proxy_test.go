@@ -3651,3 +3651,37 @@ func BenchmarkReadChunkedMixedLocalRemote(b *testing.B) {
 		}
 	}
 }
+
+// Chunk reads happen inside the proxy rather than through its public Read RPC.
+// A missing remote chunk must notify the CAS proxy for the chunk's own digest.
+type presenceInvalidationRecorder struct {
+	repb.ContentAddressableStorageServer
+	resources []*digest.CASResourceName
+}
+
+func (r *presenceInvalidationRecorder) InvalidatePresence(ctx context.Context, rn *digest.CASResourceName) {
+	r.resources = append(r.resources, rn)
+}
+
+func TestReadRemoteChunk_InvalidatesPresence(t *testing.T) {
+	ctx := context.Background()
+	remoteEnv := testenv.GetTestEnv(t)
+	remote, _, _, _ := runRemoteServices(ctx, remoteEnv, t)
+	env := testenv.GetTestEnv(t)
+	env.SetByteStreamClient(remote)
+	local, err := byte_stream_server.NewByteStreamServer(env)
+	require.NoError(t, err)
+	env.SetLocalByteStreamServer(local)
+	proxy, err := New(env)
+	require.NoError(t, err)
+	// Match registration order: ByteStream is constructed before CAS.
+	recorder := &presenceInvalidationRecorder{}
+	env.SetCASServer(recorder)
+	d, err := digest.Compute(strings.NewReader("missing chunk"), repb.DigestFunction_SHA256)
+	require.NoError(t, err)
+	rn := digest.NewCASResourceName(d, "instance", repb.DigestFunction_SHA256)
+	_, err = proxy.readRemoteChunk(ctx, rn, 0, d.GetSizeBytes())
+	require.True(t, status.IsNotFoundError(err))
+	require.Len(t, recorder.resources, 1)
+	require.Equal(t, rn.DownloadString(), recorder.resources[0].DownloadString())
+}
