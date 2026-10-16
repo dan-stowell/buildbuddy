@@ -11,10 +11,13 @@ import (
 	"log"
 	"maps"
 	"math/rand/v2"
+	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -34,6 +37,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testnetworking"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testshell"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testtar"
@@ -3519,4 +3523,162 @@ func TestTaskCPUControllerDisabled(t *testing.T) {
 			require.Equal(t, string(before), string(after))
 		})
 	}
+}
+
+// TestImageStoreLifecycleAudit exercises a live store; each operation releases
+// its image lock or cancels its only waiter before resource growth is checked.
+func TestImageStoreLifecycleAudit(t *testing.T) {
+	for _, n := range []int{10, 50} {
+		for _, mode := range []string{"success", "invalid-tar", "cancel"} {
+			t.Run(fmt.Sprintf("%s/N=%d", mode, n), func(t *testing.T) {
+				testleak.Check(t)
+				testleak.CheckFDs(t)
+				flags.Set(t, "http.client.allow_localhost", true)
+				flags.Set(t, "executor.oci.image_eviction_enabled", true)
+				var block atomic.Bool
+				started := make(chan struct{}, 1)
+				layerBytes := testtar.EntryBytes(t, &tar.Header{Name: "file", Typeflag: tar.TypeReg, Mode: 0644, Uid: os.Getuid(), Gid: os.Getgid()}, []byte("contents"))
+				if mode == "invalid-tar" {
+					layerBytes = []byte("invalid tar")
+				}
+				layer := testregistry.NewBytesLayer(t, layerBytes)
+				digest, err := layer.Digest()
+				require.NoError(t, err)
+				reg := testregistry.Run(t, testregistry.Opts{HttpInterceptor: func(w http.ResponseWriter, r *http.Request) bool {
+					if block.Load() && r.Method == "GET" && strings.HasSuffix(r.URL.Path, digest.String()) {
+						select {
+						case started <- struct{}{}:
+						default:
+						}
+						<-r.Context().Done()
+						return false
+					}
+					return true
+				}})
+				t.Cleanup(func() { require.NoError(t, reg.Shutdown()) })
+				img, err := mutate.AppendLayers(empty.Image, layer)
+				require.NoError(t, err)
+				image := reg.Push(t, img, "audit:latest", nil)
+				layerDir := testfs.MakeTempDir(t)
+				store := newImageStoreForTest(t, layerDir)
+				block.Store(mode == "cancel")
+				counts := func() (int, int, int) {
+					fds, err := os.ReadDir("/proc/self/fd")
+					require.NoError(t, err)
+					dirs := 0
+					require.NoError(t, filepath.WalkDir(layerDir, func(path string, d fs.DirEntry, err error) error {
+						if err != nil {
+							return err
+						}
+						if d.IsDir() && strings.Contains(d.Name(), ".tmp") {
+							dirs++
+						}
+						return nil
+					}))
+					return runtime.NumGoroutine(), len(fds), dirs
+				}
+				g0, f0, _ := counts()
+				testleak.CheckGrowth(t, testleak.Growth{Iterations: n}, func(i int) {
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					if mode == "cancel" {
+						done := make(chan error, 1)
+						go func() {
+							locked, err := store.PullAndLockImage(ctx, image, oci.Credentials{}, false)
+							if locked != nil {
+								locked.Unlock()
+							}
+							done <- err
+						}()
+						select {
+						case <-started:
+						case <-time.After(10 * time.Second):
+							t.Fatal("layer request did not start")
+						}
+						cancel()
+						require.Error(t, <-done)
+					} else {
+						locked, err := store.PullAndLockImage(ctx, image, oci.Credentials{}, false)
+						if mode == "success" {
+							require.NoError(t, err)
+							locked.Unlock()
+						} else {
+							require.Error(t, err)
+							require.Nil(t, locked)
+						}
+					}
+					// Cancellation returns before the singleflight worker has unwound.
+					require.Eventually(t, func() bool { _, _, tmp := counts(); return tmp == 0 }, 10*time.Second, 10*time.Millisecond)
+				})
+				g1, f1, tmp := counts()
+				t.Logf("N=%d mode=%s goroutines=%d->%d fds=%d->%d partial_dirs=%d", n, mode, g0, g1, f0, f1, tmp)
+				if mode != "success" {
+					entries, err := os.ReadDir(filepath.Join(layerDir, "v2", "sha256"))
+					if !os.IsNotExist(err) {
+						require.NoError(t, err)
+						require.Empty(t, entries)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestImageStoreConcurrentUnlockAudit uses eviction as an observable check that
+// every reference is released, without exposing private filecache refcounts.
+func TestImageStoreConcurrentUnlockAudit(t *testing.T) {
+	testleak.Check(t)
+	testleak.CheckFDs(t)
+	flags.Set(t, "http.client.allow_localhost", true)
+	flags.Set(t, "executor.oci.image_eviction_enabled", true)
+	reg := testregistry.Run(t, testregistry.Opts{})
+	t.Cleanup(func() { require.NoError(t, reg.Shutdown()) })
+	layer := testregistry.NewBytesLayer(t, testtar.EntryBytes(t, &tar.Header{Name: "file", Typeflag: tar.TypeReg, Mode: 0644, Uid: os.Getuid(), Gid: os.Getgid()}, []byte("contents")))
+	img, err := mutate.AppendLayers(empty.Image, layer)
+	require.NoError(t, err)
+	image := reg.Push(t, img, "concurrent:latest", nil)
+	env := testenv.GetTestEnv(t)
+	resolver, err := oci.NewResolver(env)
+	require.NoError(t, err)
+	fc, err := filecache.NewFileCache(testfs.MakeTempDir(t), 64_000, false)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, fc.Close()) })
+	fc.WaitForDirectoryScanToComplete()
+	store, err := ociruntime.NewImageStore(resolver, testfs.MakeTempDir(t), fc)
+	require.NoError(t, err)
+	pressure := filepath.Join(fc.TempDir(), "pressure")
+	require.NoError(t, os.WriteFile(pressure, make([]byte, 64_000), 0644))
+	testleak.CheckGrowth(t, testleak.Growth{Iterations: 50}, func(i int) {
+		type result struct {
+			image *ociruntime.LockedImage
+			err   error
+		}
+		results := make(chan result, 8)
+		start := make(chan struct{})
+		for range 8 {
+			go func() {
+				<-start
+				im, err := store.PullAndLockImage(context.Background(), image, oci.Credentials{}, false)
+				results <- result{im, err}
+			}()
+		}
+		close(start)
+		locked := make([]*ociruntime.LockedImage, 0, 8)
+		for range 8 {
+			r := <-results
+			require.NoError(t, r.err)
+			locked = append(locked, r.image)
+		}
+		path := singleLayerPath(t, locked[0])
+		require.NoError(t, fc.AddFile(context.Background(), &repb.FileNode{Digest: &repb.Digest{Hash: fmt.Sprintf("%064x", i+1), SizeBytes: 64_000}}, pressure))
+		for _, im := range locked[:7] {
+			im.Unlock()
+		}
+		_, err := os.Stat(path)
+		require.NoError(t, err, "last reference must protect layer")
+		locked[7].Unlock()
+		_, err = os.Stat(path)
+		require.True(t, os.IsNotExist(err), "all references released: layer must be evictable; got %v", err)
+	})
+	t.Log("51 pull/evict cycles (one warmup), 8 waiters each: all layers evicted after final unlock")
 }
