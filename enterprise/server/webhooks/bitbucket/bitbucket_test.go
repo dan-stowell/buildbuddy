@@ -77,3 +77,24 @@ func TestParseRequest_ValidPullRequestEvent_Success(t *testing.T) {
 		TargetBranch:  "main",
 	}, data)
 }
+
+func TestBughuntForkPullRequestNumber(t *testing.T) {
+	payload := []byte(`{
+  "pullrequest": {
+   "id": 42,
+   "source": {"branch":{"name":"feature/日本語"},"commit":{"hash":"abcdef"},"repository":{"uuid":"fork","links":{"html":{"href":"https://bitbucket.org/fork/repo"}}}},
+   "destination": {"branch":{"name":"release/main"},"repository":{"uuid":"base","links":{"html":{"href":"https://bitbucket.org/org/repo"}}}}
+  }
+ }`)
+	data, err := bitbucket.NewProvider().ParseWebhookData(webhookRequest(t, "pullrequest:created", payload))
+	assert.NoError(t, err)
+	if !assert.NotNil(t, data) {
+		return
+	}
+	assert.Equal(t, "feature/日本語", data.PushedBranch)
+	assert.Equal(t, "release/main", data.TargetBranch)
+	assert.Equal(t, "abcdef", data.SHA)
+	assert.Equal(t, "https://bitbucket.org/fork/repo", data.PushedRepoURL)
+	assert.Equal(t, "https://bitbucket.org/org/repo", data.TargetRepoURL)
+	assert.Equal(t, int64(42), data.PullRequestNumber)
+}
