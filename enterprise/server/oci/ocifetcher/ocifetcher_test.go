@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +27,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testcache"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testhttp"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/claims"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
@@ -2443,5 +2446,68 @@ func TestPrivateImageManifestCacheRequiresCredentials(t *testing.T) {
 				manifestHead:             2,
 			})
 		})
+	}
+}
+
+// Diagnostic: distinct keys retain live cached pullers; this is not by itself
+// evidence of a leak. The zero growth bound intentionally exposes the counts.
+func TestPullerResourceGrowthDiagnostic(t *testing.T) {
+	for _, mode := range []string{"same", "images", "credentials", "evicted", "discarded-owner"} {
+		for _, n := range []int{10, 50} {
+			t.Run(fmt.Sprintf("%s/N=%d", mode, n), func(t *testing.T) {
+				var failNext atomic.Bool
+				reg, counter := setupRegistry(t, nil, func(w http.ResponseWriter, r *http.Request) bool {
+					if r.Method == http.MethodHead && failNext.Swap(false) {
+						w.WriteHeader(http.StatusUnauthorized)
+						return false
+					}
+					return true
+				})
+				defer reg.Shutdown()
+				refs := make([]string, n+1)
+				for i := range refs {
+					name := "same"
+					if mode == "images" {
+						name = fmt.Sprintf("image%d", i)
+					}
+					if i == 0 || mode == "images" {
+						refs[i], _ = reg.PushNamedImage(t, name, nil)
+					} else {
+						refs[i] = refs[0]
+					}
+				}
+				// Push uses a shared transport. All pushes finish before baseline.
+				_, bs, ac := setupCacheEnv(t)
+				s := newTestServerWithCache(t, bs, ac)
+				var err error
+				flags.Set(t, "http.client.allow_localhost", true)
+				flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.0/8", "::1/128"})
+				// Recreate after configuring the allowlist.
+				s, err = ocifetcher.NewServer(bs, ac)
+				require.NoError(t, err)
+				initialPings := counter.Snapshot()["GET /v2/"]
+				testleak.CheckGrowth(t, testleak.Growth{Iterations: n}, func(i int) {
+					if mode == "discarded-owner" {
+						s, err = ocifetcher.NewServer(bs, ac)
+						require.NoError(t, err)
+					}
+					var creds *rgpb.Credentials
+					if mode == "credentials" {
+						creds = &rgpb.Credentials{Username: fmt.Sprintf("user%d", i), Password: "test-only"}
+					}
+					if mode == "evicted" && i > 0 {
+						failNext.Store(true)
+					}
+					_, err := s.FetchManifestMetadata(context.Background(), &ofpb.FetchManifestMetadataRequest{Ref: refs[i], Credentials: creds})
+					require.NoError(t, err)
+					fds, err := os.ReadDir("/proc/self/fd")
+					require.NoError(t, err)
+					t.Logf("iteration=%d goroutines=%d fds=%d", i, runtime.NumGoroutine(), len(fds))
+				})
+				if mode == "evicted" {
+					require.Equal(t, n+1, counter.Snapshot()["GET /v2/"]-initialPings, "each retry must create a new puller")
+				}
+			})
+		}
 	}
 }
