@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -615,4 +617,229 @@ not json at all
 			assert.Equal(t, tc.want, parseGitFetchedBytes(strings.NewReader(tc.trace2Log)))
 		})
 	}
+}
+
+// --- Reproducers: recycled-runner stale content across runs ---
+//
+// These tests exercise the real ci_runner setup path (workspace.sync, which
+// runs the `git clean` + `git checkout --force` used between actions on a
+// recycled runner). They simulate two or more workflow runs sharing the same
+// workspace directory and check whether content left by an earlier run
+// survives into a later run for a different commit.
+
+// newRepoRunnerWorkspace returns a workspace rooted at a fresh temp dir, with
+// the process cwd changed into it (git() runs in cwd), matching how the runner
+// sets up its repo-root. It also initializes the git repo once, like init().
+func newRepoRunnerWorkspace(t *testing.T) (*workspace, string) {
+	checkoutDir := t.TempDir()
+	originalWorkingDir, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(checkoutDir))
+	t.Cleanup(func() { require.NoError(t, os.Chdir(originalWorkingDir)) })
+
+	invocationLog := newInvocationLog(nil)
+	invocationLog.writer = io.Discard
+	ws := &workspace{
+		rootDir: checkoutDir,
+		log:     &buildEventReporter{log: invocationLog},
+	}
+	require.NoError(t, ws.init(t.Context()))
+	return ws, checkoutDir
+}
+
+// runRunnerSync runs one workflow "run" through the real setup path: it points
+// the runner at the given branch and calls workspace.sync, which fetches,
+// cleans, and checks out the branch tip exactly as production does between
+// actions on a recycled runner.
+func runRunnerSync(t *testing.T, ws *workspace, repoURL, branch string) {
+	t.Helper()
+	// commit_sha is set by a previous sync (it rev-parses HEAD when empty), so
+	// reset it each run; otherwise checkoutRef would re-check-out the old sha.
+	flags.Set(t, "commit_sha", "")
+	flags.Set(t, "pushed_branch", branch)
+	flags.Set(t, "pushed_repo_url", repoURL)
+	require.NoError(t, ws.sync(t.Context()))
+}
+
+func gitOut(t *testing.T, args ...string) string {
+	t.Helper()
+	out, gitErr := git(t.Context(), io.Discard, args...)
+	require.Nil(t, gitErr)
+	return strings.TrimSpace(out)
+}
+
+// setupRunnerRemote starts an in-process git server, creates a public repo, and
+// returns the server, the (token-less) repo URL the runner fetches from, and a
+// token-bearing URL used to push updates between runs.
+func setupRunnerRemote(t *testing.T) (remote *testgit.Server, fetchURL, pushURL string) {
+	remote = testgit.StartServer(t, testgit.ServerOptions{LogWriter: io.Discard})
+	remote.CreateProject("test-org", "test-repo", &testgit.ProjectSettings{Public: true})
+	fetchURL = remote.RepoURL("test-org", "test-repo", "")
+	pushURL = remote.RepoURL("test-org", "test-repo", remote.AccessToken())
+	return remote, fetchURL, pushURL
+}
+
+func pushMaster(t *testing.T, sourceDir, pushURL string) {
+	t.Helper()
+	testshell.Run(t, sourceDir, fmt.Sprintf(`
+		git remote remove origin 2>/dev/null || true
+		git remote add origin %q
+		export GIT_ASKPASS=/usr/bin/true
+		git -c credential.helper= push -f --set-upstream origin master
+	`, pushURL))
+}
+
+// commonSyncFlags sets the flags needed for sync() to run against a local test
+// remote without lazy fetching, submodule handling, or base-branch merges.
+func commonSyncFlags(t *testing.T) {
+	// No filter: fetch full objects so checkout never needs to lazily fetch.
+	flags.Set(t, "git_fetch_filters", []string{})
+	// A minimal action with no pull_request/merge_with_base trigger disables
+	// the base-branch merge path in sync().
+	flags.Set(t, "serialized_action", base64.StdEncoding.EncodeToString([]byte("name: test\n")))
+	// Use the repo URL as-is (public repo); avoids global ~/.gitconfig writes.
+	t.Setenv("USE_SYSTEM_GIT_CREDENTIALS", "1")
+}
+
+// Claim A: `git clean` with a single --force keeps untracked nested Git
+// repositories, so a nested repo created by a previous workflow run survives
+// into the next run for a different commit, while plain untracked files are
+// removed. Setup still reports success and HEAD is the new commit.
+func TestRunnerCleanLeavesNestedRepo(t *testing.T) {
+	commonSyncFlags(t)
+	remote, fetchURL, pushURL := setupRunnerRemote(t)
+	_ = remote
+
+	// Source repo with two commits on master.
+	sourceDir, commit1 := testgit.MakeTempRepo(t, map[string]string{"a.txt": "1"})
+	pushMaster(t, sourceDir, pushURL)
+
+	ws, checkoutDir := newRepoRunnerWorkspace(t)
+
+	// --- Run 1: check out commit1. ---
+	runRunnerSync(t, ws, fetchURL, "master")
+	require.Equal(t, commit1, gitOut(t, "rev-parse", "HEAD"))
+
+	// A previous workflow leaves behind (a) a plain untracked file and (b) an
+	// untracked *nested git repository* (e.g. a tool that clones a dep, or a
+	// previous run's submodule init).
+	testshell.Run(t, checkoutDir, `
+		echo junk > junk.txt
+		mkdir nested_repo
+		cd nested_repo
+		git -c init.defaultBranch=master init -q
+		git config user.email a@b.c
+		git config user.name A
+		echo stale-from-previous-run > leftover.txt
+		git add .
+		git commit -qm x
+	`)
+	require.FileExists(t, filepath.Join(checkoutDir, "junk.txt"))
+	require.FileExists(t, filepath.Join(checkoutDir, "nested_repo", "leftover.txt"))
+
+	// Advance master to a different commit and re-push.
+	commit2 := testgit.CommitFiles(t, sourceDir, map[string]string{"a.txt": "2"})
+	require.NotEqual(t, commit1, commit2)
+	pushMaster(t, sourceDir, pushURL)
+
+	// --- Run 2 on the SAME runner workspace: check out commit2. ---
+	runRunnerSync(t, ws, fetchURL, "master")
+
+	// Setup reports success and HEAD is correct...
+	require.Equal(t, commit2, gitOut(t, "rev-parse", "HEAD"))
+	require.Equal(t, "2", gitOut(t, "show", "HEAD:a.txt"))
+	// ...the plain untracked file was removed by `git clean`...
+	require.NoFileExists(t, filepath.Join(checkoutDir, "junk.txt"))
+	// ...but the untracked nested git repo SURVIVES into the new run.
+	require.FileExists(t, filepath.Join(checkoutDir, "nested_repo", "leftover.txt"),
+		"nested git repo from a previous run leaked into the next run (git clean needs -ff to remove it)")
+}
+
+// Claim B: after a previous run initialized a submodule, a later run whose
+// commit changes the submodule pointer leaves the old submodule contents
+// checked out; a later run whose commit removes the submodule leaves its
+// directory behind. Setup reports success and HEAD is correct in both cases.
+func TestRunnerLeavesStaleSubmoduleContent(t *testing.T) {
+	commonSyncFlags(t)
+	remote, fetchURL, pushURL := setupRunnerRemote(t)
+	_ = remote
+
+	// Allow file:// for the test's own submodule operations (simulating the
+	// user's workflow steps). ci_runner never runs submodule commands itself.
+	gitEnv := `export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.file.allow GIT_CONFIG_VALUE_0=always`
+
+	// Submodule repo with two versions: "A" then "B".
+	subDir := t.TempDir()
+	testshell.Run(t, subDir, `
+		git -c init.defaultBranch=master init -q
+		git config user.email a@b.c
+		git config user.name A
+		echo A > sub.txt && git add . && git commit -qm sA
+		echo B > sub.txt && git commit -qam sB
+	`)
+	subSA := strings.TrimSpace(testshell.Run(t, subDir, `git rev-parse HEAD~1`))
+	subSB := strings.TrimSpace(testshell.Run(t, subDir, `git rev-parse HEAD`))
+
+	// Main repo:
+	//   commit1: submodule "sub" -> A
+	//   commit2: submodule "sub" -> B (pointer change)
+	//   commit3: submodule removed
+	sourceDir, _ := testgit.MakeTempRepo(t, map[string]string{"root.txt": "root"})
+	commit1 := testshell.Run(t, sourceDir, gitEnv+fmt.Sprintf(`
+		git submodule add %q sub >/dev/null 2>&1
+		cd sub && git checkout -q %s && cd ..
+		git add sub .gitmodules && git commit -qm "c1 sub@A"
+		git rev-parse HEAD
+	`, "file://"+subDir, subSA))
+	commit1 = strings.TrimSpace(commit1)
+	pushMaster(t, sourceDir, pushURL)
+
+	ws, checkoutDir := newRepoRunnerWorkspace(t)
+
+	// --- Run 1: check out commit1, then the user's workflow inits the
+	// submodule (ci_runner does not do this itself). ---
+	runRunnerSync(t, ws, fetchURL, "master")
+	require.Equal(t, commit1, gitOut(t, "rev-parse", "HEAD"))
+	testshell.Run(t, checkoutDir, gitEnv+`
+		git submodule update --init >/dev/null 2>&1
+	`)
+	require.Equal(t, "A", strings.TrimSpace(testshell.Run(t, checkoutDir, `cat sub/sub.txt`)))
+
+	// commit2: change the submodule pointer to B, re-push.
+	commit2 := testshell.Run(t, sourceDir, gitEnv+fmt.Sprintf(`
+		cd sub && git checkout -q %s && cd ..
+		git add sub && git commit -qm "c2 sub@B"
+		git rev-parse HEAD
+	`, subSB))
+	commit2 = strings.TrimSpace(commit2)
+	pushMaster(t, sourceDir, pushURL)
+
+	// --- Run 2 on the SAME runner workspace. ---
+	runRunnerSync(t, ws, fetchURL, "master")
+	// Setup reports success and HEAD is correct (points at commit2)...
+	require.Equal(t, commit2, gitOut(t, "rev-parse", "HEAD"))
+	// ...but the submodule working tree still holds the OLD contents ("A"),
+	// even though HEAD records pointer "B". ci_runner never re-syncs it.
+	require.Equal(t, "A", strings.TrimSpace(testshell.Run(t, checkoutDir, `cat sub/sub.txt`)),
+		"submodule content is stale after a pointer-changing commit")
+
+	// commit3: remove the submodule entirely, re-push.
+	commit3 := testshell.Run(t, sourceDir, gitEnv+`
+		git rm -q sub
+		rm -f .gitmodules
+		git add -A && git commit -qm "c3 remove sub"
+		git rev-parse HEAD
+	`)
+	commit3 = strings.TrimSpace(commit3)
+	pushMaster(t, sourceDir, pushURL)
+
+	// --- Run 3 on the SAME runner workspace. ---
+	runRunnerSync(t, ws, fetchURL, "master")
+	// Setup reports success and HEAD is correct (points at commit3)...
+	require.Equal(t, commit3, gitOut(t, "rev-parse", "HEAD"))
+	// ...but the removed submodule's directory and contents are left behind.
+	require.DirExists(t, filepath.Join(checkoutDir, "sub"),
+		"removed submodule directory left behind after the commit that removed it")
+	require.FileExists(t, filepath.Join(checkoutDir, "sub", "sub.txt"),
+		"removed submodule contents left behind after the commit that removed it")
 }
