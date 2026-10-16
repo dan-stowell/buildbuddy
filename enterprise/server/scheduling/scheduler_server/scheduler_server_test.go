@@ -2757,3 +2757,16 @@ func TestWatchTaskLiveness_StopsWhenWatchersAreDone(t *testing.T) {
 	defer s.livenessMu.Unlock()
 	require.Empty(t, s.livenessWatches)
 }
+
+// A pool with no executor capable of satisfying a GPU request must reject it,
+// just as it rejects oversized CPU and memory requests.
+func TestSizing_RejectGPURequestAbovePoolCapacity(t *testing.T) {
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+	fe := newFakeExecutor(ctx, t, env.GetSchedulerClient())
+	fe.node.AssignableGpuMemoryBytes = 8 << 30
+	fe.Register()
+	req := newScheduleRequest(ctx, t, env, scheduleOpts{})
+	req.Metadata.TaskSize.EstimatedGpuMemoryBytes = 9 << 30
+	_, err := env.GetSchedulerService().ScheduleTask(ctx, req)
+	require.Error(t, err, "accepted GPU request that no registered executor can run")
+}
