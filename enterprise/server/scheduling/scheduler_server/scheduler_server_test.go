@@ -2903,3 +2903,29 @@ func TestExecutorRegistration_ReconnectReplacesRoutingHandle(t *testing.T) {
 	require.Same(t, newHandle, connected.handle)
 	require.Equal(t, int64(1000), connected.GetAssignableMilliCpu())
 }
+
+func TestExecutorRegistration_DrainingRejectsForwardedReservation(t *testing.T) {
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+	s := env.GetSchedulerService().(*SchedulerServer)
+	executor := newFakeExecutorWithId(ctx, t, "draining", env.GetSchedulerClient())
+	executor.Register()
+	key := nodePoolKey{os: defaultOS, arch: defaultArch}
+	pool := s.getOrCreatePool(key)
+	require.Eventually(t, func() bool { return pool.FindConnectedExecutorByID("draining") != nil }, 5*time.Second, time.Millisecond)
+	// Warm the routing cache as if a peer had selected this executor before
+	// the shutdown announcement. The forwarded RPC must still be rejected.
+	require.NoError(t, pool.RefreshNodes(ctx))
+	require.Len(t, pool.GetNodes(false), 1)
+	executor.Send(&scpb.RegisterAndStreamWorkRequest{ShuttingDownRequest: &scpb.ShuttingDownRequest{}})
+	require.Eventually(t, func() bool {
+		exists, err := s.rdb.HExists(ctx, key.redisPoolKey(), "draining").Result()
+		return err == nil && !exists && pool.FindConnectedExecutorByID("draining") == nil
+	}, 5*time.Second, time.Millisecond)
+	_, err := s.EnqueueTaskReservation(ctx, &scpb.EnqueueTaskReservationRequest{
+		TaskId: "forwarded-after-draining", ExecutorId: "draining",
+		TaskSize:           &scpb.TaskSize{EstimatedMilliCpu: 1, EstimatedMemoryBytes: 1},
+		SchedulingMetadata: &scpb.SchedulingMetadata{Os: defaultOS, Arch: defaultArch},
+	})
+	require.True(t, status.IsUnavailableError(err), "forwarded reservation should be rejected: %v", err)
+	executor.EnsureNoSchedulerMessage()
+}
