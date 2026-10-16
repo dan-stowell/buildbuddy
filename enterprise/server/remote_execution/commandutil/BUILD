@@ -31,8 +31,12 @@ go_test(
     name = "commandutil_test",
     size = "enormous",
     srcs = [
+        "commandutil_bgchild_unix_test.go",
+        "commandutil_escaped_linux_test.go",
+        "commandutil_internal_unix_test.go",
         "commandutil_internal_windows_test.go",
         "commandutil_test.go",
+        "commandutil_verify_unix_test.go",
         "commandutil_unix_test.go",
         "commandutil_windows_test.go",
     ],

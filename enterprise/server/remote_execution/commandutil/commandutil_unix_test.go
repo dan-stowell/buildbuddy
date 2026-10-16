@@ -7,6 +7,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -298,4 +302,101 @@ func TestRun_EnableStats_ComplexProcessTree_RecordsStatsFromAllChildren(t *testi
 	require.LessOrEqual(
 		t, res.UsageStats.GetPeakMemoryBytes(), int64(850e6),
 		"expected not much more than 750MB peak memory")
+}
+
+// The root exits successfully, but its child retains the stdout/stderr pipes.
+// Cancellation must still bound Run's wait for EOF on those pipes.
+func TestRun_ExitedRootWithOpenPipe_Deadline(t *testing.T) {
+	wd := testfs.MakeTempDir(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan *interfaces.CommandResult, 1)
+	go func() {
+		cmd := exec.Command("sh", "-c", "sleep 30 & echo $! > child.pid; echo partial; echo diagnostic >&2; exit 0")
+		cmd.Dir = wd
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		_, err := commandutil.RunWithProcessTreeCleanup(ctx, cmd, nil)
+		code, err := commandutil.ExitCode(ctx, cmd, err)
+		done <- &interfaces.CommandResult{ExitCode: code, Error: err, Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}
+	}()
+	// Capture the child PID independently of Run, whose pipe readers may block.
+	var pid int
+	require.Eventually(t, func() bool {
+		b, err := os.ReadFile(filepath.Join(wd, "child.pid"))
+		if err != nil {
+			return false
+		}
+		pid, err = strconv.Atoi(strings.TrimSpace(string(b)))
+		return err == nil && pid > 0
+	}, 5*time.Second, 10*time.Millisecond)
+	defer syscall.Kill(pid, syscall.SIGKILL)
+	select {
+	case res := <-done:
+		assert.True(t, status.IsDeadlineExceededError(res.Error), "got exit=%d err=%v", res.ExitCode, res.Error)
+		assert.Equal(t, "partial\n", string(res.Stdout))
+		assert.Equal(t, "diagnostic\n", string(res.Stderr))
+	case <-time.After(3 * time.Second):
+		t.Error("Run remained blocked more than 2 seconds after deadline with an exited root and a live pipe-holding child")
+		// Release the pipe and join Run even on the failing baseline.
+		require.NoError(t, syscall.Kill(pid, syscall.SIGKILL))
+		select {
+		case res := <-done:
+			t.Logf("after test cleanup: exit=%d error=%v stdout=%q stderr=%q", res.ExitCode, res.Error, res.Stdout, res.Stderr)
+		case <-time.After(5 * time.Second):
+			t.Fatal("Run did not return after child cleanup")
+		}
+	}
+}
+
+// The intermediate shell exits before cancellation; its child is no longer
+// discoverable by walking the still-running root's current descendants.
+func TestRun_OrphanedGrandchild_Deadline(t *testing.T) {
+	wd := testfs.MakeTempDir(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan *interfaces.CommandResult, 1)
+	go func() {
+		done <- commandutil.Run(ctx, &repb.Command{Arguments: []string{"sh", "-c", `sh -c 'sleep 30 & echo $! > child.pid'; echo partial; sleep 30`}}, wd, nil, &interfaces.Stdio{})
+	}()
+	var pid int
+	require.Eventually(t, func() bool {
+		b, err := os.ReadFile(filepath.Join(wd, "child.pid"))
+		if err != nil {
+			return false
+		}
+		pid, err = strconv.Atoi(strings.TrimSpace(string(b)))
+		return err == nil && pid > 0
+	}, 5*time.Second, 10*time.Millisecond)
+	defer syscall.Kill(pid, syscall.SIGKILL)
+	select {
+	case res := <-done:
+		assert.True(t, status.IsDeadlineExceededError(res.Error), "%v", res.Error)
+		assert.Equal(t, "partial\n", string(res.Stdout))
+	case <-time.After(3 * time.Second):
+		t.Error("orphaned grandchild survived deadline and kept Run blocked")
+		require.NoError(t, syscall.Kill(pid, syscall.SIGKILL))
+		select {
+		case res := <-done:
+			t.Logf("after test cleanup: exit=%d error=%v", res.ExitCode, res.Error)
+		case <-time.After(5 * time.Second):
+			t.Fatal("Run did not return after orphan cleanup")
+		}
+	}
+}
+
+// Callers opting into bounded drains must receive an explicit truncation error.
+func TestRunWithProcessTreeCleanup_ExplicitWaitDelay(t *testing.T) {
+	wd := testfs.MakeTempDir(t)
+	writer := &exitSynchronizedWriter{dir: wd}
+	cmd := exec.Command("sh", "-c", "printf a; while [ ! -f reader-ready ]; do sleep 0.01; done; printf '%s' "+strings.Repeat("x", 4096)+"; : > root-exiting")
+	cmd.Dir = wd
+	cmd.Stdout = writer
+	cmd.WaitDelay = 100 * time.Millisecond
+	_, err := commandutil.RunWithProcessTreeCleanup(context.Background(), cmd, nil)
+	require.ErrorIs(t, err, exec.ErrWaitDelay)
+	code, err := commandutil.ExitCode(context.Background(), cmd, err)
+	require.Error(t, err)
+	require.NotEqual(t, 0, code, "truncated output must not be reported as success")
 }

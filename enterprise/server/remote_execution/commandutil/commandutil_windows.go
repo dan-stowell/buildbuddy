@@ -50,8 +50,10 @@ const (
 // process to the job object. When the job object is closed, the process
 // tree is killed.
 type process struct {
-	cmd        *exec.Cmd
-	terminated chan struct{}
+	cmd         *exec.Cmd
+	terminated  chan struct{}
+	cleanupDone chan struct{}
+	drainOutput func() error
 
 	jobMu     sync.Mutex
 	jobHandle windows.Handle
@@ -258,7 +260,7 @@ func (p *process) wait() (*espb.Rusage, error) {
 	}); err != nil {
 		_ = p.cleanup()
 		_ = p.killRootProcess()
-		_ = p.cmd.Wait()
+		_ = p.waitCommand()
 		return nil, fmt.Errorf("wait for root process: %w", err)
 	}
 	// Cmd.Wait also waits for stdout/stderr copying. Terminate descendants
@@ -281,7 +283,7 @@ func (p *process) wait() (*espb.Rusage, error) {
 	} else {
 		p.inactive = true
 	}
-	err := p.cmd.Wait()
+	err := p.waitCommand()
 	if cleanupErr != nil {
 		return nil, fmt.Errorf("wait for job processes: %w", cleanupErr)
 	}
