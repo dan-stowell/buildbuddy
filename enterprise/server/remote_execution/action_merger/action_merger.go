@@ -113,35 +113,23 @@ func RecordClaimedExecution(ctx context.Context, rdb redis.UniversalClient, exec
 	if !*enableActionMerging {
 		return nil
 	}
+
+	// Use the execution ID to lookup the action digest and insert the forward
+	// entry (from action digest to execution ID).
 	reverseKey := redisKeyForPendingExecutionDigest(executionID)
-	mapping, err := rdb.Get(ctx, pairKey(executionID)).Result()
-	if err == redis.Nil {
-		mapping, err = rdb.Get(ctx, reverseKey).Result()
-	}
+	forwardKey, err := rdb.Get(ctx, reverseKey).Result()
 	if err == redis.Nil {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	forwardKey, canonical, paired := strings.Cut(mapping, "\n")
-	if paired {
-		// Keep the pair's fencing state alive for as long as either copy runs.
-		pipe := rdb.TxPipeline()
-		pipe.Expire(ctx, copyKey(executionID), 24*time.Hour)
-		pipe.Expire(ctx, copyKey(canonical), 24*time.Hour)
-		pipe.Expire(ctx, pairKey(executionID), 24*time.Hour)
-		pipe.Expire(ctx, pairKey(canonical), 24*time.Hour)
-		if _, err := pipe.Exec(ctx); err != nil {
-			return err
-		}
-		executionID = canonical
-	}
-	_, err = rdb.Eval(ctx, `
- if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
- redis.call('PEXPIRE', KEYS[1], ARGV[3])
- if ARGV[4] == '0' then redis.call('PEXPIRE', KEYS[2], ARGV[3]) end
- return 1`, []string{forwardKey, reverseKey}, executionIDKey, executionID, ttl.Milliseconds(), boolInt(paired)).Result()
+
+	pipe := rdb.TxPipeline()
+	pipe.HSet(ctx, forwardKey, executionIDKey, executionID)
+	pipe.Expire(ctx, forwardKey, ttl)
+	pipe.Set(ctx, reverseKey, forwardKey, ttl)
+	_, err = pipe.Exec(ctx)
 	return err
 }
 
@@ -367,19 +355,6 @@ func GetOrCreateExecutionID(ctx context.Context, rdb redis.UniversalClient, sche
 			return retry.NonRetryableError(err)
 		}
 		if !existsInScheduler {
-			// A canonical copy may fail while a hedge is still making progress.
-			for key := range hash {
-				if !strings.HasPrefix(key, "hedge:") {
-					continue
-				}
-				exists, err := schedulerService.ExistsTask(ctx, strings.TrimPrefix(key, "hedge:"))
-				if err != nil {
-					return retry.NonRetryableError(err)
-				}
-				if exists {
-					return nil
-				}
-			}
 			return fmt.Errorf("pending execution does not exist in the scheduler yet")
 		}
 		return nil
@@ -437,200 +412,11 @@ func DeletePendingExecution(ctx context.Context, rdb redis.UniversalClient, exec
 	if err != nil {
 		return err
 	}
-	forward, _, paired := strings.Cut(pendingExecutionKey, "\n")
-	pendingExecutionKey = forward
-	if *hedgedActionCount == 0 {
-		if err := rdb.Del(ctx, pendingExecutionKey).Err(); err != nil {
-			return err
-		}
-		return rdb.Del(ctx, pendingExecutionDigestKey).Err()
+	if err := rdb.Del(ctx, pendingExecutionKey).Err(); err != nil {
+		log.CtxWarningf(ctx, "could not delete pending execution key %q: %s", pendingExecutionKey, err)
 	}
-	_, err = rdb.Eval(ctx, `
- if redis.call('EXISTS', KEYS[3]) == 1 and redis.call('HEXISTS', KEYS[3], 'winner') == 0 then return 0 end
- if redis.call('HGET', KEYS[1], ARGV[1]) == ARGV[2] then redis.call('DEL', KEYS[1]) end
- if ARGV[3] == '0' then redis.call('DEL', KEYS[2]) end
- return 1`, []string{pendingExecutionKey, pendingExecutionDigestKey, copyKey(executionID)}, executionIDKey, executionID, boolInt(paired)).Result()
-	return err
-}
-
-// Copy state outlives the digest-to-pending mapping so late completions cannot
-// replace a winner, including after a new execution of the same action starts.
-func copyKey(id string) string {
-	s, err := executionIDWithDigestSharding(id)
-	if err != nil {
-		s = id
+	if err := rdb.Del(ctx, pendingExecutionDigestKey).Err(); err != nil {
+		log.CtxWarningf(ctx, "could not delete pending execution digest key %q: %s", pendingExecutionDigestKey, err)
 	}
-	return "executionCopies/1/" + s
-}
-
-// Pair mappings are separate from the v4 reverse mappings consumed by older
-// replicas. Legacy cleanup can remove pending state, but cannot erase a winner's
-// fence. Old replicas still publish without fencing; full fencing requires all
-// completion handlers to be upgraded. Pair state expires after 24 hours.
-func pairKey(id string) string {
-	return "executionPair/1/" + redisKeyForPendingExecutionDigest(id)
-}
-
-// RegisterHedge creates copy state only when a hedge is about to be dispatched.
-// Registration and completion serialize on the canonical copy hash.
-func RegisterHedge(ctx context.Context, rdb redis.UniversalClient, canonical, id string) error {
-	rn, err := digest.ParseUploadResourceName(canonical)
-	if err != nil {
-		return err
-	}
-	forward, err := redisKeyForPendingExecutionID(ctx, rn)
-	if err != nil {
-		return err
-	}
-	_, err = rdb.Eval(ctx, `
- if redis.call('HGET', KEYS[3], 'execution-id') ~= ARGV[1] then return redis.error_reply('execution no longer pending') end
- if tonumber(redis.call('HGET', KEYS[3], 'hedged-execution-count') or '0') >= tonumber(ARGV[3]) then return redis.error_reply('hedge budget exhausted') end
- if redis.call('HEXISTS', KEYS[1], 'winner') == 1 then return redis.error_reply('execution already completed') end
- redis.call('HINCRBY', KEYS[3], 'hedged-execution-count', 1)
- redis.call('HSET', KEYS[3], 'last-execution-submit-time', ARGV[4], 'hedge:' .. ARGV[2], '1')
- redis.call('HSET', KEYS[1], 'canonical', ARGV[1])
- redis.call('HSETNX', KEYS[1], 'copy:' .. ARGV[1], 'pending')
- redis.call('HSETNX', KEYS[1], 'copy:' .. ARGV[2], 'pending')
- redis.call('HSET', KEYS[2], 'canonical', ARGV[1])
- redis.call('EXPIRE', KEYS[1], 86400)
- redis.call('EXPIRE', KEYS[2], 86400)
- redis.call('SET', KEYS[4], KEYS[3] .. '\n' .. ARGV[1], 'EX', 86400)
- redis.call('SET', KEYS[5], KEYS[3] .. '\n' .. ARGV[1], 'EX', 86400)
- return 1`, []string{copyKey(canonical), copyKey(id), forward, pairKey(canonical), pairKey(id)}, canonical, id, *hedgedActionCount, strconv.FormatInt(time.Now().UnixMicro(), 36)).Result()
-	return err
-}
-
-// CompleteCopy atomically elects the first success. Failures are withheld until
-// every registered copy has failed. Replays by the winner are safe to publish.
-// A non-nil copy list means this function owns pending-state cleanup; an empty
-// list means the execution was unpaired and its pending state is already removed.
-func CompleteCopy(ctx context.Context, rdb redis.UniversalClient, id string, success bool, serializedOperation ...[]byte) (string, bool, []string, error) {
-	if *hedgedActionCount == 0 {
-		return id, true, nil, nil
-	}
-	// Failure callers may run on a different replica than hedge registration.
-	// One shared-state lookup is required even when no hedge was dispatched.
-	reverseKey := redisKeyForPendingExecutionDigest(id)
-	var mapping string
-	var err error
-	if success {
-		mapping, err = rdb.Get(ctx, pairKey(id)).Result()
-	} else {
-		// Serialize the unpaired failure with RegisterHedge in one round trip.
-		// Removing pending state prevents a hedge from registering after failure.
-		mapping, err = rdb.Eval(ctx, `
- local pair = redis.call('GET', KEYS[1])
- if pair then return pair end
- local forward = redis.call('GET', KEYS[2])
- if forward and redis.call('HGET', forward, 'execution-id') == ARGV[1] then redis.call('DEL', forward) end
- redis.call('DEL', KEYS[2])
- return false`, []string{pairKey(id), reverseKey}, id).Text()
-	}
-	if err == redis.Nil {
-		if !success {
-			return id, true, []string{}, nil
-		}
-		// Preserve atomic registration-versus-completion ordering on the success path.
-		mapping, err = rdb.Get(ctx, reverseKey).Result()
-		if err == redis.Nil {
-			return id, true, []string{}, nil
-		}
-	}
-	if err != nil {
-		return "", false, nil, err
-	}
-	forward, canonical, paired := strings.Cut(mapping, "\n")
-	if !paired {
-		canonical = id
-	}
-	var operation []byte
-	if len(serializedOperation) > 0 {
-		operation = serializedOperation[0]
-	}
-	result, err := rdb.Eval(ctx, `
- -- Registration may have happened after the mapping lookup. Inspect the
- -- canonical copy hash and remove the unpaired pending mapping atomically.
- if redis.call('EXISTS', KEYS[1]) == 0 then
-   if redis.call('HGET', KEYS[2], 'execution-id') == ARGV[1] then redis.call('DEL', KEYS[2]) end
-   redis.call('DEL', KEYS[3])
-   return {1}
- end
- local winner = redis.call('HGET', KEYS[1], 'winner')
- if winner and (winner ~= ARGV[1] or redis.call('HGET', KEYS[1], 'success') ~= ARGV[2]) then return {0} end
- if not winner then redis.call('HSET', KEYS[1], 'copy:' .. ARGV[1], 'failed') end
- local fields = redis.call('HKEYS', KEYS[1])
- local copies = {}
- local pending = false
- for _, f in ipairs(fields) do
-   if string.sub(f,1,5) == 'copy:' then
-     table.insert(copies, string.sub(f,6))
-     if redis.call('HGET', KEYS[1], f) == 'pending' then pending = true end
-   end
- end
- if not winner and ARGV[2] ~= '1' and pending then return {0} end
- redis.call('HSET', KEYS[1], 'winner', ARGV[1], 'success', ARGV[2])
- if ARGV[3] ~= '' then redis.call('HSETNX', KEYS[1], 'operation', ARGV[3]) end
- redis.call('EXPIRE', KEYS[1], 86400)
- local result = {1}
- for _, id in ipairs(copies) do table.insert(result,id) end
- return result`, []string{copyKey(canonical), forward, reverseKey}, id, boolInt(success), operation).Slice()
-	if err != nil {
-		return "", false, nil, err
-	}
-	copies := make([]string, 0, len(result)-1)
-	for _, v := range result[1:] {
-		copies = append(copies, v.(string))
-	}
-	return canonical, result[0].(int64) == 1, copies, nil
-}
-
-func boolInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
-}
-
-// CopyState is only consulted when the scheduler reports the canonical task
-// lost. Ordinary Execute and WaitExecution perform no copy-state lookups.
-func CopyState(ctx context.Context, rdb redis.UniversalClient, canonical string) ([]byte, bool, error) {
-	if *hedgedActionCount == 0 {
-		return nil, false, nil
-	}
-	fields, err := rdb.HGetAll(ctx, copyKey(canonical)).Result()
-	if err != nil {
-		return nil, false, err
-	}
-	if fields["winner"] != "" {
-		return []byte(fields["operation"]), false, nil
-	}
-	for key, value := range fields {
-		if strings.HasPrefix(key, "copy:") && key != "copy:"+canonical && value == "pending" {
-			return nil, true, nil
-		}
-	}
-	return nil, false, nil
-}
-
-// CopyShouldStop closes the race between registration and scheduling: a winner
-// or cancellation can be recorded while ScheduleTask is in flight.
-func CopyShouldStop(ctx context.Context, rdb redis.UniversalClient, id string) (bool, error) {
-	if *hedgedActionCount == 0 {
-		return false, nil
-	}
-	canonical, err := rdb.HGet(ctx, copyKey(id), "canonical").Result()
-	if err == redis.Nil {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	winner, err := rdb.HGet(ctx, copyKey(canonical), "winner").Result()
-	if err == redis.Nil {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return winner != "" && winner != id, nil
+	return nil
 }
