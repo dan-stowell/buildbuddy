@@ -17,6 +17,7 @@ go_test(
     name = "testleak_test",
     size = "medium",
     srcs = [
+        "gc_test.go",
         "helpers_test.go",
         "testleak_test.go",
     ],
