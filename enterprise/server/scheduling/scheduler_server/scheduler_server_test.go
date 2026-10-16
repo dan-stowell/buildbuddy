@@ -2757,3 +2757,45 @@ func TestWatchTaskLiveness_StopsWhenWatchersAreDone(t *testing.T) {
 	defer s.livenessMu.Unlock()
 	require.Empty(t, s.livenessWatches)
 }
+
+// A partitioned stream can outlive its replacement. Cleanup of the old
+// stream must not unregister the replacement, even on a different replica.
+func TestExecutorRegistration_OldStreamCleanupPreservesReplacement(t *testing.T) {
+	for _, anotherReplica := range []bool{false, true} {
+		t.Run(fmt.Sprintf("another_replica=%t", anotherReplica), func(t *testing.T) {
+			env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+			ctx, cancel := context.WithCancel(ctx)
+			t.Cleanup(cancel)
+			oldScheduler := env.GetSchedulerService().(*SchedulerServer)
+			newScheduler := oldScheduler
+			if anotherReplica {
+				var err error
+				newScheduler, err = NewSchedulerServerWithOptions(env, &Options{LocalPortOverride: 19876})
+				require.NoError(t, err)
+			}
+			node := &scpb.ExecutionNode{ExecutorId: "reused-id", ExecutorHostId: "old-host", Host: "old", OsFamily: defaultOS, Arch: defaultArch}
+			oldHandle := newExecutorHandle(env, oldScheduler, false, &fakeExecutorStream{ctx: ctx, sent: make(chan *scpb.RegisterAndStreamWorkResponse, 10)})
+			require.NoError(t, oldScheduler.AddConnectedExecutor(ctx, oldHandle, node))
+			replacement := proto.Clone(node).(*scpb.ExecutionNode)
+			replacement.Host = "replacement"
+			replacement.ExecutorHostId = "new-host"
+			newHandle := newExecutorHandle(env, newScheduler, false, &fakeExecutorStream{ctx: ctx, sent: make(chan *scpb.RegisterAndStreamWorkResponse, 10)})
+			require.NoError(t, newScheduler.AddConnectedExecutor(ctx, newHandle, replacement))
+			t.Cleanup(func() { newScheduler.RemoveConnectedExecutor(ctx, newHandle, replacement) })
+
+			// Force the ordering: new registration is committed before old cleanup.
+			oldScheduler.RemoveConnectedExecutor(ctx, oldHandle, node)
+			key := newHandle.nodePoolKey(replacement)
+			data, err := newScheduler.rdb.HGet(ctx, key.redisPoolKey(), replacement.GetExecutorId()).Result()
+			require.NoError(t, err, "old stream cleanup deleted the replacement's Redis registration")
+			registered := &scpb.RegisteredExecutionNode{}
+			require.NoError(t, proto.Unmarshal([]byte(data), registered))
+			require.Equal(t, "replacement", registered.GetRegistration().GetHost())
+			pool, ok := newScheduler.getPool(key)
+			require.True(t, ok)
+			connected := pool.FindConnectedExecutorByID(replacement.GetExecutorId())
+			require.NotNil(t, connected, "replacement cannot receive reservations")
+			require.Same(t, newHandle, connected.handle)
+		})
+	}
+}
