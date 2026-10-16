@@ -2017,3 +2017,45 @@ func TestFilecache_ConcurrentDirectoryEvictionAndLocking(t *testing.T) {
 	err = eg.Wait()
 	require.NoError(t, err)
 }
+
+// Bare actions can mutate their inputs. Cache hits must never serve changed
+// bytes under the original digest, including to an already-running action.
+func TestExecutorInputCacheMutationIsolation(t *testing.T) {
+	for _, operation := range []string{"write", "truncate", "chmod", "delete"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx := claims.AuthContextWithJWT(t.Context(), &claims.Claims{GroupID: "GR_INPUT_ISOLATION"}, nil)
+			fc, err := filecache.NewFileCache(testfs.MakeTempDir(t), 1<<20, false)
+			require.NoError(t, err)
+			t.Cleanup(func() { fc.Close() })
+			fc.WaitForDirectoryScanToComplete()
+			dir := testfs.MakeTempDir(t)
+			const original = "original input bytes"
+			source := writeFileContent(t, dir, "source", original, false)
+			node := nodeFromString(original, false)
+			require.NoError(t, fc.AddFile(ctx, node, source))
+			input := filepath.Join(dir, "action-input")
+			peer := filepath.Join(dir, "concurrent-input")
+			require.True(t, fc.FastLinkFile(ctx, node, input))
+			require.True(t, fc.FastLinkFile(ctx, node, peer))
+			switch operation {
+			case "write":
+				require.NoError(t, os.WriteFile(input, []byte("modified input bytes"), 0644))
+			case "truncate":
+				require.NoError(t, os.Truncate(input, 0))
+			case "chmod":
+				require.NoError(t, os.Chmod(input, 0600))
+			case "delete":
+				require.NoError(t, os.Remove(input))
+			}
+			data, err := os.ReadFile(peer)
+			require.NoError(t, err)
+			assert.Equal(t, original, string(data), "concurrent action input changed")
+			later := filepath.Join(dir, "later-input")
+			if fc.FastLinkFile(ctx, node, later) {
+				data, err := os.ReadFile(later)
+				require.NoError(t, err)
+				assert.Equal(t, original, string(data), "cache hit served bytes inconsistent with digest")
+			}
+		})
+	}
+}
