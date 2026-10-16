@@ -3080,19 +3080,35 @@ func testReplayAfterLostAckCountsUsageOnce(t *testing.T, flushAfterCleanup bool)
 	)
 	require.NoError(t, err)
 
-	// Stream 1: publish COMPLETED, wait until the server has demonstrably
-	// processed it (the in-progress execution appears in Redis, written by
-	// updateExecution which runs after markTaskComplete/updateUsage), then
-	// break the stream by cancelling its context. The server's recv loop sees
-	// a cancellation, not io.EOF.
+	ut := env.GetUsageTracker().(*testusage.Tracker)
+	executorUsage := func() *testusage.Total {
+		for _, u := range ut.Totals() {
+			if u.Labels.Client == "executor" {
+				found := u
+				return &found
+			}
+		}
+		return nil
+	}
+
+	// Stream 1: publish COMPLETED, then wait until the server has FULLY
+	// processed it to completion. We can't key off the in-progress execution
+	// row (written at dispatch time, not completion) nor off usage (the
+	// flush-after-cleanup path records usage only on EOF). The cached
+	// ExecuteResponse is written at the very end of the COMPLETED handler in
+	// BOTH paths, so its presence proves stream 1 ran the whole COMPLETED
+	// branch -- including markTaskComplete/updateUsage in the legacy path.
+	// Only then do we break the stream by cancelling its context, mimicking a
+	// connection drop AFTER the server finished processing but BEFORE the
+	// client receives the CloseAndRecv ACK.
 	stream1Ctx, cancelStream1 := context.WithCancel(executorCtx)
 	stream1, err := client.PublishOperation(stream1Ctx)
 	require.NoError(t, err)
 	require.NoError(t, stream1.Send(completedOp))
 	require.Eventually(t, func() bool {
-		execProto, err := env.GetExecutionCollector().GetInProgressExecution(ctx, taskID)
-		return err == nil && execProto != nil
-	}, 5*time.Second, 10*time.Millisecond, "stream 1's COMPLETED should be processed by the server")
+		resp, err := execution.GetCachedExecuteResponse(ctx, env.GetActionCacheClient(), taskID)
+		return err == nil && resp != nil
+	}, 5*time.Second, 5*time.Millisecond, "stream 1's COMPLETED should be fully processed by the server")
 	cancelStream1()
 	_, _ = stream1.CloseAndRecv()
 
@@ -3113,15 +3129,7 @@ func testReplayAfterLostAckCountsUsageOnce(t *testing.T, flushAfterCleanup bool)
 		require.NoError(t, err)
 	}
 
-	ut := env.GetUsageTracker().(*testusage.Tracker)
-	var foundExecutorUsage *testusage.Total
-	for _, u := range ut.Totals() {
-		if u.Labels.Client == "executor" {
-			found := u
-			foundExecutorUsage = &found
-			break
-		}
-	}
+	foundExecutorUsage := executorUsage()
 	require.NotNil(t, foundExecutorUsage, "expected executor usage to be recorded")
 	assert.Equal(t, durationUsec, foundExecutorUsage.Counts.LinuxExecutionDurationUsec,
 		"execution duration should be billed exactly once across the retried/replayed stream")
