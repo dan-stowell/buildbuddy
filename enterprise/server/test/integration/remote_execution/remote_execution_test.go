@@ -1565,6 +1565,37 @@ func TestWaitExecution_UnknownOperation(t *testing.T) {
 	require.Equal(t, int32(5), response.GetStatus().GetCode(), "unknown operation must report NotFound")
 }
 
+// Cache-hit Execute responses also return completed operation names. Clients
+// must be able to reconnect to those names just as for executed actions.
+func TestWaitExecution_CacheHitOperation(t *testing.T) {
+	rbe := rbetest.NewRBETestEnv(t)
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutor(t)
+	cmd := rbe.Execute(&repb.Command{
+		Arguments: []string{"echo", "cached output"},
+		Platform:  &repb.Platform{Properties: []*repb.Platform_Property{{Name: "OSFamily", Value: runtime.GOOS}, {Name: "Arch", Value: runtime.GOARCH}}},
+	}, &rbetest.ExecuteOpts{})
+	cmd.Wait()
+	arn := cmd.GetActionResourceName()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client := rbe.GetRemoteExecutionClient()
+	hit, err := client.Execute(ctx, &repb.ExecuteRequest{InstanceName: arn.GetInstanceName(), ActionDigest: arn.GetDigest(), DigestFunction: arn.GetDigestFunction()})
+	require.NoError(t, err)
+	completed, err := hit.Recv()
+	require.NoError(t, err)
+	require.True(t, completed.GetDone())
+	response := &repb.ExecuteResponse{}
+	require.NoError(t, completed.GetResponse().UnmarshalTo(response))
+	require.True(t, response.GetCachedResult())
+	replay, err := client.WaitExecution(ctx, &repb.WaitExecutionRequest{Name: completed.GetName()})
+	require.NoError(t, err)
+	replayed, err := replay.Recv()
+	require.NoError(t, err, "completed cache-hit operation must be replayable promptly")
+	require.True(t, replayed.GetDone())
+	assert.Empty(t, cmp.Diff(completed.GetResponse(), replayed.GetResponse(), protocmp.Transform()))
+}
+
 // Test WaitExecution across different severs.
 func TestWaitExecution(t *testing.T) {
 	rbe := rbetest.NewRBETestEnv(t)
