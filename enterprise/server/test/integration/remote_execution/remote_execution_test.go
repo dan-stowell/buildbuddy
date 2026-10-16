@@ -2860,6 +2860,7 @@ func (p *lossyRedisProxy) take(b []byte) bool {
 	defer p.mu.Unlock()
 	if p.match != nil && p.match(b) {
 		p.match = nil
+		log.Infof("lossyRedisProxy: dropping the reply to %q", b)
 		return true
 	}
 	return false
@@ -2962,6 +2963,7 @@ func TestLostRedisReplyDuringClaim_CommandStillCompletes(t *testing.T) {
 			if result.Stage != repb.ExecutionStage_COMPLETED {
 				continue
 			}
+			require.EqualValues(t, 1, proxy.dropped.Load(), "expected the claim reply to be dropped")
 			require.NoError(t, result.Err)
 			require.Equal(t, 0, result.ExitCode)
 			return
