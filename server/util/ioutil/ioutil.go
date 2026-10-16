@@ -206,12 +206,23 @@ func ReadAllLimited(r io.Reader, limit int64) ([]byte, error) {
 // from the reader until it runs out of data. If the underlying reader does
 // not have enough data left to fill the buffer, the returned buffer will only
 // be partially filled.
+//
+// Errors from the underlying reader, including io.ErrUnexpectedEOF (which
+// readers such as HTTP response bodies use to report truncation), are
+// returned as-is. Only a clean io.EOF after a partial fill is suppressed.
 func ReadTryFillBuffer(r io.Reader, buf []byte) (int, error) {
-	n, err := io.ReadFull(r, buf)
-	if err == io.ErrUnexpectedEOF {
-		return n, nil
+	n := 0
+	for n < len(buf) {
+		m, err := r.Read(buf[n:])
+		n += m
+		if err == io.EOF && n > 0 {
+			return n, nil
+		}
+		if err != nil {
+			return n, err
+		}
 	}
-	return n, err
+	return n, nil
 }
 
 type byteRepeater byte
