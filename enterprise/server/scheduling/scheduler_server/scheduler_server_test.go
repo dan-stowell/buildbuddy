@@ -2758,3 +2758,44 @@ func TestWatchTaskLiveness_StopsWhenWatchersAreDone(t *testing.T) {
 	defer s.livenessMu.Unlock()
 	require.Empty(t, s.livenessWatches)
 }
+
+func TestRegistrationCancellationGrowth(t *testing.T) {
+	flags.Set(t, "grpc_server_worker_multiplier", 0)
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+	s := env.GetSchedulerService().(*SchedulerServer)
+	rdb := s.rdb.(*redis.Client)
+	var conns []*redis.Conn
+	for range 4 {
+		c := rdb.Conn(ctx)
+		require.NoError(t, c.Ping(ctx).Err())
+		conns = append(conns, c)
+	}
+	for _, c := range conns {
+		require.NoError(t, c.Close())
+	}
+	key := nodePoolKey{os: defaultOS, arch: defaultArch}
+	testleak.CheckGrowth(t, testleak.Growth{Iterations: 20}, func(i int) {
+		streamCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		stream, err := env.GetSchedulerClient().RegisterAndStreamWork(streamCtx)
+		require.NoError(t, err)
+		id := fmt.Sprintf("churn-%d", i)
+		require.NoError(t, stream.Send(&scpb.RegisterAndStreamWorkRequest{RegisterExecutorRequest: &scpb.RegisterExecutorRequest{Node: &scpb.ExecutionNode{ExecutorId: id, Host: "churn", OsFamily: defaultOS, Arch: defaultArch}}}))
+		require.NoError(t, stream.Send(&scpb.RegisterAndStreamWorkRequest{AskForMoreWorkRequest: &scpb.AskForMoreWorkRequest{}}))
+		rsp, err := stream.Recv()
+		require.NoError(t, err)
+		require.NotNil(t, rsp.GetAskForMoreWorkResponse())
+		pool, ok := s.getPool(key)
+		require.True(t, ok)
+		node := pool.FindConnectedExecutorByID(id)
+		require.NotNil(t, node)
+		cancel()
+		_, err = stream.Recv()
+		require.Error(t, err)
+		require.Eventually(t, func() bool { return node.handle.getRegistration() == nil }, 5*time.Second, time.Millisecond)
+		require.Eventually(t, func() bool {
+			count, err := s.rdb.HLen(ctx, key.redisPoolKey()).Result()
+			return err == nil && count == 0
+		}, 5*time.Second, time.Millisecond)
+	})
+}
