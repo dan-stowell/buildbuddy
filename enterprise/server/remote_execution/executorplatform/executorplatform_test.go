@@ -11,6 +11,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/util/expflag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
+	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
@@ -576,4 +577,20 @@ func (x *xcodeLocator) PathsForVersionAndSDK(xcodeVersion string, sdk string) (s
 
 func (x *xcodeLocator) Versions() []string {
 	return []string{}
+}
+
+func TestPlatformRoutingRejectMalformedImage(t *testing.T) {
+	for _, image := range []string{"docker://", "docker://bad image", "docker://alpine:bad:tag"} {
+		t.Run(image, func(t *testing.T) {
+			props, err := platform.ParseProperties(&repb.ExecutionTask{Action: &repb.Action{Platform: &repb.Platform{
+				Properties: []*repb.Platform_Property{
+					{Name: "workload-isolation-type", Value: "docker"},
+					{Name: "container-image", Value: image},
+				},
+			}}})
+			require.NoError(t, err)
+			err = ApplyOverrides(t.Context(), testenv.GetTestEnv(t), docker, props, &repb.Command{})
+			assert.True(t, status.IsInvalidArgumentError(err), "expected InvalidArgument for %q; got %v (image %q)", image, err, props.ContainerImage)
+		})
+	}
 }
