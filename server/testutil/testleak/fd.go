@@ -73,7 +73,8 @@ func AllowGC() FDOption {
 // happens on the first socket, pipe, or even regular file opened with the os
 // package, so in practice it has usually happened before a test starts, but
 // not always. CheckFDs makes sure the poller is initialized before taking its
-// snapshot, so these are never reported.
+// snapshot, so these are never reported. Neither are the lock files that
+// testport.FindFree holds open for the life of the process.
 //
 // *os.File, network connections and *os.Process (a pidfd) close their file
 // descriptor in a finalizer or cleanup when they are garbage collected. A
@@ -194,10 +195,18 @@ func readFDs() (map[int]string, error) {
 	return fds, nil
 }
 
+// processLifetimeFDs matches descriptors that are deliberately held open
+// until the test process exits, and so are never reported: the lock files
+// with which testport.FindFree reserves ports across test processes.
+var processLifetimeFDs = regexp.MustCompile(`/testport\.[0-9]+\.lock$`)
+
 func newFDs(before, after map[int]string) []fdEntry {
 	var out []fdEntry
 	for fd, target := range after {
 		if prev, ok := before[fd]; ok && prev == target {
+			continue
+		}
+		if processLifetimeFDs.MatchString(target) {
 			continue
 		}
 		out = append(out, fdEntry{fd: fd, target: target, desc: target})
