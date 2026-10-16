@@ -31,6 +31,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/oci"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
@@ -3545,12 +3546,18 @@ func TestRunWriteToHardlinkedInput(t *testing.T) {
 			provider, err := ociruntime.NewProvider(env, buildRoot, cacheRoot)
 			require.NoError(t, err)
 
-			// Simulated filecache entry, hardlinked into the workspace.
+			// Materialize an actual file-cache input. A raw os.Link bypasses
+			// the cache's isolation contract and cannot protect writable files.
 			fcEntryDir := testfs.MakeTempDir(t)
 			fcEntry := filepath.Join(fcEntryDir, "entry")
 			require.NoError(t, os.WriteFile(fcEntry, []byte("hello\n"), 0o644))
 			wd := testfs.MakeDirAll(t, buildRoot, "work")
-			require.NoError(t, os.Link(fcEntry, filepath.Join(wd, "input.txt")))
+			d, err := digest.Compute(strings.NewReader("hello\n"), repb.DigestFunction_SHA256)
+			require.NoError(t, err)
+			node := &repb.FileNode{Digest: d}
+			fc := env.GetFileCache()
+			require.NoError(t, fc.AddFile(ctx, node, fcEntry))
+			require.True(t, fc.FastLinkFile(ctx, node, filepath.Join(wd, "input.txt")))
 
 			c, err := provider.New(ctx, &container.Init{Props: &platform.Properties{
 				ContainerImage: image,
@@ -3569,6 +3576,9 @@ func TestRunWriteToHardlinkedInput(t *testing.T) {
 			b, err := os.ReadFile(fcEntry)
 			require.NoError(t, err)
 			require.Equal(t, "hello\n", string(b), "filecache entry linked into the workspace was modified by the container")
+			cached, err := fc.Read(ctx, node)
+			require.NoError(t, err)
+			require.Equal(t, "hello\n", string(cached))
 		})
 	}
 }
