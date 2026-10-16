@@ -91,6 +91,10 @@ type testHitTracker struct {
 	// order, without recording any hits.
 	errMu        sync.Mutex
 	injectedErrs []error
+
+	// If set, called after a Track RPC has recorded its hits and before it
+	// returns.
+	afterRecord atomic.Pointer[func()]
 }
 
 func (ht *testHitTracker) failNextTracks(errs ...error) {
@@ -157,6 +161,9 @@ func (ht *testHitTracker) Track(ctx context.Context, req *hitpb.TrackRequest) (*
 				ht.casBytesUploaded[key].Add(hit.GetSizeBytes())
 			}
 		}
+	}
+	if f := ht.afterRecord.Load(); f != nil {
+		(*f)()
 	}
 	return &hitpb.TrackResponse{}, nil
 }
@@ -783,5 +790,91 @@ func TestTrackNotRetriedWhenAppMayHaveRecordedHits(t *testing.T) {
 			}, 10*time.Second, 10*time.Millisecond)
 			require.Equal(t, int64(1), h.service.casDownloads[anonKey].Load())
 		})
+	}
+}
+
+// If the connection to the app breaks after the app has recorded a batch but
+// before the response reaches the proxy, the proxy sees Unavailable. Resending
+// that batch counts its hits twice.
+func TestVerifyUnavailableAfterAppRecordedBatchIsNotCountedTwice(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.trackDownloads(ctx, 10)
+	require.Eventually(t, pendingHitsExpectation(h.factory, anonKey, 10), 10*time.Second, 10*time.Millisecond)
+
+	recorded := make(chan struct{})
+	release := make(chan struct{})
+	var recordedOnce, releaseOnce sync.Once
+	releaseFn := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseFn)
+	hook := func() {
+		recordedOnce.Do(func() {
+			close(recorded)
+			<-release
+		})
+	}
+	h.service.afterRecord.Store(&hook)
+
+	h.tick(t)
+	select {
+	case <-recorded:
+	case <-time.After(10 * time.Second):
+		require.FailNow(t, "Track never reached the app")
+	}
+	require.Equal(t, int64(10), h.service.casDownloads[anonKey].Load())
+	// The app goes away while its handler is still running.
+	h.srv.Stop()
+	err := h.nextTrackResult(t)
+	releaseFn()
+	t.Logf("Track error seen by the proxy: %v", err)
+	require.True(t, status.IsUnavailableError(err), "expected Unavailable, got %v", err)
+
+	h.startServer(t)
+	readyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	h.conn.Connect()
+	for state := h.conn.GetState(); state != connectivity.Ready; state = h.conn.GetState() {
+		require.True(t, h.conn.WaitForStateChange(readyCtx, state), "connection never became ready")
+	}
+
+	// A hit for another collection, batched after the failed one, so that
+	// once it has been reported any resend has happened too.
+	h.trackDownloads(authenticatedContext(user1, h.authenticator), 1)
+	require.Eventually(t, pendingHitsExpectation(h.factory, group1Key, 1), 10*time.Second, 10*time.Millisecond)
+	h.tick(t)
+	require.Eventually(t, h.service.casDownloadExpectation(group1Key, 1), 10*time.Second, 10*time.Millisecond)
+	require.Equal(t, int64(10), h.service.casDownloads[anonKey].Load(), "hits recorded by the app")
+}
+
+// Shutdown should finish within max_shutdown_duration even when the app
+// never answers a Track RPC.
+func TestVerifyShutdownReturnsWhenTrackHangs(t *testing.T) {
+	flags.Set(t, "max_shutdown_duration", 2*time.Second)
+	h := newHarness(t)
+	ctx := context.Background()
+	h.trackDownloads(ctx, 10)
+	require.Eventually(t, pendingHitsExpectation(h.factory, anonKey, 10), 10*time.Second, 10*time.Millisecond)
+	resume := h.service.pause(t)
+	h.tick(t)
+	// Wait for the sender to take the batch, i.e. to be inside Track.
+	require.Eventually(t, func() bool {
+		h.factory.mu.Lock()
+		defer h.factory.mu.Unlock()
+		return len(h.factory.hitsQueue) == 0
+	}, 10*time.Second, 10*time.Millisecond)
+
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		h.shutdown()
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Logf("shutdown returned after %s", time.Since(start))
+	case <-time.After(10 * time.Second):
+		resume()
+		<-done
+		require.FailNow(t, "shutdown still blocked 10s after it started (max_shutdown_duration 2s) while a Track RPC hung")
 	}
 }
