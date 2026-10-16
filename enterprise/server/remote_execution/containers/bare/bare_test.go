@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -230,4 +231,28 @@ func TestBareExec_WorkingDirectory(t *testing.T) {
 	require.NoError(t, result.Error)
 	assert.Equal(t, 0, result.ExitCode)
 	assert.Equal(t, "hello", string(result.Stdout))
+}
+
+// A recycled bare runner must not apply a previous task's late signal to a
+// subsequent task. This also checks the signal-lifecycle overlap with the
+// independently developed leak/regress-cmd change.
+func TestV4ReviewLateSignalOnRecycledRunner(t *testing.T) {
+	c := bare.NewBareCommandContainer(&bare.Opts{})
+	require.NoError(t, c.Create(context.Background(), t.TempDir()))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	first := c.Exec(ctx, &repb.Command{Arguments: []string{"true"}}, nil)
+	require.NoError(t, first.Error)
+	cancel()
+	// Let the previous forwarder observe termination before enqueueing the late
+	// signal. This does not affect the deadline/output reproduction tests.
+	time.Sleep(100 * time.Millisecond)
+	require.NoError(t, c.Signal(context.Background(), syscall.SIGTERM))
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	second := c.Exec(ctx2, &repb.Command{Arguments: []string{"sh", "-c", "sleep 0.2; echo next"}}, nil)
+	t.Logf("next task: exit=%d error=%v stdout=%q", second.ExitCode, second.Error, second.Stdout)
+	require.NoError(t, second.Error)
+	require.Equal(t, 0, second.ExitCode)
+	require.Equal(t, "next\n", string(second.Stdout))
 }
