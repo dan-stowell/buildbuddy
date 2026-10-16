@@ -52,7 +52,9 @@ func Register(env *real_environment.RealEnv) error {
 	if err != nil {
 		return err
 	}
-	env.SetHitTrackerFactory(newHitTrackerClient(env.GetServerContext(), env, conn))
+	h := newHitTrackerClient(env.GetServerContext(), env, conn)
+	h.closeConn = conn.Close
+	env.SetHitTrackerFactory(h)
 	return nil
 }
 
@@ -96,8 +98,9 @@ func newHitTrackerClient(ctx context.Context, env *real_environment.RealEnv, con
 	factory.wg.Go(factory.batcher)
 	for i := 0; i < *remoteHitTrackerWorkers; i++ {
 		factory.wg.Go(func() {
-			ticker := env.GetClock().NewTicker(*remoteHitTrackerPollInterval).Chan()
-			factory.sender(sendCtx, ticker)
+			ticker := env.GetClock().NewTicker(*remoteHitTrackerPollInterval)
+			defer ticker.Stop()
+			factory.sender(sendCtx, ticker.Chan())
 		})
 	}
 	env.GetHealthChecker().RegisterShutdownFunction(factory.shutdown)
@@ -135,6 +138,8 @@ type HitTrackerFactory struct {
 	quit        chan struct{}
 	wg          sync.WaitGroup // The batcher and the senders.
 	cancelSends context.CancelFunc
+	// Set only by Register, which owns the dialed pool. Injected connections remain caller-owned.
+	closeConn func() error
 
 	enqueueChan chan *enqueuedCacheHit
 
@@ -375,11 +380,13 @@ func (h *HitTrackerFactory) sender(ctx context.Context, ticker <-chan time.Time)
 		select {
 		case <-h.quit:
 			return
+		case <-ctx.Done():
+			return
 		case <-ticker:
 		}
 		h.requeueFailed()
 		// Keep flushing until there is nothing to flush.
-		for h.sendTrackRequest(ctx) > 0 {
+		for ctx.Err() == nil && h.sendTrackRequest(ctx) > 0 {
 		}
 	}
 }
@@ -414,6 +421,9 @@ func (h *HitTrackerFactory) sendTrackRequest(ctx context.Context) int {
 }
 
 func (h *HitTrackerFactory) sendBatch(ctx context.Context, retryLater bool) int {
+	if ctx.Err() != nil {
+		return 0
+	}
 	h.mu.Lock()
 	if len(h.hitsQueue) == 0 {
 		h.mu.Unlock()
@@ -550,10 +560,14 @@ func (h *HitTrackerFactory) requeue(failed *cacheHits, groupID string) {
 }
 
 func (h *HitTrackerFactory) shutdown(ctx context.Context) error {
+	if h.closeConn != nil {
+		defer h.closeConn()
+	}
 	// Senders don't use ctx, so cancel their Track RPCs if ctx expires
 	// before they return.
 	stop := context.AfterFunc(ctx, h.cancelSends)
 	defer stop()
+	defer h.cancelSends()
 	close(h.quit)
 	h.wg.Wait()
 
