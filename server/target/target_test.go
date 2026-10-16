@@ -8,10 +8,12 @@ import (
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/proto/api/v1/common"
+	"github.com/buildbuddy-io/buildbuddy/server/tables"
 	"github.com/buildbuddy-io/buildbuddy/server/target"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testclickhouse"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/util/perms"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
@@ -357,4 +359,35 @@ func TestPaginationTargetHistoryTies(t *testing.T) {
 			require.ElementsMatch(t, want, got, "every target/commit exactly once")
 		})
 	}
+}
+
+func TestPaginationPrimaryHistoryRepeatedCommit(t *testing.T) {
+	flags.Set(t, "app.enable_read_target_statuses_from_olap_db", false)
+	env := testenv.GetTestEnv(t)
+	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1"))
+	env.SetAuthenticator(ta)
+	ctx, err := ta.WithAuthenticatedUser(context.Background(), "US1")
+	require.NoError(t, err)
+	const repo = "https://github.com/example/repo"
+	require.NoError(t, env.GetDBHandle().NewQuery(ctx, "pagination_target").Create(&tables.Target{TargetID: 1, GroupID: "GR1", RepoURL: repo, Label: "//:test", Perms: perms.GROUP_READ}))
+	for i := range 2 {
+		uuid := make([]byte, 16)
+		uuid[15] = byte(i + 1)
+		iid := fmt.Sprintf("00000000-0000-0000-0000-%012d", i+1)
+		require.NoError(t, env.GetDBHandle().NewQuery(ctx, "pagination_invocation").Create(&tables.Invocation{InvocationID: iid, InvocationUUID: uuid, GroupID: "GR1", RepoURL: repo, CommitSHA: "same_commit", Role: "CI", Command: "test", Perms: perms.GROUP_READ}))
+		require.NoError(t, env.GetDBHandle().GORM(ctx, "pagination_timestamp").Exec("UPDATE Invocations SET created_at_usec = ? WHERE invocation_id = ?", int64(1000000+i), iid).Error)
+		require.NoError(t, env.GetDBHandle().NewQuery(ctx, "pagination_status").Create(&tables.TargetStatus{TargetID: 1, InvocationUUID: uuid, Status: int32(bespb.TestStatus_PASSED)}))
+	}
+	req := &trpb.GetTargetHistoryRequest{RequestContext: &ctxpb.RequestContext{GroupId: "GR1"}, ServerSidePagination: true, Query: &trpb.TargetQuery{RepoUrl: repo}}
+	first, err := target.GetTargetHistory(ctx, env, req)
+	require.NoError(t, err)
+	require.Len(t, first.InvocationTargets, 1)
+	require.Len(t, first.InvocationTargets[0].TargetStatus, 2)
+	if first.NextPageToken == "" {
+		return
+	}
+	req.PageToken = first.NextPageToken
+	second, err := target.GetTargetHistory(ctx, env, req)
+	require.NoError(t, err)
+	require.Empty(t, second.InvocationTargets, "both invocations of the only commit were already returned: %v", second)
 }

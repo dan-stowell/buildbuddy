@@ -34,6 +34,8 @@ go_test(
     name = "target_test",
     srcs = ["target_test.go"],
     deps = [
+        "//server/tables",
+        "//server/util/perms",
         ":target",
         "//proto:build_event_stream_go_proto",
         "//proto:context_go_proto",
