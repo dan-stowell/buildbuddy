@@ -88,7 +88,7 @@ func TestStopThenRecord_MergeIsRefused(t *testing.T) {
 	for name, mk := range clients(t) {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t, mk())
-			for i := 0; i < 10; i++ {
+			for range 10 {
 				ad := randomAction("")
 				p := h.newScheduled(ad)
 				h.mustMerge(ad, p) // looked up, not yet recorded
@@ -118,7 +118,7 @@ func TestRecordThenStop_CancelIsSkipped(t *testing.T) {
 	for name, mk := range clients(t) {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t, mk())
-			for i := 0; i < 10; i++ {
+			for range 10 {
 				ad := randomAction("")
 				p := h.newScheduled(ad)
 				h.mustMerge(ad, p)
@@ -140,7 +140,7 @@ func TestRecordThenStop_CancelIsSkipped(t *testing.T) {
 func TestMarkerOnSameShardAsForwardKey(t *testing.T) {
 	ring := testredis.StartSharded(t, 4)
 	h := newHarness(t, ring.Client())
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		ad := randomAction("")
 		p := h.newScheduled(ad)
 		fwd, err := redisKeyForPendingExecutionID(h.ctx, ad)
@@ -174,7 +174,7 @@ func TestMarkerOnSameShardAsForwardKey(t *testing.T) {
 func TestInstanceNameWithBraces(t *testing.T) {
 	ring := testredis.StartSharded(t, 4)
 	h := newHarness(t, ring.Client())
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		ad := randomAction(fmt.Sprintf("inst{%d}", i))
 		p := h.newScheduled(ad)
 		h.mustMerge(ad, p)
