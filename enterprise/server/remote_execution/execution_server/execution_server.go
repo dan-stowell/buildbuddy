@@ -2240,6 +2240,7 @@ func (s *ExecutionServer) Cancel(ctx context.Context, invocationID string) error
 	}
 	log.CtxInfof(ctx, "Cancelling invocation %q with %v in-progress executions", invocationID, len(ids))
 	numCancelled := 0
+	seen := make(map[string]bool)
 	for _, id := range ids {
 		ctx := log.EnrichContext(ctx, log.ExecutionIDKey, id)
 
@@ -2247,9 +2248,10 @@ func (s *ExecutionServer) Cancel(ctx context.Context, invocationID string) error
 		if err != nil {
 			return err
 		}
-		if len(copies) == 0 {
+		if len(copies) == 0 || seen[canonical] {
 			continue
 		}
+		seen[canonical] = true
 		for _, copyID := range copies {
 			cancelled, err := s.env.GetSchedulerService().CancelTask(ctx, copyID)
 			if err != nil {

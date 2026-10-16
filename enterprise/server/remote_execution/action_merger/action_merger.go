@@ -545,7 +545,8 @@ func RemoveInvocation(ctx context.Context, rdb redis.UniversalClient, id, invoca
    if string.sub(f,1,11) == 'invocation:' then return {} end
    if string.sub(f,1,5) == 'copy:' then table.insert(copies,string.sub(f,6)) end
  end
- if redis.call('HEXISTS', KEYS[1], 'winner') == 1 then return {} end
+ local winner = redis.call('HGET', KEYS[1], 'winner')
+ if winner and winner ~= 'cancelled' then return {} end
  redis.call('HSET', KEYS[1], 'winner', 'cancelled')
  redis.call('EXPIRE', KEYS[1], 86400)
  return copies`, []string{copyKey(canonical)}, invocation, canonical).StringSlice()
