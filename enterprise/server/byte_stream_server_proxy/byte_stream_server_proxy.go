@@ -154,7 +154,14 @@ func (s *ByteStreamServerProxy) Read(req *bspb.ReadRequest, stream bspb.ByteStre
 	stream = meteredStream
 	readMetrics, err := s.read(ctx, req, meteredStream)
 	if status.IsNotFoundError(err) && !proxy_util.SkipRemote(ctx) {
-		s.invalidatePresence(ctx, req.GetResourceName())
+		// Resolve lazily since ByteStream is registered before CAS.
+		if invalidator, ok := s.env.GetCASServer().(interface {
+			InvalidatePresence(context.Context, *digest.CASResourceName)
+		}); ok {
+			if rn, parseErr := digest.ParseDownloadResourceName(req.GetResourceName()); parseErr == nil {
+				invalidator.InvalidatePresence(ctx, rn)
+			}
+		}
 	}
 	bsm := byteStreamMetrics{
 		requestType:  requestTypeLabel,
@@ -172,17 +179,6 @@ func (s *ByteStreamServerProxy) Read(req *bspb.ReadRequest, stream bspb.ByteStre
 	}
 	recordReadMetrics(bsm, readMetrics.cacheStatus)
 	return err
-}
-
-func (s *ByteStreamServerProxy) invalidatePresence(ctx context.Context, resourceName string) {
-	// Resolve lazily since ByteStream is registered before CAS.
-	if invalidator, ok := s.env.GetCASServer().(interface {
-		InvalidatePresence(context.Context, *digest.CASResourceName)
-	}); ok {
-		if rn, err := digest.ParseDownloadResourceName(resourceName); err == nil {
-			invalidator.InvalidatePresence(ctx, rn)
-		}
-	}
 }
 
 type readMetrics struct {
@@ -709,12 +705,7 @@ func chunkReadRetryOptions() *retry.Options {
 	return opts
 }
 
-func (s *ByteStreamServerProxy) readRemoteOnly(ctx context.Context, req *bspb.ReadRequest, stream bspb.ByteStream_ReadServer) (err error) {
-	defer func() {
-		if status.IsNotFoundError(err) {
-			s.invalidatePresence(ctx, req.GetResourceName())
-		}
-	}()
+func (s *ByteStreamServerProxy) readRemoteOnly(ctx context.Context, req *bspb.ReadRequest, stream bspb.ByteStream_ReadServer) error {
 	remoteReadStream, err := s.remote.Read(ctx, req)
 	if err != nil {
 		log.CtxInfof(ctx, "error reading from remote: %s", err)
