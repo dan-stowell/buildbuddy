@@ -477,12 +477,6 @@ func (s *Executor) ExecuteTaskAndStreamResults(ctx context.Context, st *repb.Sch
 	if cmdResult.ExitCode != 0 {
 		log.CtxDebugf(ctx, "%q finished with non-zero exit code (%d). Err: %s, Stdout: %s, Stderr: %s", taskID, cmdResult.ExitCode, cmdResult.Error, cmdResult.Stdout, cmdResult.Stderr)
 	}
-	// A runner may return a successful exit status after waiting for inherited
-	// output pipes. Enforce the execution deadline even for exit code zero.
-	if cmdResult.Error == nil && !time.Now().Before(forceShutdownAt) {
-		cmdResult.ExitCode = commandutil.NoExitCode
-		cmdResult.Error = status.DeadlineExceededError("deadline exceeded")
-	}
 	// Exit codes < 0 mean that the command either never started or was killed.
 	// Make sure we return an error in this case.
 	if cmdResult.ExitCode < 0 {
