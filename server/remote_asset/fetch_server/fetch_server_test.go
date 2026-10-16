@@ -1982,7 +1982,11 @@ func TestFetchBlob_ErrorLifecycle(t *testing.T) {
 						require.NoError(t, err)
 						require.Equal(t, int32(gcodes.NotFound), resp.GetStatus().GetCode())
 						if strings.HasPrefix(mode, "timeout") {
-							<-started
+							select {
+							case <-started:
+							case <-ctx.Done():
+								t.Fatal("timed out before origin started")
+							}
 						}
 					}
 					entries, err := os.ReadDir(filepath.Join(scratchRoot, "buildbuddy-scratch"))
