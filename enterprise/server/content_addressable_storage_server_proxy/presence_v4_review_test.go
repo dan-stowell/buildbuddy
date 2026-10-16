@@ -66,3 +66,42 @@ func TestReviewPresence_OverlapSurvivesTombstonePressure(t *testing.T) {
 	require.Equal(t, 2, remote.calls)
 	t.Log("deterministic schedule; no random seed; 200,000 distinct invalidations")
 }
+
+// Zero disables the suppression window, but must retain overlap protection.
+func TestReviewPresence_ZeroTombstoneTTL(t *testing.T) {
+	for _, overlap := range []bool{false, true} {
+		t.Run(fmt.Sprintf("overlap=%t", overlap), func(t *testing.T) {
+			flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+			flags.Set(t, "cache_proxy.find_missing_blobs_tombstone_ttl", time.Duration(0))
+			ctx := testauth.WithAuthenticatedUserInfo(testContext(), testauth.TestUsers("US1", "GR1")["US1"])
+			env := testenv.GetTestEnv(t)
+			env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+			env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+			remote := &reviewPresenceClient{beforeResponse: func() {}}
+			env.SetContentAddressableStorageClient(remote)
+			proxy, err := New(env)
+			require.NoError(t, err)
+			d := digestProto(fooDigest, 3)
+			invalidate := func() {
+				_, err := proxy.batchReadBlobsRemote(ctx, readBlobsRequest([]*repb.Digest{d}))
+				require.Equal(t, codes.NotFound, status.Code(err))
+			}
+			if overlap {
+				remote.beforeResponse = invalidate
+			} else {
+				invalidate()
+			}
+			_, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+			require.NoError(t, err)
+			rsp, err := proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+			require.NoError(t, err)
+			if overlap {
+				require.Equal(t, []*repb.Digest{d}, rsp.GetMissingBlobDigests())
+				require.Equal(t, 2, remote.calls)
+			} else {
+				require.Empty(t, rsp.GetMissingBlobDigests(), "TTL zero explicitly permits a later stale positive to be cached")
+				require.Equal(t, 1, remote.calls)
+			}
+		})
+	}
+}
