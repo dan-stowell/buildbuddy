@@ -1412,3 +1412,182 @@ func TestReadChunked_UsesParallelReads(t *testing.T) {
 		})
 	}
 }
+
+// TestCompressionIntegrityMatrix uses a fixed seed so boundary failures reproduce.
+func TestCompressionIntegrityMatrix(t *testing.T) {
+	const seed = 646
+	t.Logf("seed=%d", seed)
+	flags.Set(t, "cache.zstd_transcoding_enabled", true)
+	for _, size := range []int{0, 1, 65535, 65536, 65537, 4*1024*1024 + 1} {
+		for _, compressedCache := range []bool{false, true} {
+			t.Run(fmt.Sprintf("size=%d/cache_zstd=%t", size, compressedCache), func(t *testing.T) {
+				ctx := context.Background()
+				blob := make([]byte, size)
+				_, err := rand.New(rand.NewSource(seed + int64(size))).Read(blob)
+				require.NoError(t, err)
+				d, err := digest.Compute(bytes.NewReader(blob), repb.DigestFunction_SHA256)
+				require.NoError(t, err)
+				for _, compressor := range []repb.Compressor_Value{repb.Compressor_IDENTITY, repb.Compressor_ZSTD} {
+					t.Run(compressor.String(), func(t *testing.T) {
+						te := testenv.GetTestEnv(t)
+						if compressedCache {
+							te.SetCache(&testcompression.CompressionCache{Cache: te.GetCache()})
+						}
+						client := bspb.NewByteStreamClient(runByteStreamServer(ctx, t, te))
+						rn := digest.NewCASResourceName(d, compressor.String(), repb.DigestFunction_SHA256)
+						rn.SetCompressor(compressor)
+						wire := blob
+						if compressor == repb.Compressor_ZSTD {
+							wire = compression.CompressZstd(nil, blob)
+						}
+						stream, err := client.Write(ctx)
+						require.NoError(t, err)
+						upload := rn.NewUploadString()
+						// Explicit empty first frame also covers zero-byte resources.
+						require.NoError(t, stream.Send(&bspb.WriteRequest{ResourceName: upload}))
+						for off := 0; off < len(wire); {
+							end := min(off+65536, len(wire))
+							require.NoError(t, stream.Send(&bspb.WriteRequest{WriteOffset: int64(off), Data: wire[off:end]}))
+							off = end
+						}
+						require.NoError(t, stream.Send(&bspb.WriteRequest{WriteOffset: int64(len(wire)), FinishWrite: true}))
+						resp, err := stream.CloseAndRecv()
+						require.NoError(t, err)
+						require.Equal(t, int64(len(wire)), resp.GetCommittedSize())
+						for _, readCompressor := range []repb.Compressor_Value{repb.Compressor_IDENTITY, repb.Compressor_ZSTD} {
+							rn.SetCompressor(readCompressor)
+							for _, offset := range []int{0, size / 2, size} {
+								limits := []int64{0}
+								if readCompressor == repb.Compressor_IDENTITY {
+									limits = append(limits, 1, 65536)
+								}
+								for _, limit := range limits {
+									rs, err := client.Read(ctx, &bspb.ReadRequest{ResourceName: rn.DownloadString(), ReadOffset: int64(offset), ReadLimit: limit})
+									require.NoError(t, err)
+									got := []byte{}
+									for {
+										r, err := rs.Recv()
+										if err == io.EOF {
+											break
+										}
+										require.NoError(t, err)
+										got = append(got, r.GetData()...)
+									}
+									if readCompressor == repb.Compressor_ZSTD && len(got) > 0 {
+										got, err = compression.DecompressZstd(nil, got)
+										require.NoError(t, err)
+									}
+									end := size
+									if limit > 0 {
+										end = min(end, offset+int(limit))
+									}
+									require.True(t, bytes.Equal(blob[offset:end], got), "read compressor=%s offset=%d limit=%d got=%d want=%d", readCompressor, offset, limit, len(got), end-offset)
+								}
+							}
+						}
+					})
+				}
+			})
+		}
+	}
+}
+
+func TestCompressionRejectsInvalidWrites(t *testing.T) {
+	flags.Set(t, "cache.zstd_transcoding_enabled", true)
+	for _, compressedCache := range []bool{false, true} {
+		for _, compressor := range []repb.Compressor_Value{repb.Compressor_IDENTITY, repb.Compressor_ZSTD} {
+			for _, invalid := range []string{"hash", "size", "offset", "truncated", "garbage"} {
+				if compressor == repb.Compressor_IDENTITY && (invalid == "truncated" || invalid == "garbage") {
+					continue
+				}
+				t.Run(fmt.Sprintf("cache_zstd=%t/%s/%s", compressedCache, compressor, invalid), func(t *testing.T) {
+					ctx := context.Background()
+					te := testenv.GetTestEnv(t)
+					if compressedCache {
+						te.SetCache(&testcompression.CompressionCache{Cache: te.GetCache()})
+					}
+					server, err := NewByteStreamServer(te)
+					require.NoError(t, err)
+					blob := bytes.Repeat([]byte("deterministic integrity data"), 100)
+					d, err := digest.Compute(bytes.NewReader(blob), repb.DigestFunction_SHA256)
+					require.NoError(t, err)
+					if invalid == "hash" {
+						blob[0] ^= 1
+					}
+					if invalid == "size" {
+						d.SizeBytes++
+					}
+					rn := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256)
+					rn.SetCompressor(compressor)
+					wire := blob
+					if compressor == repb.Compressor_ZSTD {
+						wire = compression.CompressZstd(nil, blob)
+					}
+					if invalid == "truncated" {
+						wire = wire[:len(wire)-1]
+					}
+					if invalid == "garbage" {
+						wire = []byte("not a zstd frame")
+					}
+					offset := int64(0)
+					if invalid == "offset" {
+						offset = 1
+					}
+					stream := &testWriteStream{ctx: ctx, reqs: []*bspb.WriteRequest{
+						{ResourceName: rn.NewUploadString(), Data: wire[:len(wire)/2]},
+						{WriteOffset: int64(len(wire)/2) + offset, Data: wire[len(wire)/2:], FinishWrite: true},
+					}}
+					require.Error(t, server.Write(stream))
+					cacheCtx, err := prefix.AttachUserPrefixToContext(ctx, te.GetAuthenticator())
+					require.NoError(t, err)
+					rn.SetCompressor(repb.Compressor_IDENTITY)
+					exists, err := te.GetCache().Contains(cacheCtx, rn.ToProto())
+					require.NoError(t, err)
+					require.False(t, exists, "invalid write must not become visible")
+				})
+			}
+		}
+	}
+}
+
+func TestCompressionConcurrentWrites(t *testing.T) {
+	flags.Set(t, "cache.zstd_transcoding_enabled", true)
+	ctx := context.Background()
+	te := testenv.GetTestEnv(t)
+	server, err := NewByteStreamServer(te)
+	require.NoError(t, err)
+	blob := bytes.Repeat([]byte("concurrent upload"), 20000)
+	d, err := digest.Compute(bytes.NewReader(blob), repb.DigestFunction_SHA256)
+	require.NoError(t, err)
+	// Begin both writes before either commits, avoiding scheduler-dependent deduplication.
+	var handlers []*writeHandler
+	var wires [][]byte
+	for _, c := range []repb.Compressor_Value{repb.Compressor_IDENTITY, repb.Compressor_ZSTD} {
+		rn := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256)
+		rn.SetCompressor(c)
+		h, err := server.beginWrite(ctx, &bspb.WriteRequest{ResourceName: rn.NewUploadString()})
+		require.NoError(t, err)
+		defer h.Close()
+		handlers = append(handlers, h)
+		wire := blob
+		if c == repb.Compressor_ZSTD {
+			wire = compression.CompressZstd(nil, blob)
+		}
+		wires = append(wires, wire)
+	}
+	var wg sync.WaitGroup
+	for i, h := range handlers {
+		wg.Add(1)
+		go func(h *writeHandler, wire []byte) {
+			defer wg.Done()
+			resp, err := h.Write(&bspb.WriteRequest{Data: wire, FinishWrite: true})
+			assert.NoError(t, err)
+			assert.Equal(t, int64(len(wire)), resp.GetCommittedSize())
+		}(h, wires[i])
+	}
+	wg.Wait()
+	client := bspb.NewByteStreamClient(runByteStreamServer(ctx, t, te))
+	var out bytes.Buffer
+	require.NoError(t, cachetools.GetBlob(ctx, client, digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256), &out))
+	require.True(t, bytes.Equal(blob, out.Bytes()))
+}

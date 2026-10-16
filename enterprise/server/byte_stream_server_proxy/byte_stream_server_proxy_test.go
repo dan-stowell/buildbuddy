@@ -3651,3 +3651,83 @@ func BenchmarkReadChunkedMixedLocalRemote(b *testing.B) {
 		}
 	}
 }
+
+// Exercise both read-through (remote upload) and write-through (proxy upload),
+// including a second read after local population.
+func TestCompressionProxyIntegrityMatrix(t *testing.T) {
+	flags.Set(t, "cache.zstd_transcoding_enabled", true)
+	for _, size := range []int{0, 1, 65535, 65536, 65537, 4*1024*1024 + 1} {
+		for _, throughProxy := range []bool{false, true} {
+			for _, c := range []repb.Compressor_Value{repb.Compressor_IDENTITY, repb.Compressor_ZSTD} {
+				t.Run(fmt.Sprintf("size=%d/write_through=%t/%s", size, throughProxy, c), func(t *testing.T) {
+					ctx := testContext()
+					remoteEnv := testenv.GetTestEnv(t)
+					proxyEnv := testenv.GetTestEnv(t)
+					remote, _, _, _ := runRemoteServices(ctx, remoteEnv, t)
+					proxy := runBSProxy(ctx, remote, proxyEnv, t)
+					blob := make([]byte, size)
+					for i := range blob {
+						blob[i] = byte((i*31 + i/257) % 251)
+					}
+					d, err := digest.Compute(bytes.NewReader(blob), repb.DigestFunction_SHA256)
+					require.NoError(t, err)
+					rn := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256)
+					rn.SetCompressor(c)
+					target := remote
+					if throughProxy {
+						target = proxy
+					}
+					_, _, err = cachetools.UploadFromReader(ctx, target, rn, bytes.NewReader(blob))
+					require.NoError(t, err)
+					for pass := range 2 {
+						for _, source := range []bspb.ByteStreamClient{proxy, remote} {
+							var out bytes.Buffer
+							require.NoError(t, cachetools.GetBlob(ctx, source, rn, &out))
+							require.True(t, bytes.Equal(blob, out.Bytes()), "pass=%d size=%d", pass, size)
+							for _, offset := range []int{size / 2, size} {
+								rs, err := source.Read(ctx, &bspb.ReadRequest{ResourceName: rn.DownloadString(), ReadOffset: int64(offset)})
+								require.NoError(t, err)
+								got := []byte{}
+								for {
+									r, err := rs.Recv()
+									if err == io.EOF {
+										break
+									}
+									require.NoError(t, err)
+									got = append(got, r.GetData()...)
+								}
+								if c == repb.Compressor_ZSTD && len(got) > 0 {
+									got, err = compression.DecompressZstd(nil, got)
+									require.NoError(t, err)
+								}
+								require.True(t, bytes.Equal(blob[offset:], got), "pass=%d offset=%d", pass, offset)
+							}
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestCompressionProxyClientFlags(t *testing.T) {
+	flags.Set(t, "cache.zstd_transcoding_enabled", true)
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("upload_compression=%t", enabled), func(t *testing.T) {
+			flags.Set(t, "cache.client.enable_upload_compression", enabled)
+			ctx := testContext()
+			remoteEnv := testenv.GetTestEnv(t)
+			proxyEnv := testenv.GetTestEnv(t)
+			remote, _, _, _ := runRemoteServices(ctx, remoteEnv, t)
+			proxy := runBSProxy(ctx, remote, proxyEnv, t)
+			blob := bytes.Repeat([]byte("client compression flag"), 200000)
+			d, err := cachetools.UploadBlob(ctx, proxy, "", repb.DigestFunction_SHA256, bytes.NewReader(blob))
+			require.NoError(t, err)
+			for _, client := range []bspb.ByteStreamClient{proxy, remote} {
+				var out bytes.Buffer
+				require.NoError(t, cachetools.GetBlob(ctx, client, digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256), &out))
+				require.True(t, bytes.Equal(blob, out.Bytes()))
+			}
+		})
+	}
+}
