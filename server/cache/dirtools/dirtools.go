@@ -1290,7 +1290,9 @@ func (ff *BatchFileFetcher) bytestreamReadToFilesystem(ctx context.Context, bsCl
 		return nil
 	}
 
-	fp, _, err := DownloadDeduper.Do(ctx, dedupeKey, func(ctx context.Context) (*FilePointer, error) {
+	// Without a cache there is no stable shared source. Download once per
+	// fetcher so concurrent actions never depend on each other's workspace.
+	fp, err := func(ctx context.Context) (*FilePointer, error) {
 		// Only the deduped call takes a slot, since waiting tasks do no I/O.
 		release, err := inputDownloadLimit.acquire(ctx, 1)
 		if err != nil {
@@ -1311,16 +1313,12 @@ func (ff *BatchFileFetcher) bytestreamReadToFilesystem(ctx context.Context, bsCl
 		}
 
 		return fp0, nil
-	})
+	}(ctx)
 	if err != nil {
 		return err
 	}
 
-	// Depending on whether or not this bytestream request was deduped, fp
-	// will either be == fps[0], or a different fp from a concurrent request
-	// made by the same user.
-	// Check for that case, to avoid copying a file over itself, and copy fp
-	// to all of the destination fps.
+	// Copy within this fetcher while its workspace is still owned by it.
 	for _, dest := range fps {
 		if fp == dest {
 			continue
