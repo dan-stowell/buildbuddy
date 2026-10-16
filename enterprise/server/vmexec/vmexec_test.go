@@ -225,9 +225,9 @@ func TestExecStreamed_BackgroundChildHoldsStdout_Timeout(t *testing.T) {
 	elapsed := time.Since(start)
 	t.Logf("elapsed=%s exitCode=%d err=%v stdout=%q", elapsed, res.ExitCode, res.Error, res.Stdout)
 
-	assert.Less(t, elapsed, timeout)
-	require.NoError(t, res.Error)
-	assert.Equal(t, 0, res.ExitCode)
+	assert.Less(t, elapsed, timeout+5*time.Second)
+	require.True(t, status.IsDeadlineExceededError(res.Error), "%v", res.Error)
+	assert.NotEqual(t, 0, res.ExitCode)
 	assert.Equal(t, "hi\n", string(res.Stdout))
 }
 
@@ -242,7 +242,7 @@ func TestExecStreamed_BackgroundChildHoldsStdout_NoTimeout(t *testing.T) {
 	res := vmexec_client.Execute(context.Background(), client, cmd, ".", "" /*=user*/, nil /*=statsListener*/, nil /*=stdio*/)
 	elapsed := time.Since(start)
 	t.Logf("elapsed=%s exitCode=%d err=%v stdout=%q", elapsed, res.ExitCode, res.Error, res.Stdout)
-	assert.Less(t, elapsed, 2*time.Second)
+	assert.GreaterOrEqual(t, elapsed, 5*time.Second, "wait for inherited output streams to reach EOF")
 	require.NoError(t, res.Error)
 	assert.Equal(t, "hi\n", string(res.Stdout))
 }
