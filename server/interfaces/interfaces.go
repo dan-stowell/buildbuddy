@@ -1029,6 +1029,11 @@ type RemoteExecutionService interface {
 }
 
 type FileCache interface {
+	// MaterializeWritable creates independent workspace bytes unless trusted-workload hardlinks are enabled.
+	MaterializeWritable(ctx context.Context, f *repb.FileNode, outputPath string) bool
+	// LinkReadOnly and AddReadOnly require callers never to modify the shared inode.
+	LinkReadOnly(ctx context.Context, f *repb.FileNode, outputPath string) bool
+	AddReadOnly(ctx context.Context, f *repb.FileNode, existingFilePath string) error
 	FastLinkFile(ctx context.Context, f *repb.FileNode, outputPath string) bool
 	DeleteFile(ctx context.Context, f *repb.FileNode) bool
 	AddFile(ctx context.Context, f *repb.FileNode, existingFilePath string) error

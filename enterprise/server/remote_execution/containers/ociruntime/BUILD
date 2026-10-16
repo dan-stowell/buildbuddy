@@ -116,6 +116,7 @@ go_test(
         "//server/interfaces",
         "//server/real_environment",
         "//server/testutil/testauth",
+        "//server/remote_cache/digest",
         "//server/testutil/testenv",
         "//server/testutil/testfs",
         "//server/testutil/testnetworking",

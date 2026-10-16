@@ -51,7 +51,9 @@ go_test(
     name = "filecache_test",
     size = "small",
     srcs = [
+        "filecache_input_mutation_test.go",
         "filecache_test.go",
+        "filecache_verifier_test.go",
         "filecache_windows_test.go",
     ],
     deps = [
@@ -66,6 +68,7 @@ go_test(
         "//server/util/authutil",
         "//server/util/claims",
         "//server/util/disk",
+        "//server/util/fastcopy",
         "//server/util/hash",
         "//server/util/log",
         "//server/util/status",
@@ -73,5 +76,21 @@ go_test(
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
         "@org_golang_x_sync//errgroup",
+    ],
+)
+
+go_test(
+    name = "filecache_verifier_bench_test",
+    size = "large",
+    srcs = ["filecache_verifier_bench_test.go"],
+    tags = ["manual"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":filecache",
+        "//proto:remote_execution_go_proto",
+        "//server/testutil/testfs",
+        "//server/util/claims",
+        "//server/util/testing/flags",
+        "@com_github_stretchr_testify//require",
     ],
 )

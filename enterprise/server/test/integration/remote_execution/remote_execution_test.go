@@ -2803,3 +2803,54 @@ func getExecutionAuxiliaryMetadata(t testing.TB, execRes *repb.ExecuteResponse) 
 	require.True(t, ok)
 	return auxMeta
 }
+
+// Action 1 appends to one of its inputs. Action 2 is a different action whose
+// input root has the same digest; it should see the original input bytes.
+func testInputModifiedInPlaceByPreviousAction(t *testing.T, apiKey func(rbe *rbetest.Env) string) {
+	rbe := rbetest.NewRBETestEnv(t)
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutor(t)
+
+	tmpDir := testfs.MakeTempDir(t)
+	testfs.WriteAllFileContents(t, tmpDir, map[string]string{"in.txt": "hello\n"})
+	platform := &repb.Platform{
+		Properties: []*repb.Platform_Property{
+			{Name: "OSFamily", Value: runtime.GOOS},
+			{Name: "Arch", Value: runtime.GOARCH},
+		},
+	}
+	opts := &rbetest.ExecuteOpts{InputRootDir: tmpDir, APIKey: apiKey(rbe)}
+
+	res1 := rbe.Execute(&repb.Command{
+		Arguments: []string{"sh", "-c", "printf 'MUTATED\\n' >> in.txt && cat in.txt"},
+		Platform:  platform,
+	}, opts).Wait()
+	require.Equal(t, 0, res1.ExitCode)
+	t.Logf("action 1 stdout: %q", res1.Stdout)
+
+	action2 := &repb.Command{
+		Arguments: []string{"cat", "in.txt"},
+		Platform:  platform,
+	}
+	res2 := rbe.Execute(action2, opts).Wait()
+	require.Equal(t, 0, res2.ExitCode)
+	t.Logf("action 2 stdout: %q; io stats: %+v", res2.Stdout, res2.ActionResult.GetExecutionMetadata().GetIoStats())
+
+	// Is action 2's result served from the action cache on a later request?
+	cachedOpts := *opts
+	cachedOpts.CheckCache = true
+	res3 := rbe.Execute(action2, &cachedOpts).Wait()
+	fromCache := res3.ActionResult.GetExecutionMetadata().GetWorkerStartTimestamp().AsTime().Equal(
+		res2.ActionResult.GetExecutionMetadata().GetWorkerStartTimestamp().AsTime())
+	t.Logf("action 2 re-request (cache lookup enabled): stdout %q, served from action cache: %t", res3.Stdout, fromCache)
+
+	require.Equal(t, "hello\n", res2.Stdout, "action 2 should see the input bytes matching its input digest")
+}
+
+func TestInputModifiedInPlaceByPreviousAction_Authenticated(t *testing.T) {
+	testInputModifiedInPlaceByPreviousAction(t, func(rbe *rbetest.Env) string { return rbe.APIKey1 })
+}
+
+func TestInputModifiedInPlaceByPreviousAction_Anonymous(t *testing.T) {
+	testInputModifiedInPlaceByPreviousAction(t, func(rbe *rbetest.Env) string { return "" })
+}

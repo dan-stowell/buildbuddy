@@ -555,13 +555,13 @@ func TestFileCacheOverwrite(t *testing.T) {
 				require.Equal(t, "file1-content", file1Link2Content)
 			}
 			{
-				// Overwrite again, this time the contents don't match the
-				// digest (filecache supports this, similar to AC).
+				// A duplicate digest is immutable: skip admission even if the
+				// new source bytes differ.
 				writeFileContent(t, tempDir, "file2", "file2-content", test.Executable)
 				err = fc.AddFile(ctx, node, filepath.Join(tempDir, "file2"))
 				require.NoError(t, err)
 				linked := fc.FastLinkFile(ctx, node, filepath.Join(tempDir, "file2-link1"))
-				require.True(t, linked, "expected cache hit after overwriting file with different digest")
+				require.True(t, linked, "expected cache hit after duplicate admission")
 				// Verify all file contents
 				file1Content := testfs.ReadFileAsString(t, tempDir, "file1")
 				file1Link1Content := testfs.ReadFileAsString(t, tempDir, "file1-link1")
@@ -572,7 +572,7 @@ func TestFileCacheOverwrite(t *testing.T) {
 				require.Equal(t, "file1-content", file1Link1Content)
 				require.Equal(t, "file1-content", file1Link2Content)
 				require.Equal(t, "file2-content", file2Content)
-				require.Equal(t, "file2-content", file2Link1Content)
+				require.Equal(t, "file1-content", file2Link1Content)
 			}
 
 			// No evictions should have occurred.
@@ -2016,4 +2016,46 @@ func TestFilecache_ConcurrentDirectoryEvictionAndLocking(t *testing.T) {
 
 	err = eg.Wait()
 	require.NoError(t, err)
+}
+
+// Bare actions can mutate their inputs. Cache hits must never serve changed
+// bytes under the original digest, including to an already-running action.
+func TestExecutorInputCacheMutationIsolation(t *testing.T) {
+	for _, operation := range []string{"write", "truncate", "chmod", "delete"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx := claims.AuthContextWithJWT(t.Context(), &claims.Claims{GroupID: "GR_INPUT_ISOLATION"}, nil)
+			fc, err := filecache.NewFileCache(testfs.MakeTempDir(t), 1<<20, false)
+			require.NoError(t, err)
+			t.Cleanup(func() { fc.Close() })
+			fc.WaitForDirectoryScanToComplete()
+			dir := testfs.MakeTempDir(t)
+			const original = "original input bytes"
+			source := writeFileContent(t, dir, "source", original, false)
+			node := nodeFromString(original, false)
+			require.NoError(t, fc.AddFile(ctx, node, source))
+			input := filepath.Join(dir, "action-input")
+			peer := filepath.Join(dir, "concurrent-input")
+			require.True(t, fc.FastLinkFile(ctx, node, input))
+			require.True(t, fc.FastLinkFile(ctx, node, peer))
+			switch operation {
+			case "write":
+				require.NoError(t, os.WriteFile(input, []byte("modified input bytes"), 0644))
+			case "truncate":
+				require.NoError(t, os.Truncate(input, 0))
+			case "chmod":
+				require.NoError(t, os.Chmod(input, 0600))
+			case "delete":
+				require.NoError(t, os.Remove(input))
+			}
+			data, err := os.ReadFile(peer)
+			require.NoError(t, err)
+			assert.Equal(t, original, string(data), "concurrent action input changed")
+			later := filepath.Join(dir, "later-input")
+			if fc.FastLinkFile(ctx, node, later) {
+				data, err := os.ReadFile(later)
+				require.NoError(t, err)
+				assert.Equal(t, original, string(data), "cache hit served bytes inconsistent with digest")
+			}
+		})
+	}
 }

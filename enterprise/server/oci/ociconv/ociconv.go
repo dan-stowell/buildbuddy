@@ -97,7 +97,7 @@ func diskImageFileNode(containerImage string) *repb.FileNode {
 func AddDiskImageToFileCache(ctx context.Context, fileCache interfaces.FileCache, containerImage, imagePath string) error {
 	sharedCtx := sharedFileCacheContext(ctx, fileCache)
 	node := diskImageFileNode(containerImage)
-	return fileCache.AddFile(sharedCtx, node, imagePath)
+	return fileCache.AddReadOnly(sharedCtx, node, imagePath)
 }
 
 // getDiskImagesPath returns the parent directory where legacy disk images are
@@ -184,7 +184,7 @@ func MigrateImagesToFileCache(ctx context.Context, fileCache interfaces.FileCach
 		if fileCache.ContainsFile(sharedCtx, node) {
 			continue
 		}
-		if err := fileCache.AddFile(sharedCtx, node, legacyPath); err != nil {
+		if err := fileCache.AddReadOnly(sharedCtx, node, legacyPath); err != nil {
 			return fmt.Errorf("add legacy disk image %q to filecache: %w", legacyPath, err)
 		}
 		log.Infof("Migrated legacy ext4 image with cache key %q from %q to filecache", cacheKey, legacyPath)
@@ -207,7 +207,7 @@ func LinkCachedImage(ctx context.Context, fileCache interfaces.FileCache, cacheR
 	if *localCacheStoreExt4Images {
 		sharedCtx := sharedFileCacheContext(ctx, fileCache)
 		node := diskImageFileNode(containerImage)
-		if ok := fileCache.FastLinkFile(sharedCtx, node, outputPath); ok {
+		if ok := fileCache.LinkReadOnly(sharedCtx, node, outputPath); ok {
 			log.CtxDebugf(ctx, "Linked cached %q disk image to %q", containerImage, outputPath)
 			return nil
 		}

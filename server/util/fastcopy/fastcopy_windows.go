@@ -197,3 +197,19 @@ func roundUp(value, base int64) int64 {
 
 	return value - mod + base
 }
+
+// CloneOrCopy creates an independent inode, using the platform's native clone
+// implementation when possible and copying otherwise.
+func CloneOrCopy(source, destination string) error {
+	if _, err := os.Lstat(destination); err == nil {
+		return &os.PathError{Op: "copy", Path: destination, Err: os.ErrExist}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := Clone(source, destination); err == nil {
+		return nil
+	} else if os.IsExist(err) {
+		return err
+	}
+	return copyFile(source, destination)
+}

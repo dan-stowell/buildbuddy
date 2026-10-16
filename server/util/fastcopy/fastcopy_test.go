@@ -192,3 +192,43 @@ func TestFastCopyXFSReflink(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []byte{}, b)
 }
+
+// Exercise both the copy fallback and the optional reflink path. Neither is
+// allowed to share a writable inode with the source.
+func TestCloneOrCopyIsolation(t *testing.T) {
+	for _, reflink := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reflink=%t", reflink), func(t *testing.T) {
+			flags.Set(t, "executor.enable_fastcopy_reflinking", reflink)
+			dir := testfs.MakeTempDir(t)
+			src, dst := filepath.Join(dir, "src"), filepath.Join(dir, "dst")
+			require.NoError(t, os.WriteFile(src, []byte("original"), 0755))
+			require.NoError(t, fastcopy.CloneOrCopy(src, dst))
+			si, err := os.Stat(src)
+			require.NoError(t, err)
+			di, err := os.Stat(dst)
+			require.NoError(t, err)
+			require.False(t, os.SameFile(si, di))
+			require.Equal(t, si.Mode(), di.Mode())
+			require.NoError(t, os.WriteFile(dst, []byte("modified"), 0644))
+			require.NoError(t, os.Chmod(dst, 0600))
+			contents, err := os.ReadFile(src)
+			require.NoError(t, err)
+			require.Equal(t, "original", string(contents))
+			siAfter, err := os.Stat(src)
+			require.NoError(t, err)
+			require.Equal(t, si.Mode(), siAfter.Mode())
+		})
+	}
+}
+
+func TestCloneOrCopyDoesNotOverwrite(t *testing.T) {
+	flags.Set(t, "executor.enable_fastcopy_reflinking", false)
+	dir := testfs.MakeTempDir(t)
+	src, dst := filepath.Join(dir, "src"), filepath.Join(dir, "dst")
+	require.NoError(t, os.WriteFile(src, []byte("source"), 0644))
+	require.NoError(t, os.WriteFile(dst, []byte("destination"), 0644))
+	require.ErrorIs(t, fastcopy.CloneOrCopy(src, dst), os.ErrExist)
+	contents, err := os.ReadFile(dst)
+	require.NoError(t, err)
+	require.Equal(t, "destination", string(contents))
+}
