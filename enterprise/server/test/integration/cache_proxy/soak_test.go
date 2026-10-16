@@ -105,6 +105,7 @@ func TestCacheProxyResourceSoak(t *testing.T) {
 		require.GreaterOrEqual(t, batches, 4)
 	}
 	testleak.Soak(t, 2, batches, func(batch int) {
+		t.Logf("batch %d: Redis pool stats: %+v", batch, rbe.GetRedisClient().PoolStats())
 		instance := fmt.Sprintf("soak/%d", batch)
 		small := []byte(fmt.Sprintf("small-%d", batch))
 		d, err := digest.Compute(bytes.NewReader(small), repb.DigestFunction_SHA256)
@@ -179,5 +180,6 @@ func TestCacheProxyResourceSoak(t *testing.T) {
 			t.Cleanup(func() { f.Close() })
 		}
 	})
+	t.Logf("final Redis pool stats: %+v", rbe.GetRedisClient().PoolStats())
 	require.Positive(t, hits.Load(), "remote hit tracker must reach the app")
 }
