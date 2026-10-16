@@ -136,7 +136,7 @@ func TestV4DistinctPermittedTargets(t *testing.T) {
 			testleak.Check(t)
 			env := real_environment.NewRealEnv(nil)
 			flags.Set(t, "app.restrict_bytestream_dialing", true)
-			flags.Set(t, "app.cache_api_url", "grpcs://cache.example.com")
+			flags.Set(t, "app.cache_api_url", url.URL{Scheme: "grpcs", Host: "cache.example.com"})
 			p := NewPooledByteStreamClient(env)
 			before := runtime.NumGoroutine()
 			for i := range n {
