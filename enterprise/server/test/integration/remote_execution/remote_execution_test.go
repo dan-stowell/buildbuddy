@@ -2803,3 +2803,33 @@ func getExecutionAuxiliaryMetadata(t testing.TB, execRes *repb.ExecuteResponse) 
 	require.True(t, ok)
 	return auxMeta
 }
+
+// Header precedence must not let an action reuse output produced under a
+// different effective environment.
+func TestPlatformRoutingHeaderOverrideCacheSeparation(t *testing.T) {
+	rbe := rbetest.NewRBETestEnv(t)
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutor(t)
+	cmd := &repb.Command{
+		Arguments: []string{"sh", "-c", `printf '%s' "$PLATFORM_ROUTING_MARKER"`},
+		Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+			{Name: "OSFamily", Value: runtime.GOOS},
+			{Name: "Arch", Value: runtime.GOARCH},
+			{Name: "env-overrides", Value: "PLATFORM_ROUTING_MARKER=action"},
+		}},
+	}
+	execute := func(value string) *rbetest.CommandResult {
+		return rbe.Execute(cmd, &rbetest.ExecuteOpts{
+			CheckCache: true,
+			RemoteHeaders: map[string]string{
+				"x-buildbuddy-platform.env-overrides": "PLATFORM_ROUTING_MARKER=" + value,
+			},
+		}).Wait()
+	}
+	first := execute("first")
+	require.Equal(t, 0, first.ExitCode)
+	require.Equal(t, "first", first.Stdout)
+	second := execute("second")
+	require.Equal(t, 0, second.ExitCode)
+	require.Equal(t, "second", second.Stdout, "changed effective environment must not reuse incompatible cached output")
+}
