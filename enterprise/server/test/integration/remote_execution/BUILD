@@ -36,6 +36,7 @@ go_test(
         "//server/metrics",
         "//server/real_environment",
         "//server/remote_cache/cachetools",
+        "//server/remote_cache/digest",
         "//server/resources",
         "//server/testutil/testbazel",
         "//server/testutil/testenv",
