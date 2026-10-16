@@ -202,12 +202,12 @@ func TestRun_MainLargeOutputWithBackgroundPipe(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	res := commandutil.Run(ctx, &repb.Command{Arguments: []string{"sh", "-c",
-		"sh -c 'echo $$ > bg.pid; exec sleep 3' & head -c 4194304 /dev/zero"}},
+		"sh -c 'echo $$ > bg.pid; exec sleep 3' & chunk=" + strings.Repeat("x", 4096) + "; i=0; while [ \"$i\" -lt 1024 ]; do printf '%s' \"$chunk\"; i=$((i+1)); done"}},
 		wd, nil, &interfaces.Stdio{})
 	require.NoError(t, res.Error)
 	require.Equal(t, 0, res.ExitCode)
 	require.Equal(t, 4*1024*1024, len(res.Stdout))
-	require.Equal(t, make([]byte, 4*1024*1024), res.Stdout)
+	require.Equal(t, bytes.Repeat([]byte("x"), 4*1024*1024), res.Stdout)
 }
 
 // A writer can be slower than WaitDelay (for example an io.Pipe consumer).
@@ -246,7 +246,7 @@ func TestRun_MainOutputSlowConsumer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	res := commandutil.Run(ctx, &repb.Command{Arguments: []string{"sh", "-c",
-		"printf a; while [ ! -f reader-ready ]; do sleep 0.01; done; head -c 4096 /dev/zero; touch root-exiting"}},
+		"printf a; while [ ! -f reader-ready ]; do sleep 0.01; done; printf '%s' " + strings.Repeat("x", 4096) + "; : > root-exiting"}},
 		wd, nil, &interfaces.Stdio{Stdout: writer})
 	require.NoError(t, res.Error)
 	require.Equal(t, 0, res.ExitCode)
