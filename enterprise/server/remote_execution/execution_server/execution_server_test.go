@@ -2976,3 +2976,153 @@ func TestRedactCachedExecuteResponse(t *testing.T) {
 		})
 	}
 }
+
+// TestPublishOperation_ReplayAfterLostAck_CountsUsageOnce is an independent
+// reproducer for a billing-double-count hazard. The executor's retrying
+// publisher keeps the COMPLETED Operation buffered until the server ACKs the
+// stream (CloseAndRecv). If the stream breaks AFTER the server has already
+// processed the COMPLETED message but BEFORE the client receives the ACK, the
+// publisher reconnects on a brand-new PublishOperation RPC and resends the full
+// COMPLETED Operation. The second server-side handler invocation has no
+// completion receipt for the task, so it reprocesses the COMPLETED message.
+//
+// This test drives the real execution server over gRPC and asserts that the
+// execution's duration is billed to the usage tracker exactly once across the
+// retry chain. It is parameterized over the flush_executions_after_cleanup
+// experiment so we can observe behavior under both usage-recording paths.
+func TestPublishOperation_ReplayAfterLostAck_CountsUsageOnce(t *testing.T) {
+	for _, flushAfterCleanup := range []bool{false, true} {
+		name := "flushAfterCleanup=false"
+		if flushAfterCleanup {
+			name = "flushAfterCleanup=true"
+		}
+		t.Run(name, func(t *testing.T) {
+			testReplayAfterLostAckCountsUsageOnce(t, flushAfterCleanup)
+		})
+	}
+}
+
+func testReplayAfterLostAckCountsUsageOnce(t *testing.T, flushAfterCleanup bool) {
+	ctx := context.Background()
+	flags.Set(t, "app.enable_write_executions_to_olap_db", true)
+	flags.Set(t, "remote_execution.write_execution_progress_state_to_redis", true)
+	env, conn, _ := setupEnv(t)
+	configureExperiments(t, env, map[string]bool{
+		"remote_execution.flush_executions_after_cleanup": flushAfterCleanup,
+	})
+	client := repb.NewExecutionClient(conn)
+	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("user1", "group1"))
+	env.SetAuthenticator(ta)
+	ctx, err := ta.WithAuthenticatedUser(ctx, "user1")
+	require.NoError(t, err)
+
+	const instanceName = "repro-instance"
+	const invocationID = "11111111-2222-3333-4444-555555555555"
+
+	clientCtx, err := bazel_request.WithRequestMetadata(ctx, &repb.RequestMetadata{
+		ToolInvocationId: invocationID,
+		TargetId:         "//some:target",
+		ActionMnemonic:   "TestRunner",
+	})
+	require.NoError(t, err)
+
+	arn := uploadAction(clientCtx, t, env, instanceName, repb.DigestFunction_SHA256, &repb.Action{
+		Timeout: &durationpb.Duration{Seconds: 10},
+		Platform: &repb.Platform{
+			Properties: []*repb.Platform_Property{
+				{Name: "pool", Value: "test-pool"},
+				{Name: "workload-isolation-type", Value: "oci"},
+			},
+		},
+	})
+
+	executionClient, err := client.Execute(clientCtx, &repb.ExecuteRequest{
+		InstanceName:   arn.GetInstanceName(),
+		ActionDigest:   arn.GetDigest(),
+		DigestFunction: arn.GetDigestFunction(),
+	})
+	require.NoError(t, err)
+	require.NoError(t, executionClient.CloseSend())
+	op, err := executionClient.Recv()
+	require.NoError(t, err)
+	taskID := op.GetName()
+
+	executorCtx := metadata.AppendToOutgoingContext(clientCtx, usageutil.ClientHeaderName, "executor")
+	executorCtx = metadata.AppendToOutgoingContext(executorCtx, "x-buildbuddy-executor-region", "test-region")
+
+	// A 7-second Linux execution.
+	queuedTime := time.Unix(100, 0)
+	workerStartTime := queuedTime.Add(1 * time.Second)
+	workerEndTime := workerStartTime.Add(7 * time.Second)
+	durationUsec := (7 * time.Second).Microseconds()
+	aux := &espb.ExecutionAuxiliaryMetadata{
+		PlatformOverrides: &repb.Platform{},
+		SchedulingMetadata: &scpb.SchedulingMetadata{
+			ExecutorGroupId: sharedPoolGroupID,
+			Pool:            "test-pool",
+		},
+	}
+	auxAny, err := anypb.New(aux)
+	require.NoError(t, err)
+	completedOp, err := operation.Assemble(
+		taskID,
+		operation.Metadata(repb.ExecutionStage_COMPLETED, arn.GetDigest()),
+		&repb.ExecuteResponse{
+			Result: &repb.ActionResult{
+				ExecutionMetadata: &repb.ExecutedActionMetadata{
+					QueuedTimestamp:          tspb.New(queuedTime),
+					WorkerStartTimestamp:     tspb.New(workerStartTime),
+					WorkerCompletedTimestamp: tspb.New(workerEndTime),
+					AuxiliaryMetadata:        []*anypb.Any{auxAny},
+				},
+			},
+		},
+	)
+	require.NoError(t, err)
+
+	// Stream 1: publish COMPLETED, wait until the server has demonstrably
+	// processed it (the in-progress execution appears in Redis, written by
+	// updateExecution which runs after markTaskComplete/updateUsage), then
+	// break the stream by cancelling its context. The server's recv loop sees
+	// a cancellation, not io.EOF.
+	stream1Ctx, cancelStream1 := context.WithCancel(executorCtx)
+	stream1, err := client.PublishOperation(stream1Ctx)
+	require.NoError(t, err)
+	require.NoError(t, stream1.Send(completedOp))
+	require.Eventually(t, func() bool {
+		execProto, err := env.GetExecutionCollector().GetInProgressExecution(ctx, taskID)
+		return err == nil && execProto != nil
+	}, 5*time.Second, 10*time.Millisecond, "stream 1's COMPLETED should be processed by the server")
+	cancelStream1()
+	_, _ = stream1.CloseAndRecv()
+
+	// Stream 2 (the reconnect/replay): the retrying publisher re-opens the RPC
+	// and resends the same buffered COMPLETED Operation, then cleanly closes.
+	stream2, err := client.PublishOperation(executorCtx)
+	require.NoError(t, err)
+	require.NoError(t, stream2.Send(completedOp))
+	_, err = stream2.CloseAndRecv()
+	require.NoError(t, err, "retry stream closed cleanly")
+
+	// Drain the /Execute stream to avoid leaking goroutines.
+	for {
+		_, err := executionClient.Recv()
+		if err == io.EOF {
+			break
+		}
+		require.NoError(t, err)
+	}
+
+	ut := env.GetUsageTracker().(*testusage.Tracker)
+	var foundExecutorUsage *testusage.Total
+	for _, u := range ut.Totals() {
+		if u.Labels.Client == "executor" {
+			found := u
+			foundExecutorUsage = &found
+			break
+		}
+	}
+	require.NotNil(t, foundExecutorUsage, "expected executor usage to be recorded")
+	assert.Equal(t, durationUsec, foundExecutorUsage.Counts.LinuxExecutionDurationUsec,
+		"execution duration should be billed exactly once across the retried/replayed stream")
+}
