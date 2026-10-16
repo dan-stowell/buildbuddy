@@ -738,3 +738,23 @@ func BenchmarkDigestCompute(b *testing.B) {
 		}
 	}
 }
+
+// Function names are case-insensitive, including when carried in a resource URL.
+func TestDigestFunctionResourceNameCase(t *testing.T) {
+	for _, df := range digest.SupportedDigestFunctions() {
+		d, err := digest.Compute(strings.NewReader("digest-function-case"), df)
+		require.NoError(t, err)
+		for _, blobType := range []string{"blobs", "compressed-blobs/zstd"} {
+			for _, segment := range []string{strings.ToLower(df.String()), df.String()} {
+				t.Run(df.String()+"/"+blobType+"/"+segment, func(t *testing.T) {
+					name := fmt.Sprintf("instance/%s/%s/%s/%d", blobType, segment, d.GetHash(), d.GetSizeBytes())
+					rn, err := digest.ParseDownloadResourceName(name)
+					require.NoError(t, err)
+					require.Equal(t, df, rn.GetDigestFunction())
+					require.Equal(t, d, rn.GetDigest())
+					require.Equal(t, "instance", rn.GetInstanceName())
+				})
+			}
+		}
+	}
+}
