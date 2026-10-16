@@ -2810,10 +2810,13 @@ func TestRedisRetryIdempotency_InsertTask(t *testing.T) {
 }
 
 func TestRedisRetryIdempotency_DeleteClaimedTask(t *testing.T) {
+	flags.Set(t, "remote_execution.proactive_cancellation_enabled", true)
 	ctx := t.Context()
 	rdb, drop := redisWithLostReply(t)
 	s := &SchedulerServer{rdb: rdb}
 	key := s.redisKeyForTask("retry-delete")
+	reservationsKey := s.redisKeyForTaskReservations("retry-delete")
+	require.NoError(t, rdb.SAdd(ctx, reservationsKey, "executor").Err())
 	require.NoError(t, rdb.HSet(ctx, key, "claimed", "1").Err())
 	// Preload the script so the lost reply is EVALSHA's successful deletion,
 	// rather than the initial NOSCRIPT error.
@@ -2822,6 +2825,8 @@ func TestRedisRetryIdempotency_DeleteClaimedTask(t *testing.T) {
 	err := s.deleteClaimedTask(ctx, "retry-delete")
 	require.False(t, drop.Load(), "must lose the successful EVALSHA reply")
 	require.Zero(t, rdb.Exists(ctx, key).Val(), "first execution deleted the task")
+	t.Logf("deleteClaimedTask returned %v", err)
+	require.Zero(t, rdb.Exists(ctx, reservationsKey).Val(), "successful deletion replay must clean up tracked reservations")
 	require.NoError(t, err, "successful deletion replay must reach action-merging and reservation cleanup")
 }
 
