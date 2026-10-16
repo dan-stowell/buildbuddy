@@ -45,7 +45,10 @@ go_library(
 go_test(
     name = "byte_stream_server_test",
     size = "small",
-    srcs = ["byte_stream_server_test.go"],
+    srcs = [
+        "byte_stream_server_test.go",
+        "zstd_lifecycle_test.go",
+    ],
     embed = [":byte_stream_server"],
     deps = [
         "//proto:remote_execution_go_proto",
@@ -60,6 +63,7 @@ go_test(
         "//server/testutil/testcompression",
         "//server/testutil/testdigest",
         "//server/testutil/testenv",
+        "//server/testutil/testleak",
         "//server/util/bazel_request",
         "//server/util/bytebufferpool",
         "//server/util/compression",

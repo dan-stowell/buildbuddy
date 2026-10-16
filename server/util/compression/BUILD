@@ -18,10 +18,14 @@ go_library(
 
 go_test(
     name = "compression_test",
-    srcs = ["compression_test.go"],
+    srcs = [
+        "compression_test.go",
+        "lifecycle_test.go",
+    ],
     deps = [
         ":compression",
         "//server/testutil/testdigest",
+        "//server/testutil/testleak",
         "//server/util/bytebufferpool",
         "//server/util/ioutil",
         "@com_github_google_go_cmp//cmp",
