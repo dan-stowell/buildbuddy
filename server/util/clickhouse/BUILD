@@ -45,5 +45,6 @@ go_test(
         "//server/util/testing/flags",
         "@com_github_prometheus_client_golang//prometheus/testutil",
         "@com_github_stretchr_testify//require",
+        "@io_gorm_gorm//:gorm",
     ],
 )

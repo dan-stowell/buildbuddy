@@ -17,6 +17,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 	sipb "github.com/buildbuddy-io/buildbuddy/proto/stored_invocation"
@@ -312,4 +313,54 @@ func TestFlushExecutionStats_AllMalformedExecutionIDs_SkipsInsert(t *testing.T) 
 	).Count(&count).Error
 	require.NoError(t, err)
 	require.Zero(t, count)
+}
+
+// A slow insert honors its own query context. The app's shutdown deadline must
+// still bound shutdown rather than waiting for the independent insert timeout.
+func TestShutdown_SlowInvocationFlushHonorsDeadline(t *testing.T) {
+	env := testenv.GetTestEnv(t)
+	flags.Set(t, "olap_database.invocation_batch_insert_interval", time.Hour)
+	flags.Set(t, "olap_database.async_insert", false)
+	flags.Set(t, "max_shutdown_duration", 50*time.Millisecond)
+	flags.Set(t, "shutdown_lameduck_duration", time.Duration(0))
+	testclickhouse.Configure(t, env)
+	ctx := context.Background()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	db := env.GetOLAPDBHandle().GORM(ctx, "test_slow_shutdown")
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register("test:slow_insert", func(tx *gorm.DB) {
+		close(started)
+		select {
+		case <-release:
+		case <-tx.Statement.Context.Done():
+			tx.AddError(tx.Statement.Context.Err())
+		}
+	}))
+	invocationUUID, err := hex.DecodeString("c75e42d8cbf44ad0bcf2f2d0b5ad4b13")
+	require.NoError(t, err)
+	require.NoError(t, env.GetOLAPDBHandle().FlushInvocationStats(ctx, &tables.Invocation{
+		InvocationID: "c75e42d8-cbf4-4ad0-bcf2-f2d0b5ad4b13", InvocationUUID: invocationUUID,
+	}))
+	hc := env.GetHealthChecker()
+	expired := make(chan struct{})
+	hc.RegisterShutdownFunction(func(ctx context.Context) error {
+		<-ctx.Done()
+		close(expired)
+		return nil
+	})
+	done := make(chan struct{})
+	hc.Shutdown()
+	go func() { hc.WaitForGracefulShutdown(); close(done) }()
+	defer func() { close(release); <-done }()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("final batch insert did not start")
+	}
+	<-expired
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown waits for the slow invocation insert beyond max_shutdown_duration")
+	}
 }
