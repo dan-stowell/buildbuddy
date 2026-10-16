@@ -412,3 +412,16 @@ func TestPaginationStatic(t *testing.T) {
 		}
 	}
 }
+
+func TestPaginationBlendedSingleItemPageAdvances(t *testing.T) {
+	flags.Set(t, "app.blended_invocation_search_enabled", true)
+	ctx, _, service := paginationFixture(t, 2, false, true)
+	req := &inpb.SearchInvocationRequest{Count: 1, Query: &inpb.InvocationQuery{User: "pager"}}
+	first, err := service.QueryInvocations(ctx, req)
+	require.NoError(t, err)
+	req.PageToken = first.NextPageToken
+	require.NotEmpty(t, req.PageToken)
+	second, err := service.QueryInvocations(ctx, req)
+	require.NoError(t, err)
+	require.NotEqual(t, first.NextPageToken, second.NextPageToken, "a nonterminal page must advance; first=%v second=%v", first, second)
+}
