@@ -3,16 +3,24 @@ package byte_stream_client
 import (
 	"bytes"
 	"context"
+	"encoding/pem"
 	"fmt"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
+	bspb "google.golang.org/genproto/googleapis/bytestream"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"io"
+	"net"
+	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bazelbuild/rules_go/go/runfiles"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
@@ -149,6 +157,65 @@ func TestV4DistinctPermittedTargets(t *testing.T) {
 			}
 			t.Logf("N=%d cached=%d goroutine_delta=%d", n, len(p.connPoolMap), runtime.NumGoroutine()-before)
 			// Polling cannot release these pools: there is no baseline cleanup path.
+		})
+	}
+}
+
+type v4ByteStreamServer struct {
+	bspb.UnimplementedByteStreamServer
+}
+
+func (*v4ByteStreamServer) Read(*bspb.ReadRequest, bspb.ByteStream_ReadServer) error { return nil }
+
+// v4SocketTargets counts distinct socket inodes, excluding the transient FD
+// used to enumerate /proc. This local helper supplements testleak's goroutines.
+func v4SocketTargets(t *testing.T) map[string]bool {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	require.NoError(t, err)
+	result := map[string]bool{}
+	for _, entry := range entries {
+		target, err := os.Readlink(filepath.Join("/proc/self/fd", entry.Name()))
+		if err == nil && strings.HasPrefix(target, "socket:[") {
+			result[target] = true
+		}
+	}
+	return result
+}
+func TestV4ReachablePermittedTargets(t *testing.T) {
+	// httptest supplies a test certificate valid for 127.0.0.1.
+	certServer := httptest.NewTLSServer(nil)
+	tlsConfig := certServer.TLS.Clone()
+	cert := certServer.Certificate()
+	certServer.Close()
+	certFile := filepath.Join(t.TempDir(), "test-root.pem")
+	require.NoError(t, os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}), 0600))
+	t.Setenv("SSL_CERT_FILE", certFile)
+	for _, n := range []int{1, 10, 50} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			testleak.Check(t)
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			server := grpc.NewServer(grpc.Creds(credentials.NewTLS(tlsConfig)))
+			bspb.RegisterByteStreamServer(server, &v4ByteStreamServer{})
+			go server.Serve(listener)
+			t.Cleanup(server.Stop)
+			env := real_environment.NewRealEnv(nil)
+			flags.Set(t, "app.restrict_bytestream_dialing", true)
+			flags.Set(t, "app.cache_api_url", url.URL{Scheme: "grpcs", Host: "127.0.0.1"})
+			p := NewPooledByteStreamClient(env)
+			before := v4SocketTargets(t)
+			for i := range n {
+				u, err := url.Parse(fmt.Sprintf("bytestream://synthetic-%d@%s/blobs/abc/1", i, listener.Addr()))
+				require.NoError(t, err)
+				require.True(t, isPermittedForDial(getTargetForURL(u, true)))
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				err = p.StreamBytestreamFile(ctx, u, io.Discard)
+				cancel()
+				require.NoError(t, err)
+			}
+			require.Eventually(t, func() bool { return len(v4SocketTargets(t))-len(before) >= 4*n }, 5*time.Second, 10*time.Millisecond)
+			t.Logf("N=%d pools=%d retained_socket_delta=%d (client and server)", n, len(p.connPoolMap), len(v4SocketTargets(t))-len(before))
 		})
 	}
 }
