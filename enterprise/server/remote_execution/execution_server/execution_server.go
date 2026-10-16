@@ -1746,8 +1746,11 @@ func (s *ExecutionServer) PublishOperation(stream repb.Execution_PublishOperatio
 			// action is merged. At the same time, we don't want the window between the calls to be too large to avoid
 			// reducing the effectiveness of merging.
 			if publishResult {
-				action_merger.DeletePendingExecution(ctx, s.rdb, publishID)
-				deletePendingExecutionOnce()
+				if len(otherCopies) > 0 {
+					action_merger.DeletePendingExecution(ctx, s.rdb, publishID)
+				} else if otherCopies == nil {
+					deletePendingExecutionOnce()
+				}
 			}
 			actionRN := digest.NewACResourceName(actionCASRN.GetDigest(), actionCASRN.GetInstanceName(), actionCASRN.GetDigestFunction())
 			if publishResult {
