@@ -2,6 +2,7 @@ package action_merger
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -107,25 +108,55 @@ func TestHedgePairRegistrationReservesBudget(t *testing.T) {
 // An old app completing the canonical copy runs the pre-v2 cleanup against the
 // shared Redis database. A late loser on a new app must remain fenced afterward.
 func TestHedgeRollingDeployOldCompletionPreservesFence(t *testing.T) {
-	flags.Set(t, "remote_execution.enable_action_merging", true)
-	flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
-	ctx, err := prefix.AttachUserPrefixToContext(t.Context(), nullauth.NewNullAuthenticator(true))
-	require.NoError(t, err)
-	rdb := testredis.Start(t).Client()
-	action := digest.NewCASResourceName(&repb.Digest{Hash: strings.Repeat("c", 64), SizeBytes: 1}, "", repb.DigestFunction_SHA256)
-	canonical, _ := GetOrCreateExecutionID(ctx, rdb, &pendingScheduler{}, action, false)
-	hedge := action.NewUploadString()
-	require.NoError(t, RegisterHedge(ctx, rdb, canonical, hedge))
-	_, publish, _, err := CompleteCopy(ctx, rdb, hedge, true, []byte("winner"))
-	require.NoError(t, err)
-	require.True(t, publish)
-	// Exact Redis operations performed by baseline DeletePendingExecution.
-	reverse := redisKeyForPendingExecutionDigest(canonical)
-	pending, err := rdb.Get(ctx, reverse).Result()
-	require.NoError(t, err)
-	require.NoError(t, rdb.Del(ctx, pending).Err())
-	require.NoError(t, rdb.Del(ctx, reverse).Err())
-	_, publish, _, err = CompleteCopy(ctx, rdb, canonical, true, []byte("late loser"))
-	require.NoError(t, err)
-	require.False(t, publish, "old replica cleanup must not allow the losing canonical copy to publish/cache its result")
+	for _, winnerIsHedge := range []bool{false, true} {
+		for _, cleanupBeforeWinner := range []bool{false, true} {
+			t.Run(fmt.Sprintf("hedge_wins=%t/cleanup_first=%t", winnerIsHedge, cleanupBeforeWinner), func(t *testing.T) {
+				flags.Set(t, "remote_execution.enable_action_merging", true)
+				flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
+				ctx, err := prefix.AttachUserPrefixToContext(t.Context(), nullauth.NewNullAuthenticator(true))
+				require.NoError(t, err)
+				rdb := testredis.Start(t).Client()
+				action := digest.NewCASResourceName(&repb.Digest{Hash: strings.Repeat("c", 64), SizeBytes: 1}, "", repb.DigestFunction_SHA256)
+				canonical, _ := GetOrCreateExecutionID(ctx, rdb, &pendingScheduler{}, action, false)
+				hedge := action.NewUploadString()
+				require.NoError(t, RegisterHedge(ctx, rdb, canonical, hedge))
+				forward, err := redisKeyForPendingExecutionID(ctx, action)
+				require.NoError(t, err)
+				require.Equal(t, forward, rdb.Get(ctx, redisKeyForPendingExecutionDigest(canonical)).Val(), "legacy values retain their format")
+				cleanup := func() {
+					// Baseline cleanup of either copy must not touch pair metadata.
+					for _, id := range []string{canonical, hedge} {
+						reverse := redisKeyForPendingExecutionDigest(id)
+						pending, err := rdb.Get(ctx, reverse).Result()
+						if err == redis.Nil {
+							continue
+						}
+						require.NoError(t, err)
+						require.NoError(t, rdb.Del(ctx, pending).Err())
+						require.NoError(t, rdb.Del(ctx, reverse).Err())
+					}
+				}
+				if cleanupBeforeWinner {
+					cleanup()
+				}
+				winner, loser := canonical, hedge
+				if winnerIsHedge {
+					winner, loser = hedge, canonical
+				}
+				_, publish, _, err := CompleteCopy(ctx, rdb, winner, true, []byte("winner"))
+				require.NoError(t, err)
+				require.True(t, publish)
+				if !cleanupBeforeWinner {
+					cleanup()
+				}
+				id, publish, _, err := CompleteCopy(ctx, rdb, loser, true, []byte("late loser"))
+				require.NoError(t, err)
+				require.Equal(t, canonical, id)
+				require.False(t, publish, "legacy cleanup must preserve loser fencing")
+				data, _, err := CopyState(ctx, rdb, canonical)
+				require.NoError(t, err)
+				require.Equal(t, "winner", string(data))
+			})
+		}
+	}
 }

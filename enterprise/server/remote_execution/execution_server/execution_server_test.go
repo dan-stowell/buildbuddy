@@ -3045,7 +3045,7 @@ type copyRegistryHook struct{ commands chan string }
 
 func (h *copyRegistryHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
 	for _, arg := range cmd.Args() {
-		if strings.HasPrefix(fmt.Sprint(arg), "executionCopies/") {
+		if strings.HasPrefix(fmt.Sprint(arg), "executionCopies/") || strings.HasPrefix(fmt.Sprint(arg), "executionPair/") {
 			h.commands <- cmd.String()
 			break
 		}
@@ -3206,7 +3206,7 @@ type mergeFailureRedisHook struct{ commands chan string }
 
 func (h *mergeFailureRedisHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
 	for _, arg := range cmd.Args() {
-		if strings.HasPrefix(fmt.Sprint(arg), "pendingExecution") || strings.HasPrefix(fmt.Sprint(arg), "executionCopies/") {
+		if strings.HasPrefix(fmt.Sprint(arg), "pendingExecution") || strings.HasPrefix(fmt.Sprint(arg), "executionCopies/") || strings.HasPrefix(fmt.Sprint(arg), "executionPair/") {
 			h.commands <- cmd.Name()
 			break
 		}
@@ -3243,5 +3243,5 @@ func TestNoHedgeFailurePreservesBaselineMergeRedisWork(t *testing.T) {
 		commands = append(commands, <-hook.commands)
 	}
 	t.Logf("no-hedge failure merge Redis commands: %v", commands)
-	require.Empty(t, commands, "ordinary failure must preserve baseline merge-state Redis work")
+	require.Equal(t, []string{"get"}, commands, "ordinary failure is limited to one pair lookup and no cleanup")
 }
