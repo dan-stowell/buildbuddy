@@ -30,6 +30,10 @@ func TestSoakGrowing(t *testing.T) {
 		// waits for commands asynchronously.
 		{"released in bulk", []int{1, 1, 1, 23, 1, 1, 23, 19, 23, 23, 23}, false},
 		{"shrinking", []int{29, 29, 29, 29, 29, 29, 29, 1, 1, 23, 23}, false},
+		// A bounded pool that grows lazily, e.g. a client connection pool
+		// that opens a second connection the first time two requests
+		// overlap. A leak this slow (one per ten batches) looks the same.
+		{"one step in the middle", []int{1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2}, false},
 		// Limitations.
 		{"less than one per batch is not caught", []int{0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5}, false},
 		{"pool that grows past the middle is reported", []int{0, 2, 4, 6, 8, 10, 12, 14, 14, 14, 14}, true},

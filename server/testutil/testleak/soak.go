@@ -3,6 +3,7 @@ package testleak
 import (
 	"maps"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -46,8 +47,9 @@ const (
 // unrelated group shrinking at the same time; see soakGrowing for other
 // limitations.
 //
-// Each sample is taken when three consecutive observations, 100ms apart, are
-// identical, or after DefaultSettle; periodic background work can delay that.
+// Each sample is taken after a garbage collection, once three consecutive
+// observations, 100ms apart, are identical, or after DefaultSettle; periodic
+// background work can delay that.
 // Do not run other tests in parallel.
 func Soak(t testing.TB, warmup, batches int, op func(batch int)) {
 	t.Helper()
@@ -101,6 +103,10 @@ func Soak(t testing.TB, warmup, batches int, op func(batch int)) {
 		return counts
 	}
 	settle := func() map[string]int {
+		// Resources released by finalizers or cleanups (e.g. the pidfds of
+		// os.Process values) otherwise pile up until the next GC, and then
+		// drop all at once, which hides steady growth in the same group.
+		runtime.GC()
 		deadline := time.Now().Add(DefaultSettle)
 		last := snapshot()
 		for stable := 0; stable < 3; {
