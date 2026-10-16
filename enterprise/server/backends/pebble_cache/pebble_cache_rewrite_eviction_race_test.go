@@ -231,3 +231,48 @@ func TestConcurrentExternalRewrites(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, second, got)
 }
+
+// Delete may linearize before or after a rewrite, but must never leave a
+// positive presence answer pointing at a file it removed.
+func TestDeleteDuringExternalRewrite(t *testing.T) {
+	t.Cleanup(func() { beforeWriteMetadataHook = nil })
+	env := testenv.GetTestEnv(t)
+	ctx := anonCtx(t, env)
+	pc, err := NewPebbleCache(env, &Options{
+		RootDirectory: t.TempDir(), MaxSizeBytes: 100_000_000,
+		MaxInlineFileSizeBytes: 1024, MinBytesAutoZstdCompression: new(int64(1 << 60)),
+	})
+	require.NoError(t, err)
+	l := observeCommitLock(pc)
+	require.NoError(t, pc.Start())
+	defer pc.Stop()
+	t.Log("seed=20261017")
+	d, data, err := digest.UniformRandomGenerator(20261017).RandomDigestBuf(4096)
+	require.NoError(t, err)
+	r := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256).ToProto()
+	require.NoError(t, pc.Set(ctx, r, data))
+	record, err := pc.makeFileRecord(pc.userGroupID(ctx), nil, r)
+	require.NoError(t, err)
+	key, err := pc.fileStorer.PebbleKey(record)
+	require.NoError(t, err)
+	l.target.Store(key.LockID())
+	deleteErr := make(chan error, 1)
+	var done <-chan struct{}
+	beforeWriteMetadataHook = func(_ filestore.PebbleKey) {
+		beforeWriteMetadataHook = nil
+		done = evictionAtCommitBarrier(l, func() { deleteErr <- pc.Delete(ctx, r) })
+	}
+	require.NoError(t, pc.Set(ctx, r, data))
+	<-done
+	require.NoError(t, <-deleteErr)
+	present, err := pc.Contains(ctx, r)
+	require.NoError(t, err)
+	missing, err := pc.FindMissing(ctx, []*rspb.ResourceName{r})
+	require.NoError(t, err)
+	require.Equal(t, !present, len(missing) == 1)
+	if present {
+		got, err := pc.Get(ctx, r)
+		require.NoError(t, err, "Delete + rewrite left metadata pointing to a missing file")
+		require.Equal(t, data, got)
+	}
+}
