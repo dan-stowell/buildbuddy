@@ -26,6 +26,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testhttp"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/claims"
 	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
@@ -1964,4 +1965,34 @@ func TestRegistryETLDPlusOne(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+// Each resolver request used to create a new HTTP transport, leaving one idle
+// connection (and its two goroutines) open per request until the registry
+// closed it.
+func TestResolverReusesConnections(t *testing.T) {
+	flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
+	te := testenv.GetTestEnv(t)
+	creds := &testregistry.BasicAuthCreds{Username: "user", Password: "pass"}
+	registry := testregistry.Run(t, testregistry.Opts{Creds: creds})
+	t.Cleanup(func() { registry.Shutdown() })
+	const iterations = 10
+	_, img := registry.PushNamedImage(t, "img", creds)
+	for i := range iterations + 1 { // +1 for the warmup iteration
+		registry.Push(t, img, fmt.Sprintf("img:t%d", i), creds)
+	}
+	resolver := newResolver(t, te)
+	ctx := context.Background()
+	ociCreds := oci.Credentials{Username: creds.Username, Password: creds.Password}
+
+	testleak.CheckGrowth(t, testleak.Growth{Iterations: iterations}, func(i int) {
+		// Use a new tag each time to bypass the tag-to-digest cache.
+		imageName := registry.ImageAddress(fmt.Sprintf("img:t%d", i))
+		_, err := resolver.ResolveImageDigest(ctx, imageName, oci.RuntimePlatform(), ociCreds)
+		require.NoError(t, err)
+		err = resolver.AuthenticateWithRegistry(ctx, imageName, oci.RuntimePlatform(), ociCreds)
+		require.NoError(t, err)
+		_, err = resolver.Resolve(ctx, imageName, oci.RuntimePlatform(), ociCreds, false /*=useOCIFetcher*/)
+		require.NoError(t, err)
+	})
 }
