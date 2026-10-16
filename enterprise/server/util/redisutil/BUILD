@@ -31,6 +31,8 @@ go_test(
         "//enterprise/server/experiments",
         "//enterprise/server/testutil/testredis",
         "//server/testutil/testenv",
+        "//server/testutil/testleak",
+        "//server/util/testing/flags",
         "//server/util/status",
         "@com_github_go_redis_redis_v8//:redis",
         "@com_github_google_go_cmp//cmp",

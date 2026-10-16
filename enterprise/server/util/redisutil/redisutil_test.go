@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -20,7 +21,9 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testredis"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/redisutil"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/go-redis/redis/v8"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -763,6 +766,109 @@ func TestIsTransientError(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			transient := redisutil.IsTransientError(tc.err)
 			require.Equal(t, tc.transient, transient)
+		})
+	}
+}
+
+// blockedPipeline models a Redis operation which waits until its context is
+// cancelled. Embedding keeps this fake limited to the method under test.
+type blockedPipeline struct {
+	redis.Pipeliner
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *blockedPipeline) IncrBy(ctx context.Context, key string, value int64) *redis.IntCmd {
+	return redis.NewIntCmd(ctx, "incrby", key, value)
+}
+
+func (p *blockedPipeline) Exec(ctx context.Context) ([]redis.Cmder, error) {
+	select {
+	case p.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-p.release:
+		return nil, nil
+	}
+}
+
+type blockedPipelineClient struct {
+	redis.UniversalClient
+	pipeline *blockedPipeline
+}
+
+func (c *blockedPipelineClient) Pipeline() redis.Pipeliner { return c.pipeline }
+
+func TestCommandBuffer_ShutdownCancelsBlockedPeriodicFlush(t *testing.T) {
+	flags.Set(t, "redis_command_buffer_flush_period", time.Millisecond)
+	for _, n := range []int{1, 10, 50} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			testleak.Check(t)
+			var finished []chan error
+			var releases []chan struct{}
+			t.Cleanup(func() {
+				for _, release := range releases {
+					close(release)
+				}
+				for _, done := range finished {
+					<-done
+				}
+			})
+			for range n {
+				p := &blockedPipeline{entered: make(chan struct{}, 1), release: make(chan struct{})}
+				releases = append(releases, p.release)
+				buf := redisutil.NewCommandBuffer(&blockedPipelineClient{pipeline: p})
+				require.NoError(t, buf.IncrBy(context.Background(), "count", 1))
+				buf.StartPeriodicFlush(context.Background())
+				select {
+				case <-p.entered:
+				case <-time.After(5 * time.Second):
+					t.Fatal("periodic flush did not start")
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+				defer cancel()
+				done := make(chan error, 1)
+				finished = append(finished, done)
+				go func() { done <- buf.StopPeriodicFlush(ctx) }()
+			}
+			// The grace period exceeds every shutdown deadline. No dependency is
+			// released until cleanup, so a successful stop must cancel its own work.
+			timer := time.NewTimer(time.Second)
+			defer timer.Stop()
+			blocked := 0
+			for _, done := range finished {
+				select {
+				case err := <-done:
+					require.ErrorIs(t, err, context.DeadlineExceeded)
+					done <- err // cleanup joins every invocation, including completed ones
+				case <-timer.C:
+					blocked++
+					goto counted
+				}
+			}
+		counted:
+			if blocked > 0 {
+				blocked = 0
+				for _, done := range finished {
+					if len(done) == 0 {
+						blocked++
+					}
+				}
+			}
+			t.Logf("N=%d shutdown calls still blocked after deadlines: %d", n, blocked)
+			if blocked > 0 && n == 1 {
+				dump := make([]byte, 1<<20)
+				dump = dump[:runtime.Stack(dump, true)]
+				for _, stack := range strings.Split(string(dump), "\n\n") {
+					if strings.Contains(stack, "blockedPipeline).Exec") || strings.Contains(stack, "CommandBuffer).StopPeriodicFlush") {
+						t.Log(stack)
+					}
+				}
+			}
+			require.Zero(t, blocked, "shutdown ignored its deadline while Redis flush was blocked")
 		})
 	}
 }
