@@ -1,10 +1,12 @@
 package scheduler_server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"slices"
 	"sort"
 	"sync"
@@ -64,6 +66,8 @@ const (
 
 type fakeTaskRouter struct {
 	preferredExecutors []string
+	// If set, use this Redis target instead of starting a new Redis server.
+	redisTarget string
 }
 
 type fakeRankedNode struct {
@@ -114,7 +118,10 @@ type schedulerOpts struct {
 
 func getEnv(t *testing.T, opts *schedulerOpts, user string) (*testenv.TestEnv, context.Context) {
 	testleak.Check(t)
-	redisTarget := testredis.Start(t).Target
+	redisTarget := opts.redisTarget
+	if redisTarget == "" {
+		redisTarget = testredis.Start(t).Target
+	}
 	env := enterprise_testenv.GetCustomTestEnv(t, &enterprise_testenv.Options{
 		RedisTarget: redisTarget,
 	})
@@ -2756,4 +2763,314 @@ func TestWatchTaskLiveness_StopsWhenWatchersAreDone(t *testing.T) {
 	s.livenessMu.Lock()
 	defer s.livenessMu.Unlock()
 	require.Empty(t, s.livenessWatches)
+}
+
+// lossyRedisProxy forwards TCP connections to a Redis server. When armed via
+// dropReplyTo, the next request containing the given bytes is forwarded to
+// Redis (so Redis executes it), but Redis' reply is discarded and the client
+// connection is closed, as if the connection had been reset after the command
+// ran but before the reply arrived (e.g. a network blip or a Redis failover).
+type lossyRedisProxy struct {
+	upstream string
+	lis      net.Listener
+	dropped  atomic.Int32
+
+	mu     sync.Mutex
+	marker []byte
+	conns  []net.Conn
+	closed bool
+	wg     sync.WaitGroup
+}
+
+func startLossyRedisProxy(t *testing.T, upstream string) *lossyRedisProxy {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	p := &lossyRedisProxy{upstream: upstream, lis: lis}
+	p.wg.Go(func() {
+		for {
+			c, err := lis.Accept()
+			if err != nil {
+				return
+			}
+			p.handle(c)
+		}
+	})
+	t.Cleanup(func() {
+		lis.Close()
+		p.mu.Lock()
+		p.closed = true
+		for _, c := range p.conns {
+			c.Close()
+		}
+		p.mu.Unlock()
+		p.wg.Wait()
+	})
+	return p
+}
+
+func (p *lossyRedisProxy) Addr() string {
+	return p.lis.Addr().String()
+}
+
+func (p *lossyRedisProxy) dropReplyTo(marker []byte) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.marker = marker
+}
+
+func (p *lossyRedisProxy) takeMarker(b []byte) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.marker != nil && bytes.Contains(b, p.marker) {
+		p.marker = nil
+		return true
+	}
+	return false
+}
+
+func (p *lossyRedisProxy) track(c net.Conn) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		c.Close()
+		return false
+	}
+	p.conns = append(p.conns, c)
+	return true
+}
+
+func (p *lossyRedisProxy) handle(client net.Conn) {
+	if !p.track(client) {
+		return
+	}
+	server, err := net.Dial("tcp", p.upstream)
+	if err != nil {
+		client.Close()
+		return
+	}
+	if !p.track(server) {
+		client.Close()
+		return
+	}
+	var dropReplies atomic.Bool
+	p.wg.Go(func() {
+		defer client.Close()
+		defer server.Close()
+		buf := make([]byte, 64<<10)
+		for {
+			n, err := server.Read(buf)
+			if n > 0 {
+				if dropReplies.Load() {
+					// The command was executed by Redis; lose its reply.
+					p.dropped.Add(1)
+					return
+				}
+				if _, err := client.Write(buf[:n]); err != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	})
+	p.wg.Go(func() {
+		defer client.Close()
+		defer server.Close()
+		buf := make([]byte, 64<<10)
+		for {
+			n, err := client.Read(buf)
+			if n > 0 {
+				if p.takeMarker(buf[:n]) {
+					dropReplies.Store(true)
+				}
+				if _, err := server.Write(buf[:n]); err != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	})
+}
+
+// describeTaskState returns the scheduler's Redis state for a task, for
+// failure messages.
+func describeTaskState(t *testing.T, env environment.Env, taskID string) string {
+	s := env.GetSchedulerService().(*SchedulerServer)
+	rdb := env.GetRemoteExecutionRedisClient()
+	ctx := context.Background()
+	key := s.redisKeyForTask(taskID)
+	fields, err := rdb.HMGet(ctx, key, "claimed", "leaseId", "attemptCount", "reconnectPeriodEnd").Result()
+	if err != nil {
+		return fmt.Sprintf("<error reading task: %s>", err)
+	}
+	ttl, _ := rdb.PTTL(ctx, key).Result()
+	exists, _ := rdb.Exists(ctx, key).Result()
+	return fmt.Sprintf("exists=%d claimed=%v leaseId=%v attemptCount=%v reconnectPeriodEnd=%v ttl=%s", exists, fields[0], fields[1], fields[2], fields[3], ttl)
+}
+
+// requireTaskClaimableWithin asserts that some executor can claim the task
+// within the given time (a reconnecting or new executor would get it).
+func requireTaskClaimableWithin(t *testing.T, env environment.Env, fe *fakeExecutor, taskID string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		lease, err := fe.leaseTask(taskID, "" /*=reconnectToken*/)
+		if err == nil {
+			require.NoError(t, lease.Finalize())
+			return
+		}
+		lastErr = err
+		time.Sleep(250 * time.Millisecond)
+	}
+	require.FailNowf(t, "task stranded",
+		"no executor could claim task %q for %s, although no executor holds a lease on it. Last claim error: %v. Task state: %s",
+		taskID, timeout, lastErr, describeTaskState(t, env, taskID))
+}
+
+func TestLeaseTask_LostClaimReplyDoesNotStrandTask(t *testing.T) {
+	redisServer := testredis.StartTCP(t)
+	proxy := startLossyRedisProxy(t, redisServer.Target)
+	env, ctx := getEnv(t, &schedulerOpts{redisTarget: proxy.Addr()}, "user1")
+
+	fe := newFakeExecutor(ctx, t, env.GetSchedulerClient())
+	fe.Register()
+
+	taskID := scheduleTask(ctx, t, env, map[string]string{})
+	fe.WaitForTask(taskID)
+
+	// Make sure the claim script is cached so the claim is a single EVALSHA,
+	// then lose the reply to that EVALSHA.
+	rdb := env.GetRemoteExecutionRedisClient()
+	require.NoError(t, redisAcquireClaim.Load(ctx, rdb).Err())
+	proxy.dropReplyTo([]byte(redisAcquireClaim.Hash()))
+
+	_, err := fe.leaseTask(taskID, "" /*=reconnectToken*/)
+	require.EqualValues(t, 1, proxy.dropped.Load(), "expected the claim reply to be dropped")
+	// The executor did not get a lease. A real executor drops the reservation
+	// in this case (priority_task_scheduler), so nothing else will release a
+	// claim that was recorded.
+	require.Error(t, err)
+	t.Logf("claim attempt whose Redis reply was lost returned: %v; task state: %s", err, describeTaskState(t, env, taskID))
+
+	// Nobody holds a lease on the task, so it must still be runnable.
+	other := newFakeExecutor(ctx, t, env.GetSchedulerClient())
+	other.Register()
+	requireTaskClaimableWithin(t, env, other, taskID, 10*time.Second)
+}
+
+func TestLeaseTask_LostReconnectReplyDoesNotStrandTask(t *testing.T) {
+	redisServer := testredis.StartTCP(t)
+	proxy := startLossyRedisProxy(t, redisServer.Target)
+	env, ctx := getEnv(t, &schedulerOpts{redisTarget: proxy.Addr()}, "user1")
+
+	holder := newFakeExecutorWithId(ctx, t, "holder", env.GetSchedulerClient())
+	holder.Register()
+
+	taskID := scheduleTask(ctx, t, env, map[string]string{})
+	holder.WaitForTask(taskID)
+	lease := holder.Claim(taskID)
+
+	// The scheduler replica holding the lease shuts down and releases the task
+	// with a reconnect grace period (what the LeaseTask defer does).
+	s := env.GetSchedulerService().(*SchedulerServer)
+	reconnectToken := lease.leaseID
+	require.NoError(t, s.reEnqueueTask(ctx, taskID, lease.leaseID, reconnectToken, 1 /*=numReplicas*/, "server shutting down"))
+
+	// The executor reconnects, but the reply to its claim is lost.
+	rdb := env.GetRemoteExecutionRedisClient()
+	require.NoError(t, redisAcquireClaim.Load(ctx, rdb).Err())
+	proxy.dropReplyTo([]byte(redisAcquireClaim.Hash()))
+	_, err := holder.Reconnect(taskID, reconnectToken)
+	require.EqualValues(t, 1, proxy.dropped.Load(), "expected the claim reply to be dropped")
+	require.Error(t, err)
+	t.Logf("reconnect whose Redis reply was lost returned: %v; task state: %s", err, describeTaskState(t, env, taskID))
+
+	// Like task_leaser, the executor gives up on the task and asks the
+	// scheduler to re-enqueue it, using the last lease ID it knows.
+	_, err = env.GetSchedulerClient().ReEnqueueTask(ctx, &scpb.ReEnqueueTaskRequest{
+		TaskId:  taskID,
+		LeaseId: lease.leaseID,
+		Reason:  "lease reconnect failed",
+	})
+	t.Logf("executor's fallback ReEnqueueTask returned: %v", err)
+
+	other := newFakeExecutor(ctx, t, env.GetSchedulerClient())
+	other.Register()
+	requireTaskClaimableWithin(t, env, other, taskID, 10*time.Second)
+}
+
+// A scheduler replica dies without running the LeaseTask defer: the claim is
+// left set. The executor's reconnect is refused, and it falls back to
+// ReEnqueueTask with its lease ID, which must make the task runnable again.
+func TestLeaseTask_SchedulerCrashThenExecutorReEnqueueRecovers(t *testing.T) {
+	fakeClock := clockwork.NewFakeClock()
+	env, ctx := getEnv(t, &schedulerOpts{options: Options{Clock: fakeClock}}, "user1")
+
+	holder := newFakeExecutorWithId(ctx, t, "holder", env.GetSchedulerClient())
+	holder.Register()
+	taskID := scheduleTask(ctx, t, env, map[string]string{})
+	holder.WaitForTask(taskID)
+	// The lease stream stays open but is never used again, and the fake clock
+	// never advances, so this replica never releases the claim (as if it had
+	// crashed).
+	lease := holder.Claim(taskID)
+	holder.ResetTasks()
+
+	_, err := holder.Reconnect(taskID, lease.leaseID)
+	require.Error(t, err)
+	t.Logf("reconnect after crash returned: %v", err)
+
+	_, err = env.GetSchedulerClient().ReEnqueueTask(ctx, &scpb.ReEnqueueTaskRequest{
+		TaskId:  taskID,
+		LeaseId: lease.leaseID,
+		Reason:  "lease reconnect failed",
+	})
+	require.NoError(t, err)
+	holder.WaitForTask(taskID)
+}
+
+// A scheduler replica shuts down while a retry=false task is running, so the
+// task is reserved for its executor to reconnect. If that executor dies before
+// reconnecting, the task must not be left waiting forever.
+func TestLeaseReconnectGrace_RetriesDisabled_ExecutorNeverReconnects(t *testing.T) {
+	flags.Set(t, "remote_execution.lease_reconnect_grace_period", 100*time.Millisecond)
+	env, ctx := getEnv(t, &schedulerOpts{options: Options{
+		LeaseDuration:    1 * time.Second,
+		LeaseGracePeriod: 1 * time.Second,
+	}}, "user1")
+
+	holder := newFakeExecutorWithId(ctx, t, "holder", env.GetSchedulerClient())
+	holder.Register()
+	taskID := scheduleTask(ctx, t, env, map[string]string{platform.RetryPropertyName: "false"})
+	holder.WaitForTask(taskID)
+	lease := holder.Claim(taskID)
+
+	s := env.GetSchedulerService().(*SchedulerServer)
+	require.NoError(t, s.reEnqueueTask(ctx, taskID, lease.leaseID, lease.leaseID, probesPerTask, "server shutting down"))
+	// The holder now dies: it never reconnects or calls ReEnqueueTask.
+
+	other := newFakeExecutorWithId(ctx, t, "other", env.GetSchedulerClient())
+	other.Register()
+
+	// Allow far more than the reconnect grace period plus a lease period.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := s.readTask(ctx, taskID); status.IsNotFoundError(err) {
+			// The task was failed/removed; the client is not left waiting.
+			return
+		}
+		other.mu.Lock()
+		_, offered := other.tasks[taskID]
+		other.mu.Unlock()
+		if offered {
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	require.FailNowf(t, "task stranded",
+		"retry=false task %q was neither re-offered nor failed 10s after its executor stopped reconnecting (grace 100ms, lease 1s). Task state: %s",
+		taskID, describeTaskState(t, env, taskID))
 }
