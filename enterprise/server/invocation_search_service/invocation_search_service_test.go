@@ -462,3 +462,20 @@ func TestPaginationMutationDoesNotRepeatOrSkip(t *testing.T) {
 		})
 	}
 }
+
+func TestPaginationInvalidTokens(t *testing.T) {
+	ctx, _, service := paginationFixture(t, 3, false, false)
+	for _, token := range []string{"garbage", "offset_", "offset_no", "offset_9223372036854775808", "offset_-1"} {
+		t.Run(token, func(t *testing.T) {
+			_, err := service.QueryInvocations(ctx, &inpb.SearchInvocationRequest{Count: 1, PageToken: token, Query: &inpb.InvocationQuery{User: "pager"}})
+			require.True(t, status.IsInvalidArgumentError(err), "token %q: expected InvalidArgument, got %v", token, err)
+		})
+	}
+	t.Run("different_query", func(t *testing.T) {
+		first, err := service.QueryInvocations(ctx, &inpb.SearchInvocationRequest{Count: 1, Query: &inpb.InvocationQuery{User: "pager"}})
+		require.NoError(t, err)
+		require.NotEmpty(t, first.NextPageToken)
+		_, err = service.QueryInvocations(ctx, &inpb.SearchInvocationRequest{Count: 1, PageToken: first.NextPageToken, Query: &inpb.InvocationQuery{User: "someone_else"}})
+		require.True(t, status.IsInvalidArgumentError(err), "token from another query must be rejected; got %v", err)
+	})
+}
