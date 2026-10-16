@@ -252,3 +252,37 @@ func TestRunnerReuseRemovesNestedRepository(t *testing.T) {
 	f.assertFresh(sha)
 }
 
+func TestRunnerReuseSubmodule(t *testing.T) {
+	for _, scenario := range []string{"pointer-change", "removed"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newReuseFixture(t)
+			sub := t.TempDir()
+			reuseGit(t, sub, "init")
+			reuseGit(t, sub, "symbolic-ref", "HEAD", "refs/heads/main")
+			reuseWrite(t, sub, "input", "old submodule\n")
+			reuseCommit(t, sub)
+			reuseGit(t, f.source, "submodule", "add", "file://"+sub, "dependency")
+			old := reuseCommit(t, f.source)
+			require.NoError(t, f.setup("x", "", old))
+			checkout := filepath.Join(f.root, repoDirName)
+			// Model a workflow that initialized its dependencies on a prior run.
+			reuseGit(t, checkout, "submodule", "update", "--init", "--recursive")
+			if scenario == "pointer-change" {
+				reuseWrite(t, sub, "input", "new submodule\n")
+				next := reuseCommit(t, sub)
+				reuseGit(t, filepath.Join(f.source, "dependency"), "fetch", "origin")
+				reuseGit(t, filepath.Join(f.source, "dependency"), "checkout", next)
+			} else {
+				reuseGit(t, f.source, "rm", "-f", "dependency")
+			}
+			sha := reuseCommit(t, f.source)
+			require.NoError(t, f.setup("x", "", sha))
+			require.Equal(t, sha, reuseGit(t, checkout, "rev-parse", "HEAD"))
+			fresh := t.TempDir()
+			reuseGit(t, fresh, "clone", "--quiet", "file://"+f.source, ".")
+			reuseGit(t, fresh, "checkout", "--quiet", sha)
+			reuseGit(t, fresh, "submodule", "update", "--init", "--recursive")
+			require.Equal(t, reuseTree(t, fresh), reuseTree(t, checkout))
+		})
+	}
+}
