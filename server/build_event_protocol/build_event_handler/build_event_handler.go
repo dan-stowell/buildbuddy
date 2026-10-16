@@ -952,6 +952,14 @@ func (e *EventChannel) FinalizeInvocation(iid string) error {
 		return status.CanceledErrorf("Attempt %d of invocation %s pre-empted by more recent attempt, invocation not finalized.", e.attempt, iid)
 	}
 
+	// Only flush after the COMPLETE update succeeds: blob/log write failures
+	// and superseded attempts must not publish statuses that a retry resends.
+	// Completed invocations reject subsequent attempts. Finalize is idempotent
+	// when last_message already flushed the tracker.
+	if e.beValues.BuildFinished() {
+		e.targetTracker.Finalize(ctx)
+	}
+
 	e.flushAPIFacets(iid)
 
 	// Report a disconnect only if we successfully updated the invocation.
