@@ -2954,6 +2954,9 @@ func TestPersistentWorker_UnresponsiveWorker_ActionTimeout(t *testing.T) {
 }
 
 func TestPersistentWorker_UnresponsiveWorker_InvocationCancellation(t *testing.T) {
+	// Cancellation reaches the executor through lease renewal. Keep that delay
+	// below the assertion bound so this test measures worker responsiveness.
+	flags.Set(t, "remote_execution.lease_duration", time.Second)
 	workerHang := unresponsiveWorkerHangSeconds(t) // bounded so the worker always exits
 	rbe := rbetest.NewRBETestEnv(t)
 	bbServer := rbe.AddBuildBuddyServer()
