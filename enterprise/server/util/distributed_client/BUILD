@@ -43,9 +43,13 @@ go_library(
 
 go_test(
     name = "distributed_client_test",
-    srcs = ["distributed_client_test.go"],
+    srcs = [
+        "distributed_client_test.go",
+        "v5_measure_test.go",
+    ],
     deps = [
         ":distributed_client",
+        "//enterprise/server/backends/pebble_cache",
         "//enterprise/server/experiments",
         "//proto:distributed_cache_go_proto",
         "//proto:reference_go_proto",
@@ -59,6 +63,7 @@ go_test(
         "//server/testutil/testauth",
         "//server/testutil/testcompression",
         "//server/testutil/testdigest",
+        "//server/testutil/testfs",
         "//server/testutil/testenv",
         "//server/testutil/testmetrics",
         "//server/testutil/testport",
