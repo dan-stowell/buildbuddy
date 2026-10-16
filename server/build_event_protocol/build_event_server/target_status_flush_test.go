@@ -14,6 +14,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testclickhouse"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
+	"github.com/buildbuddy-io/buildbuddy/server/util/db"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/buildbuddy-io/buildbuddy/server/util/uuid"
 	"github.com/stretchr/testify/require"
@@ -258,6 +259,10 @@ func runTargetStatusFlush(t *testing.T, ending streamEnding, olap bool) {
 		require.NoError(t, perr)
 		q := `SELECT t.label, ts.status FROM "TargetStatuses" AS ts JOIN "Targets" AS t ON t.target_id = ts.target_id WHERE ts.invocation_uuid = ? ORDER BY t.label`
 		err = te.GetDBHandle().NewQuery(context.Background(), "tf_get_status").Raw(q, iidBytes).Take(&rows)
+	}
+	if db.IsRecordNotFound(err) {
+		// Take() reports "record not found" when the query matches no rows.
+		rows, err = nil, nil
 	}
 	require.NoError(t, err)
 	t.Logf("ending=%s olap=%t stored target statuses: %v", ending, olap, rows)
