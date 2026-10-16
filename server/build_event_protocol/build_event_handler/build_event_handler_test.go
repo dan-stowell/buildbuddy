@@ -37,6 +37,7 @@ import (
 	bspb "github.com/buildbuddy-io/buildbuddy/proto/build_event_stream"
 	bepb "github.com/buildbuddy-io/buildbuddy/proto/build_events"
 	clpb "github.com/buildbuddy-io/buildbuddy/proto/command_line"
+	elpb "github.com/buildbuddy-io/buildbuddy/proto/eventlog"
 	inpb "github.com/buildbuddy-io/buildbuddy/proto/invocation"
 	inspb "github.com/buildbuddy-io/buildbuddy/proto/invocation_status"
 	pepb "github.com/buildbuddy-io/buildbuddy/proto/publish_build_event"
@@ -2404,4 +2405,45 @@ func TestTruncateStringSlice(t *testing.T) {
 			assert.Equal(t, test.Truncated, truncated, "truncated should be %t", test.Truncated)
 		})
 	}
+}
+
+func TestBuildLogsReplayAfterDisconnect(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
+	te.SetAuthenticator(auth)
+	ctx := t.Context()
+	iid := "99c99b39-7865-4c01-9e8a-a71d2b3e1981"
+	handler := build_event_handler.NewBuildEventHandler(te)
+	// Retry from sequence 1, as Bazel does on reconnect. Events are freshly
+	// marshaled because HandleEvent removes stdout/stderr from the stored proto.
+	for attempt := range 2 {
+		ch, err := handler.OpenChannel(ctx, iid)
+		require.NoError(t, err)
+		require.NoError(t, ch.HandleEvent(streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), iid, 1)))
+		require.NoError(t, ch.HandleEvent(streamRequest(progressEventWithOutput("out1\n", "err1\n"), iid, 2)))
+		require.NoError(t, ch.HandleEvent(streamRequest(progressEventWithOutput("", ""), iid, 3)))
+		require.NoError(t, ch.HandleEvent(streamRequest(progressEventWithOutput("out2\n", "err2\n"), iid, 4)))
+		if attempt == 1 {
+			require.NoError(t, ch.HandleEvent(streamRequest(finishedEvent(), iid, 5)))
+		}
+		require.NoError(t, ch.FinalizeInvocation(iid))
+		ch.Close()
+	}
+	authCtx := auth.AuthContextFromAPIKey(ctx, "USER1")
+	inv, err := te.GetInvocationDB().LookupInvocation(authCtx, iid)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), inv.Attempt)
+	var got strings.Builder
+	next := "0000"
+	for range 10 {
+		rsp, err := eventlog.GetEventLogChunk(authCtx, te, &elpb.GetEventLogChunkRequest{InvocationId: iid, ChunkId: next, MinLines: 100})
+		require.NoError(t, err)
+		require.False(t, rsp.Live)
+		got.Write(rsp.Buffer)
+		if rsp.NextChunkId == "" {
+			break
+		}
+		next = rsp.NextChunkId
+	}
+	require.Equal(t, "err1\nout1\nerr2\nout2\n", got.String())
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"strings"
@@ -445,4 +446,109 @@ func TestEventLogWriterSuffixWrites(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, rsp.GetLive())
 	require.Equal(t, "1\n3\n4\n", string(rsp.GetBuffer()))
+}
+
+// A live response is a replacement snapshot of its chunk. Only persisted
+// responses advance the durable prefix; appending every live response is invalid.
+func TestBuildLogsBoundaryPolling(t *testing.T) {
+	for _, size := range []int{1_999_999, 2_000_000, 2_000_001} {
+		for _, minLines := range []int32{0, 1000000} {
+			t.Run(fmt.Sprintf("size=%d/min_lines=%d", size, minLines), func(t *testing.T) {
+				ctx := t.Context()
+				env := testenv.GetTestEnv(t)
+				kv := newTestKeyValStore(t)
+				env.SetKeyValStore(kv)
+				env.SetBlobstore(mockstore.New())
+				inv := newInProgressInvocation("boundary")
+				env.SetInvocationDB(&mockinvocationdb.MockInvocationDB{DB: map[string]*tables.Invocation{"boundary": inv}})
+				path := eventlog.GetEventLogPathFromInvocationIdAndAttempt("boundary", 1)
+				w, err := eventlog.NewEventLogWriter(ctx, env.GetBlobstore(), kv, nil, "", path, 2000, 2)
+				require.NoError(t, err)
+				defer w.Close(ctx)
+				// Short lines avoid terminal wrapping. The second event crosses the flush
+				// boundary; an empty event exercises the no-op write path.
+				first := strings.Repeat("0123456789abcdef\n", size/17) + strings.Repeat("x", size%17)
+				events := []string{first, "\n" + strings.Repeat("next\n", 20), "", "final tail"}
+				var sent, durable string
+				next := "0000"
+				poll := func() string {
+					for range 10 {
+						rsp, err := eventlog.GetEventLogChunk(ctx, env, &elpb.GetEventLogChunkRequest{InvocationId: "boundary", ChunkId: next, MinLines: minLines})
+						require.NoError(t, err)
+						if rsp.Live {
+							require.Equal(t, next, rsp.NextChunkId)
+							return durable + string(rsp.Buffer)
+						}
+						durable += string(rsp.Buffer)
+						if rsp.NextChunkId == "" || rsp.NextChunkId == next {
+							return durable
+						}
+						next = rsp.NextChunkId
+					}
+					t.Fatal("poll failed to reach live chunk or end")
+					return ""
+				}
+				for _, e := range events {
+					_, err := w.Write(ctx, []byte(e))
+					require.NoError(t, err)
+					// GetLastChunkId synchronizes with the writer loop and its write hook.
+					inv.LastChunkId = w.GetLastChunkId(ctx)
+					sent += e
+					require.Equal(t, sent, poll())
+					require.Equal(t, sent, poll(), "unchanged poll must not duplicate data")
+					if len(sent) > size {
+						require.NotEqual(t, eventlog.EmptyId, inv.LastChunkId)
+					}
+				}
+				require.NoError(t, w.Close(ctx))
+				inv.LastChunkId = w.GetLastChunkId(ctx)
+				inv.InvocationStatus = int64(inspb.InvocationStatus_COMPLETE_INVOCATION_STATUS)
+				require.Equal(t, sent, poll(), "completion must deliver the final tail")
+				require.Equal(t, sent, durable)
+				actualLast, err := chunkstore.New(env.GetBlobstore(), &chunkstore.ChunkstoreOptions{}).GetLastChunkId(ctx, path, "0000")
+				require.NoError(t, err)
+				last, err := eventlog.GetEventLogChunk(ctx, env, &elpb.GetEventLogChunkRequest{InvocationId: "boundary", ChunkId: actualLast})
+				require.NoError(t, err)
+				require.NotEmpty(t, last.Buffer)
+				beyond, err := eventlog.GetEventLogChunk(ctx, env, &elpb.GetEventLogChunkRequest{InvocationId: "boundary", ChunkId: last.NextChunkId})
+				require.NoError(t, err)
+				require.Empty(t, beyond.Buffer)
+				require.Empty(t, beyond.NextChunkId)
+				require.Equal(t, actualLast, beyond.PreviousChunkId)
+			})
+		}
+	}
+}
+
+func renderBuildLogEvents(t *testing.T, events []string) string {
+	t.Helper()
+	ctx := t.Context()
+	store := chunkstore.New(mockstore.New(), &chunkstore.ChunkstoreOptions{})
+	output := store.Writer(ctx, "partition", &chunkstore.ChunkstoreWriterOptions{})
+	screen, err := terminal.NewScreenWriter(2000, 4)
+	require.NoError(t, err)
+	w := eventlog.NewANSICursorBufferWriter(output, screen)
+	for _, event := range events {
+		_, err := w.Write(ctx, []byte(event))
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Close(ctx))
+	data, err := io.ReadAll(store.Reader(ctx, "partition"))
+	require.NoError(t, err)
+	return string(data)
+}
+
+func TestBuildLogsEventPartitionInvariant(t *testing.T) {
+	for _, stream := range []string{"plain\n\nend", "\x1b[31mred\x1b[0m\n", "old\rnew\n", "hello\n\x1b[A\x1b[K\n\n\n", strings.Repeat("x", 70000) + "\nend"} {
+		t.Run(fmt.Sprintf("prefix=%q/bytes=%d", stream[:min(12, len(stream))], len(stream)), func(t *testing.T) {
+			want := renderBuildLogEvents(t, []string{stream})
+			// Exhaust every byte boundary for small examples, including boundaries
+			// inside UTF-8 and ANSI sequences. Sample long lines deterministically.
+			step := max(1, len(stream)/20)
+			for split := 0; split <= len(stream); split += step {
+				got := renderBuildLogEvents(t, []string{stream[:split], "", stream[split:]})
+				assert.Equal(t, ansiDebugString(want), ansiDebugString(got), "split=%d", split)
+			}
+		})
+	}
 }
