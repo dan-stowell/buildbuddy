@@ -2911,3 +2911,50 @@ func getExecutionAuxiliaryMetadata(t testing.TB, execRes *repb.ExecuteResponse) 
 	require.True(t, ok)
 	return auxMeta
 }
+
+func TestActionMerging_HedgeWinnerCancelsRunningOriginal(t *testing.T) {
+	flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
+	flags.Set(t, "remote_execution.action_merging_hedge_delay", time.Microsecond)
+	flags.Set(t, "remote_execution.proactive_cancellation_enabled", true)
+	rbe := rbetest.NewRBETestEnv(t)
+	server := rbe.AddBuildBuddyServer()
+	conn, err := grpc_client.DialSimple(server.GRPCAddress())
+	require.NoError(t, err)
+	defer conn.Close()
+	scheduler := scpb.NewSchedulerClient(conn)
+	rbe.AddExecutor(t)
+	// The first copy creates the directory and blocks. Every subsequent copy
+	// exits successfully. The marker is a barrier proving the original is
+	// running before the request that dispatches the hedge is submitted.
+	marker := filepath.Join(t.TempDir(), "original-started")
+	cmd := &repb.Command{
+		Arguments: []string{"sh", "-c", fmt.Sprintf(`if mkdir %q 2>/dev/null; then
+while true; do sleep 1; done
+else
+ echo winner
+fi`, marker)},
+		Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+			{Name: "OSFamily", Value: runtime.GOOS},
+			{Name: "Arch", Value: runtime.GOARCH},
+		}},
+	}
+	original := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "original"})
+	originalID := original.WaitAccepted()
+	require.Eventually(t, func() bool { _, err := os.Stat(marker); return err == nil }, 10*time.Second, 10*time.Millisecond)
+	merged := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "merged"})
+	require.Equal(t, originalID, merged.WaitAccepted())
+	actionRN, err := digest.ParseUploadResourceName(originalID)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		_, err := rbe.GetActionResultStorageClient().GetActionResult(context.Background(), &repb.GetActionResultRequest{
+			ActionDigest: actionRN.GetDigest(), InstanceName: actionRN.GetInstanceName(), DigestFunction: actionRN.GetDigestFunction(),
+		})
+		return err == nil
+	}, 10*time.Second, 10*time.Millisecond, "hedge must finish successfully")
+	// A completed hedge must remove the running sibling from the scheduler,
+	// which causes lease renewal to cancel the executing command.
+	require.Eventually(t, func() bool {
+		response, err := scheduler.TaskExists(context.Background(), &scpb.TaskExistsRequest{TaskId: originalID})
+		return err == nil && !response.GetExists()
+	}, 5*time.Second, 10*time.Millisecond, "successful hedge must cancel the running original")
+}
