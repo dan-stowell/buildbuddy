@@ -109,7 +109,11 @@ func testPresenceAfterBackendEviction(t *testing.T, method string) {
 		stream, err := proxy.GetTree(ctx, &repb.GetTreeRequest{RootDigest: barDigestProto, DigestFunction: repb.DigestFunction_SHA256})
 		require.NoError(t, err)
 		_, err = stream.Recv()
-		require.Equal(t, codes.NotFound, status.Code(err))
+		expected := codes.NotFound
+		if method == "tree" {
+			expected = codes.FailedPrecondition
+		}
+		require.Equal(t, expected, status.Code(err))
 	}
 
 	// Expected: the proxy reports the blob missing so that clients re-upload
@@ -189,6 +193,6 @@ func TestGetTree_MissingDescendantInvalidatesPresence(t *testing.T) {
 		}
 	}
 	require.NotEqual(t, io.EOF, err)
-	require.Equal(t, codes.NotFound, status.Code(err))
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 	findMissing(ctx, client, []*repb.Digest{root, child}, []*repb.Digest{child}, t)
 }
