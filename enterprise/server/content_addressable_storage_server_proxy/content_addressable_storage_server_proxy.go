@@ -28,6 +28,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/tracing"
 	"github.com/prometheus/client_golang/prometheus"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	gstatus "google.golang.org/grpc/status"
 
@@ -566,6 +567,21 @@ func (s *CASServerProxy) getTreeWithoutCaching(req *repb.GetTreeRequest, stream 
 	defer func() {
 		if status.IsNotFoundError(err) {
 			s.InvalidatePresence(stream.Context(), nil)
+		} else if status.IsFailedPreconditionError(err) {
+			// The backend also reports missing directories as REAPI MISSING
+			// precondition violations, with digest subjects but no instance.
+			for _, detail := range gstatus.Convert(err).Details() {
+				if pf, ok := detail.(*errdetails.PreconditionFailure); ok {
+					for _, v := range pf.GetViolations() {
+						if v.GetType() != "MISSING" {
+							continue
+						}
+						if rn, parseErr := digest.ParseDownloadResourceName(v.GetSubject()); parseErr == nil {
+							s.InvalidatePresence(stream.Context(), digest.NewCASResourceName(rn.GetDigest(), req.GetInstanceName(), req.GetDigestFunction()))
+						}
+					}
+				}
+			}
 		}
 	}()
 	digests := 0
