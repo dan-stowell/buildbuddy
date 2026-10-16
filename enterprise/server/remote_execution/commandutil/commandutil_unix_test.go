@@ -7,6 +7,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -15,6 +19,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/commandutil"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -298,4 +303,118 @@ func TestRun_EnableStats_ComplexProcessTree_RecordsStatsFromAllChildren(t *testi
 	require.LessOrEqual(
 		t, res.UsageStats.GetPeakMemoryBytes(), int64(850e6),
 		"expected not much more than 750MB peak memory")
+}
+
+// Background children that inherit the output pipes must not keep Run blocked
+// after cancellation, even when they are no longer descendants of the root
+// process (because the root, or an intermediate parent, already exited).
+func TestRun_CancelKillsOrphanedChildHoldingOutputPipes(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("uses /proc")
+	}
+	for _, tc := range []struct {
+		name      string
+		script    string
+		rootExits bool
+	}{
+		// The root exits and is reaped before cancellation.
+		{"root_reaped", `sleep 100 & echo "$$ $!" > "$1"`, true},
+		// The root is alive at cancellation, but the child was reparented.
+		{"child_reparented", `(sleep 100 & echo "$$ $!" > "$1"); sleep 100`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testleak.Check(t)
+			pipesBefore := pipeFDCount(t)
+			pidFile := filepath.Join(testfs.MakeTempDir(t), "pids")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan *interfaces.CommandResult, 1)
+			go func() {
+				done <- commandutil.Run(ctx, &repb.Command{Arguments: []string{"sh", "-c", tc.script, "sh", pidFile}}, ".", nil, nil)
+			}()
+			var root, child int
+			require.Eventually(t, func() bool {
+				b, err := os.ReadFile(pidFile)
+				if err != nil {
+					return false
+				}
+				_, err = fmt.Sscanf(string(b), "%d %d\n", &root, &child)
+				return err == nil
+			}, 10*time.Second, time.Millisecond)
+			// On failure, release the child so that Run can return. (On
+			// success it was already killed; its pid may have been reused.)
+			defer func() {
+				if t.Failed() {
+					cancel()
+					_ = syscall.Kill(child, syscall.SIGKILL)
+					<-done
+				}
+			}()
+			// Wait until the child can no longer be found by walking the
+			// process tree from the root.
+			require.Eventually(t, func() bool {
+				if tc.rootExits {
+					if _, err := os.Stat(fmt.Sprintf("/proc/%d", root)); !os.IsNotExist(err) {
+						return false
+					}
+				}
+				for pid := child; pid > 1; pid = parentPid(pid) {
+					if pid == root {
+						return false
+					}
+				}
+				return true
+			}, 10*time.Second, time.Millisecond)
+
+			cancel()
+			select {
+			case res := <-done:
+				done <- res
+			case <-time.After(10 * time.Second):
+				require.FailNow(t, "Run did not return after cancellation; orphaned child still holds output pipes")
+			}
+			assert.Equal(t, pipesBefore, pipeFDCount(t), "pipe FDs leaked")
+		})
+	}
+}
+
+// parentPid returns the parent pid of pid, or -1 if it can't be read.
+func parentPid(pid int) int {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return -1
+	}
+	s := string(b)
+	fields := strings.Fields(s[strings.LastIndex(s, ")")+1:])
+	ppid, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return -1
+	}
+	return ppid
+}
+
+func pipeFDCount(t *testing.T) int {
+	entries, err := os.ReadDir("/proc/self/fd")
+	require.NoError(t, err)
+	n := 0
+	for _, e := range entries {
+		if target, err := os.Readlink(filepath.Join("/proc/self/fd", e.Name())); err == nil && strings.HasPrefix(target, "pipe:") {
+			n++
+		}
+	}
+	return n
+}
+
+// A container's signal channel and caller context may outlive an individual
+// command; the command's signal forwarding goroutine must not.
+func TestRun_SignalForwarderExitsWithCommand(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	// Registered before testleak.Check, so it runs after the leak check.
+	t.Cleanup(cancel)
+	testleak.Check(t)
+	signal := make(chan syscall.Signal, 1)
+	for range 10 {
+		res := commandutil.RunWithOpts(ctx, &repb.Command{Arguments: []string{"true"}}, &commandutil.RunOpts{Signal: signal})
+		require.NoError(t, res.Error)
+	}
 }
