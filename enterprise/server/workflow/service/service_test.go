@@ -2602,3 +2602,66 @@ func TestBughuntRedeliveredWebhookRunsOnce(t *testing.T) {
 	}
 	assert.Equal(t, 1, count, "one action should execute for a redelivered webhook")
 }
+
+func TestBughuntDispatchActionSets(t *testing.T) {
+	for _, tc := range []struct {
+		name, event, branch, prAction string
+		draft                         bool
+		want                          []string
+	}{
+		{name: "main push", event: "push", branch: "main", want: []string{"push"}},
+		{name: "queue push", event: "push", branch: "gh-readonly-queue/main/pr-42", want: []string{"queue"}},
+		{name: "PR base", event: "pull_request", branch: "main", prAction: "synchronize", want: []string{"pr"}},
+		{name: "draft PR", event: "pull_request", branch: "main", prAction: "opened", draft: true},
+		{name: "unmatched push", event: "push", branch: "feature/日本語"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			flags.Set(t, "remote_execution.enable_remote_exec", true)
+			te := newTestEnv(t)
+			ctx, _, gid := authenticate(t, context.Background(), te)
+			runBBServer(ctx, t, te)
+			provider := setupFakeGitProvider(t, te)
+			repoURL := makeTempRepo(t)
+			repo := createWorkflow(t, te, repoURL, gid, false)
+			provider.FileContents = map[string]string{"buildbuddy.yaml": `
+actions:
+ - name: push
+   triggers: {push: {branches: [main]}}
+   git_fetch_depth: 17
+   timeout: 30m
+   platform_properties: {custom: value}
+   steps: [{run: 'echo push'}]
+ - name: queue
+   triggers: {push: {branches: ['gh-readonly-queue/main/*']}}
+   steps: [{run: 'echo queue'}]
+ - name: pr
+   triggers: {pull_request: {branches: [main], skip_drafts: true}}
+   steps: [{run: 'echo pr'}]
+`}
+			wd := &interfaces.WebhookData{EventName: tc.event, TargetRepoURL: repoURL, PushedRepoURL: repoURL, TargetBranch: tc.branch, PushedBranch: "feature/日本語", SHA: "c04d68571cb519e095772c865847007ed3e7fea9", IsTargetRepoPublic: true, PullRequestAction: tc.prAction, PullRequestIsDraft: tc.draft}
+			if tc.event == "push" {
+				wd.PushedBranch = tc.branch
+			}
+			require.NoError(t, te.GetWorkflowService().HandleRepositoryEvent(ctx, repo, wd, "token"))
+			te.GetHealthChecker().Shutdown()
+			te.GetHealthChecker().WaitForGracefulShutdown()
+			execClient := te.GetRemoteExecutionClient().(*fakeExecutionClient)
+			var got []string
+			count := len(execClient.executeRequests)
+			for range count {
+				req := <-execClient.executeRequests
+				name := getExecutedActionName(t, ctx, te, req.Payload)
+				got = append(got, name)
+				exec := getExecution(t, ctx, te, req.Payload)
+				assert.Contains(t, exec.Command.Arguments, "--commit_sha="+wd.SHA)
+				if name == "push" {
+					assert.Contains(t, exec.Command.Arguments, "--git_fetch_depth=17")
+					assert.Contains(t, exec.Command.Arguments, "--timeout=30m0s")
+					assert.Equal(t, 40*time.Minute, exec.Action.Timeout.AsDuration())
+					assert.Contains(t, exec.Command.Platform.Properties, &repb.Platform_Property{Name: "custom", Value: "value"})
+				}
+			}
+			assert.ElementsMatch(t, tc.want, got)
+		})
+	}
+}
