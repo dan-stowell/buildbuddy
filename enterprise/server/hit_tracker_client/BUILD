@@ -34,6 +34,8 @@ go_test(
     srcs = ["hit_tracker_client_test.go"],
     embed = [":hit_tracker_client"],
     deps = [
+ "//server/testutil/testleak",
+ "@org_golang_google_grpc//:grpc",
         "//enterprise/server/util/proxy_util",
         "//proto:cache_go_proto",
         "//proto:hit_tracker_go_proto",
