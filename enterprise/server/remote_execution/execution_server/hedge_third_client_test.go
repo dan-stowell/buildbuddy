@@ -17,6 +17,7 @@ func TestHedgeWinnerCompletesThirdMergedClient(t *testing.T) {
 	flags.Set(t, "remote_execution.action_merging_hedge_delay", time.Duration(0))
 	env, conn, _ := setupEnv(t)
 	scheduler := &hedgeSchedulerMock{env.GetSchedulerService().(*schedulerServerMock)}
+	scheduler.taskLost = make(chan struct{})
 	env.SetSchedulerService(scheduler)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -58,5 +59,29 @@ func TestHedgeWinnerCompletesThirdMergedClient(t *testing.T) {
 			require.Equal(t, "hedge winner", string(operation.ExtractExecuteResponse(op).GetResult().GetStdoutRaw()))
 			break
 		}
+	}
+
+	// A losing canonical executor can still send an in-flight progress update.
+	// Reconnects must recover the elected terminal result when cancellation makes
+	// the canonical task disappear, even if that progress update is stream-tail.
+	late, err := operation.Assemble(canonical, operation.Metadata(repb.ExecutionStage_EXECUTING, arn.GetDigest()), operation.InProgressExecuteResponse())
+	require.NoError(t, err)
+	publisher, err = client.PublishOperation(ctx)
+	require.NoError(t, err)
+	require.NoError(t, publisher.Send(late))
+	_, err = publisher.CloseAndRecv()
+	require.NoError(t, err)
+	close(scheduler.taskLost)
+	reconnect, err := client.WaitExecution(ctx, &repb.WaitExecutionRequest{Name: canonical})
+	require.NoError(t, err)
+	for {
+		op, err := reconnect.Recv()
+		require.NoError(t, err)
+		require.Equal(t, canonical, op.GetName())
+		if !op.GetDone() {
+			continue
+		}
+		require.Equal(t, "hedge winner", string(operation.ExtractExecuteResponse(op).GetResult().GetStdoutRaw()))
+		break
 	}
 }
