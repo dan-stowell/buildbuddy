@@ -785,3 +785,25 @@ func TestExecuteTaskAndStreamResults_Timeout(t *testing.T) {
 		})
 	}
 }
+
+func TestExecuteTaskAndStreamResults_LateSuccessIsDeadlineExceeded(t *testing.T) {
+	ctx := t.Context()
+	task := getTask()
+	task.ExecutionTask.Action.Timeout = durationpb.New(50 * time.Millisecond)
+	exec, _, execClient, mockServer, counter := getExecutor(t, func(ctx context.Context, original rbetest.RunFunc) *interfaces.CommandResult {
+		<-ctx.Done()
+		return &interfaces.CommandResult{ExitCode: 0}
+	})
+	publisher, err := operation.Publish(ctx, execClient, task.ExecutionTask.ExecutionId)
+	require.NoError(t, err)
+	retry, err := exec.ExecuteTaskAndStreamResults(ctx, task, publisher)
+	require.NoError(t, err)
+	require.False(t, retry)
+	<-mockServer.finished
+	ops := mockServer.getOperations()
+	completed, err := rexec.UnpackOperation(ops[len(ops)-1])
+	require.NoError(t, err)
+	require.Equal(t, int32(codes.DeadlineExceeded), completed.ExecuteResponse.GetStatus().GetCode())
+	require.Equal(t, int32(commandutil.NoExitCode), completed.ExecuteResponse.GetResult().GetExitCode())
+	require.Equal(t, 0, counter.countFinishedCleanly)
+}
