@@ -144,6 +144,9 @@ func TestFetchBlob_RandomizedChecksumIntegrity(t *testing.T) {
 	}
 	t.Logf("seed=%d", seed)
 	rng := rand.New(rand.NewSource(seed))
+	zstd := rng.Intn(2) == 0
+	t.Logf("zstd_transcoding=%t", zstd)
+	flags.Set(t, "cache.zstd_transcoding_enabled", zstd)
 
 	ctx := context.Background()
 	te := testenv.GetTestEnv(t)
