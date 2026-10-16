@@ -57,6 +57,7 @@ go_test(
     size = "medium",
     srcs = [
         "pebble_cache_internal_test.go",
+        "pebble_cache_rewrite_eviction_race_test.go",
         "pebble_cache_test.go",
     ],
     embed = [":pebble_cache"],
@@ -79,6 +80,7 @@ go_test(
         "//server/remote_cache/digest",
         "//server/tables",
         "//server/testutil/mockgcs",
+        "//server/util/approxlru",
         "//server/testutil/testauth",
         "//server/testutil/testdigest",
         "//server/testutil/testenv",
