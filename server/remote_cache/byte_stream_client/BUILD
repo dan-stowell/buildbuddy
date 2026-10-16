@@ -41,6 +41,13 @@ go_test(
         "tooManyFilesRunfilePath": "$(rlocationpath too_many_files.zip)",
     },
     deps = [
+ "@org_golang_google_grpc//:grpc",
+ "@org_golang_google_grpc//credentials",
+ "@org_golang_google_genproto_googleapis_bytestream//:bytestream",
+ "@com_github_jonboulle_clockwork//:clockwork",
+ "//server/real_environment",
+ "//server/testutil/testleak",
+ "//server/util/testing/flags",
         "//proto:zip_go_proto",
         "//server/util/proto",
         "@com_github_stretchr_testify//assert",
