@@ -1283,28 +1283,33 @@ func TestPresenceInvalidation_UnrelatedMissesDoNotStarveFills(t *testing.T) {
 }
 
 func TestPresenceLookupTracking_BoundedAndReleased(t *testing.T) {
-	s := &CASServerProxy{presenceLookups: make(map[string]*presenceLookup)}
-	// Fill tracking capacity with active lookups. Capacity must never evict an
-	// active entry: doing so would lose invalidations for delayed RPCs.
-	for i := range maxPresenceLookups {
-		s.presenceLookups[fmt.Sprint(i)] = &presenceLookup{refs: 1}
+	s := &CASServerProxy{}
+	// Saturate every shard without evicting active lookup records.
+	for i := range s.presenceShards {
+		sh := &s.presenceShards[i]
+		sh.lookups = make(map[string]*presenceLookup)
+		for j := range presenceShardCapacity {
+			sh.lookups[fmt.Sprint(j)] = &presenceLookup{refs: 1}
+		}
 	}
 	key := digest.NewKey(&repb.Digest{Hash: "a", SizeBytes: 1})
+	before := testutil.ToFloat64(metrics.FindMissingBlobsTrackingSaturation)
 	require.Empty(t, s.beginPresenceLookups(map[digest.Key]string{key: "overflow"}))
-	require.Len(t, s.presenceLookups, maxPresenceLookups)
-	// Existing keys still participate when capacity is exhausted.
+	require.Equal(t, before+1, testutil.ToFloat64(metrics.FindMissingBlobsTrackingSaturation))
+	sh := s.presenceShard("0")
+	require.Len(t, sh.lookups, presenceShardCapacity)
 	snapshot := s.beginPresenceLookups(map[digest.Key]string{key: "0"})
 	require.Contains(t, snapshot, "0")
-	s.presenceLookups["0"].sequence++
-	require.NotEqual(t, snapshot["0"], s.presenceLookups["0"].sequence)
+	sh.lookups["0"].sequence++
+	require.NotEqual(t, snapshot["0"], sh.lookups["0"].sequence)
 	s.endPresenceLookups(snapshot)
-	require.Equal(t, 1, s.presenceLookups["0"].refs)
+	require.Equal(t, 1, sh.lookups["0"].refs)
 	s.endPresenceLookups(map[string]uint64{"0": 0})
-	require.NotContains(t, s.presenceLookups, "0")
-	snapshot = s.beginPresenceLookups(map[digest.Key]string{key: "overflow"})
-	require.Contains(t, snapshot, "overflow")
+	require.NotContains(t, sh.lookups, "0")
+	snapshot = s.beginPresenceLookups(map[digest.Key]string{key: "0"})
+	require.Contains(t, snapshot, "0")
 	s.endPresenceLookups(snapshot)
-	require.NotContains(t, s.presenceLookups, "overflow")
+	require.NotContains(t, sh.lookups, "0")
 }
 
 // A lagging replica (or an upstream presence cache) can answer from a snapshot
@@ -1330,4 +1335,84 @@ func TestPresenceInvalidation_LaterLookupWithStaleBackendSnapshot(t *testing.T) 
 	rsp, err := proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
 	require.NoError(t, err)
 	require.Equal(t, []*repb.Digest{d}, rsp.GetMissingBlobDigests(), "post-invalidation stale snapshot was cached for the configured TTL")
+}
+
+// A recovered blob is passed through during suppression, then cached normally
+// at the window boundary. Repeated invalidations extend the window.
+func TestPresenceTombstone_ExpiryAndRenewal(t *testing.T) {
+	for _, chunked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("chunked=%t", chunked), func(t *testing.T) {
+			flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+			flags.Set(t, "cache_proxy.find_missing_blobs_tombstone_ttl", 3*time.Minute)
+			ctx := testContext()
+			if chunked {
+				ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(cdc.ChunkedHeaderName, cdc.ChunkedHeaderValue))
+			}
+			env := testenv.GetTestEnv(t)
+			clock := clockwork.NewFakeClock()
+			env.SetClock(clock)
+			env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+			env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+			remote := &delayedPresenceClient{beforePresenceResponse: func() {}}
+			env.SetContentAddressableStorageClient(remote)
+			proxy, err := New(env)
+			require.NoError(t, err)
+			d := digestProto(fooDigest, 3)
+			rn := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256)
+			key := proxy.findMissingBlobsCacheKey("GR1", findMissingBlobsRequest([]*repb.Digest{d}), d)
+			proxy.InvalidatePresence(ctx, rn)
+			check := func(cached bool) {
+				// This client returns a positive snapshot once, then missing; reset it so
+				// every backend lookup in this test reports a recovered blob.
+				remote.calls = 0
+				remote.beforePresenceResponse = func() {}
+				rsp, err := proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+				require.NoError(t, err)
+				require.Empty(t, rsp.GetMissingBlobDigests())
+				require.Equal(t, cached, proxy.findMissingBlobsCache.Contains(key) || proxy.findMissingChunksCache.Contains(key))
+			}
+			check(false)
+			clock.Advance(2 * time.Minute)
+			proxy.InvalidatePresence(ctx, rn)
+			clock.Advance(time.Minute)
+			check(false)
+			clock.Advance(2 * time.Minute)
+			check(true)
+		})
+	}
+}
+
+func TestPresenceTombstone_BoundedLRU(t *testing.T) {
+	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+	ctx := testContext()
+	env := testenv.GetTestEnv(t)
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+	env.SetContentAddressableStorageClient(&delayedPresenceClient{})
+	proxy, err := New(env)
+	require.NoError(t, err)
+	// Generate deterministic colliding keys to exercise a single shard's limit.
+	var keys []string
+	var rns []*digest.CASResourceName
+	for i := 0; len(keys) < presenceShardCapacity+1; i++ {
+		d := &repb.Digest{Hash: fmt.Sprintf("%064x", i), SizeBytes: 1}
+		rn := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256)
+		key := "GR1/" + rn.DownloadString()
+		if proxy.presenceShard(key) != &proxy.presenceShards[0] {
+			continue
+		}
+		keys = append(keys, key)
+		rns = append(rns, rn)
+	}
+	for _, rn := range rns[:presenceShardCapacity] {
+		proxy.InvalidatePresence(ctx, rn)
+	}
+	sh := &proxy.presenceShards[0]
+	require.True(t, sh.tombstoned(keys[0], proxy.now())) // touch oldest
+	proxy.InvalidatePresence(ctx, rns[presenceShardCapacity])
+	require.Len(t, sh.tombstones, presenceShardCapacity)
+	require.Equal(t, presenceShardCapacity, sh.order.Len())
+	require.Contains(t, sh.tombstones, keys[0])
+	require.NotContains(t, sh.tombstones, keys[1])
+	require.Empty(t, sh.lookups)
 }
