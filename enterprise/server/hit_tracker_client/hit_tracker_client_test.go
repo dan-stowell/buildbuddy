@@ -897,3 +897,14 @@ func TestVerifyShutdownReturnsWhenTrackHangs(t *testing.T) {
 		require.FailNow(t, "shutdown still blocked 10s after it started (max_shutdown_duration 2s) while a Track RPC hung")
 	}
 }
+
+// retainedHits returns the hits pending in the factory. The unfixed client
+// holds nothing for retry.
+func retainedHits(f *HitTrackerFactory) (pending, held int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.hitsByCollection {
+		pending += len(c.hits)
+	}
+	return pending, 0
+}
