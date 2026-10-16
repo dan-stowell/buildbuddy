@@ -80,6 +80,7 @@ func casLifecycleFDs(t *testing.T) []string {
 	return targets
 }
 func TestCASRequestLifecycle(t *testing.T) {
+	flags.Set(t, "grpc_server_worker_multiplier", 0)
 	for _, op := range []string{"batch_read", "get_tree", "get_tree_cached"} {
 		for _, mode := range []string{"success", "cancel", "remote_error", "deadline"} {
 			t.Run(op+"/"+mode, func(t *testing.T) {
