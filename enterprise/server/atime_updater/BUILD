@@ -21,7 +21,10 @@ go_library(
 go_test(
     name = "atime_updater_test",
     size = "small",
-    srcs = ["atime_updater_test.go"],
+    srcs = [
+        "atime_updater_test.go",
+        "leak_i3_test.go",
+    ],
     embed = [":atime_updater"],
     deps = [
         "//enterprise/server/batch_operator",

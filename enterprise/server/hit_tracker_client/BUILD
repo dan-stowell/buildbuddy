@@ -31,7 +31,10 @@ go_library(
 
 go_test(
     name = "hit_tracker_client_test",
-    srcs = ["hit_tracker_client_test.go"],
+    srcs = [
+        "hit_tracker_client_test.go",
+        "leak_i3_test.go",
+    ],
     embed = [":hit_tracker_client"],
     deps = [
         "//enterprise/server/util/proxy_util",
@@ -45,10 +48,12 @@ go_test(
         "//server/util/authutil",
         "//server/util/bazel_request",
         "//server/util/log",
+        "//server/util/status",
         "//server/util/testing/flags",
         "//server/util/usageutil",
         "@com_github_jonboulle_clockwork//:clockwork",
         "@com_github_stretchr_testify//require",
+        "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//metadata",
     ],
 )

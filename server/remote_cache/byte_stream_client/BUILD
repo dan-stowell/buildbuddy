@@ -28,7 +28,10 @@ go_library(
 go_test(
     name = "byte_stream_client_test",
     size = "small",
-    srcs = ["byte_stream_client_test.go"],
+    srcs = [
+        "byte_stream_client_test.go",
+        "leak_i3_test.go",
+    ],
     data = [
         "no_files.zip",
         "some_files.zip",
@@ -42,7 +45,13 @@ go_test(
     },
     deps = [
         "//proto:zip_go_proto",
+        "//server/real_environment",
+        "//server/testutil/testhealthcheck",
         "//server/util/proto",
+        "//server/util/status",
+        "@org_golang_google_genproto_googleapis_bytestream//:bytestream",
+        "@org_golang_google_grpc//:grpc",
+        "@com_github_jonboulle_clockwork//:clockwork",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
         "@io_bazel_rules_go//go/runfiles",

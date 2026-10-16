@@ -33,6 +33,7 @@ go_test(
     srcs = [
         "grpc_client_internal_test.go",
         "grpc_client_test.go",
+        "leak_i3_test.go",
     ],
     embed = [":grpc_client"],
     deps = [
@@ -50,5 +51,6 @@ go_test(
         "@com_github_prometheus_client_model//io/prometheus/client:go",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
+        "@org_golang_google_grpc//:grpc",
     ],
 )
