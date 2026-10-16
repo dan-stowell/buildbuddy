@@ -5014,8 +5014,10 @@ func TestFindMissing_Quorum_IgnoresNonReplicaCopies(t *testing.T) {
 
 // A presence response should refresh each replica that can serve subsequent reads.
 func TestPresenceLifetime_FindMissingRefreshesReplicas(t *testing.T) {
-	for _, quorum := range []bool{false, true} {
-		t.Run(fmt.Sprintf("quorum=%t", quorum), func(t *testing.T) {
+	for _, tc := range []struct {
+		quorum, lookaside bool
+	}{{false, false}, {true, false}, {false, true}, {true, true}} {
+		t.Run(fmt.Sprintf("quorum=%t/lookaside=%t", tc.quorum, tc.lookaside), func(t *testing.T) {
 			env, _, ctx := getEnvAuthAndCtx(t)
 			peers := make([]string, 3)
 			for i := range peers {
@@ -5025,7 +5027,7 @@ func TestPresenceLifetime_FindMissingRefreshesReplicas(t *testing.T) {
 			var dc *Cache
 			for i, peer := range peers {
 				caches[i] = &quorumTestCache{Cache: newMemoryCache(t, 1000000), lookups: make(map[string]int)}
-				dc = startNewDCache(t, env, Options{ListenAddr: peer, Nodes: slices.Clone(peers), ReplicationFactor: 3, DisableLocalLookup: true}, caches[i])
+				dc = startNewDCache(t, env, Options{ListenAddr: peer, Nodes: slices.Clone(peers), ReplicationFactor: 3, DisableLocalLookup: true, LookasideCacheSizeBytes: 1000000}, caches[i])
 				waitForReady(t, peer)
 			}
 			buf := []byte("presence-lifetime")
@@ -5035,7 +5037,12 @@ func TestPresenceLifetime_FindMissingRefreshesReplicas(t *testing.T) {
 			for _, c := range caches {
 				require.NoError(t, c.Cache.Set(ctx, rn, buf))
 			}
-			if quorum {
+			if tc.lookaside {
+				got, err := dc.Get(ctx, rn)
+				require.NoError(t, err)
+				require.Equal(t, buf, got)
+			}
+			if tc.quorum {
 				ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(findmissing.RequireQuorumHeader, "true"))
 			}
 			missing, err := dc.FindMissing(ctx, []*rspb.ResourceName{rn})
