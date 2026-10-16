@@ -19,9 +19,11 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/tasksize"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/test/integration/remote_execution/rbetest"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/buildbuddy_enterprise"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/redisfault"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testexecutor"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testredis"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/execution"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/redisutil"
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/build_event_handler"
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_publisher"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
@@ -32,6 +34,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testbazel"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testhealthcheck"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testmetrics"
 	"github.com/buildbuddy-io/buildbuddy/server/util/bazel"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_client"
@@ -2802,4 +2805,58 @@ func getExecutionAuxiliaryMetadata(t testing.TB, execRes *repb.ExecuteResponse) 
 	require.NoError(t, err)
 	require.True(t, ok)
 	return auxMeta
+}
+
+// The reply to an executor's task claim is lost after Redis ran the claim
+// (connection reset). The client must still get a result.
+func TestLostClaimReply_ClientGetsResult(t *testing.T) {
+	target := testredis.Start(t).Target
+	opts := redisutil.TargetToOpts(target)
+	fi := redisfault.New()
+	opts.Dialer = fi.WrapDialer(opts.Dialer)
+	rdb, err := redisutil.NewClientWithOpts(opts, testhealthcheck.NewTestingHealthChecker(), "remote_execution_redis")
+	require.NoError(t, err)
+	t.Cleanup(func() { rdb.Close() })
+
+	rbe := rbetest.NewRBETestEnvWithOptions(t, &rbetest.EnvOptions{RedisClient: rdb})
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutors(t, 2)
+
+	// Run one command so that the claim script is cached in Redis and claims
+	// are a single EVALSHA.
+	rbe.ExecuteCustomCommand("sh", "-c", "echo warmup").Wait()
+
+	// The claim script is the only scheduler script run on a task key with
+	// one key and four arguments (8 RESP elements).
+	fi.Arm(1, redisfault.Reset, []byte("*8\r\n$7\r\nevalsha\r\n"), []byte("task/"))
+	cmd := rbe.ExecuteCustomCommand("sh", "-c", "echo hello")
+
+	timeout := time.After(60 * time.Second)
+	lastStage := repb.ExecutionStage_UNKNOWN
+	for {
+		select {
+		case r, ok := <-cmd.StatusChannel():
+			require.True(t, ok, "status channel closed without a result")
+			require.NoError(t, r.Err)
+			lastStage = r.Stage
+			if r.Stage != repb.ExecutionStage_COMPLETED {
+				continue
+			}
+			require.Equal(t, 1, fi.Lost(), "expected one claim reply to be lost")
+			require.Equal(t, 0, r.ExitCode)
+			return
+		case <-timeout:
+			ctx := context.Background()
+			keys, _ := rdb.Keys(ctx, "task/*").Result()
+			state := ""
+			for _, k := range keys {
+				f, _ := rdb.HMGet(ctx, k, "claimed", "leaseId", "attemptCount").Result()
+				ttl, _ := rdb.PTTL(ctx, k).Result()
+				state += fmt.Sprintf(" %s: claimed=%v leaseId=%v attemptCount=%v ttl=%s;", k, f[0], f[1], f[2], ttl)
+			}
+			require.FailNowf(t, "client still waiting",
+				"no result 60s after one lost claim reply: last stage %s, claim sends %d, replies lost %d. Scheduler tasks:%s",
+				lastStage, fi.Sent(), fi.Lost(), state)
+		}
+	}
 }
