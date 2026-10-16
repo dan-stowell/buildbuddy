@@ -17,8 +17,10 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/oom"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/scheduling/scheduler_server"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/tasksize"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/test/integration/remote_execution/rbeclient"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/test/integration/remote_execution/rbetest"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/buildbuddy_enterprise"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testcontext"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testexecutor"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testredis"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/execution"
@@ -2802,4 +2804,287 @@ func getExecutionAuxiliaryMetadata(t testing.TB, execRes *repb.ExecuteResponse) 
 	require.NoError(t, err)
 	require.True(t, ok)
 	return auxMeta
+}
+
+// hedgeWatcher drains a command's status channel in the background and records
+// every update so that tests can inspect what a client observed and when.
+type hedgeWatcher struct {
+	name string
+	mu   sync.Mutex
+	log  []string
+	done chan struct{}
+	res  *rbeclient.CommandResult
+	at   time.Time
+}
+
+func watchHedgeCommand(t *testing.T, name string, cmd *rbetest.Command) *hedgeWatcher {
+	w := &hedgeWatcher{name: name, done: make(chan struct{})}
+	start := time.Now()
+	go func() {
+		for r := range cmd.StatusChannel() {
+			w.mu.Lock()
+			w.log = append(w.log, fmt.Sprintf("+%s stage=%s err=%v", time.Since(start).Round(10*time.Millisecond), r.Stage, r.Err))
+			if r.Stage == repb.ExecutionStage_COMPLETED || r.Err != nil {
+				w.res = r
+				w.at = time.Now()
+				w.mu.Unlock()
+				close(w.done)
+				return
+			}
+			w.mu.Unlock()
+		}
+	}()
+	return w
+}
+
+func (w *hedgeWatcher) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return fmt.Sprintf("%s updates=%v", w.name, w.log)
+}
+
+func countLines(t *testing.T, path string) int {
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	require.NoError(t, err)
+	return strings.Count(string(b), "\n")
+}
+
+func waitForFile(t *testing.T, path string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	require.FailNowf(t, "file not created", "%s was not created within %s", path, timeout)
+}
+
+// The first copy of the action to start (the canonical execution) runs slowly
+// (simulating a stuck executor), any later copy (the hedge) finishes fast.
+func hedgeTestCommand(dir string, slowIterations int) *repb.Command {
+	script := fmt.Sprintf(`D=%q
+if mkdir "$D/lock" 2>/dev/null; then
+	i=0
+	while [ $i -lt %d ]; do echo x >> "$D/orig_hb"; sleep 0.1; i=$((i+1)); done
+	echo SLOW
+else
+	echo x >> "$D/hedge_hb"
+	echo FAST
+fi`, dir, slowIterations)
+	return &repb.Command{
+		Arguments: []string{"sh", "-c", script},
+		Platform: &repb.Platform{
+			Properties: []*repb.Platform_Property{
+				{Name: "OSFamily", Value: runtime.GOOS},
+				{Name: "Arch", Value: runtime.GOARCH},
+			},
+		},
+	}
+}
+
+// When a merged action is hedged and the hedge succeeds, clients that are
+// already waiting on the action should receive the result.
+func TestActionMerging_HedgeResultReachesWaitingClients(t *testing.T) {
+	flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
+	flags.Set(t, "remote_execution.action_merging_hedge_delay", 1*time.Second)
+	rbe := rbetest.NewRBETestEnvWithOptions(t, &rbetest.EnvOptions{ShardedRedis: true})
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutor(t)
+
+	dir := testfs.MakeTempDir(t)
+	// Canonical execution runs ~40s; the hedge returns immediately.
+	cmd := hedgeTestCommand(dir, 400)
+
+	t0 := time.Now()
+	cmd1 := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "invocation1"})
+	op1 := cmd1.WaitAccepted()
+	w1 := watchHedgeCommand(t, "client1", cmd1)
+	waitForFile(t, filepath.Join(dir, "orig_hb"), 30*time.Second)
+
+	// Wait past the hedge delay so the next request triggers a hedge.
+	time.Sleep(1500 * time.Millisecond)
+	cmd2 := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "invocation2"})
+	op2 := cmd2.WaitAccepted()
+	w2 := watchHedgeCommand(t, "client2", cmd2)
+	require.Equal(t, op1, op2, "expected the hedge-triggering request to be merged into the canonical execution")
+
+	// Wait for the hedge to finish and populate the action cache.
+	ctx := context.Background()
+	acClient := rbe.GetActionResultStorageClient()
+	arn := cmd1.GetActionResourceName()
+	var hedgeAR *repb.ActionResult
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		ar, err := acClient.GetActionResult(ctx, &repb.GetActionResultRequest{
+			InstanceName:   arn.GetInstanceName(),
+			ActionDigest:   arn.GetDigest(),
+			DigestFunction: arn.GetDigestFunction(),
+		})
+		if err == nil {
+			hedgeAR = ar
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	require.NotNil(t, hedgeAR, "hedge result never reached the action cache")
+	hedgeDone := time.Now()
+	stdout, _, err := rbe.GetStdoutAndStderr(ctx, hedgeAR, arn.GetInstanceName())
+	require.NoError(t, err)
+	require.Equal(t, "FAST", strings.TrimSpace(stdout), "action cache should hold the hedge's result")
+	log.Infof("HEDGE-REPRO: hedge result in AC at +%s (op1=%s)", hedgeDone.Sub(t0).Round(10*time.Millisecond), op1)
+
+	// Claim B: is the canonical copy still running after the hedge succeeded?
+	hb1 := countLines(t, filepath.Join(dir, "orig_hb"))
+	time.Sleep(3 * time.Second)
+	hb2 := countLines(t, filepath.Join(dir, "orig_hb"))
+	log.Infof("HEDGE-REPRO: canonical heartbeat lines %d -> %d over 3s after hedge success", hb1, hb2)
+
+	// Does a WaitExecution reconnect on the operation name learn of the hedge?
+	wctx, wcancel := context.WithTimeout(ctx, 5*time.Second)
+	wctx = testcontext.AttachInvocationIDToContext(t, wctx, "invocation2")
+	waitStream, err := rbe.GetRemoteExecutionClient().WaitExecution(wctx, &repb.WaitExecutionRequest{Name: op1})
+	require.NoError(t, err)
+	reconnectDone := false
+	var reconnectErr error
+	for {
+		op, err := waitStream.Recv()
+		if err != nil {
+			reconnectErr = err
+			break
+		}
+		if op.GetDone() {
+			reconnectDone = true
+			break
+		}
+	}
+	wcancel()
+	log.Infof("HEDGE-REPRO: WaitExecution(%s) reconnect for 5s: done=%t err=%v", op1, reconnectDone, reconnectErr)
+
+	// A brand new request with cache lookup gets the hedge's result from AC.
+	cmd3 := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "invocation3"})
+	res3 := cmd3.Wait()
+	log.Infof("HEDGE-REPRO: new request with cache lookup: stdout=%q", strings.TrimSpace(res3.Stdout))
+	// A new request with skip_cache_lookup merges into the canonical execution.
+	cmd4 := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: false, InvocationID: "invocation4"})
+	op4 := cmd4.WaitAccepted()
+	log.Infof("HEDGE-REPRO: new request with skip_cache_lookup merged into canonical: %t", op4 == op1)
+
+	// Claim A: clients already waiting should receive the hedge's result
+	// promptly (allow 10s after the hedge result was available).
+	waitBy := time.After(time.Until(hedgeDone.Add(10 * time.Second)))
+	got := map[string]bool{}
+	for _, w := range []*hedgeWatcher{w1, w2} {
+		select {
+		case <-w.done:
+			got[w.name] = true
+		case <-waitBy:
+		}
+	}
+	for _, w := range []*hedgeWatcher{w1, w2} {
+		select {
+		case <-w.done:
+			got[w.name] = true
+		default:
+		}
+	}
+	// For the report: wait for the canonical execution to finish and record
+	// what each client eventually received.
+	for _, w := range []*hedgeWatcher{w1, w2} {
+		select {
+		case <-w.done:
+		case <-time.After(60 * time.Second):
+		}
+		w.mu.Lock()
+		res, at := w.res, w.at
+		w.mu.Unlock()
+		out := ""
+		if res != nil && res.ActionResult != nil {
+			out, _, _ = rbe.GetStdoutAndStderr(ctx, res.ActionResult, arn.GetInstanceName())
+		}
+		after := "never"
+		if !at.IsZero() {
+			after = at.Sub(hedgeDone).Round(10 * time.Millisecond).String()
+		}
+		log.Infof("HEDGE-REPRO: %s; completed %s after hedge result; stdout=%q", w, after, strings.TrimSpace(out))
+	}
+
+	assert.True(t, got["client1"], "client1 (original requester) did not receive the hedge's successful result within 10s")
+	assert.True(t, got["client2"], "client2 (the request that triggered the hedge) did not receive the hedge's successful result within 10s")
+	assert.Equal(t, hb1, hb2, "canonical execution kept running after the hedge succeeded")
+}
+
+// Cancelling every invocation that is waiting on a merged+hedged action should
+// stop both copies of the action.
+func TestActionMerging_CancelAllInvocationsStopsHedgedAction(t *testing.T) {
+	flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
+	flags.Set(t, "remote_execution.action_merging_hedge_delay", 1*time.Second)
+	rbe := rbetest.NewRBETestEnvWithOptions(t, &rbetest.EnvOptions{ShardedRedis: true})
+	bbServer := rbe.AddBuildBuddyServer()
+	rbe.AddExecutor(t)
+
+	dir := testfs.MakeTempDir(t)
+	// Both copies run for ~60s and write heartbeats.
+	script := fmt.Sprintf(`D=%q
+if mkdir "$D/lock" 2>/dev/null; then HB="$D/orig_hb"; else HB="$D/hedge_hb"; fi
+i=0
+while [ $i -lt 600 ]; do echo x >> "$HB"; sleep 0.1; i=$((i+1)); done
+echo DONE`, dir)
+	cmd := &repb.Command{
+		Arguments: []string{"sh", "-c", script},
+		Platform: &repb.Platform{
+			Properties: []*repb.Platform_Property{
+				{Name: "OSFamily", Value: runtime.GOOS},
+				{Name: "Arch", Value: runtime.GOARCH},
+			},
+		},
+	}
+
+	ctx := context.Background()
+	startInvocation := func(iid string) *build_event_publisher.Publisher {
+		bep, err := build_event_publisher.New(bbServer.PublishBuildEventClient(), "", iid)
+		require.NoError(t, err)
+		bep.Start(ctx)
+		require.NoError(t, bep.Publish(&bespb.BuildEvent{
+			Payload: &bespb.BuildEvent_Started{Started: &bespb.BuildStarted{StartTime: timestamppb.Now()}},
+		}))
+		return bep
+	}
+	iid1, iid2 := uuid.NewString(), uuid.NewString()
+	bep1 := startInvocation(iid1)
+	bep2 := startInvocation(iid2)
+
+	cmd1 := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: iid1})
+	op1 := cmd1.WaitAccepted()
+	w1 := watchHedgeCommand(t, "client1", cmd1)
+	waitForFile(t, filepath.Join(dir, "orig_hb"), 30*time.Second)
+	time.Sleep(1500 * time.Millisecond)
+	cmd2 := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: iid2})
+	op2 := cmd2.WaitAccepted()
+	w2 := watchHedgeCommand(t, "client2", cmd2)
+	require.Equal(t, op1, op2, "expected actions to be merged")
+	waitForFile(t, filepath.Join(dir, "hedge_hb"), 30*time.Second)
+
+	// Cancel both invocations (the only two clients interested in the action).
+	for _, bep := range []*build_event_publisher.Publisher{bep1, bep2} {
+		require.NoError(t, bep.Publish(&bespb.BuildEvent{
+			Payload: &bespb.BuildEvent_Finished{Finished: &bespb.BuildFinished{
+				ExitCode:   &bespb.BuildFinished_ExitCode{Name: "INTERRUPTED", Code: build_event_handler.InterruptedExitCode},
+				FinishTime: timestamppb.Now(),
+			}},
+		}))
+	}
+	time.Sleep(5 * time.Second)
+	o1, h1 := countLines(t, filepath.Join(dir, "orig_hb")), countLines(t, filepath.Join(dir, "hedge_hb"))
+	time.Sleep(3 * time.Second)
+	o2, h2 := countLines(t, filepath.Join(dir, "orig_hb")), countLines(t, filepath.Join(dir, "hedge_hb"))
+	log.Infof("HEDGE-REPRO: after cancelling both invocations: canonical heartbeat %d -> %d, hedge heartbeat %d -> %d (over 3s)", o1, o2, h1, h2)
+	log.Infof("HEDGE-REPRO: %s", w1)
+	log.Infof("HEDGE-REPRO: %s", w2)
+
+	assert.Equal(t, o1, o2, "canonical execution kept running after all interested invocations were cancelled")
+	assert.Equal(t, h1, h2, "hedged execution kept running after all interested invocations were cancelled")
 }
