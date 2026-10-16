@@ -32,7 +32,10 @@ go_library(
 
 go_test(
     name = "copy_on_write_test",
-    srcs = ["copy_on_write_test.go"],
+    srcs = [
+        "copy_on_write_test.go",
+        "copy_on_write_verify_v2_test.go",
+    ],
     deps = [
         ":copy_on_write",
         "//enterprise/server/remote_execution/copy_on_write/cow_cgo_testutil",
