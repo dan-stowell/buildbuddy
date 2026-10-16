@@ -10,6 +10,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/resources"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/expflag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
@@ -1340,4 +1341,69 @@ func TestStopCancelsDelayedEnqueue(t *testing.T) {
 	// delayed enqueue's goroutine is still running.
 	require.NoError(t, scheduler.Stop())
 	require.Empty(t, scheduler.GetQueuedTaskReservations())
+}
+
+// shutdownProbe models an active task which owns resources until its execution
+// context is cancelled. Always rescue it so a failing regression does not leave
+// goroutines behind or contaminate subsequent measurements.
+func shutdownProbe(t *testing.T, clock clockwork.Clock) bool {
+	t.Helper()
+	env := testenv.GetTestEnv(t)
+	env.SetClock(clock)
+	q, err := NewPriorityTaskScheduler(env, NewFakeExecutor(), &FakeRunnerPool{}, NewFakeTaskLeaser(), &Options{})
+	require.NoError(t, err)
+	q.activeTaskCancelFuncs.Go(func() { <-q.rootContext.Done() })
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); assert.NoError(t, q.Shutdown(ctx)) }()
+	// Observe after the parent's hard deadline and an additional settling window.
+	<-ctx.Done()
+	timer := time.NewTimer(20 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+	}
+	cancelled := q.rootContext.Err() != nil
+	t.Logf("shutdown missed parent deadline: rootErr=%v", q.rootContext.Err())
+	q.rootCancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rescue did not finish shutdown")
+	}
+	return cancelled
+}
+
+func TestShutdownCancelsInFlightTasks_ContextExpiresFirst(t *testing.T) {
+	testleak.Check(t)
+	flags.Set(t, "executor.shutdown_cleanup_duration", 20*time.Millisecond)
+	// Keep the scheduler clock frozen: the real context timeout becomes ready
+	// first, deterministically selecting the formerly incorrect success branch.
+	require.True(t, shutdownProbe(t, clockwork.NewFakeClockAt(time.Now())), "task remained alive after shutdown deadline")
+}
+
+func TestShutdownCancelsInFlightTasks_RealClock(t *testing.T) {
+	testleak.Check(t)
+	flags.Set(t, "executor.shutdown_cleanup_duration", 20*time.Millisecond)
+	missed := 0
+	for range 100 {
+		if !shutdownProbe(t, clockwork.NewRealClock()) {
+			missed++
+		}
+	}
+	t.Logf("uncancelled tasks after deadline: %d/100", missed)
+	require.Zero(t, missed)
+}
+
+func TestShutdownCancelsInFlightTasks_NoDeadline(t *testing.T) {
+	testleak.Check(t)
+	q, err := NewPriorityTaskScheduler(testenv.GetTestEnv(t), NewFakeExecutor(), &FakeRunnerPool{}, NewFakeTaskLeaser(), &Options{})
+	require.NoError(t, err)
+	defer q.rootCancel()
+	q.activeTaskCancelFuncs.Go(func() { <-q.rootContext.Done() })
+	require.NoError(t, q.Shutdown(context.Background()))
+	require.ErrorIs(t, q.rootContext.Err(), context.Canceled)
 }
