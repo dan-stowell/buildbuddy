@@ -3159,3 +3159,48 @@ func TestHedgeFailureOrderingAndReconnect(t *testing.T) {
 		})
 	}
 }
+
+// copyRegistryHook observes commands without changing Redis responses.
+type copyRegistryHook struct{ commands chan string }
+
+func (h *copyRegistryHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
+	for _, arg := range cmd.Args() {
+		if strings.HasPrefix(fmt.Sprint(arg), "executionCopies/") {
+			h.commands <- cmd.String()
+			break
+		}
+	}
+	return ctx, nil
+}
+func (*copyRegistryHook) AfterProcess(context.Context, redis.Cmder) error { return nil }
+func (h *copyRegistryHook) BeforeProcessPipeline(ctx context.Context, cmds []redis.Cmder) (context.Context, error) {
+	for _, cmd := range cmds {
+		h.BeforeProcess(ctx, cmd)
+	}
+	return ctx, nil
+}
+func (*copyRegistryHook) AfterProcessPipeline(context.Context, []redis.Cmder) error { return nil }
+
+func TestExecute_HedgingDisabledAvoidsCopyRegistry(t *testing.T) {
+	flags.Set(t, "remote_execution.action_merging_hedge_count", 0)
+	env, conn, _ := setupEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	arn := uploadAction(ctx, t, env, "", repb.DigestFunction_SHA256, &repb.Action{})
+	hook := &copyRegistryHook{commands: make(chan string, 100)}
+	env.GetRemoteExecutionRedisClient().AddHook(hook)
+	stream, err := repb.NewExecutionClient(conn).Execute(ctx, &repb.ExecuteRequest{
+		ActionDigest: arn.GetDigest(), DigestFunction: arn.GetDigestFunction(),
+	})
+	require.NoError(t, err)
+	_, err = stream.Recv()
+	require.NoError(t, err)
+	require.Len(t, env.GetSchedulerService().(*schedulerServerMock).scheduleReqs, 1)
+	close(hook.commands) // Initial operation is sent after dispatch and terminal-state lookup.
+	var commands []string
+	for cmd := range hook.commands {
+		commands = append(commands, cmd)
+	}
+	t.Logf("hedging disabled; copy registry commands before initial operation: %d", len(commands))
+	require.Empty(t, commands, "the common no-hedge Execute must preserve baseline Redis work")
+}
