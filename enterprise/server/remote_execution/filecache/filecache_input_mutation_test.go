@@ -2,10 +2,12 @@ package filecache_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/filecache"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
@@ -203,4 +205,28 @@ func TestFileCacheInputMutation_NotVisibleAcrossGroups(t *testing.T) {
 	require.False(t, fc.FastLinkFile(ctx2, node, ws2Path), "other group should miss")
 	require.False(t, fc.FastLinkFile(context.Background(), node, ws2Path), "anonymous should miss")
 	require.True(t, fc.FastLinkFile(ctx1, node, ws2Path), "same group should hit")
+}
+
+// Report the warm-filesystem cost of a metadata pass over a large input tree.
+// No timing threshold: remote workers vary, and this is a measurement rather
+// than a performance regression assertion.
+func TestInputFingerprintStatCost(t *testing.T) {
+	dir := testfs.MakeTempDir(t)
+	paths := make([]string, 10000)
+	for i := range paths {
+		paths[i] = filepath.Join(dir, fmt.Sprintf("input-%05d", i))
+		require.NoError(t, os.WriteFile(paths[i], nil, 0644))
+	}
+	for _, n := range []int{1000, 10000} {
+		for pass := 0; pass < 3; pass++ {
+			start := time.Now()
+			for _, path := range paths[:n] {
+				info, err := os.Stat(path)
+				require.NoError(t, err)
+				require.True(t, info.Mode().IsRegular())
+			}
+			elapsed := time.Since(start)
+			t.Logf("metadata scan: files=%d pass=%d elapsed=%s ns/file=%d", n, pass, elapsed, elapsed.Nanoseconds()/int64(n))
+		}
+	}
 }
