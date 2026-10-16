@@ -479,14 +479,8 @@ func (r *statsRecorder) handleTask(ctx context.Context, task *recordStatsTask) {
 	}
 	// Cleanup regardless of whether the stats are flushed successfully to
 	// the DB (since we won't retry the flush and we don't need these stats
-	// for any other purpose). Counters are keyed by invocation ID only, so if
-	// this attempt was disconnected, keep them: Bazel may retry the BES upload
-	// as a new attempt of the same invocation, and that attempt's stats must
-	// include the cache traffic from before the disconnect. The counters
-	// expire on their own via TTL.
-	if task.invocationStatus != inspb.InvocationStatus_DISCONNECTED_INVOCATION_STATUS {
-		hit_tracker.CleanupCacheStats(ctx, r.env, task.invocationInfo.id)
-	}
+	// for any other purpose).
+	hit_tracker.CleanupCacheStats(ctx, r.env, task.invocationInfo.id)
 	if !updated {
 		log.CtxWarningf(ctx, "Attempt %d of invocation pre-empted by more recent attempt, no cache stats flushed.", task.invocationInfo.attempt)
 		// Don't notify the webhook; the more recent attempt should trigger
