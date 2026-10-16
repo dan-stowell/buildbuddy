@@ -23,6 +23,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/cas"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/cdc"
 	"github.com/buildbuddy-io/buildbuddy/server/util/findmissing"
@@ -1067,4 +1068,47 @@ func TestFindMissingBlobs_QuorumBypassesPresenceCache(t *testing.T) {
 		findMissing(findmissing.WithQuorum(ctx), proxy, []*repb.Digest{d}, nil, t)
 		require.Equal(t, i, requestCount.Load())
 	}
+}
+
+type cancelledTreeRemote struct {
+	repb.UnimplementedContentAddressableStorageServer
+}
+
+func (*cancelledTreeRemote) GetTree(_ *repb.GetTreeRequest, stream repb.ContentAddressableStorage_GetTreeServer) error {
+	if err := stream.Send(&repb.GetTreeResponse{Directories: []*repb.Directory{{}}}); err != nil {
+		return err
+	}
+	<-stream.Context().Done()
+	return stream.Context().Err()
+}
+
+// A client that cancels GetTree after a partial response must not leave proxy
+// or remote stream goroutines behind while the proxy and remote stay up, and
+// nothing may remain once they shut down.
+func TestCancelledGetTreeLifecycleResources(t *testing.T) {
+	testleak.Check(t)
+	testleak.CheckFDs(t)
+	// Run server handlers on their own goroutines, so stuck handlers are
+	// visible to the checks (see testleak package docs).
+	flags.Set(t, "grpc_server_worker_multiplier", 0)
+	flags.Set(t, "cache_proxy.enable_get_tree_caching", false)
+	remoteEnv, proxyEnv := testenv.GetTestEnv(t), testenv.GetTestEnv(t)
+	server, run, lis := testenv.RegisterLocalGRPCServer(t, remoteEnv)
+	repb.RegisterContentAddressableStorageServer(server, &cancelledTreeRemote{})
+	go run()
+	conn, err := testenv.LocalGRPCConn(t, context.Background(), lis)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	proxy := repb.NewContentAddressableStorageClient(runCASProxy(context.Background(), conn, proxyEnv, t))
+	testleak.CheckGrowth(t, testleak.Growth{Iterations: 10}, func(int) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		stream, err := proxy.GetTree(ctx, &repb.GetTreeRequest{RootDigest: &repb.Digest{Hash: fooDigest, SizeBytes: 100}, DigestFunction: repb.DigestFunction_SHA256})
+		require.NoError(t, err)
+		_, err = stream.Recv()
+		require.NoError(t, err)
+		cancel()
+		_, err = stream.Recv()
+		require.Error(t, err)
+	})
 }

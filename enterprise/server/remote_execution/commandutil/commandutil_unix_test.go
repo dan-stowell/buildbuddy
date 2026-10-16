@@ -15,7 +15,9 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/commandutil"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -299,3 +301,57 @@ func TestRun_EnableStats_ComplexProcessTree_RecordsStatsFromAllChildren(t *testi
 		t, res.UsageStats.GetPeakMemoryBytes(), int64(850e6),
 		"expected not much more than 750MB peak memory")
 }
+
+// Running a command must not leave goroutines or FDs (pipes, pidfds) behind,
+// whether it succeeds, fails, times out, is cancelled, is killed, or exceeds
+// the output limit.
+func TestRun_RepeatedLifecycleResources(t *testing.T) {
+	for _, outcome := range []string{"success", "nonzero", "timeout", "cancel", "killed", "output_limit"} {
+		t.Run(outcome, func(t *testing.T) {
+			testleak.Check(t)
+			testleak.CheckFDs(t)
+			if outcome == "output_limit" {
+				flags.Set(t, "executor.stdouterr_max_size_bytes", uint64(32))
+			}
+			for range 10 {
+				ctx, cancel := context.WithCancel(context.Background())
+				script := "echo hi"
+				stdio := &interfaces.Stdio{}
+				switch outcome {
+				case "nonzero":
+					script = "exit 7"
+				case "timeout":
+					cancel()
+					ctx, cancel = context.WithTimeout(context.Background(), 20*time.Millisecond)
+					script = "sleep 100"
+				case "cancel":
+					script = "echo ready; exec sleep 100"
+					stdio.Stdout = cancelOnWrite{cancel: cancel}
+				case "killed":
+					script = "kill -KILL $$"
+				case "output_limit":
+					// Exercise the actual output limiter with finite output so the test
+					// doesn't depend on a producer ignoring EPIPE forever.
+					stdio.Stdout = commandutil.LimitStdOutErrWriter(io.Discard)
+					script = "printf '%0100d' 0"
+				}
+				result := commandutil.Run(ctx, &repb.Command{Arguments: []string{"sh", "-c", script}}, ".", nil, stdio)
+				cancel()
+				switch outcome {
+				case "success":
+					require.NoError(t, result.Error)
+					require.Zero(t, result.ExitCode)
+				case "nonzero":
+					require.NoError(t, result.Error)
+					require.Equal(t, 7, result.ExitCode)
+				default:
+					require.Error(t, result.Error)
+				}
+			}
+		})
+	}
+}
+
+type cancelOnWrite struct{ cancel context.CancelFunc }
+
+func (w cancelOnWrite) Write(p []byte) (int, error) { w.cancel(); return len(p), nil }

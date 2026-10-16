@@ -51,6 +51,7 @@ go_test(
     deps = [
         "//proto:remote_execution_go_proto",
         "//server/interfaces",
+        "//server/testutil/testleak",
         "//server/util/status",
         "//server/util/testing/flags",
         "@com_github_stretchr_testify//assert",

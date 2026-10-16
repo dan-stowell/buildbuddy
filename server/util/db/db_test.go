@@ -111,6 +111,7 @@ func TestClose_StopsBackgroundGoroutines(t *testing.T) {
 	dbPath := filepath.Join(testfs.MakeTempDir(t), "test.db")
 	flags.Set(t, "database.data_source", fmt.Sprintf("sqlite3://file:%s?mode=memory&cache=shared", dbPath))
 	testleak.Check(t)
+	testleak.CheckFDs(t)
 
 	env := real_environment.NewRealEnv(testhealthcheck.NewTestingHealthChecker())
 	dbh, err := db.GetConfiguredDatabase(context.Background(), env)

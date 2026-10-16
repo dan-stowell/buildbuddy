@@ -75,6 +75,22 @@ go_library(
 )
 
 go_test(
+    name = "lifecycle_test",
+    size = "small",
+    srcs = ["lifecycle_test.go"],
+    embed = [":runner"],
+    deps = [
+        "//proto:remote_execution_go_proto",
+        "//server/testutil/testauth",
+        "//server/testutil/testenv",
+        "//server/testutil/testfs",
+        "//server/testutil/testleak",
+        "//server/util/testing/flags",
+        "@com_github_stretchr_testify//require",
+    ],
+)
+
+go_test(
     name = "runner_test",
     size = "small",
     srcs = ["runner_test.go"],
