@@ -1111,3 +1111,25 @@ func TestNewDiskCache_InvalidPartitionStopsStartedPartitions(t *testing.T) {
 	require.True(t, status.IsInvalidArgumentError(err), "got %v", err)
 	// TestMain fails if the default partition's goroutines are still running.
 }
+
+func TestDigestFunctionDiskIsolation(t *testing.T) {
+	for _, cacheType := range []rspb.CacheType{rspb.CacheType_CAS, rspb.CacheType_AC} {
+		t.Run(cacheType.String(), func(t *testing.T) {
+			te := getTestEnv(t, emptyUserMap)
+			ctx := getAnonContext(t, te)
+			dc, err := disk_cache.NewDiskCache(te, &disk_cache.Options{RootDirectory: testfs.MakeTempDir(t)}, 1_000_000_000)
+			require.NoError(t, err)
+			data := []byte("deterministic disk isolation")
+			d, err := digest.Compute(bytes.NewReader(data), repb.DigestFunction_SHA256)
+			require.NoError(t, err)
+			sha := digest.NewResourceName(d, "instance", cacheType, repb.DigestFunction_SHA256).ToProto()
+			blake := digest.NewResourceName(d, "instance", cacheType, repb.DigestFunction_BLAKE3).ToProto()
+			require.NoError(t, dc.Set(ctx, sha, data))
+			got, err := dc.Get(ctx, sha)
+			require.NoError(t, err)
+			require.Equal(t, data, got)
+			_, err = dc.Get(ctx, blake)
+			require.True(t, status.IsNotFoundError(err), "cross-function Get: %v", err)
+		})
+	}
+}
