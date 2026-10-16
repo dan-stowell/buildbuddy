@@ -86,11 +86,12 @@ func newHitTrackerClient(ctx context.Context, env *real_environment.RealEnv, con
 		hitsByCollection:     map[string]*cacheHits{},
 		client:               hitpb.NewHitTrackerServiceClient(conn),
 	}
-	go factory.batcher()
+	factory.wg.Go(factory.batcher)
 	for i := 0; i < *remoteHitTrackerWorkers; i++ {
 		factory.wg.Go(func() {
-			ticker := env.GetClock().NewTicker(*remoteHitTrackerPollInterval).Chan()
-			factory.sender(ctx, ticker)
+			ticker := env.GetClock().NewTicker(*remoteHitTrackerPollInterval)
+			defer ticker.Stop()
+			factory.sender(ctx, ticker.Chan())
 		})
 	}
 	env.GetHealthChecker().RegisterShutdownFunction(factory.shutdown)
