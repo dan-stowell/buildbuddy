@@ -1367,3 +1367,51 @@ func TestCancelDelayedReservationDoesNotReappear(t *testing.T) {
 	}
 	require.Empty(t, q.GetQueuedTaskReservations(), "cancelled delayed reservation reappeared in executor queue")
 }
+
+type pruningSchedulerClient struct {
+	scpb.SchedulerClient
+	missing string
+}
+
+func (c *pruningSchedulerClient) TaskExists(ctx context.Context, req *scpb.TaskExistsRequest, opts ...grpc.CallOption) (*scpb.TaskExistsResponse, error) {
+	return &scpb.TaskExistsResponse{Exists: req.GetTaskId() != c.missing}, nil
+}
+
+func TestMissingReservationPruningPreservesLiveWork(t *testing.T) {
+	env := testenv.GetTestEnv(t)
+	env.SetSchedulerClient(&pruningSchedulerClient{missing: "missing"})
+	q, err := NewPriorityTaskScheduler(env, NewFakeExecutor(), &FakeRunnerPool{}, NewFakeTaskLeaser(), &Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, q.Stop()) })
+	for _, id := range []string{"missing", "live"} {
+		_, err := q.EnqueueTaskReservation(t.Context(), newTaskReservationRequest(id, testGroupID1, 0))
+		require.NoError(t, err)
+	}
+	require.True(t, q.trimQueue(), "nonexistent head must be removed")
+	require.False(t, q.trimQueue(), "live task must survive pruning")
+	q.CancelTaskReservation(t.Context(), "missing")
+	require.Len(t, q.GetQueuedTaskReservations(), 1)
+	require.Equal(t, "live", q.GetQueuedTaskReservations()[0].GetTaskId())
+}
+
+func TestTaskQueueContinuouslyBackloggedGroupsMakeProgress(t *testing.T) {
+	q := newTaskQueue(clockwork.NewFakeClock())
+	ctx := t.Context()
+	// Priorities apply within each group; a continually replenished group
+	// with higher priority must not prevent another group from progressing.
+	q.Enqueue(ctx, newTaskReservationRequest("other", testGroupID2, 100))
+	for i := range 20 {
+		q.Enqueue(ctx, newTaskReservationRequest(fmt.Sprintf("busy-%d", i), testGroupID1, -100))
+	}
+	found := false
+	for i := range 4 {
+		task := q.Dequeue()
+		require.NotNil(t, task)
+		if task.GetTaskId() == "other" {
+			found = true
+			break
+		}
+		q.Enqueue(ctx, newTaskReservationRequest(fmt.Sprintf("refill-%d", i), testGroupID1, -100))
+	}
+	require.True(t, found, "backlogged high-priority group starved another group")
+}
