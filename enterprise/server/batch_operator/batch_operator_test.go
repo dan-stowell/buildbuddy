@@ -810,6 +810,9 @@ func TestEnqueue_SingleDigestEnqueuesWithConcurrentFlushLoseDigests(t *testing.T
 		MaxBatchesPerGroup: 50,
 		BatchInterval:      time.Hour,
 	})
+	// Silence per-flush debug logging; it otherwise produces ~20MB of output.
+	*log.LogLevel = "warn"
+	require.NoError(t, log.Configure())
 	updater.Start(&testhealthcheck.TestingHealthChecker{})
 	ctx := authenticatedContext(t.Context(), user1, authenticator)
 
