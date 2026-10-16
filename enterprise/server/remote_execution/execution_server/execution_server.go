@@ -2155,6 +2155,10 @@ func (s *ExecutionServer) Cancel(ctx context.Context, invocationID string) error
 			log.CtxWarningf(ctx, "Failed to cancel task %q: %s", id, err)
 		}
 		if err == nil && cancelled {
+			// The task no longer exists; stop advertising it as a merge target.
+			if err := action_merger.DeletePendingExecution(ctx, s.rdb, id); err != nil {
+				log.CtxWarningf(ctx, "Could not delete pending execution %q: %s", id, err)
+			}
 			err = s.MarkExecutionFailed(ctx, id, status.CanceledError("invocation cancelled"))
 			if err != nil {
 				log.CtxWarningf(ctx, "Could not mark execution %q as cancelled: %s", id, err)
