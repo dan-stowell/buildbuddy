@@ -257,6 +257,14 @@ func runTargetStatusFlush(t *testing.T, ending streamEnding, olap bool, partial 
 		filtered := make([]*bspb.BuildEvent, 0, len(events))
 		for _, ev := range events {
 			if ev.GetTestSummary() == nil {
+				if len(partial) > 1 && partial[1] {
+					if ev.GetTestResult() != nil {
+						continue
+					}
+					if completed := ev.GetCompleted(); completed != nil {
+						completed.Success = false
+					}
+				}
 				filtered = append(filtered, ev)
 			}
 		}
@@ -330,6 +338,12 @@ func runTargetStatusFlush(t *testing.T, ending streamEnding, olap bool, partial 
 			for i := range expected {
 				expected[i].Status = int32(bspb.TestStatus_NO_STATUS)
 			}
+		}
+	}
+	if len(partial) > 1 && partial[1] {
+		expected = []tfStatusRow{
+			{Label: "//pkg:fail_test", Status: int32(bspb.TestStatus_FAILED_TO_BUILD)},
+			{Label: "//pkg:pass_test", Status: int32(bspb.TestStatus_FAILED_TO_BUILD)},
 		}
 	}
 	require.Equal(t, expected, rows, "invocation %s ending=%s", iid, ending)
@@ -442,6 +456,19 @@ func TestTargetStatusFlushMissingSummary(t *testing.T) {
 		for _, ending := range []streamEnding{endWithLastMessage, endWithEOFAfterFinished, endWithCancelAfterFinished} {
 			t.Run(fmt.Sprintf("%s/olap=%t", ending, olap), func(t *testing.T) {
 				runTargetStatusFlush(t, ending, olap, true)
+			})
+		}
+	}
+}
+
+// A failed TargetComplete already establishes FAILED_TO_BUILD without any
+// TestResult or TestSummary. EOF and cancellation must preserve that status,
+// including in OLAP (which excludes targets whose status is still unknown).
+func TestTargetStatusFlushFailedToBuildWithoutSummary(t *testing.T) {
+	for _, olap := range []bool{false, true} {
+		for _, ending := range []streamEnding{endWithLastMessage, endWithEOFAfterFinished, endWithCancelAfterFinished} {
+			t.Run(fmt.Sprintf("%s/olap=%t", ending, olap), func(t *testing.T) {
+				runTargetStatusFlush(t, ending, olap, true, true)
 			})
 		}
 	}
