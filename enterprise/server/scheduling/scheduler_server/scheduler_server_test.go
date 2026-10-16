@@ -2757,3 +2757,22 @@ func TestWatchTaskLiveness_StopsWhenWatchersAreDone(t *testing.T) {
 	defer s.livenessMu.Unlock()
 	require.Empty(t, s.livenessWatches)
 }
+
+// A partial legacy hash is still an existing task. HSET's count of newly
+// added fields must not authorize overwriting an existing owner's state.
+func TestVerifyRedisRetry_InsertPartialLegacyHash(t *testing.T) {
+	ctx := t.Context()
+	rdb := testredis.Start(t).Client()
+	s := &SchedulerServer{rdb: rdb}
+	key := s.redisKeyForTask("partial-legacy")
+	require.NoError(t, rdb.HSet(ctx, key, "claimed", "1", "leaseId", "owner", "attemptCount", 7).Err())
+	require.NoError(t, rdb.Expire(ctx, key, time.Minute).Err())
+	before, err := rdb.HGetAll(ctx, key).Result()
+	require.NoError(t, err)
+	err = s.insertTask(ctx, "partial-legacy", &scpb.SchedulingMetadata{}, []byte("replacement"), "jwt")
+	after, readErr := rdb.HGetAll(ctx, key).Result()
+	require.NoError(t, readErr)
+	require.Equal(t, before, after, "conflicting insertion must preserve partial legacy state")
+	require.True(t, status.IsAlreadyExistsError(err), "got %v", err)
+	require.InDelta(t, time.Minute, rdb.TTL(ctx, key).Val(), float64(2*time.Second))
+}
