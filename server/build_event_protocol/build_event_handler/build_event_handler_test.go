@@ -2405,3 +2405,42 @@ func TestTruncateStringSlice(t *testing.T) {
 		})
 	}
 }
+
+// BuildFinished completes an invocation even if its test summary and the
+// last-message event never arrive. Persist the observed target as NO_STATUS,
+// just as the last-message path does, rather than dropping the target entirely.
+func TestTargetStatusMissingSummaryOnFinalize(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	flags.Set(t, "app.enable_target_tracking", true)
+	flags.Set(t, "app.enable_write_test_target_statuses_to_olap_db", false)
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
+	te.SetAuthenticator(auth)
+	ctx := auth.AuthContextFromAPIKey(context.Background(), "USER1")
+	seq := NewBESSequence(t)
+	ch, err := build_event_handler.NewBuildEventHandler(te).OpenChannel(ctx, seq.InvocationID)
+	require.NoError(t, err)
+	defer ch.Close()
+	label := "//pkg:partial_test"
+	configured := &bspb.BuildEventId{Id: &bspb.BuildEventId_TargetConfigured{TargetConfigured: &bspb.BuildEventId_TargetConfiguredId{Label: label}}}
+	completed := &bspb.BuildEventId{Id: &bspb.BuildEventId_TargetCompleted{TargetCompleted: &bspb.BuildEventId_TargetCompletedId{Label: label}}}
+	result := &bspb.BuildEventId{Id: &bspb.BuildEventId_TestResult{TestResult: &bspb.BuildEventId_TestResultId{Label: label, Shard: 1, Attempt: 1, Run: 1}}}
+	for _, ev := range []*bspb.BuildEvent{
+		{Id: &bspb.BuildEventId{Id: &bspb.BuildEventId_Started{}}, Payload: &bspb.BuildEvent_Started{Started: &bspb.BuildStarted{Command: "test", OptionsDescription: "--remote_header='" + authutil.APIKeyHeader + "=USER1'"}}},
+		{Payload: &bspb.BuildEvent_BuildMetadata{BuildMetadata: &bspb.BuildMetadata{Metadata: map[string]string{"ROLE": "CI", "REPO_URL": "https://github.com/example/repo"}}}},
+		{Children: []*bspb.BuildEventId{configured}, Payload: &bspb.BuildEvent_Expanded{Expanded: &bspb.PatternExpanded{}}},
+		{Id: configured, Children: []*bspb.BuildEventId{completed}, Payload: &bspb.BuildEvent_Configured{Configured: &bspb.TargetConfigured{TargetKind: "go_test rule", TestSize: bspb.TestSize_SMALL}}},
+		{Payload: &bspb.BuildEvent_WorkspaceStatus{WorkspaceStatus: &bspb.WorkspaceStatus{}}},
+		{Id: completed, Children: []*bspb.BuildEventId{result}, Payload: &bspb.BuildEvent_Completed{Completed: &bspb.TargetComplete{Success: true}}},
+		{Id: result, Payload: &bspb.BuildEvent_TestResult{TestResult: &bspb.TestResult{Status: bspb.TestStatus_FAILED}}},
+		{Payload: &bspb.BuildEvent_Finished{Finished: &bspb.BuildFinished{ExitCode: &bspb.BuildFinished_ExitCode{Code: 3}}}},
+	} {
+		require.NoError(t, ch.HandleEvent(seq.NextRequest(ev)))
+	}
+	require.NoError(t, ch.FinalizeInvocation(seq.InvocationID))
+	inv, err := te.GetInvocationDB().LookupInvocation(ctx, seq.InvocationID)
+	require.NoError(t, err)
+	require.Equal(t, int64(inspb.InvocationStatus_COMPLETE_INVOCATION_STATUS), inv.InvocationStatus)
+	var row struct{ Count int64 }
+	require.NoError(t, te.GetDBHandle().NewQuery(ctx, "partial_target_status").Raw(`SELECT count(*) AS count FROM "TargetStatuses" WHERE status = ?`, int32(bspb.TestStatus_NO_STATUS)).Take(&row))
+	require.Equal(t, int64(1), row.Count, "COMPLETE invocation lost its partially observed target")
+}
