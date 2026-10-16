@@ -2,6 +2,8 @@ package hit_tracker_client
 
 import (
 	"context"
+	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testhealthcheck"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"google.golang.org/grpc"
 	"strings"
@@ -526,7 +528,7 @@ func (c *v4BlockingConn) Invoke(ctx context.Context, method string, args, reply 
 }
 func TestV4ShutdownDeadline(t *testing.T) {
 	testleak.Check(t)
-	env := testenv.GetTestEnv(t)
+	env := real_environment.NewRealEnv(testhealthcheck.NewTestingHealthChecker())
 	flags.Set(t, "cache_proxy.remote_hit_tracker.workers", 1)
 	flags.Set(t, "cache_proxy.remote_hit_tracker.remote_hit_queue_size", 10)
 	flags.Set(t, "cache_proxy.remote_hit_tracker.update_interval", time.Millisecond)
