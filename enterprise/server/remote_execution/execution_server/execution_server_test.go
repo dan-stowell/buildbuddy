@@ -2976,3 +2976,65 @@ func TestRedactCachedExecuteResponse(t *testing.T) {
 		})
 	}
 }
+
+// Hedge tests control executor completion through PublishOperation, without
+// starting executor processes or depending on execution duration.
+type hedgeSchedulerMock struct{ *schedulerServerMock }
+
+func (s *hedgeSchedulerMock) ExistsTask(context.Context, string) (bool, error) {
+	return true, nil
+}
+
+func TestHedgeLateSuccessDoesNotOverwriteActionCache(t *testing.T) {
+	flags.Set(t, "remote_execution.enable_action_merging", true)
+	flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
+	flags.Set(t, "remote_execution.action_merging_hedge_delay", time.Microsecond)
+	env, conn, _ := setupEnv(t)
+	scheduler := &hedgeSchedulerMock{env.GetSchedulerService().(*schedulerServerMock)}
+	env.SetSchedulerService(scheduler)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := repb.NewExecutionClient(conn)
+	arn := uploadAction(ctx, t, env, "", repb.DigestFunction_SHA256, &repb.Action{})
+	req := &repb.ExecuteRequest{ActionDigest: arn.GetDigest(), DigestFunction: arn.GetDigestFunction()}
+	original, err := client.Execute(ctx, req)
+	require.NoError(t, err)
+	accepted, err := original.Recv()
+	require.NoError(t, err)
+	merged, err := client.Execute(ctx, req)
+	require.NoError(t, err)
+	mergedAccepted, err := merged.Recv()
+	require.NoError(t, err)
+	require.Equal(t, accepted.GetName(), mergedAccepted.GetName())
+	require.Len(t, scheduler.scheduleReqs, 2, "one original and one hedge must be dispatched")
+	originalID := scheduler.scheduleReqs[0].GetTaskId()
+	hedgeID := scheduler.scheduleReqs[1].GetTaskId()
+	require.NotEqual(t, originalID, hedgeID)
+
+	publish := func(taskID, stdout string) {
+		t.Helper()
+		op, err := operation.Assemble(taskID, operation.Metadata(repb.ExecutionStage_COMPLETED, arn.GetDigest()), &repb.ExecuteResponse{
+			Result: &repb.ActionResult{StdoutRaw: []byte(stdout), ExecutionMetadata: &repb.ExecutedActionMetadata{
+				QueuedTimestamp: tspb.New(time.Unix(100, 0)), WorkerStartTimestamp: tspb.New(time.Unix(101, 0)), WorkerCompletedTimestamp: tspb.New(time.Unix(102, 0)),
+			}},
+		})
+		require.NoError(t, err)
+		stream, err := client.PublishOperation(ctx)
+		require.NoError(t, err)
+		require.NoError(t, stream.Send(op))
+		_, err = stream.CloseAndRecv()
+		require.NoError(t, err)
+	}
+	readCache := func() string {
+		t.Helper()
+		result, err := env.GetActionCacheClient().GetActionResult(ctx, &repb.GetActionResultRequest{ActionDigest: arn.GetDigest(), DigestFunction: arn.GetDigestFunction()})
+		require.NoError(t, err)
+		return string(result.GetStdoutRaw())
+	}
+	publish(hedgeID, "winner")
+	require.Equal(t, "winner", readCache())
+	// Even a duplicate that was already finishing when cancellation arrived
+	// must not replace the result of the first successful completion.
+	publish(originalID, "late loser")
+	require.Equal(t, "winner", readCache(), "late duplicate must not overwrite the winning action result")
+}
