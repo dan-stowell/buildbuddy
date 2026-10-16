@@ -4687,12 +4687,16 @@ func TestSeededEvictionConcurrentRefresh(t *testing.T) {
 			te.SetAuthenticator(testauth.NewTestAuthenticator(t, emptyUserMap))
 			ctx := getAnonContext(t, te)
 			clock := clockwork.NewFakeClock()
+			minAge := map[int64]time.Duration{1: time.Minute, 17: time.Hour, 20261016: 2 * time.Hour}[seed]
+			threshold := map[int64]time.Duration{1: 0, 17: time.Minute, 20261016: time.Hour}[seed]
+			inlineLimit := map[int64]int64{1: 256, 17: 1024, 20261016: 2048}[seed]
+			t.Logf("min_age=%s atime_threshold=%s inline_limit=%d", minAge, threshold, inlineLimit)
 			pc, err := pebble_cache.NewPebbleCache(te, &pebble_cache.Options{
 				RootDirectory: t.TempDir(), MaxSizeBytes: 40_000,
-				Clock: clock, MinEvictionAge: new(time.Hour),
-				MaxInlineFileSizeBytes:      1024,
+				Clock: clock, MinEvictionAge: &minAge,
+				MaxInlineFileSizeBytes:      inlineLimit,
 				MinBytesAutoZstdCompression: new(int64(math.MaxInt64)),
-				AtimeUpdateThreshold:        new(time.Duration(0)),
+				AtimeUpdateThreshold:        &threshold,
 				SamplesPerBatch:             new(50), SampleBufferSize: new(10),
 			})
 			require.NoError(t, err)
@@ -4715,7 +4719,7 @@ func TestSeededEvictionConcurrentRefresh(t *testing.T) {
 				for i, r := range resources {
 					require.NoError(t, pc.Set(ctx, r, contents[i]))
 				}
-				clock.Advance(2 * time.Hour)
+				clock.Advance(2 * minAge)
 				var eg errgroup.Group
 				for worker := range 4 {
 					eg.Go(func() error {
