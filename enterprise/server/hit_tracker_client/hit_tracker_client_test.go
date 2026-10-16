@@ -2,6 +2,10 @@ package hit_tracker_client
 
 import (
 	"context"
+	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testhealthcheck"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
+	"google.golang.org/grpc"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -503,5 +507,50 @@ func TestRegister(t *testing.T) {
 			_, isNoOp := te.GetHitTrackerFactory().(*NoOpHitTrackerFactory)
 			require.Equal(t, tc.expectNoOp, isNoOp)
 		})
+	}
+}
+
+// v4BlockingConn models an accepted RPC that only returns on client cancellation.
+type v4BlockingConn struct {
+	grpc.ClientConnInterface
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *v4BlockingConn) Invoke(ctx context.Context, method string, args, reply any, opts ...grpc.CallOption) error {
+	close(c.entered)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.release:
+		return nil
+	}
+}
+func TestV4ShutdownDeadline(t *testing.T) {
+	testleak.Check(t)
+	env := real_environment.NewRealEnv(testhealthcheck.NewTestingHealthChecker())
+	flags.Set(t, "cache_proxy.remote_hit_tracker.workers", 1)
+	flags.Set(t, "cache_proxy.remote_hit_tracker.remote_hit_queue_size", 10)
+	flags.Set(t, "cache_proxy.remote_hit_tracker.update_interval", time.Millisecond)
+	conn := &v4BlockingConn{entered: make(chan struct{}), release: make(chan struct{})}
+	h := newHitTrackerClient(context.Background(), env, conn)
+	h.batch(&enqueuedCacheHit{collection: &usageutil.Collection{GroupID: interfaces.AuthAnonymousUser}, hit: &hitpb.CacheHit{}})
+	select {
+	case <-conn.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sender never entered Track")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { h.shutdown(ctx); close(done) }()
+	select {
+	case <-done:
+		t.Log("shutdown joined sender at deadline")
+	case <-time.After(time.Second):
+		// Release the fake remote so the failure doesn't contaminate other tests.
+		close(conn.release)
+		<-done
+		t.Fatal("shutdown retained sender beyond expired deadline")
 	}
 }
