@@ -2,11 +2,17 @@ package uffd
 
 import (
 	"errors"
+	"fmt"
+	"net"
 	"os"
+	"path/filepath"
+	"runtime"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/copy_on_write"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
@@ -416,4 +422,52 @@ func TestZero_RejectsInvalidProgress(t *testing.T) {
 	err := h.copyZeroes(0 /*=uffd*/, faultingAddress, mapping)
 	require.Error(t, err)
 	require.Contains(t, h.removedAddresses, int64(faultingAddress))
+}
+
+// Setup is used once per restored VM. The receiver must release the accepted
+// setup socket after it has received the mappings and passed the UFFD to handle.
+func TestSetupSocketGrowth(t *testing.T) {
+	for _, collect := range []bool{false, true} {
+		for _, n := range []int{10, 50} {
+			t.Run(fmt.Sprintf("GC=%v/N=%d", collect, n), func(t *testing.T) {
+				dir := t.TempDir()
+				runtime.GC()
+				t.Cleanup(runtime.GC)
+				testleak.CheckGrowth(t, testleak.Growth{Iterations: n}, func(i int) {
+					path := filepath.Join(dir, "setup.sock")
+					lis, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+					require.NoError(t, err)
+					h := &Handler{lis: lis, stoppedChan: make(chan struct{})}
+					done := make(chan error, 1)
+					go func() {
+						setup, err := h.receiveSetupMsg(t.Context())
+						if err == nil {
+							syscall.Close(int(setup.Uffd))
+						}
+						done <- err
+					}()
+					client, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
+					require.NoError(t, err)
+					// No page faults are handled here; use a real transferable descriptor
+					// instead of requiring userfaultfd privileges just to test setup ownership.
+					f, err := os.Open("/dev/null")
+					require.NoError(t, err)
+					_, _, err = client.WriteMsgUnix([]byte("[]"), syscall.UnixRights(int(f.Fd())), nil)
+					require.NoError(t, err)
+					require.NoError(t, f.Close())
+					require.NoError(t, client.Close())
+					select {
+					case err := <-done:
+						require.NoError(t, err)
+					case <-time.After(10 * time.Second):
+						t.Fatal("setup did not finish")
+					}
+					_ = lis.Close()
+					if collect {
+						runtime.GC()
+					}
+				})
+			})
+		}
+	}
 }
