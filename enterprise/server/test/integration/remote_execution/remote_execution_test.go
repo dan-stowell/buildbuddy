@@ -17,8 +17,10 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/oom"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/scheduling/scheduler_server"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/tasksize"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/test/integration/remote_execution/rbeclient"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/test/integration/remote_execution/rbetest"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/buildbuddy_enterprise"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testcontext"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testexecutor"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testredis"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/execution"
@@ -28,10 +30,12 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/resources"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testbazel"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testgrpc"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testmetrics"
 	"github.com/buildbuddy-io/buildbuddy/server/util/bazel"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_client"
@@ -2216,6 +2220,113 @@ touch %s`, counter, fname)
 	require.Equal(t, "FAST", strings.Trim(cmd4.Wait().Stdout, "\n"))
 }
 
+func TestActionMerging_HedgeWinnerReachesMergedWaiters(t *testing.T) {
+	flags.Set(t, "remote_execution.action_merging_hedge_count", 2)
+	flags.Set(t, "remote_execution.action_merging_hedge_delay", time.Microsecond)
+	rbe := rbetest.NewRBETestEnvWithOptions(t, &rbetest.EnvOptions{ShardedRedis: true})
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutor(t)
+
+	// This script runs quickly and outputs "FAST" if `fname` exists. Otherwise
+	// it writes a line to `counter`, runs slowly, and then outputs "SLOW".
+	fname := fmt.Sprintf("/tmp/%s", uuid.New().String())
+	counter := fmt.Sprintf("/tmp/%s", uuid.New().String())
+	flakyScript := fmt.Sprintf(`FILE="%s"
+COUNTER="%s"
+if [ -f $FILE ]; then
+	echo "FAST"
+else
+	echo "hello" >> $COUNTER
+	sleep 600
+	echo "SLOW"
+fi`, fname, counter)
+	platform := &repb.Platform{
+		Properties: []*repb.Platform_Property{
+			{Name: "OSFamily", Value: runtime.GOOS},
+			{Name: "Arch", Value: runtime.GOARCH},
+		},
+	}
+	flakyCmd := &repb.Command{
+		Arguments: []string{"sh", "-c", flakyScript},
+		Platform:  platform,
+	}
+
+	// Waits for two lines to be written to `counter`, to make sure the first 2
+	// flaky commands checked for the existance of `fname` and are sleeping.
+	// Then creates `fname`, making subsequent invocations of flakyCmd fast.
+	unlockScript := fmt.Sprintf(`COUNTER="%s"
+touch $COUNTER
+while [ $(wc -l <"$COUNTER") -lt 2 ]
+do
+	sleep 0.1
+done
+touch %s`, counter, fname)
+	unlockCmd := &repb.Command{
+		Arguments: []string{"sh", "-c", unlockScript},
+		Platform:  platform,
+	}
+
+	// Run flakyCmd the first time, this will be slow.
+	cmd1 := rbe.Execute(flakyCmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "invocation1"})
+	op1 := cmd1.WaitAccepted()
+	WaitForPendingExecution(rbe.GetRedisClient(), op1)
+
+	// The next invocation will merge against the slow op1 above and run a
+	// hedged action which will also be slow.
+	cmd2 := rbe.Execute(flakyCmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "invocation2"})
+	op2 := cmd2.WaitAccepted()
+	require.Equal(t, op1, op2, "expected actions to be merged")
+
+	// Run the unlock command, so the next execution of flakyCmd will be fast.
+	unlockRes := rbe.Execute(unlockCmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "unlock"}).Wait()
+	require.Empty(t, unlockRes.Stderr) // Helps with debugging the unlock command.
+
+	// The next execution should merge against the original execution, but run
+	// a second hedge, which will finish quickly.
+	cmd3 := rbe.Execute(flakyCmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "invocation3"})
+	op3 := cmd3.WaitAccepted()
+	require.Equal(t, op1, op3, "expected action to be merged")
+
+	// Wait for observable publication of the hedge result, rather than
+	// assuming that execution and upload finish within a fixed sleep.
+	actionRN, err := digest.ParseUploadResourceName(op1)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		_, err := rbe.GetActionResultStorageClient().GetActionResult(context.Background(), &repb.GetActionResultRequest{
+			ActionDigest: actionRN.GetDigest(), InstanceName: actionRN.GetInstanceName(), DigestFunction: actionRN.GetDigestFunction(),
+		})
+		return err == nil
+	}, 10*time.Second, 10*time.Millisecond, "successful hedge must populate the action cache")
+
+	// op3's hedged execution should populate the action cache, unblocking
+	// subsequent invocations.
+	cmd4 := rbe.Execute(flakyCmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "invocation4"})
+	op4 := cmd4.WaitAccepted()
+	require.NotEqual(t, op1, op4, "expected action to be hedged")
+	require.Equal(t, "FAST", strings.Trim(cmd4.Wait().Stdout, "\n"))
+	// The cache hit above confirms that the hedge's successful result has
+	// been uploaded. All clients already waiting on the canonical execution
+	// must receive that winner too, while the original remains blocked.
+	for i, cmd := range []*rbetest.Command{cmd1, cmd2, cmd3} {
+		deadline := time.NewTimer(5 * time.Second)
+		completed := false
+		for !completed {
+			select {
+			case result, ok := <-cmd.StatusChannel():
+				require.True(t, ok, "waiter %d closed without completion", i+1)
+				if result.Stage == repb.ExecutionStage_COMPLETED {
+					require.NoError(t, result.Err)
+					require.NotNil(t, result.ActionResult)
+					completed = true
+				}
+			case <-deadline.C:
+				t.Fatalf("waiter %d did not receive successful hedge completion within 5s", i+1)
+			}
+		}
+		deadline.Stop()
+	}
+}
+
 func TestActionMerging_DisabledWithDoNotCache(t *testing.T) {
 	rbe := rbetest.NewRBETestEnvWithOptions(t, &rbetest.EnvOptions{ShardedRedis: true})
 
@@ -2802,4 +2913,341 @@ func getExecutionAuxiliaryMetadata(t testing.TB, execRes *repb.ExecuteResponse) 
 	require.NoError(t, err)
 	require.True(t, ok)
 	return auxMeta
+}
+
+func TestActionMerging_HedgeWinnerCancelsRunningOriginal(t *testing.T) {
+	flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
+	flags.Set(t, "remote_execution.action_merging_hedge_delay", time.Microsecond)
+	flags.Set(t, "remote_execution.proactive_cancellation_enabled", true)
+	rbe := rbetest.NewRBETestEnv(t)
+	server := rbe.AddBuildBuddyServer()
+	conn, err := grpc_client.DialSimple(server.GRPCAddress())
+	require.NoError(t, err)
+	defer conn.Close()
+	scheduler := scpb.NewSchedulerClient(conn)
+	rbe.AddExecutor(t)
+	// The first copy creates the directory and blocks. Every subsequent copy
+	// exits successfully. The marker is a barrier proving the original is
+	// running before the request that dispatches the hedge is submitted.
+	marker := filepath.Join(t.TempDir(), "original-started")
+	cmd := &repb.Command{
+		Arguments: []string{"sh", "-c", fmt.Sprintf(`if mkdir %q 2>/dev/null; then
+while true; do sleep 1; done
+else
+ echo winner
+fi`, marker)},
+		Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+			{Name: "OSFamily", Value: runtime.GOOS},
+			{Name: "Arch", Value: runtime.GOARCH},
+		}},
+	}
+	original := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "original"})
+	originalID := original.WaitAccepted()
+	require.Eventually(t, func() bool { _, err := os.Stat(marker); return err == nil }, 10*time.Second, 10*time.Millisecond)
+	merged := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "merged"})
+	require.Equal(t, originalID, merged.WaitAccepted())
+	actionRN, err := digest.ParseUploadResourceName(originalID)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		_, err := rbe.GetActionResultStorageClient().GetActionResult(context.Background(), &repb.GetActionResultRequest{
+			ActionDigest: actionRN.GetDigest(), InstanceName: actionRN.GetInstanceName(), DigestFunction: actionRN.GetDigestFunction(),
+		})
+		return err == nil
+	}, 10*time.Second, 10*time.Millisecond, "hedge must finish successfully")
+	// A completed hedge must remove the running sibling from the scheduler,
+	// which causes lease renewal to cancel the executing command.
+	require.Eventually(t, func() bool {
+		response, err := scheduler.TaskExists(context.Background(), &scpb.TaskExistsRequest{TaskId: originalID})
+		return err == nil && !response.GetExists()
+	}, 5*time.Second, 10*time.Millisecond, "successful hedge must cancel the running original")
+}
+
+func TestActionMerging_HedgeWinnerRemovesQueuedOriginalReservation(t *testing.T) {
+	testHedgeWinnerRemovesQueuedOriginalReservation(t, false)
+}
+
+func TestActionMerging_HedgeWinnerCancelsReservationsOnPeerScheduler(t *testing.T) {
+	testHedgeWinnerRemovesQueuedOriginalReservation(t, true)
+}
+
+func testHedgeWinnerRemovesQueuedOriginalReservation(t *testing.T, peerScheduler bool) {
+	flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
+	flags.Set(t, "remote_execution.action_merging_hedge_delay", time.Microsecond)
+	flags.Set(t, "remote_execution.proactive_cancellation_enabled", true)
+	flags.Set(t, "executor.excess_capacity_threshold", -1)
+	flags.Set(t, "executor.queue_trim_interval", 0)
+	rbe := rbetest.NewRBETestEnv(t)
+	rbe.AddBuildBuddyServer()
+	// Register every executor before scheduling so the scheduler's cached
+	// node list includes all three. Intercept actual start order: blocker,
+	// original, then successful hedge.
+	started := make(chan struct{})
+	busyIndex := make(chan int, 1)
+	release := make(chan struct{})
+	defer close(release)
+	var mu sync.Mutex
+	starts := 0
+	var executors []*rbetest.Executor
+	for i := range 3 {
+		executors = append(executors, rbe.AddSingleTaskExecutorWithOptions(t, &rbetest.ExecutorOptions{
+			Name: fmt.Sprintf("executor%d", i),
+			RunInterceptor: func(ctx context.Context, original rbetest.RunFunc) *interfaces.CommandResult {
+				mu.Lock()
+				starts++
+				n := starts
+				mu.Unlock()
+				switch n {
+				case 1:
+					busyIndex <- i
+					return original(ctx, &repb.IOStats{})
+				case 2:
+					close(started)
+					select {
+					case <-ctx.Done():
+						return &interfaces.CommandResult{Error: status.CanceledError("cancelled"), ExitCode: -1}
+					case <-release:
+						return &interfaces.CommandResult{ExitCode: 0}
+					}
+				default:
+					return &interfaces.CommandResult{ExitCode: 0}
+				}
+			},
+		}))
+	}
+	if peerScheduler {
+		// Registration streams stay attached to the first scheduler. Route
+		// execution and completion through a second scheduler which owns no
+		// executor connections, forcing cancellation to cross the peer RPC.
+		completionServer := rbe.AddBuildBuddyServer()
+		rbe.AppProxy.SetDirector(testgrpc.RandomDialer([]string{completionServer.GRPCAddress()}))
+	}
+	blocker := rbe.ExecuteControlledCommand("blocker", &rbetest.ExecuteControlledOpts{})
+	blocker.WaitStarted()
+	defer blocker.Exit(0)
+	busy := executors[<-busyIndex]
+	require.Eventually(t, func() bool { return busy.QueueLength() == 0 }, 10*time.Second, 10*time.Millisecond)
+	cmd := &repb.Command{Arguments: []string{"/bin/true"}}
+	original := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true})
+	originalID := original.WaitAccepted()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("original did not start")
+	}
+	require.Eventually(t, func() bool { return busy.QueueLength() == 1 }, 10*time.Second, 10*time.Millisecond, "original reservation must be queued on busy executor")
+	merged := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true})
+	require.Equal(t, originalID, merged.WaitAccepted())
+	actionRN, err := digest.ParseUploadResourceName(originalID)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		_, err := rbe.GetActionResultStorageClient().GetActionResult(context.Background(), &repb.GetActionResultRequest{
+			ActionDigest: actionRN.GetDigest(), InstanceName: actionRN.GetInstanceName(), DigestFunction: actionRN.GetDigestFunction(),
+		})
+		return err == nil
+	}, 10*time.Second, 10*time.Millisecond, "hedge must finish successfully")
+	require.Eventually(t, func() bool { return busy.QueueLength() == 0 }, 5*time.Second, 10*time.Millisecond, "hedge completion must remove original's queued reservation")
+}
+
+// hedgeWatcher drains a command's status channel in the background and records
+// every update so that tests can inspect what a client observed and when.
+type hedgeWatcher struct {
+	name string
+	mu   sync.Mutex
+	log  []string
+	done chan struct{}
+	res  *rbeclient.CommandResult
+	at   time.Time
+}
+
+func watchHedgeCommand(t *testing.T, name string, cmd *rbetest.Command) *hedgeWatcher {
+	w := &hedgeWatcher{name: name, done: make(chan struct{})}
+	start := time.Now()
+	go func() {
+		for r := range cmd.StatusChannel() {
+			w.mu.Lock()
+			w.log = append(w.log, fmt.Sprintf("+%s stage=%s err=%v", time.Since(start).Round(10*time.Millisecond), r.Stage, r.Err))
+			if r.Stage == repb.ExecutionStage_COMPLETED || r.Err != nil {
+				w.res = r
+				w.at = time.Now()
+				w.mu.Unlock()
+				close(w.done)
+				return
+			}
+			w.mu.Unlock()
+		}
+	}()
+	return w
+}
+
+func (w *hedgeWatcher) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return fmt.Sprintf("%s updates=%v", w.name, w.log)
+}
+
+func countLines(t *testing.T, path string) int {
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	require.NoError(t, err)
+	return strings.Count(string(b), "\n")
+}
+
+func waitForFile(t *testing.T, path string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	require.FailNowf(t, "file not created", "%s was not created within %s", path, timeout)
+}
+
+// The first copy of the action to start (the canonical execution) runs slowly
+// (simulating a stuck executor), any later copy (the hedge) finishes fast.
+func hedgeTestCommand(dir string, slowIterations int) *repb.Command {
+	script := fmt.Sprintf(`D=%q
+if mkdir "$D/lock" 2>/dev/null; then
+	i=0
+	while [ $i -lt %d ]; do echo x >> "$D/orig_hb"; sleep 0.1; i=$((i+1)); done
+	echo SLOW
+else
+	echo x >> "$D/hedge_hb"
+	echo FAST
+fi`, dir, slowIterations)
+	return &repb.Command{
+		Arguments: []string{"sh", "-c", script},
+		Platform: &repb.Platform{
+			Properties: []*repb.Platform_Property{
+				{Name: "OSFamily", Value: runtime.GOOS},
+				{Name: "Arch", Value: runtime.GOARCH},
+			},
+		},
+	}
+}
+
+// When a merged action is hedged and the hedge succeeds, clients that are
+// already waiting on the action should receive the result.
+func TestActionMerging_HedgeResultReachesWaitingClients(t *testing.T) {
+	flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
+	flags.Set(t, "remote_execution.action_merging_hedge_delay", 1*time.Second)
+	rbe := rbetest.NewRBETestEnvWithOptions(t, &rbetest.EnvOptions{ShardedRedis: true})
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutor(t)
+
+	dir := testfs.MakeTempDir(t)
+	// Canonical execution runs ~40s; the hedge returns immediately.
+	cmd := hedgeTestCommand(dir, 400)
+
+	t0 := time.Now()
+	cmd1 := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "invocation1"})
+	op1 := cmd1.WaitAccepted()
+	w1 := watchHedgeCommand(t, "client1", cmd1)
+	waitForFile(t, filepath.Join(dir, "orig_hb"), 30*time.Second)
+
+	// Wait past the hedge delay so the next request triggers a hedge.
+	time.Sleep(1500 * time.Millisecond)
+	cmd2 := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "invocation2"})
+	op2 := cmd2.WaitAccepted()
+	w2 := watchHedgeCommand(t, "client2", cmd2)
+	require.Equal(t, op1, op2, "expected the hedge-triggering request to be merged into the canonical execution")
+
+	// Wait for the hedge to finish and populate the action cache.
+	ctx := context.Background()
+	acClient := rbe.GetActionResultStorageClient()
+	arn := cmd1.GetActionResourceName()
+	var hedgeAR *repb.ActionResult
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		ar, err := acClient.GetActionResult(ctx, &repb.GetActionResultRequest{
+			InstanceName:   arn.GetInstanceName(),
+			ActionDigest:   arn.GetDigest(),
+			DigestFunction: arn.GetDigestFunction(),
+		})
+		if err == nil {
+			hedgeAR = ar
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	require.NotNil(t, hedgeAR, "hedge result never reached the action cache")
+	hedgeDone := time.Now()
+	stdout, _, err := rbe.GetStdoutAndStderr(ctx, hedgeAR, arn.GetInstanceName())
+	require.NoError(t, err)
+	require.Equal(t, "FAST", strings.TrimSpace(stdout), "action cache should hold the hedge's result")
+	log.Infof("HEDGE-REPRO: hedge result in AC at +%s (op1=%s)", hedgeDone.Sub(t0).Round(10*time.Millisecond), op1)
+
+	// Claim B: is the canonical copy still running after the hedge succeeded?
+	hb1 := countLines(t, filepath.Join(dir, "orig_hb"))
+	time.Sleep(3 * time.Second)
+	hb2 := countLines(t, filepath.Join(dir, "orig_hb"))
+	log.Infof("HEDGE-REPRO: canonical heartbeat lines %d -> %d over 3s after hedge success", hb1, hb2)
+
+	// Does a WaitExecution reconnect on the operation name learn of the hedge?
+	wctx, wcancel := context.WithTimeout(ctx, 5*time.Second)
+	wctx = testcontext.AttachInvocationIDToContext(t, wctx, "invocation2")
+	waitStream, err := rbe.GetRemoteExecutionClient().WaitExecution(wctx, &repb.WaitExecutionRequest{Name: op1})
+	require.NoError(t, err)
+	reconnectDone := false
+	var reconnectErr error
+	for {
+		op, err := waitStream.Recv()
+		if err != nil {
+			reconnectErr = err
+			break
+		}
+		if op.GetDone() {
+			reconnectDone = true
+			break
+		}
+	}
+	wcancel()
+	log.Infof("HEDGE-REPRO: WaitExecution(%s) reconnect for 5s: done=%t err=%v", op1, reconnectDone, reconnectErr)
+
+	// A brand new request with cache lookup gets the hedge's result from AC.
+	cmd3 := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "invocation3"})
+	res3 := cmd3.Wait()
+	log.Infof("HEDGE-REPRO: new request with cache lookup: stdout=%q", strings.TrimSpace(res3.Stdout))
+	// A new request with skip_cache_lookup merges into the canonical execution.
+	cmd4 := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: false, InvocationID: "invocation4"})
+	op4 := cmd4.WaitAccepted()
+	log.Infof("HEDGE-REPRO: new request with skip_cache_lookup merged into canonical: %t", op4 == op1)
+
+	// Claim A: clients already waiting should receive the hedge's result
+	// promptly (allow 10s after the hedge result was available).
+	waitDeadline := hedgeDone.Add(10 * time.Second)
+	got := map[string]bool{}
+	for _, w := range []*hedgeWatcher{w1, w2} {
+		select {
+		case <-w.done:
+			got[w.name] = true
+		case <-time.After(time.Until(waitDeadline)):
+		}
+	}
+	// For the report: wait for the canonical execution to finish and record
+	// what each client eventually received.
+	for _, w := range []*hedgeWatcher{w1, w2} {
+		select {
+		case <-w.done:
+		case <-time.After(60 * time.Second):
+		}
+		w.mu.Lock()
+		res, at := w.res, w.at
+		w.mu.Unlock()
+		out := ""
+		if res != nil && res.ActionResult != nil {
+			out, _, _ = rbe.GetStdoutAndStderr(ctx, res.ActionResult, arn.GetInstanceName())
+		}
+		after := "never"
+		if !at.IsZero() {
+			after = at.Sub(hedgeDone).Round(10 * time.Millisecond).String()
+		}
+		log.Infof("HEDGE-REPRO: %s; completed %s after hedge result; stdout=%q", w, after, strings.TrimSpace(out))
+	}
+
+	assert.True(t, got["client1"], "client1 (original requester) did not receive the hedge's successful result within 10s")
+	assert.True(t, got["client2"], "client2 (the request that triggered the hedge) did not receive the hedge's successful result within 10s")
+	assert.Equal(t, hb1, hb2, "canonical execution kept running after the hedge succeeded")
 }
