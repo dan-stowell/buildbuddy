@@ -117,6 +117,13 @@ func NewServer(bsClient bspb.ByteStreamClient, acClient repb.ActionCacheClient) 
 	pullerLRU, err := lru.New[*pullerLRUEntry](&lru.Config[*pullerLRUEntry]{
 		SizeFn:  func(_ *pullerLRUEntry) int64 { return 1 },
 		MaxSize: int64(pullerLRUMaxEntries),
+		// Each puller has its own HTTP client. Release its idle connections
+		// when it leaves the cache rather than leaving them open until the
+		// idle timeout. Requests still using an evicted puller keep working;
+		// their connections are closed instead of pooled when they finish.
+		OnEvict: func(_ string, e *pullerLRUEntry, _ lru.EvictionReason) {
+			e.client.CloseIdleConnections()
+		},
 	})
 	if err != nil {
 		return nil, status.InternalErrorf("error initializing puller cache: %s", err)
@@ -625,7 +632,7 @@ func (s *ociFetcherServer) fetchManifestMetadataFromRemote(ctx context.Context, 
 	}, nil
 }
 
-func (s *ociFetcherServer) getRemoteOpts(ctx context.Context, creds *rgpb.Credentials) []remote.Option {
+func (s *ociFetcherServer) getRemoteOpts(ctx context.Context, creds *rgpb.Credentials) ([]remote.Option, *http.Client) {
 	opts := []remote.Option{remote.WithContext(ctx)}
 
 	if creds != nil && creds.GetUsername() != "" && creds.GetPassword() != "" {
@@ -644,7 +651,7 @@ func (s *ociFetcherServer) getRemoteOpts(ctx context.Context, creds *rgpb.Creden
 	}
 	opts = append(opts, remote.WithTransport(NewBlobHeadFallbackTransport(client)))
 
-	return opts
+	return opts, client
 }
 
 func (s *ociFetcherServer) getOrCreatePuller(ctx context.Context, imageRef ctrname.Reference, creds *rgpb.Credentials) (*remote.Puller, error) {
@@ -658,12 +665,12 @@ func (s *ociFetcherServer) getOrCreatePuller(ctx context.Context, imageRef ctrna
 		return entry.puller, nil
 	}
 
-	remoteOpts := s.getRemoteOpts(ctx, creds)
+	remoteOpts, client := s.getRemoteOpts(ctx, creds)
 	puller, err := remote.NewPuller(remoteOpts...)
 	if err != nil {
 		return nil, status.InternalErrorf("error creating puller: %s", err)
 	}
-	s.pullerLRU.Add(key, &pullerLRUEntry{puller: puller})
+	s.pullerLRU.Add(key, &pullerLRUEntry{puller: puller, client: client})
 
 	return puller, nil
 }
@@ -796,6 +803,7 @@ func (w *grpcStreamWriter) Write(p []byte) (int, error) {
 
 type pullerLRUEntry struct {
 	puller *remote.Puller
+	client *http.Client
 }
 
 func ParseAllowedPrivateIPs() ([]*net.IPNet, error) {
@@ -964,6 +972,14 @@ func (t *mirrorTransport) RoundTrip(in *http.Request) (out *http.Response, err e
 		}
 	}
 	return t.inner.RoundTrip(in)
+}
+
+// CloseIdleConnections lets http.Client.CloseIdleConnections reach the inner
+// transport.
+func (t *mirrorTransport) CloseIdleConnections() {
+	if closer, ok := t.inner.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
 }
 
 func matchesMirror(mc interfaces.MirrorConfig, u *url.URL) (bool, error) {
