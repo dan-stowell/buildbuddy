@@ -2757,3 +2757,130 @@ func TestWatchTaskLiveness_StopsWhenWatchersAreDone(t *testing.T) {
 	defer s.livenessMu.Unlock()
 	require.Empty(t, s.livenessWatches)
 }
+
+// claimLeaseID returns the lease ID of the current claim on the task in Redis,
+// or "" if the task is not claimed.
+func claimLeaseID(ctx context.Context, t *testing.T, s *SchedulerServer, taskID string) string {
+	fields, err := s.rdb.HGetAll(ctx, s.redisKeyForTask(taskID)).Result()
+	require.NoError(t, err)
+	if fields["claimed"] != "1" {
+		return ""
+	}
+	return fields["leaseId"]
+}
+
+// An executor whose task failed with a retryable error re-enqueues it on its
+// lease stream (TaskLease.Close with retry=true). As soon as the scheduler
+// releases that executor's claim, another executor with a queued reservation
+// for the task may legitimately claim it. The re-enqueue must not then release
+// the new executor's claim: that executor keeps running the task while the
+// task is offered to yet another executor, so the action runs twice.
+func TestLeaseReEnqueue_DoesNotReleaseClaimOfNextExecutor(t *testing.T) {
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+	s := env.GetSchedulerService().(*SchedulerServer)
+
+	a := newFakeExecutorWithId(ctx, t, "a", env.GetSchedulerClient())
+	a.Register()
+	b := newFakeExecutorWithId(ctx, t, "b", env.GetSchedulerClient())
+	b.Register()
+
+	const trials = 100
+	released := 0
+	for i := range trials {
+		taskID := scheduleTask(ctx, t, env, map[string]string{})
+		leaseA := a.Claim(taskID)
+
+		// b has a queued reservation for the task and tries to claim it
+		// (each failed attempt is what an executor does when it dequeues a
+		// reservation for a task that is already claimed).
+		leaseB := make(chan *taskLease, 1)
+		go func() {
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				if l, err := b.leaseTask(taskID, "" /*=reconnectToken*/); err == nil {
+					leaseB <- l
+					return
+				}
+			}
+			leaseB <- nil
+		}()
+
+		// a's task failed with a retryable error: re-enqueue on the lease
+		// stream.
+		require.NoError(t, leaseA.ReEnqueue())
+		lb := <-leaseB
+		require.NotNil(t, lb, "b never claimed the re-enqueued task")
+
+		if got := claimLeaseID(ctx, t, s, taskID); got != lb.leaseID {
+			released++
+			log.Warningf("trial %d: b holds lease %q but the task's claim in Redis is %q (released by a's re-enqueue)", i, lb.leaseID, got)
+		}
+		require.NoError(t, lb.Finalize())
+	}
+	require.Zero(t, released, "a's re-enqueue released b's claim in %d/%d trials", released, trials)
+}
+
+// When an executor's lease stream breaks (e.g. a connection reset), the
+// scheduler re-enqueues the task and another executor claims it. The original
+// executor later notices the broken stream, kills its run and, as
+// TaskLease.Close does, asks the scheduler to re-enqueue the task with its old
+// lease ID. That stale request must not delete or fail the task that the other
+// executor is now running.
+func TestStaleReEnqueue_DoesNotFailTaskRunningElsewhere(t *testing.T) {
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+
+	a := newFakeExecutorWithId(ctx, t, "a", env.GetSchedulerClient())
+	a.Register()
+	b := newFakeExecutorWithId(ctx, t, "b", env.GetSchedulerClient())
+	b.Register()
+
+	taskID := scheduleTask(ctx, t, env, map[string]string{})
+
+	// Earlier attempts failed with retryable errors and were re-enqueued.
+	for range maxTaskAttemptCount - 2 {
+		l := a.Claim(taskID)
+		require.NoError(t, l.ReEnqueue())
+	}
+
+	// The next attempt runs on a, whose lease stream then breaks.
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	stream, err := env.GetSchedulerClient().LeaseTask(streamCtx)
+	require.NoError(t, err)
+	require.NoError(t, stream.Send(&scpb.LeaseTaskRequest{
+		TaskId:            taskID,
+		ExecutorId:        "a",
+		SupportsReconnect: true,
+	}))
+	rsp, err := stream.Recv()
+	require.NoError(t, err)
+	staleLeaseID := rsp.GetLeaseId()
+	require.NotEmpty(t, staleLeaseID)
+	cancelStream()
+
+	// The scheduler re-enqueues the task and b claims it: the last allowed
+	// attempt.
+	var leaseB *taskLease
+	require.Eventually(t, func() bool {
+		l, err := b.leaseTask(taskID, "" /*=reconnectToken*/)
+		if err != nil {
+			return false
+		}
+		leaseB = l
+		return true
+	}, 5*time.Second, 10*time.Millisecond)
+
+	// a's lease renewal fails, a kills its run and re-enqueues with its old
+	// lease ID.
+	_, err = env.GetSchedulerClient().ReEnqueueTask(ctx, &scpb.ReEnqueueTaskRequest{
+		TaskId:  taskID,
+		LeaseId: staleLeaseID,
+		Reason:  "lease lost",
+	})
+	log.Infof("stale ReEnqueueTask returned: %v", err)
+
+	exists, err := env.GetSchedulerService().ExistsTask(ctx, taskID)
+	require.NoError(t, err)
+	require.True(t, exists, "task was deleted (and its execution marked failed) by a stale re-enqueue while b was running it")
+	require.NoError(t, leaseB.Renew())
+	require.NoError(t, leaseB.Finalize())
+}
