@@ -1610,3 +1610,45 @@ func TestCompressionReadLimitMustBeRejected(t *testing.T) {
 	// remote_execution.proto requires INVALID_ARGUMENT for compressed read_limit != 0.
 	require.Equal(t, codes.InvalidArgument, gstatus.Code(err))
 }
+
+func TestCompressionInterruptedWriteCanResume(t *testing.T) {
+	flags.Set(t, "cache.zstd_transcoding_enabled", true)
+	for _, compressor := range []repb.Compressor_Value{repb.Compressor_IDENTITY, repb.Compressor_ZSTD} {
+		t.Run(compressor.String(), func(t *testing.T) {
+			ctx := context.Background()
+			te := testenv.GetTestEnv(t)
+			server, err := NewByteStreamServer(te)
+			require.NoError(t, err)
+			blob := bytes.Repeat([]byte("resume this upload"), 100)
+			d, err := digest.Compute(bytes.NewReader(blob), repb.DigestFunction_SHA256)
+			require.NoError(t, err)
+			rn := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256)
+			rn.SetCompressor(compressor)
+			wire := blob
+			if compressor == repb.Compressor_ZSTD {
+				wire = compression.CompressZstd(nil, blob)
+			}
+			upload := rn.NewUploadString()
+			// EOF without finish_write deterministically models an interrupted upload.
+			require.NoError(t, server.Write(&testWriteStream{ctx: ctx, reqs: []*bspb.WriteRequest{{ResourceName: upload, Data: wire[:len(wire)/2]}}}))
+			state, err := server.QueryWriteStatus(ctx, &bspb.QueryWriteStatusRequest{ResourceName: upload})
+			// A server may discard partial data, in which case a restart at zero is valid.
+			offset := int64(0)
+			if gstatus.Code(err) != codes.NotFound {
+				require.NoError(t, err, "QueryWriteStatus must permit recovery of an interrupted upload")
+				require.False(t, state.GetComplete())
+				offset = state.GetCommittedSize()
+			}
+			require.GreaterOrEqual(t, offset, int64(0))
+			require.LessOrEqual(t, offset, int64(len(wire)))
+			stream := &testWriteStream{ctx: ctx, reqs: []*bspb.WriteRequest{{ResourceName: upload, WriteOffset: offset, Data: wire[offset:], FinishWrite: true}}}
+			require.NoError(t, server.Write(stream))
+			require.Equal(t, int64(len(wire)), stream.resp.GetCommittedSize())
+			client := bspb.NewByteStreamClient(runByteStreamServer(ctx, t, te))
+			var out bytes.Buffer
+			rn.SetCompressor(repb.Compressor_IDENTITY)
+			require.NoError(t, cachetools.GetBlob(ctx, client, rn, &out))
+			require.True(t, bytes.Equal(blob, out.Bytes()))
+		})
+	}
+}
