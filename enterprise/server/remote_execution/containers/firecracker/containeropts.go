@@ -2,6 +2,7 @@ package firecracker
 
 import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/block_io"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/oci"
 	"github.com/buildbuddy-io/buildbuddy/server/util/networking"
 
 	fcpb "github.com/buildbuddy-io/buildbuddy/proto/firecracker"
@@ -78,4 +79,9 @@ type ContainerOpts struct {
 	// UseOCIFetcher enables using the OCI fetcher service for pulling container
 	// images instead of pulling directly from the registry.
 	UseOCIFetcher bool
+
+	// Resolver is an optional OCI image resolver to share across containers,
+	// so that its HTTP connection pool is reused instead of creating a new
+	// pool per container. If nil, NewContainer creates one.
+	Resolver *oci.Resolver
 }

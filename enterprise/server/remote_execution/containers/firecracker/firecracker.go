@@ -538,6 +538,7 @@ type Provider struct {
 	localNetworkPool       *networking.VMNetworkPool
 	marshalledDNSOverrides string
 	hostResolvConf         string
+	resolver               *oci.Resolver
 }
 
 func NewProvider(env environment.Env, buildRoot, cacheRoot string) (*Provider, error) {
@@ -580,6 +581,11 @@ func NewProvider(env environment.Env, buildRoot, cacheRoot string) (*Provider, e
 		}
 		hostResolvConf = string(b)
 	}
+	// Share one resolver (and its HTTP connection pool) across all VMs.
+	resolver, err := oci.NewResolver(env)
+	if err != nil {
+		return nil, err
+	}
 	return &Provider{
 		env:                    env,
 		executorConfig:         executorConfig,
@@ -587,6 +593,7 @@ func NewProvider(env environment.Env, buildRoot, cacheRoot string) (*Provider, e
 		localNetworkPool:       localNetworkPool,
 		marshalledDNSOverrides: dns,
 		hostResolvConf:         hostResolvConf,
+		resolver:               resolver,
 	}, nil
 }
 
@@ -637,6 +644,7 @@ func (p *Provider) New(ctx context.Context, args *container.Init) (container.Com
 		MarshalledDNSOverrides: p.marshalledDNSOverrides,
 		HostResolvConf:         p.hostResolvConf,
 		UseOCIFetcher:          args.Props.UseOCIFetcher,
+		Resolver:               p.resolver,
 	}
 	c, err := NewContainer(ctx, p.env, args.Task.GetExecutionTask(), opts)
 	if err != nil {
@@ -816,9 +824,12 @@ func NewContainer(ctx context.Context, env environment.Env, task *repb.Execution
 		return nil, err
 	}
 
-	resolver, err := oci.NewResolver(env)
-	if err != nil {
-		return nil, err
+	resolver := opts.Resolver
+	if resolver == nil {
+		resolver, err = oci.NewResolver(env)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	c := &FirecrackerContainer{
