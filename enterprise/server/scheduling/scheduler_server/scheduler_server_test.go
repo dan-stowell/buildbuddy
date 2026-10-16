@@ -2833,3 +2833,44 @@ func TestExecutorRegistration_ExpiredNodesAreNotListed(t *testing.T) {
 	require.Empty(t, nodes)
 	require.Empty(t, rsp.GetExecutor(), "GetExecutionNodes lists an expired executor that routing rejects")
 }
+
+func TestExecutorRegistration_Lifecycle(t *testing.T) {
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+	ctx, cancel := context.WithCancel(ctx)
+	t.Cleanup(cancel)
+	s := env.GetSchedulerService().(*SchedulerServer)
+	stream := &fakeExecutorStream{ctx: ctx, sent: make(chan *scpb.RegisterAndStreamWorkResponse, 10)}
+	handle := newExecutorHandle(env, s, false, stream)
+	node := &scpb.ExecutionNode{ExecutorId: "executor", ExecutorHostId: "host", Host: "host", OsFamily: defaultOS, Arch: defaultArch, Pool: "old", AssignableMilliCpu: 1000}
+	key := handle.nodePoolKey(node)
+	require.NoError(t, s.AddConnectedExecutor(ctx, handle, node))
+	// Ordinary heartbeats must not duplicate the connected registration.
+	require.NoError(t, s.AddConnectedExecutor(ctx, handle, proto.Clone(node).(*scpb.ExecutionNode)))
+	pool := s.getOrCreatePool(key)
+	require.Len(t, pool.GetNodes(true), 1)
+	s.RemoveConnectedExecutor(ctx, handle, node)
+	require.Empty(t, pool.GetNodes(true))
+	nodes, err := pool.fetchExecutionNodes(ctx)
+	require.NoError(t, err)
+	require.Empty(t, nodes)
+
+	// An orderly restart with the same executor and host IDs may change all
+	// routing properties; the old pool must no longer contain the executor.
+	restarted := proto.Clone(node).(*scpb.ExecutionNode)
+	restarted.Pool = "new"
+	restarted.OsFamily = "darwin"
+	restarted.Arch = "arm64"
+	restarted.AssignableMilliCpu = 2000
+	newHandle := newExecutorHandle(env, s, false, stream)
+	require.NoError(t, s.AddConnectedExecutor(ctx, newHandle, restarted))
+	t.Cleanup(func() { s.RemoveConnectedExecutor(ctx, newHandle, restarted) })
+	nodes, err = pool.fetchExecutionNodes(ctx)
+	require.NoError(t, err)
+	require.Empty(t, nodes)
+	newPool := s.getOrCreatePool(newHandle.nodePoolKey(restarted))
+	nodes, err = newPool.fetchExecutionNodes(ctx)
+	require.NoError(t, err)
+	require.Len(t, nodes, 1)
+	require.Equal(t, int64(2000), nodes[0].GetAssignableMilliCpu())
+	require.Same(t, newHandle, newPool.FindConnectedExecutorByID("executor").handle)
+}
