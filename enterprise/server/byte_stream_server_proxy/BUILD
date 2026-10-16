@@ -50,6 +50,7 @@ go_test(
     embed = [":byte_stream_server_proxy"],
     shard_count = 2,
     deps = [
+        "//server/testutil/testleak",
         "//enterprise/server/atime_updater",
         "//enterprise/server/backends/pebble_cache",
         "//enterprise/server/experiments",

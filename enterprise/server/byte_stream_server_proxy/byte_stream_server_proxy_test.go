@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"io"
 	"sort"
 	"strconv"
@@ -3649,5 +3650,40 @@ func BenchmarkReadChunkedMixedLocalRemote(b *testing.B) {
 				}
 			})
 		}
+	}
+}
+
+// The remote owns the handler until the proxy propagates client cancellation.
+type cancelledReadRemote struct {
+	bspb.UnimplementedByteStreamServer
+}
+
+func (*cancelledReadRemote) Read(_ *bspb.ReadRequest, stream bspb.ByteStream_ReadServer) error {
+	if err := stream.Send(&bspb.ReadResponse{Data: []byte("partial")}); err != nil {
+		return err
+	}
+	<-stream.Context().Done()
+	return stream.Context().Err()
+}
+func TestCancelledReadLifecycleResources(t *testing.T) {
+	testleak.Check(t)
+	testleak.CheckFDs(t)
+	remoteEnv, proxyEnv := testenv.GetTestEnv(t), testenv.GetTestEnv(t)
+	server, run, lis := testenv.RegisterLocalGRPCServer(t, remoteEnv)
+	bspb.RegisterByteStreamServer(server, &cancelledReadRemote{})
+	go run()
+	conn, err := testenv.LocalGRPCConn(t, context.Background(), lis)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	proxy := runBSProxy(context.Background(), bspb.NewByteStreamClient(conn), proxyEnv, t)
+	for i := range 10 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		stream, err := proxy.Read(ctx, &bspb.ReadRequest{ResourceName: fmt.Sprintf("request-%d/blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/100", i)})
+		require.NoError(t, err)
+		_, err = stream.Recv()
+		require.NoError(t, err)
+		cancel()
+		_, err = stream.Recv()
+		require.Error(t, err)
 	}
 }
