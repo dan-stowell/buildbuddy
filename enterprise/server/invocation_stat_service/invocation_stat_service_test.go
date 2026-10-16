@@ -353,6 +353,10 @@ func TestGeneratedTrendFilters(t *testing.T) {
 		rows = append(rows, olaptables.Invocation{GroupID: "GR1", InvocationUUID: fmt.Sprintf("%032x", n+1), UpdatedAtUsec: start.Add(time.Duration(n) * time.Microsecond).UnixMicro(), DurationUsec: int64(n + 1), User: "user" + val(0), Host: "host" + val(1), RepoURL: "https://example.com/repo" + val(2), BranchName: "branch" + val(3), CommitSHA: "commit" + val(4), Command: "command" + val(5), Role: "role" + val(6), Pattern: "//pattern" + val(7), Tags: []string{"tag" + val(8), "common"}, Success: (n & 512) == 0, InvocationStatus: 1})
 	}
 	require.NoError(t, te.GetOLAPDBHandle().GORM(ctx, "filter_rows").Create(rows).Error)
+	for _, r := range rows {
+		require.NoError(t, te.GetDBHandle().NewQuery(ctx, "sql_filter_rows").Raw(`INSERT INTO "Invocations" (invocation_id,group_id,updated_at_usec,duration_usec,"user",host,repo_url,branch_name,commit_sha,command,role,pattern,success,invocation_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.InvocationUUID, r.GroupID, r.UpdatedAtUsec, r.DurationUsec, r.User, r.Host, r.RepoURL, r.BranchName, r.CommitSHA, r.Command, r.Role, r.Pattern, r.Success, r.InvocationStatus).Exec().Error)
+	}
+
 	iss := NewInvocationStatService(te, te.GetDBHandle(), te.GetOLAPDBHandle())
 	dimensions := []string{"user", "host", "repo", "branch", "commit", "command", "role", "pattern", "tags", "status"}
 	cases := append([]string{"all", "combined", "empty", "roles_or", "tags_and", "status_or"}, dimensions...)
@@ -440,6 +444,21 @@ func TestGeneratedTrendFilters(t *testing.T) {
 			}
 			require.Equal(t, wantCount, count, strings.Join([]string{name, "count"}, " "))
 			require.Equal(t, wantDuration, duration)
+			// The SQL fallback supports these dimensions except tags. It also has
+			// no percentile support, so compare the common count/duration fields.
+			if len(q.Tags) == 0 {
+				flags.Set(t, "app.enable_read_from_olap_db", false)
+				sqlGot, err := iss.getInvocationTrend(ctx, &statspb.GetTrendRequest{RequestContext: rc, Query: q}, iss.getTrendTimeSettings(q, "UTC"))
+				require.NoError(t, err)
+				var sqlCount, sqlDuration int64
+				for _, g := range sqlGot {
+					sqlCount += g.TotalNumBuilds
+					sqlDuration += g.TotalBuildTimeUsec
+				}
+				require.Equal(t, wantCount, sqlCount, "SQL count")
+				require.Equal(t, wantDuration, sqlDuration, "SQL duration")
+			}
+
 		})
 	}
 }
