@@ -818,6 +818,7 @@ func TestEnqueue_SingleDigestEnqueuesWithConcurrentFlushLoseDigests(t *testing.T
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
+	flushes := 0
 	wg.Go(func() {
 		for {
 			select {
@@ -825,6 +826,7 @@ func TestEnqueue_SingleDigestEnqueuesWithConcurrentFlushLoseDigests(t *testing.T
 				return
 			default:
 				updater.ForceFlushBatchesForTesting(t.Context())
+				flushes++
 			}
 		}
 	})
@@ -856,6 +858,6 @@ func TestEnqueue_SingleDigestEnqueuesWithConcurrentFlushLoseDigests(t *testing.T
 	for _, u := range cas.getUpdates() {
 		sent[u.key] = struct{}{}
 	}
-	t.Logf("sent %d of %d single-digest enqueues", len(sent), total)
+	t.Logf("sent %d of %d single-digest enqueues (concurrent flushes: %d)", len(sent), total, flushes)
 	require.Equal(t, total, len(sent), "%d single-digest updates were accepted by Enqueue but never sent", total-len(sent))
 }
