@@ -778,11 +778,11 @@ func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, 
 	} else {
 		// If the file being added is not already at the path where we expect it
 		// (i.e. it's being added from some action workspace), then remove and
-		// unlink any existing entry, then hardlink to the destination path.
+		// unlink any existing entry, then clone to the destination path.
 		c.l.Remove(k)
 
 		start := time.Now()
-		if err := cloneOrLink(keyPrefix, existingFilePath, fp); err != nil {
+		if err := cloneIndependent(existingFilePath, fp); err != nil {
 			return err
 		}
 		c.linkIntoFileCacheLatency.Observe(float64(time.Since(start).Microseconds()))
@@ -1136,6 +1136,31 @@ func (c *fileCache) tempPath(name string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(c.TempDir(), fmt.Sprintf("%s.%s.tmp", name, randStr)), nil
+}
+
+// cloneIndependent publishes a private inode. AddFile sources may belong to a
+// preserved workspace and remain writable after the action has completed.
+// Clone is a reflink where supported, but on Linux it may silently hardlink,
+// so check inode identity before accepting the result.
+func cloneIndependent(source, destination string) error {
+	if err := fastcopy.Clone(source, destination); err != nil {
+		return err
+	}
+	srcInfo, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	dstInfo, err := os.Stat(destination)
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(srcInfo, dstInfo) {
+		return nil
+	}
+	if err := os.Remove(destination); err != nil {
+		return err
+	}
+	return disk.CopyViaTmpSibling(source, destination)
 }
 
 func cloneOrLink(keyPrefix, source, destination string) error {
