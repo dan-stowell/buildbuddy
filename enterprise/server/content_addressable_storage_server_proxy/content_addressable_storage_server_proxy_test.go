@@ -1113,3 +1113,46 @@ func TestPresenceLifetime_ProxyRefreshBeforeEviction(t *testing.T) {
 		})
 	}
 }
+
+// A delayed presence response must not undo a newer backend read miss.
+// The callback orders the two overlapping RPC responses without sleeps.
+type delayedPresenceClient struct {
+	repb.ContentAddressableStorageClient
+	beforePresenceResponse func()
+	calls                  int
+}
+
+func (c *delayedPresenceClient) FindMissingBlobs(ctx context.Context, req *repb.FindMissingBlobsRequest, opts ...grpc.CallOption) (*repb.FindMissingBlobsResponse, error) {
+	c.calls++
+	if c.calls == 1 {
+		c.beforePresenceResponse()
+		return &repb.FindMissingBlobsResponse{}, nil // Snapshot taken before eviction.
+	}
+	return &repb.FindMissingBlobsResponse{MissingBlobDigests: req.GetBlobDigests()}, nil
+}
+
+func (c *delayedPresenceClient) BatchReadBlobs(ctx context.Context, req *repb.BatchReadBlobsRequest, opts ...grpc.CallOption) (*repb.BatchReadBlobsResponse, error) {
+	return nil, status.Error(codes.NotFound, "blob evicted after presence snapshot")
+}
+
+func TestPresenceInvalidation_DelayedLookupCannotResurrect(t *testing.T) {
+	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+	ctx := testContext()
+	env := testenv.GetTestEnv(t)
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+	remote := &delayedPresenceClient{}
+	env.SetContentAddressableStorageClient(remote)
+	proxy, err := New(env)
+	require.NoError(t, err)
+	d := digestProto(fooDigest, 3)
+	remote.beforePresenceResponse = func() {
+		_, err := proxy.batchReadBlobsRemote(ctx, readBlobsRequest([]*repb.Digest{d}))
+		require.Equal(t, codes.NotFound, status.Code(err))
+	}
+	_, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+	require.NoError(t, err)
+	rsp, err := proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+	require.NoError(t, err)
+	require.Equal(t, []*repb.Digest{d}, rsp.GetMissingBlobDigests(), "older presence response resurrected an entry after a backend NotFound")
+}
