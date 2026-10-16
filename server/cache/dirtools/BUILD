@@ -55,6 +55,7 @@ go_test(
         "dirtools_input_mutation_test.go",
         "dirtools_linux_test.go",
         "dirtools_test.go",
+        "dirtools_verify_mutation_v2_test.go",
     ],
     embed = [":dirtools"],
     deps = [
