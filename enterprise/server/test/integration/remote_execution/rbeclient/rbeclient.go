@@ -145,7 +145,7 @@ func (c *Command) Start(ctx context.Context, opts *StartOpts) error {
 	c.afterExecuteTime = afterExecuteTime
 
 	// start reading the stream for updates
-	c.processUpdates(ctx, stream)
+	c.processUpdates(ctx, stream, cancel)
 
 	return nil
 }
@@ -156,6 +156,10 @@ func (c *Command) ReplaceWaitUsingWaitExecutionAPI(ctx context.Context) error {
 	}
 
 	c.cancelExecutionRequest()
+	// The old reader may be blocked sending a progress update. Drain its
+	// channel before replacing it, so it can report cancellation and exit.
+	for range c.status {
+	}
 
 	executionClient := c.gRPCClientSource.GetRemoteExecutionClient()
 
@@ -164,19 +168,25 @@ func (c *Command) ReplaceWaitUsingWaitExecutionAPI(ctx context.Context) error {
 	req := &repb.WaitExecutionRequest{
 		Name: c.opName,
 	}
+	ctx, cancel := context.WithCancel(ctx)
 	stream, err := executionClient.WaitExecution(ctx, req)
 	if err != nil {
+		cancel()
 		return status.UnavailableErrorf("unable to request WaitExecution for command %q using operation %q: %v", c.Name, c.opName, err)
 	}
-	c.processUpdates(ctx, stream)
+	c.cancelExecutionRequest = cancel
+	c.processUpdates(ctx, stream, cancel)
 	return nil
 }
 
 // processUpdates starts a goroutine that processes execution updates from the passed stream.
-func (c *Command) processUpdates(ctx context.Context, stream repb.Execution_ExecuteClient) {
+func (c *Command) processUpdates(ctx context.Context, stream repb.Execution_ExecuteClient, cancel context.CancelFunc) {
 	c.status = make(chan *CommandResult, 1)
 	c.accepted = make(chan string, 1)
 	go func() {
+		// Receiving the completed operation does not consume stream EOF.
+		// Cancel explicitly to release the gRPC stream and proxy connection.
+		defer cancel()
 		c.processUpdatesAsync(ctx, stream, c.Name, c.status, c.accepted)
 	}()
 }

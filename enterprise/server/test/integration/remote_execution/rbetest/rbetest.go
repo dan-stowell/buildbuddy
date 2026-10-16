@@ -97,6 +97,7 @@ import (
 	cappb "github.com/buildbuddy-io/buildbuddy/proto/capability"
 	ctxpb "github.com/buildbuddy-io/buildbuddy/proto/context"
 	espb "github.com/buildbuddy-io/buildbuddy/proto/execution_stats"
+	hitpb "github.com/buildbuddy-io/buildbuddy/proto/hit_tracker"
 	iprpb "github.com/buildbuddy-io/buildbuddy/proto/iprules"
 	pepb "github.com/buildbuddy-io/buildbuddy/proto/publish_build_event"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
@@ -485,8 +486,13 @@ func (s *BuildBuddyServer) start() {
 		}
 	}
 
-	// Configure services needed by remote execution.
+	// Serve remote hit tracking for cache proxies, if the test's EnvModifier
+	// registered it.
+	if ht := s.env.GetHitTrackerServiceServer(); ht != nil {
+		hitpb.RegisterHitTrackerServiceServer(grpcServer, ht)
+	}
 
+	// Configure services needed by remote execution.
 	require.NotNil(s.t, s.env.GetAuthenticator())
 	authpb.RegisterAuthServiceServer(grpcServer, auth_service.New(s.env.GetAuthenticator()))
 	s.env.SetSchedulerService(s.schedulerServer)

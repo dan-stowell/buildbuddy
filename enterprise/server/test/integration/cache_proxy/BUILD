@@ -49,3 +49,33 @@ go_test(
         "@org_golang_google_grpc//metadata",
     ],
 )
+
+go_test(
+    name = "soak_test",
+    size = "enormous",
+    timeout = "long",
+    srcs = ["soak_test.go"],
+    exec_properties = {"test.EstimatedComputeUnits": "16"},
+    tags = ["manual", "cpu:8"],
+    deps = [
+        "//enterprise/server/backends/pebble_cache",
+        "//enterprise/server/hit_tracker_client",
+        "//enterprise/server/hit_tracker_service",
+        "//enterprise/server/test/integration/remote_execution/rbetest",
+        "//proto:remote_execution_go_proto",
+        "//server/remote_cache/cachetools",
+        "//server/remote_cache/digest",
+        "//server/testutil/testenv",
+        "//server/testutil/testkeys",
+        "//server/testutil/testleak",
+        "//server/util/authutil",
+        "//server/util/claims",
+        "//server/util/grpc_server",
+        "//server/util/status",
+        "//server/util/testing/flags",
+        "@com_github_stretchr_testify//require",
+        "@org_golang_google_genproto_googleapis_bytestream//:bytestream",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//metadata",
+    ],
+)

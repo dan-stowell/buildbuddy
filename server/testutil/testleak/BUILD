@@ -6,6 +6,7 @@ go_library(
     srcs = [
         "fd.go",
         "growth.go",
+        "soak.go",
         "testleak.go",
     ],
     importpath = "github.com/buildbuddy-io/buildbuddy/server/testutil/testleak",
@@ -18,6 +19,7 @@ go_test(
     size = "medium",
     srcs = [
         "helpers_test.go",
+        "soak_test.go",
         "testleak_test.go",
     ],
     data = ["//server/testutil/testleak/netpollhelper"],

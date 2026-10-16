@@ -60,3 +60,25 @@ go_test(
         "@org_golang_x_sync//errgroup",
     ],
 )
+
+go_test(
+    name = "soak_test",
+    size = "enormous",
+    timeout = "long",
+    srcs = ["soak_test.go"],
+    exec_properties = {"test.EstimatedComputeUnits": "16"},
+    tags = ["manual", "cpu:8"],
+    deps = [
+        "//enterprise/server/test/integration/remote_execution/rbetest",
+        "//proto:build_event_stream_go_proto",
+        "//proto:remote_execution_go_proto",
+        "//server/build_event_protocol/build_event_handler",
+        "//server/build_event_publisher",
+        "//server/remote_cache/cachetools",
+        "//server/remote_cache/digest",
+        "//server/testutil/testleak",
+        "//server/util/testing/flags",
+        "@com_github_stretchr_testify//require",
+        "@org_golang_google_protobuf//types/known/timestamppb",
+    ],
+)

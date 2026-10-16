@@ -1,7 +1,7 @@
 // Package testleak checks that tests don't leak goroutines or file
 // descriptors.
 //
-// There are three checks:
+// There are four checks:
 //
 //   - [Check] fails the test if goroutines started after the call are still
 //     running at the end of the test (after a settle period).
@@ -10,6 +10,9 @@
 //     FDs grow by more than a bound. Use it when the long-lived owner of the
 //     resources (a server, a pool, a cache) is still alive at the end of the
 //     test, so an end-of-test check can't be used.
+//   - [Soak] runs batches of a long, mixed workload and fails for any group of
+//     goroutines or FDs that grows steadily, without being told what to look
+//     for. Use it to search for leaks in long-lived services.
 //
 // All checks compare against a snapshot taken when they are called, so they
 // cannot tell resources created by this test apart from resources created
