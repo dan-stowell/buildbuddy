@@ -2410,12 +2410,49 @@ func TestTruncateStringSlice(t *testing.T) {
 // last-message event never arrive. Persist the observed target as NO_STATUS,
 // just as the last-message path does, rather than dropping the target entirely.
 func TestTargetStatusMissingSummaryOnFinalize(t *testing.T) {
+	runTargetStatusMissingSummaryOnFinalize(t, false)
+}
+
+// Pause workspace persistence until BuildFinished is processed and the client
+// cancels. Status finalization must survive cancellation of this earlier work.
+func TestTargetStatusFinalizeWithPendingWorkspaceWrite(t *testing.T) {
+	runTargetStatusMissingSummaryOnFinalize(t, true)
+}
+
+type delayedTargetReadDB struct {
+	interfaces.DBHandle
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (d *delayedTargetReadDB) NewQuery(ctx context.Context, name string) interfaces.DBQuery {
+	if name == "target_tracker_get_targets_by_url" {
+		close(d.entered)
+		<-d.release
+	}
+	return d.DBHandle.NewQuery(ctx, name)
+}
+
+func runTargetStatusMissingSummaryOnFinalize(t *testing.T, cancelWorkspace bool) {
 	te := testenv.GetTestEnv(t)
 	flags.Set(t, "app.enable_target_tracking", true)
 	flags.Set(t, "app.enable_write_test_target_statuses_to_olap_db", false)
 	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 	te.SetAuthenticator(auth)
-	ctx := auth.AuthContextFromAPIKey(context.Background(), "USER1")
+	ctx, cancel := context.WithCancel(auth.AuthContextFromAPIKey(context.Background(), "USER1"))
+	defer cancel()
+	var delayed *delayedTargetReadDB
+	if cancelWorkspace {
+		delayed = &delayedTargetReadDB{DBHandle: te.GetDBHandle(), entered: make(chan struct{}), release: make(chan struct{})}
+		te.SetDBHandle(delayed)
+		defer func() {
+			select {
+			case <-delayed.release:
+			default:
+				close(delayed.release)
+			}
+		}()
+	}
 	seq := NewBESSequence(t)
 	ch, err := build_event_handler.NewBuildEventHandler(te).OpenChannel(ctx, seq.InvocationID)
 	require.NoError(t, err)
@@ -2436,7 +2473,17 @@ func TestTargetStatusMissingSummaryOnFinalize(t *testing.T) {
 	} {
 		require.NoError(t, ch.HandleEvent(seq.NextRequest(ev)))
 	}
+	if cancelWorkspace {
+		select {
+		case <-delayed.entered:
+		case <-time.After(10 * time.Second):
+			t.Fatal("workspace target read did not start")
+		}
+		cancel()
+		close(delayed.release)
+	}
 	require.NoError(t, ch.FinalizeInvocation(seq.InvocationID))
+	ctx = auth.AuthContextFromAPIKey(context.Background(), "USER1")
 	inv, err := te.GetInvocationDB().LookupInvocation(ctx, seq.InvocationID)
 	require.NoError(t, err)
 	require.Equal(t, int64(inspb.InvocationStatus_COMPLETE_INVOCATION_STATUS), inv.InvocationStatus)
