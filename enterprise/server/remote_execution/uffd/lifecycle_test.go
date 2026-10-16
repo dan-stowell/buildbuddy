@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/stretchr/testify/require"
@@ -40,5 +41,48 @@ func TestReceiveSetupMessageFDGrowth(t *testing.T) {
 				_ = lis.Close()
 			})
 		})
+	}
+}
+
+// acceptSignalListener lets the test stop the owner after Accept succeeds,
+// without relying on scheduling delays or requiring a real VM.
+type acceptSignalListener struct {
+	net.Listener
+	accepted chan struct{}
+}
+
+func (l *acceptSignalListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		close(l.accepted)
+	}
+	return c, err
+}
+
+func TestReceiveSetupMessageStopAfterAccept(t *testing.T) {
+	testleak.Check(t)
+	testleak.CheckFDs(t)
+	path := filepath.Join(t.TempDir(), "setup.sock")
+	lis, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	require.NoError(t, err)
+	defer lis.Close()
+	accepted := make(chan struct{})
+	h := &Handler{lis: &acceptSignalListener{Listener: lis, accepted: accepted}, stoppedChan: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() { _, err := h.receiveSetupMsg(t.Context()); done <- err }()
+	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
+	require.NoError(t, err)
+	defer conn.Close()
+	<-accepted
+	close(h.stoppedChan)
+	// The peer remains connected but sends no setup message, as can happen
+	// during failed VM initialization. Stopping the owner must interrupt read.
+	select {
+	case err := <-done:
+		require.Error(t, err)
+	case <-time.After(testleak.DefaultSettle):
+		conn.Close() // Unblock the baseline handler so failure doesn't poison siblings.
+		<-done
+		t.Fatal("stopped UFFD setup handler remains blocked reading accepted connection")
 	}
 }
