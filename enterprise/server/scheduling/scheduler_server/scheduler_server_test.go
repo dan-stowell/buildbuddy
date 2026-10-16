@@ -2757,3 +2757,78 @@ func TestWatchTaskLiveness_StopsWhenWatchersAreDone(t *testing.T) {
 	defer s.livenessMu.Unlock()
 	require.Empty(t, s.livenessWatches)
 }
+
+// When an executor shuts down, it hands its queued task reservations back to
+// the scheduler. Because each task is enqueued on several executors, one of
+// those reservations may be for a task that another executor has already
+// claimed and is running. Handing back the stale reservation must not release
+// the other executor's claim on the task.
+func TestExecutorShutdown_HandBackDoesNotStealClaimedTask(t *testing.T) {
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+
+	executor1 := newFakeExecutorWithId(ctx, t, "n1", env.GetSchedulerClient())
+	executor1.Register()
+	executor2 := newFakeExecutorWithId(ctx, t, "n2", env.GetSchedulerClient())
+	executor2.Register()
+
+	taskID := scheduleTask(ctx, t, env, map[string]string{})
+	nextReservation(t, executor1, taskID)
+	nextReservation(t, executor2, taskID)
+
+	// executor2 claims the task and starts running it. executor1 still has a
+	// reservation for the task in its queue.
+	lease := executor2.Claim(taskID)
+	require.NotEmpty(t, lease.leaseID)
+
+	// executor1 shuts down and hands back its queued reservation.
+	executor1.Send(&scpb.RegisterAndStreamWorkRequest{
+		ShuttingDownRequest: &scpb.ShuttingDownRequest{TaskId: []string{taskID}},
+	})
+
+	// No other executor should be able to claim the task while executor2
+	// holds the lease.
+	thief := newFakeExecutorWithId(ctx, t, "thief", env.GetSchedulerClient())
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		stolen, err := thief.leaseTask(taskID, "" /*=reconnectToken*/)
+		if err == nil {
+			require.FailNowf(t, "task claimed twice", "task %q claimed by thief (lease %q) while executor2 holds lease %q", taskID, stolen.leaseID, lease.leaseID)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	require.NoError(t, lease.Renew())
+	require.NoError(t, lease.Finalize())
+}
+
+// Same as above, but for a task with retries disabled: the stale hand-back
+// must not delete the task and mark the execution failed while another
+// executor is running it.
+func TestExecutorShutdown_HandBackDoesNotFailClaimedTaskWithRetriesDisabled(t *testing.T) {
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+
+	executor1 := newFakeExecutorWithId(ctx, t, "n1", env.GetSchedulerClient())
+	executor1.Register()
+	executor2 := newFakeExecutorWithId(ctx, t, "n2", env.GetSchedulerClient())
+	executor2.Register()
+
+	taskID := scheduleTask(ctx, t, env, map[string]string{platform.RetryPropertyName: "false"})
+	nextReservation(t, executor1, taskID)
+	nextReservation(t, executor2, taskID)
+
+	lease := executor2.Claim(taskID)
+	require.NotEmpty(t, lease.leaseID)
+
+	executor1.Send(&scpb.RegisterAndStreamWorkRequest{
+		ShuttingDownRequest: &scpb.ShuttingDownRequest{TaskId: []string{taskID}},
+	})
+	// Wait for the scheduler to process the hand-back (it unregisters the
+	// executor before re-enqueueing).
+	time.Sleep(1 * time.Second)
+
+	exists, err := env.GetSchedulerService().ExistsTask(ctx, taskID)
+	require.NoError(t, err)
+	require.True(t, exists, "task %q was deleted while executor2 was still running it", taskID)
+	require.NoError(t, lease.Renew(), "lease renewal for running task failed")
+	require.NoError(t, lease.Finalize())
+}
