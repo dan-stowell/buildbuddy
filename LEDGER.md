@@ -12,6 +12,7 @@ Branch convention: `leak/det-*` detector work, `leak/repro-*` reproducers (no fi
 ## Investigations
 | ID | Subsystem / lifecycle | Hypothesis | Agent(s) | Detector | Repro | Prod rel. | Baseline meas. | Fixed meas. | Candidate fix | Regression test | Indep. verify | Human review |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
+| I25 | Executor process-stats pidfd churn (os.FindProcess per poll w/o Release → FDs closed only by GC finalizers) | possible FD exhaustion under infrequent GC | Codex lk-w2 | GC-disabled FD counting | IN PROGRESS | ? | — | — | — | — | — | — |
 | I24 | App HTTP streaming: MCP sessions, streaming HTTP, /file/download under client churn/disconnect | — | Codex lk-w1 | CheckGrowth + session maps | IN PROGRESS | High? | — | — | — | — | — | — |
 | I23 | OCI container lifecycle (default prod isolation): mounts (mountinfo), cgroup dirs, netns/veth pool, FDs, goroutines, processes via crun | — | Codex lk-w3 | CheckGrowth + custom counts | IN PROGRESS | High | — | — | — | — | — | — |
 | I21 | Firecracker UFFD `Handler.Stop` when peer connected but never sent setup msg: accepted conn blocked in ReadMsgUnix; Stop waits forever (goroutine + socket held; FC cleanup hangs) | shutdown hang | Codex lk-w3 (investigate); Claude V17 (verify) | testleak + socket targets | 3/3 (--config=remote) | **Low–Med?** (needs live-but-stalled FC peer) | blocked | returns promptly | fix branch (TBD by V17) | `leak/repro-cow-uffd` 175be1d6 | IN PROGRESS (V17) | — |
@@ -85,6 +86,7 @@ Branch convention: `leak/det-*` detector work, `leak/repro-*` reproducers (no fi
 ## Enforcement progress
 | Test target | Check enabled | Stable runs | Notes |
 |---|---|---|---|
+| **Round 2 (E2 Codex → V19 Claude review/rebase)**: pebble blob lifecycle, pubsub live-log cancel, ociruntime image unlock, execution waiter cleanup, scheduler registration, gcs reader/writer, BES RPC cancel, ByteStream zstd write cancel, compression error cleanup | CheckGrowth (+ Redis/XREAD/eviction assertions) | 20/20 each (pre --config=remote); each with production mutation caught | `leak/enforce-v2` aae09d58 → rebasing as `leak/pr-enforce2` on #66 |
 | grpc_client, healthcheck, db, pubsub, scheduler_server | +CheckFDs (Check existed) | 30/30 each | `leak/enforce-v1` (one commit each) |
 | operation (publisher lifecycle), task_leaser:lifecycle_test | Check+CheckFDs | 30/30 | from I5 audit |
 | grpc_client TestPoolRepeatedLifecycleResources | Check+CheckFDs+CheckGrowth | 30/30 | from I3 |
