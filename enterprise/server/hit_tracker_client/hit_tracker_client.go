@@ -19,6 +19,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/usageutil"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	capb "github.com/buildbuddy-io/buildbuddy/proto/cache"
@@ -76,6 +77,7 @@ func newHitTrackerClient(ctx context.Context, env *real_environment.RealEnv, con
 	factory := HitTrackerFactory{
 		authenticator:        env.GetAuthenticator(),
 		quit:                 make(chan struct{}, 1),
+		batcherDone:          make(chan struct{}),
 		enqueueChan:          make(chan *enqueuedCacheHit, *enqueueChanSize),
 		maxPendingHitsPerKey: *maxPendingHitsPerKey,
 		maxHitsPerUpdate:     *maxHitsPerUpdate,
@@ -112,8 +114,9 @@ type enqueuedCacheHit struct {
 type HitTrackerFactory struct {
 	authenticator interfaces.Authenticator
 
-	quit chan struct{}
-	wg   sync.WaitGroup
+	quit        chan struct{}
+	wg          sync.WaitGroup
+	batcherDone chan struct{}
 
 	enqueueChan chan *enqueuedCacheHit
 
@@ -359,7 +362,16 @@ func (h *HitTrackerFactory) batcher() {
 	for {
 		select {
 		case <-h.quit:
-			return
+			// Batch whatever is still queued so that shutdown can flush it.
+			defer close(h.batcherDone)
+			for {
+				select {
+				case update := <-h.enqueueChan:
+					h.batch(update)
+				default:
+					return
+				}
+			}
 		case update := <-h.enqueueChan:
 			h.batch(update)
 		}
@@ -426,13 +438,31 @@ func (h *HitTrackerFactory) sendTrackRequest(ctx context.Context) int {
 	).Observe(float64(hitCount))
 	if err != nil {
 		log.CtxWarningf(ctx, "Error sending Track request to record cache hit-tracking state group %s: %v", groupID, err)
+		if gstatus.Code(err) == codes.Unavailable {
+			h.requeue(hitsToSend)
+			return 0
+		}
 	}
 	return hitCount
+}
+
+// requeue puts the hits of a batch that failed to send back in front of any
+// hits batched for the same collection since.
+func (h *HitTrackerFactory) requeue(failed *cacheHits) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if existing, ok := h.hitsByCollection[failed.encodedCollection]; ok {
+		existing.hits = append(failed.hits[:len(failed.hits):len(failed.hits)], existing.hits...)
+		return
+	}
+	h.hitsByCollection[failed.encodedCollection] = failed
+	h.hitsQueue = append(h.hitsQueue, failed)
 }
 
 func (h *HitTrackerFactory) shutdown(ctx context.Context) error {
 	close(h.quit)
 	h.wg.Wait()
+	<-h.batcherDone
 
 	// Make a best-effort attempt to flush pending updates.
 	// TODO(iain): we could do something fancier here if necessary, like
