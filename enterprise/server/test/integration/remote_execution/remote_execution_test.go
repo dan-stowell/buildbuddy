@@ -2958,3 +2958,74 @@ fi`, marker)},
 		return err == nil && !response.GetExists()
 	}, 5*time.Second, 10*time.Millisecond, "successful hedge must cancel the running original")
 }
+
+func TestActionMerging_HedgeWinnerRemovesQueuedOriginalReservation(t *testing.T) {
+	flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
+	flags.Set(t, "remote_execution.action_merging_hedge_delay", time.Microsecond)
+	flags.Set(t, "remote_execution.proactive_cancellation_enabled", true)
+	flags.Set(t, "executor.excess_capacity_threshold", -1)
+	flags.Set(t, "executor.queue_trim_interval", 0)
+	rbe := rbetest.NewRBETestEnv(t)
+	rbe.AddBuildBuddyServer()
+	// Register every executor before scheduling so the scheduler's cached
+	// node list includes all three. Intercept actual start order: blocker,
+	// original, then successful hedge.
+	started := make(chan struct{})
+	busyIndex := make(chan int, 1)
+	release := make(chan struct{})
+	defer close(release)
+	var mu sync.Mutex
+	starts := 0
+	var executors []*rbetest.Executor
+	for i := range 3 {
+		executors = append(executors, rbe.AddSingleTaskExecutorWithOptions(t, &rbetest.ExecutorOptions{
+			Name: fmt.Sprintf("executor%d", i),
+			RunInterceptor: func(ctx context.Context, original rbetest.RunFunc) *interfaces.CommandResult {
+				mu.Lock()
+				starts++
+				n := starts
+				mu.Unlock()
+				switch n {
+				case 1:
+					busyIndex <- i
+					return original(ctx, &repb.IOStats{})
+				case 2:
+					close(started)
+					select {
+					case <-ctx.Done():
+						return &interfaces.CommandResult{Error: status.CanceledError("cancelled"), ExitCode: -1}
+					case <-release:
+						return &interfaces.CommandResult{ExitCode: 0}
+					}
+				default:
+					return &interfaces.CommandResult{ExitCode: 0}
+				}
+			},
+		}))
+	}
+	blocker := rbe.ExecuteControlledCommand("blocker", &rbetest.ExecuteControlledOpts{})
+	blocker.WaitStarted()
+	defer blocker.Exit(0)
+	busy := executors[<-busyIndex]
+	require.Eventually(t, func() bool { return busy.QueueLength() == 0 }, 10*time.Second, 10*time.Millisecond)
+	cmd := &repb.Command{Arguments: []string{"/bin/true"}}
+	original := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true})
+	originalID := original.WaitAccepted()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("original did not start")
+	}
+	require.Eventually(t, func() bool { return busy.QueueLength() == 1 }, 10*time.Second, 10*time.Millisecond, "original reservation must be queued on busy executor")
+	merged := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true})
+	require.Equal(t, originalID, merged.WaitAccepted())
+	actionRN, err := digest.ParseUploadResourceName(originalID)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		_, err := rbe.GetActionResultStorageClient().GetActionResult(context.Background(), &repb.GetActionResultRequest{
+			ActionDigest: actionRN.GetDigest(), InstanceName: actionRN.GetInstanceName(), DigestFunction: actionRN.GetDigestFunction(),
+		})
+		return err == nil
+	}, 10*time.Second, 10*time.Millisecond, "hedge must finish successfully")
+	require.Eventually(t, func() bool { return busy.QueueLength() == 0 }, 5*time.Second, 10*time.Millisecond, "hedge completion must remove original's queued reservation")
+}
