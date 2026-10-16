@@ -975,6 +975,38 @@ func TestRunnerPool_PersistentWorker(t *testing.T) {
 	}
 }
 
+// When a persistent worker stalls in the middle of a response, Run should
+// still return once its context is done (e.g. the action timeout expired),
+// like it does for non-persistent actions.
+func TestRunnerPool_PersistentWorker_StalledResponse_RunHonorsContext(t *testing.T) {
+	env := newTestEnv(t)
+	pool := newRunnerPool(t, env, noLimitsCfg())
+	ctx := withAuthenticatedUser(t, context.Background(), env, "US1")
+
+	// The worker announces a 100-byte response, writes 10 bytes of it, and
+	// then waits for the next request.
+	task := newPersistentRunnerTask(t, "abc", "", "proto", &wkpb.WorkResponse{})
+	partial := append([]byte{100}, "0123456789"...)
+	task.ExecutionTask.Command.Arguments[2] = "--response_base64=" + base64.StdEncoding.EncodeToString(partial)
+	r, err := get(ctx, pool, task)
+	require.NoError(t, err)
+
+	runCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+	done := make(chan *interfaces.CommandResult, 1)
+	go func() { done <- r.Run(runCtx, &repb.IOStats{}) }()
+	select {
+	case res := <-done:
+		require.Error(t, res.Error)
+		pool.TryRecycle(ctx, r, false)
+	case <-time.After(10 * time.Second):
+		// Removing the runner stops the worker, which unblocks Run.
+		require.NoError(t, r.RemoveWithTimeout(ctx))
+		<-done
+		require.FailNow(t, "Run did not return 9s after its context deadline; it was blocked reading the persistent worker response")
+	}
+}
+
 func TestRunnerPool_PersistentWorkerUnknownProtocol(t *testing.T) {
 	resp := &wkpb.WorkResponse{
 		ExitCode: 0,
