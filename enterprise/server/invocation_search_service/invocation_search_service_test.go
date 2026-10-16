@@ -425,3 +425,40 @@ func TestPaginationBlendedSingleItemPageAdvances(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, first.NextPageToken, second.NextPageToken, "a nonterminal page must advance; first=%v second=%v", first, second)
 }
+
+func TestPaginationMutationDoesNotRepeatOrSkip(t *testing.T) {
+	for _, mutation := range []string{"insert_before_cursor", "update_unreturned_before_cursor"} {
+		t.Run(mutation, func(t *testing.T) {
+			ctx, env, service := paginationFixture(t, 3, false, false)
+			req := &inpb.SearchInvocationRequest{Count: 1, Query: &inpb.InvocationQuery{User: "pager"}}
+			first, err := service.QueryInvocations(ctx, req)
+			require.NoError(t, err)
+			require.Equal(t, []string{getUUIDString(2)}, getInvocationIDSlice(first))
+			if mutation == "insert_before_cursor" {
+				require.NoError(t, env.GetDBHandle().NewQuery(ctx, "pagination_insert").Create(&tables.Invocation{InvocationID: getUUIDString(3), GroupID: "GR1", Perms: perms.GROUP_READ, User: "pager", InvocationStatus: 1}))
+			} else {
+				require.NoError(t, env.GetDBHandle().GORM(ctx, "pagination_update").Exec("UPDATE Invocations SET updated_at_usec = ? WHERE invocation_id = ?", int64(1700000010000000), getUUIDString(0)).Error)
+			}
+			seen := getInvocationIDSlice(first)
+			req.PageToken = first.NextPageToken
+			for page := 0; req.PageToken != ""; page++ {
+				require.Less(t, page, 5)
+				rsp, err := service.QueryInvocations(ctx, req)
+				require.NoError(t, err)
+				seen = append(seen, getInvocationIDSlice(rsp)...)
+				req.PageToken = rsp.NextPageToken
+			}
+			// Newly inserted rows may be outside the initial snapshot. Every row
+			// present at the start must still occur exactly once.
+			for i := range 3 {
+				count := 0
+				for _, id := range seen {
+					if id == getUUIDString(byte(i)) {
+						count++
+					}
+				}
+				assert.Equal(t, 1, count, "original invocation %d; sequence=%v", i, seen)
+			}
+		})
+	}
+}
