@@ -21,6 +21,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testcompression"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testdigest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/bazel_request"
 	"github.com/buildbuddy-io/buildbuddy/server/util/bytebufferpool"
 	"github.com/buildbuddy-io/buildbuddy/server/util/compression"
@@ -1411,4 +1412,39 @@ func TestReadChunked_UsesParallelReads(t *testing.T) {
 			require.NoError(t, <-errCh)
 		})
 	}
+}
+
+func TestZstdWriteCancellationGrowth(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	flags.Set(t, "cache.zstd_transcoding_enabled", true)
+	flags.Set(t, "cache.max_direct_write_size_bytes", 1)
+	server, err := NewByteStreamServer(te)
+	require.NoError(t, err)
+	_, src := testdigest.RandomCASResourceBuf(t, 256*1024)
+	compressed := compression.CompressZstd(nil, src)
+	ctx, err := prefix.AttachUserPrefixToContext(context.Background(), te.GetAuthenticator())
+	require.NoError(t, err)
+	testleak.CheckGrowth(t, testleak.Growth{Iterations: 20}, func(int) {
+		stream := &canceledZstdWriteStream{}
+		stream.ctx = ctx
+		stream.reqs = []*bspb.WriteRequest{{
+			ResourceName: fmt.Sprintf("uploads/%s/compressed-blobs/zstd/%s/%d", newUUID(t), strings.Repeat("b", 64), len(src)),
+			Data:         compressed[:len(compressed)/2],
+		}}
+		require.ErrorIs(t, server.Write(stream), context.Canceled)
+		require.True(t, stream.canceled, "must reach second Recv with a live decoder")
+	})
+}
+
+type canceledZstdWriteStream struct {
+	testWriteStream
+	canceled bool
+}
+
+func (s *canceledZstdWriteStream) Recv() (*bspb.WriteRequest, error) {
+	if len(s.reqs) > 0 {
+		return s.testWriteStream.Recv()
+	}
+	s.canceled = true
+	return nil, context.Canceled
 }
