@@ -13,6 +13,7 @@ import (
 
 func TestShutdown_StopsBackgroundGoroutines(t *testing.T) {
 	testleak.Check(t)
+	testleak.CheckFDs(t)
 
 	hc := healthcheck.NewHealthChecker("test")
 	hc.Shutdown()
