@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -332,4 +333,113 @@ func TestHeatmapPartialSecondBounds(t *testing.T) {
 	require.Equal(t, start.UnixMicro(), brackets[0], "first bracket must preserve inclusive request start")
 	require.Equal(t, end.UnixMicro(), brackets[len(brackets)-1], "last bracket must preserve exclusive request end")
 	require.Less(t, updated.UnixMicro(), brackets[len(brackets)-1], "returned data must precede final bracket")
+}
+
+// Each bit independently varies a dimension, so combined filters cannot pass
+// accidentally because the fixture correlated all its dimensions.
+func TestGeneratedTrendFilters(t *testing.T) {
+	t.Log("deterministic exhaustive bit fixture; seed=none")
+	te := testenv.GetTestEnv(t)
+	testclickhouse.Configure(t, te)
+	flags.Set(t, "app.finer_time_buckets", false)
+	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1"))
+	te.SetAuthenticator(ta)
+	ctx, err := ta.WithAuthenticatedUser(context.Background(), "US1")
+	require.NoError(t, err)
+	start := time.Date(2024, 12, 31, 12, 0, 0, 0, time.UTC)
+	rows := make([]olaptables.Invocation, 0, 1024)
+	for n := 0; n < 1024; n++ {
+		val := func(bit int) string { return fmt.Sprint((n >> bit) & 1) }
+		rows = append(rows, olaptables.Invocation{GroupID: "GR1", InvocationUUID: fmt.Sprintf("%032x", n+1), UpdatedAtUsec: start.Add(time.Duration(n) * time.Microsecond).UnixMicro(), DurationUsec: int64(n + 1), User: "user" + val(0), Host: "host" + val(1), RepoURL: "https://example.com/repo" + val(2), BranchName: "branch" + val(3), CommitSHA: "commit" + val(4), Command: "command" + val(5), Role: "role" + val(6), Pattern: "//pattern" + val(7), Tags: []string{"tag" + val(8), "common"}, Success: (n & 512) == 0, InvocationStatus: 1})
+	}
+	require.NoError(t, te.GetOLAPDBHandle().GORM(ctx, "filter_rows").Create(rows).Error)
+	iss := NewInvocationStatService(te, te.GetDBHandle(), te.GetOLAPDBHandle())
+	dimensions := []string{"user", "host", "repo", "branch", "commit", "command", "role", "pattern", "tags", "status"}
+	cases := append([]string{"all", "combined", "empty", "roles_or", "tags_and", "status_or"}, dimensions...)
+	for _, name := range cases {
+		t.Run(name, func(t *testing.T) {
+			q := &statspb.TrendQuery{UpdatedAfter: timestamppb.New(start), UpdatedBefore: timestamppb.New(start.Add(time.Hour))}
+			selected := func(dim string) bool { return name == dim || name == "combined" }
+			if selected("user") {
+				q.User = "user1"
+			}
+			if selected("host") {
+				q.Host = "host1"
+			}
+			if selected("repo") {
+				q.RepoUrl = "https://example.com/repo1"
+			}
+			if selected("branch") {
+				q.BranchName = "branch1"
+			}
+			if selected("commit") {
+				q.CommitSha = "commit1"
+			}
+			if selected("command") {
+				q.Command = "command1"
+			}
+			if selected("role") {
+				q.Role = []string{"role1"}
+			}
+			if selected("pattern") {
+				q.Pattern = "//pattern1"
+			}
+			if selected("tags") {
+				q.Tags = []string{"tag1"}
+			}
+			if selected("status") {
+				q.Status = []inspb.OverallStatus{inspb.OverallStatus_FAILURE}
+			}
+			if name == "empty" {
+				q.User = "absent"
+			}
+			if name == "roles_or" {
+				q.Role = []string{"role0", "role1"}
+			}
+			if name == "tags_and" {
+				q.Tags = []string{"tag1", "common"}
+			}
+			if name == "status_or" {
+				q.Status = []inspb.OverallStatus{inspb.OverallStatus_SUCCESS, inspb.OverallStatus_FAILURE}
+			}
+			var wantCount, wantDuration int64
+			for _, r := range rows {
+				matches := true
+				for _, pair := range [][2]string{{q.User, r.User}, {q.Host, r.Host}, {q.RepoUrl, r.RepoURL}, {q.BranchName, r.BranchName}, {q.CommitSha, r.CommitSHA}, {q.Command, r.Command}, {q.Pattern, r.Pattern}} {
+					if pair[0] != "" && pair[0] != pair[1] {
+						matches = false
+					}
+				}
+				if len(q.Role) > 0 && !slices.Contains(q.Role, r.Role) {
+					matches = false
+				}
+				for _, tag := range q.Tags {
+					if !slices.Contains(r.Tags, tag) {
+						matches = false
+					}
+				}
+				status := inspb.OverallStatus_FAILURE
+				if r.Success {
+					status = inspb.OverallStatus_SUCCESS
+				}
+				if len(q.Status) > 0 && !slices.Contains(q.Status, status) {
+					matches = false
+				}
+				if matches {
+					wantCount++
+					wantDuration += r.DurationUsec
+				}
+			}
+			rc := testauth.RequestContext("US1", "GR1")
+			got, err := iss.getInvocationTrend(ctx, &statspb.GetTrendRequest{RequestContext: rc, Query: q}, iss.getTrendTimeSettings(q, "UTC"))
+			require.NoError(t, err)
+			var count, duration int64
+			for _, g := range got {
+				count += g.TotalNumBuilds
+				duration += g.TotalBuildTimeUsec
+			}
+			require.Equal(t, wantCount, count, strings.Join([]string{name, "count"}, " "))
+			require.Equal(t, wantDuration, duration)
+		})
+	}
 }
