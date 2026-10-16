@@ -16,6 +16,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_client"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_server"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/jonboulle/clockwork"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
@@ -201,6 +202,7 @@ const (
 
 func newConnCache(t *testing.T) (*grpc_client.ConnCache, *clockwork.FakeClock) {
 	testleak.Check(t)
+	testleak.CheckFDs(t)
 	env := testenv.GetTestEnv(t)
 	clock := clockwork.NewFakeClock()
 	c, err := grpc_client.NewConnCache(env, grpc_client.ConnCacheOpts{
@@ -285,4 +287,44 @@ func TestConnCache_ExpiresUnusedConnections(t *testing.T) {
 	stillUsed, err := c.Get("used:1")
 	require.NoError(t, err)
 	assert.Same(t, used, stillUsed)
+}
+
+func TestPoolRepeatedLifecycleResources(t *testing.T) {
+	testleak.Check(t)
+	testleak.CheckFDs(t)
+	// Run server handlers on their own goroutines, so stuck handlers are
+	// visible to the checks (see testleak package docs).
+	flags.Set(t, "grpc_server_worker_multiplier", 0)
+	env := testenv.GetTestEnv(t)
+	port := testport.FindFree(t)
+	server, err := grpc_server.New(env, port, false, grpc_server.GRPCServerConfig{})
+	require.NoError(t, err)
+	pspb.RegisterApiServer(server.GetServer(), &TestService{})
+	require.NoError(t, server.Start())
+	for range 10 {
+		pool, err := grpc_client.DialSimpleWithPoolSize(fmt.Sprintf("grpc://localhost:%d", port), 10)
+		require.NoError(t, err)
+		client := pspb.NewApiClient(pool)
+		for range 20 {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, err := client.Ping(ctx, &pspb.PingRequest{})
+			cancel()
+			require.NoError(t, err)
+		}
+		require.NoError(t, pool.Close())
+	}
+
+	// Keep a fully warmed pool alive while checking per-RPC accumulation.
+	pool, err := grpc_client.DialSimpleWithPoolSize(fmt.Sprintf("grpc://localhost:%d", port), 10)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, pool.Close()) })
+	client := pspb.NewApiClient(pool)
+	testleak.CheckGrowth(t, testleak.Growth{Iterations: 10}, func(int) {
+		for range 20 {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, err := client.Ping(ctx, &pspb.PingRequest{})
+			cancel()
+			require.NoError(t, err)
+		}
+	})
 }
