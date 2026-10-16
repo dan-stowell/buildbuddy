@@ -2079,7 +2079,7 @@ func TestReviewMaterializationCost(t *testing.T) {
 			written := func() int64 {
 				b, err := os.ReadFile("/proc/self/io")
 				require.NoError(t, err)
-				for _, line := range strings.Split(string(b), "\n") {
+				for line := range strings.SplitSeq(string(b), "\n") {
 					var n int64
 					if _, err := fmt.Sscanf(line, "write_bytes: %d", &n); err == nil {
 						return n
@@ -2088,7 +2088,7 @@ func TestReviewMaterializationCost(t *testing.T) {
 				t.Fatal("write_bytes missing")
 				return 0
 			}
-			for pass := 0; pass < 3; pass++ {
+			for pass := range 3 {
 				dst := testfs.MakeTempDir(t)
 				before := written()
 				start := time.Now()
