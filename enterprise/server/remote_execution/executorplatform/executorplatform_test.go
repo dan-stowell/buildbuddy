@@ -594,3 +594,63 @@ func TestPlatformRoutingRejectMalformedImage(t *testing.T) {
 		})
 	}
 }
+
+// Exhaustive, deterministic product: no random seed is needed.
+func TestPlatformRoutingGeneratedExecutionConsistency(t *testing.T) {
+	for _, upper := range []bool{false, true} {
+		for _, override := range []bool{false, true} {
+			for _, os := range []string{"linux", "darwin"} {
+				for _, arch := range []string{"amd64", "arm64"} {
+					for _, isolation := range []string{"none", "docker", "oci", "firecracker"} {
+						t.Run(fmt.Sprintf("upper=%t/override=%t/%s/%s/%s", upper, override, os, arch, isolation), func(t *testing.T) {
+							image := "docker://alpine:3.20"
+							if isolation == "none" {
+								image = "none"
+							}
+							props := []*repb.Platform_Property{
+								{Name: "OSFamily", Value: os}, {Name: "Arch", Value: arch},
+								{Name: "Pool", Value: "testing"}, {Name: "workload-isolation-type", Value: isolation},
+								{Name: "container-image", Value: image}, {Name: "EstimatedCPU", Value: "1500m"},
+								{Name: "EstimatedMemory", Value: "2GB"}, {Name: "EstimatedFreeDiskBytes", Value: "1GB"},
+								{Name: "EstimatedComputeUnits", Value: "2"},
+							}
+							for _, p := range props {
+								if upper {
+									p.Name = strings.ToUpper(p.Name)
+								}
+							}
+							task := &repb.ExecutionTask{Action: &repb.Action{Platform: &repb.Platform{Properties: props}}}
+							if override {
+								task.Action.Platform = &repb.Platform{Properties: []*repb.Platform_Property{{Name: "Pool", Value: "old"}}}
+								task.PlatformOverrides = &repb.Platform{Properties: props}
+							}
+							app, err := platform.ParseProperties(task)
+							require.NoError(t, err)
+							exec, err := platform.ParseProperties(task)
+							require.NoError(t, err)
+							err = ApplyOverrides(t.Context(), testenv.GetTestEnv(t), &ExecutorProperties{
+								SupportedIsolationTypes: []platform.ContainerType{platform.ContainerType(isolation)},
+							}, exec, &repb.Command{})
+							require.NoError(t, err)
+							require.Equal(t, os, app.OS)
+							require.Equal(t, arch, app.Arch)
+							require.Equal(t, "testing", app.Pool)
+							require.EqualValues(t, 1500, app.EstimatedMilliCPU)
+							require.EqualValues(t, 2*1024*1024*1024, app.EstimatedMemoryBytes)
+							require.EqualValues(t, 1024*1024*1024, app.EstimatedFreeDiskBytes)
+							require.Equal(t, float64(2), app.EstimatedComputeUnits)
+							// Image prefix removal is an expected executor normalization.
+							wantImage := strings.TrimPrefix(image, "docker://")
+							if isolation == "none" {
+								wantImage = ""
+							}
+							require.Equal(t, wantImage, exec.ContainerImage)
+							exec.ContainerImage = app.ContainerImage
+							require.Empty(t, cmp.Diff(app, exec))
+						})
+					}
+				}
+			}
+		}
+	}
+}
