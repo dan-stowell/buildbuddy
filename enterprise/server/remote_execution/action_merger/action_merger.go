@@ -528,7 +528,7 @@ func CompleteCopy(ctx context.Context, rdb redis.UniversalClient, id string, suc
 	}
 	if err == redis.Nil {
 		if !success {
-			return id, true, nil, nil
+			return id, true, []string{}, nil
 		}
 		// Preserve atomic registration-versus-completion ordering on the success path.
 		mapping, err = rdb.Get(ctx, reverseKey).Result()
