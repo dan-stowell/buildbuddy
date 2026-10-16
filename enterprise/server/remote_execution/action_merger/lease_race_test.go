@@ -2,6 +2,7 @@ package action_merger
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -65,4 +66,26 @@ func TestLeaseRefreshDoesNotResurrectCompletedMerge(t *testing.T) {
 	t.Logf("no-hedge lease refresh Redis round trips: %d", client.rounds)
 	require.Equal(t, 2, client.rounds)
 	require.Zero(t, rdb.Exists(ctx, forward).Val(), "a late lease refresh must not restore a completed execution as mergeable")
+}
+
+// Independently compare the same ordinary lease with hedging off and enabled.
+// This uses public production entry points and also runs on bughunt-base.
+func TestReviewNoHedgeLeaseRoundTripBudget(t *testing.T) {
+	flags.Set(t, "remote_execution.enable_action_merging", true)
+	flags.Set(t, "remote_execution.action_merging_hedge_delay", 15*time.Minute)
+	ctx, err := prefix.AttachUserPrefixToContext(t.Context(), nullauth.NewNullAuthenticator(true))
+	require.NoError(t, err)
+	rdb := testredis.Start(t).Client()
+	action := digest.NewCASResourceName(&repb.Digest{Hash: strings.Repeat("e", 64), SizeBytes: 1}, "", repb.DigestFunction_SHA256)
+	canonical, decision := GetOrCreateExecutionID(ctx, rdb, &leaseRaceScheduler{}, action, false)
+	require.Equal(t, New, decision)
+	for _, count := range []int{0, 1} {
+		t.Run(fmt.Sprintf("hedge_count=%d", count), func(t *testing.T) {
+			flags.Set(t, "remote_execution.action_merging_hedge_count", count)
+			client := &leaseRaceClient{UniversalClient: rdb}
+			require.NoError(t, RecordClaimedExecution(ctx, client, canonical, time.Minute))
+			t.Logf("hedge_count=%d: ordinary lease used %d Redis round trips; baseline budget=2", count, client.rounds)
+			require.Equal(t, 2, client.rounds, "enabling hedging must preserve the ordinary lease budget")
+		})
+	}
 }
