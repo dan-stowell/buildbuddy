@@ -380,6 +380,25 @@ func TestFD_OpenedBeforeCheck_NotReported(t *testing.T) {
 	f.requireNoErrors(t)
 }
 
+// testport.FindFree keeps a lock file open for each leased port until the
+// process exits, by design.
+func TestFD_TestportLockFile_NotReported(t *testing.T) {
+	skipIfNoFDs(t)
+	dogfood(t)
+	f := newFakeTB(t)
+	CheckFDs(f, FDSettle(failingSettle))
+	lock, err := os.Create(filepath.Join(t.TempDir(), "testport.12345.lock"))
+	require.NoError(t, err)
+	defer lock.Close()
+	other, err := os.Create(filepath.Join(t.TempDir(), "testport.12345.lock.other"))
+	require.NoError(t, err)
+	defer other.Close()
+	f.runCleanups()
+	msg := f.requireOneError(t)
+	require.Contains(t, msg, "1 file descriptor(s): 1 file")
+	require.Contains(t, msg, "testport.12345.lock.other")
+}
+
 func TestFD_IgnoredByOption_NotReported(t *testing.T) {
 	skipIfNoFDs(t)
 	dogfood(t)
