@@ -186,17 +186,25 @@ type tfStatusRow struct {
 // cannot race the delivery of the event being tested.
 type tfObservedHandler struct {
 	interfaces.BuildEventHandler
-	finished chan struct{}
+	finished  chan struct{}
+	finalized chan error
 }
 
 func (h *tfObservedHandler) OpenChannel(ctx context.Context, iid string) (interfaces.BuildEventChannel, error) {
 	ch, err := h.BuildEventHandler.OpenChannel(ctx, iid)
-	return &tfObservedChannel{BuildEventChannel: ch, finished: h.finished}, err
+	return &tfObservedChannel{BuildEventChannel: ch, finished: h.finished, finalized: h.finalized}, err
 }
 
 type tfObservedChannel struct {
 	interfaces.BuildEventChannel
-	finished chan struct{}
+	finished  chan struct{}
+	finalized chan error
+}
+
+func (c *tfObservedChannel) FinalizeInvocation(iid string) error {
+	err := c.BuildEventChannel.FinalizeInvocation(iid)
+	c.finalized <- err
+	return err
 }
 
 func (c *tfObservedChannel) HandleEvent(req *pepb.PublishBuildToolEventStreamRequest) error {
@@ -223,7 +231,8 @@ func runTargetStatusFlush(t *testing.T, ending streamEnding, olap bool, partial 
 	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 	te.SetAuthenticator(ta)
 	finished := make(chan struct{})
-	te.SetBuildEventHandler(&tfObservedHandler{BuildEventHandler: build_event_handler.NewBuildEventHandler(te), finished: finished})
+	finalized := make(chan error, 1)
+	te.SetBuildEventHandler(&tfObservedHandler{BuildEventHandler: build_event_handler.NewBuildEventHandler(te), finished: finished, finalized: finalized})
 
 	server, err := build_event_server.NewBuildEventProtocolServer(te, false /*=synchronous*/)
 	require.NoError(t, err)
@@ -280,22 +289,19 @@ func runTargetStatusFlush(t *testing.T, ending streamEnding, olap bool, partial 
 	}
 
 	authCtx := ta.AuthContextFromAPIKey(context.Background(), "USER1")
-	// Wait for finalization (the cancel path finalizes asynchronously).
-	var invStatus inspb.InvocationStatus
-	require.Eventually(t, func() bool {
-		inv, err := build_event_handler.LookupInvocation(te, authCtx, iid)
-		if err != nil {
-			return false
-		}
-		invStatus = inv.GetInvocationStatus()
-		return invStatus != inspb.InvocationStatus_PARTIAL_INVOCATION_STATUS
-	}, 10*time.Second, 50*time.Millisecond, "invocation was never finalized")
-	t.Logf("ending=%s olap=%t invocation_status=%s", ending, olap, invStatus)
-	require.Equal(t, inspb.InvocationStatus_COMPLETE_INVOCATION_STATUS, invStatus,
+	// Cancellation returns to the client before server finalization. Observe
+	// completion directly so even slow status writes cannot race assertions.
+	select {
+	case err := <-finalized:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("invocation was never finalized")
+	}
+	inv, err := build_event_handler.LookupInvocation(te, authCtx, iid)
+	require.NoError(t, err)
+	t.Logf("ending=%s olap=%t invocation_status=%s", ending, olap, inv.GetInvocationStatus())
+	require.Equal(t, inspb.InvocationStatus_COMPLETE_INVOCATION_STATUS, inv.GetInvocationStatus(),
 		"invocation that sent BuildFinished should be stored as COMPLETE")
-
-	// Allow any asynchronous writes to land.
-	time.Sleep(500 * time.Millisecond)
 
 	var rows []tfStatusRow
 	if olap {
