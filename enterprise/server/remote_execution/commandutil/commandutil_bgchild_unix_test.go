@@ -116,7 +116,13 @@ func TestRun_BackgroundChildHoldsStdout_NoTimeout(t *testing.T) {
 	res := commandutil.Run(context.Background(), cmd, wd, nil /*=statsListener*/, &interfaces.Stdio{})
 	elapsed := time.Since(start)
 	t.Logf("elapsed=%s exitCode=%d err=%v stdout=%q", elapsed, res.ExitCode, res.Error, res.Stdout)
-	// Informational only: no assertion on elapsed here.
+	assert.Less(t, elapsed, 2*time.Second, "successful root must not wait for background child")
+	assert.Equal(t, "hi\n", string(res.Stdout))
+	assert.Equal(t, 0, res.ExitCode)
+	// Successful bare commands retain background processes for compatibility
+	// with callers intentionally keeping daemons between actions.
+	pid := readPid(t, pidFile)
+	assert.True(t, pidAlive(pid), "successful commands should not kill background processes")
 	require.NoError(t, res.Error)
 }
 

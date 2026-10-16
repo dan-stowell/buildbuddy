@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -311,7 +312,17 @@ func TestRun_ExitedRootWithOpenPipe_Deadline(t *testing.T) {
 	defer cancel()
 	done := make(chan *interfaces.CommandResult, 1)
 	go func() {
-		done <- commandutil.Run(ctx, &repb.Command{Arguments: []string{"sh", "-c", "sleep 30 & echo $! > child.pid; echo partial; echo diagnostic >&2; exit 0"}}, wd, nil, &interfaces.Stdio{})
+		cmd := exec.Command("sh", "-c", "sleep 30 & echo $! > child.pid; echo partial; echo diagnostic >&2; exit 0")
+		cmd.Dir = wd
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		// Keep the drain open past the deadline to exercise cancellation after
+		// the root was reaped, independently of the short default drain limit.
+		cmd.WaitDelay = 5 * time.Second
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		_, err := commandutil.RunWithProcessTreeCleanup(ctx, cmd, nil)
+		code, err := commandutil.ExitCode(ctx, cmd, err)
+		done <- &interfaces.CommandResult{ExitCode: code, Error: err, Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}
 	}()
 	// Capture the child PID independently of Run, whose pipe readers may block.
 	var pid int

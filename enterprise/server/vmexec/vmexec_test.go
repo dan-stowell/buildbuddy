@@ -225,10 +225,10 @@ func TestExecStreamed_BackgroundChildHoldsStdout_Timeout(t *testing.T) {
 	elapsed := time.Since(start)
 	t.Logf("elapsed=%s exitCode=%d err=%v stdout=%q", elapsed, res.ExitCode, res.Error, res.Stdout)
 
-	assert.Less(t, elapsed, timeout+5*time.Second)
-	if elapsed > timeout {
-		assert.Error(t, res.Error, "returned after the deadline; should not report success")
-	}
+	assert.Less(t, elapsed, timeout)
+	require.NoError(t, res.Error)
+	assert.Equal(t, 0, res.ExitCode)
+	assert.Equal(t, "hi\n", string(res.Stdout))
 }
 
 // Same, without a timeout: documents how long Execute blocks after the main
@@ -242,5 +242,7 @@ func TestExecStreamed_BackgroundChildHoldsStdout_NoTimeout(t *testing.T) {
 	res := vmexec_client.Execute(context.Background(), client, cmd, ".", "" /*=user*/, nil /*=statsListener*/, nil /*=stdio*/)
 	elapsed := time.Since(start)
 	t.Logf("elapsed=%s exitCode=%d err=%v stdout=%q", elapsed, res.ExitCode, res.Error, res.Stdout)
+	assert.Less(t, elapsed, 2*time.Second)
 	require.NoError(t, res.Error)
+	assert.Equal(t, "hi\n", string(res.Stdout))
 }
