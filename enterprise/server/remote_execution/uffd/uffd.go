@@ -230,6 +230,18 @@ func (h *Handler) receiveSetupMsg(ctx context.Context) (*setupMessage, error) {
 			return nil, status.WrapError(err, "accept firecracker connection")
 		}
 	}
+	defer conn.Close()
+	// Closing the listener only interrupts Accept. Once Firecracker has
+	// connected, Stop must also interrupt a setup read if initialization stalls.
+	readDone := make(chan struct{})
+	defer close(readDone)
+	go func() {
+		select {
+		case <-h.stoppedChan:
+			conn.Close()
+		case <-readDone:
+		}
+	}()
 	unixConn := conn.(*net.UnixConn)
 	log.CtxDebugf(ctx, "Firecracker connected to uffd socket")
 
