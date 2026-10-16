@@ -161,6 +161,10 @@ func TestTrackTargetForEvents_NonOLAP(t *testing.T) {
 }
 
 func runTrackTargetsForEventsTest(t *testing.T, useClickHouse bool) {
+	runTrackTargetsForEventsTransformed(t, useClickHouse, nil)
+}
+
+func runTrackTargetsForEventsTransformed(t *testing.T, useClickHouse bool, transform func([]*build_event_stream.BuildEvent) []*build_event_stream.BuildEvent) {
 	te := testenv.GetTestEnv(t)
 	if useClickHouse {
 		testclickhouse.Configure(t, te)
@@ -409,6 +413,9 @@ func runTrackTargetsForEventsTest(t *testing.T, useClickHouse bool) {
 		},
 	}
 
+	if transform != nil {
+		events = transform(events)
+	}
 	for _, e := range events {
 		tracker.TrackTargetsForEvent(ctx, e)
 	}
@@ -881,4 +888,32 @@ func TestTrackTargetForEvents_OLAPRecordsTestTimeouts(t *testing.T) {
 		TestTimeoutUsec:        (100 * time.Second).Microseconds(),
 		MaxAttemptDurationUsec: (96 * time.Second).Microseconds(),
 	}}, got)
+}
+
+// Multiple attempts and shards are results for the same target, not new targets.
+func TestTargetTrackingAttemptsShardsAndDuplicates(t *testing.T) {
+	for _, olap := range []bool{false, true} {
+		name := "primary"
+		if olap {
+			name = "olap"
+		}
+		t.Run(name, func(t *testing.T) {
+			flags.Set(t, "app.enable_write_test_target_statuses_to_olap_db", olap)
+			runTrackTargetsForEventsTransformed(t, olap, func(events []*build_event_stream.BuildEvent) []*build_event_stream.BuildEvent {
+				var out []*build_event_stream.BuildEvent
+				for _, e := range events {
+					if e.GetId().GetTestSummary().GetLabel() == "//server:foo_test" {
+						for _, pair := range [][2]int32{{0, 1}, {0, 1}, {0, 2}, {1, 1}} {
+							out = append(out, &build_event_stream.BuildEvent{
+								Id:      &build_event_stream.BuildEventId{Id: &build_event_stream.BuildEventId_TestResult{TestResult: &build_event_stream.BuildEventId_TestResultId{Label: "//server:foo_test", Shard: pair[0], Attempt: pair[1]}}},
+								Payload: &build_event_stream.BuildEvent_TestResult{TestResult: &build_event_stream.TestResult{Status: build_event_stream.TestStatus_FAILED}},
+							})
+						}
+					}
+					out = append(out, e)
+				}
+				return out
+			})
+		})
+	}
 }
