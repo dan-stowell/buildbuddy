@@ -16,6 +16,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/backends/redis_execution_collector"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/experiments"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/githubapp"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/action_merger"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/execution_server"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/tasksize"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/enterprise_testauth"
@@ -34,6 +35,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/expflag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
+	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
@@ -2756,4 +2758,48 @@ func TestWatchTaskLiveness_StopsWhenWatchersAreDone(t *testing.T) {
 	s.livenessMu.Lock()
 	defer s.livenessMu.Unlock()
 	require.Empty(t, s.livenessWatches)
+}
+
+// Cancelling a queued task must also drop its action-merging state; otherwise
+// identical requests keep finding the cancelled execution and wait for it to
+// show up in the scheduler before giving up and starting a new execution.
+func TestCancelTask_DeletesActionMergingState(t *testing.T) {
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+	ctx, err := prefix.AttachUserPrefixToContext(ctx, env.GetAuthenticator())
+	require.NoError(t, err)
+	rdb := env.GetRemoteExecutionRedisClient()
+	sched := env.GetSchedulerService()
+
+	fe := newFakeExecutor(ctx, t, env.GetSchedulerClient())
+	fe.Register()
+
+	ad := digest.NewCASResourceName(&repb.Digest{
+		Hash:      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		SizeBytes: 123,
+	}, "", repb.DigestFunction_SHA256)
+	taskID, op := action_merger.GetOrCreateExecutionID(ctx, rdb, sched, ad, false /*=doNotCache*/)
+	require.Equal(t, action_merger.New, op)
+	req := newScheduleRequest(ctx, t, env, scheduleOpts{})
+	req.TaskId = taskID
+	_, err = sched.ScheduleTask(ctx, req)
+	require.NoError(t, err)
+	fe.WaitForTask(taskID)
+
+	// While the task is queued, identical requests are merged into it.
+	mergedID, op := action_merger.GetOrCreateExecutionID(ctx, rdb, sched, ad, false /*=doNotCache*/)
+	require.Equal(t, action_merger.Merge, op)
+	require.Equal(t, taskID, mergedID)
+
+	cancelled, err := sched.CancelTask(ctx, taskID)
+	require.NoError(t, err)
+	require.True(t, cancelled)
+
+	// After cancellation, an identical request should promptly get a new
+	// execution rather than being considered for merging.
+	start := time.Now()
+	newID, op := action_merger.GetOrCreateExecutionID(ctx, rdb, sched, ad, false /*=doNotCache*/)
+	elapsed := time.Since(start)
+	require.Equal(t, action_merger.New, op)
+	require.NotEqual(t, taskID, newID)
+	require.Less(t, elapsed, 2*time.Second, "request for an action whose execution was cancelled was delayed by %s", elapsed)
 }
