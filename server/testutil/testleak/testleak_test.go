@@ -623,3 +623,34 @@ func TestNoFDsOnOtherPlatforms(t *testing.T) {
 	f.runCleanups()
 	f.requireNoErrors(t)
 }
+
+// A single worker and file are replaced on every operation. Identity changes
+// are not accumulation: the live owner's resource usage stays constant.
+func TestGrowth_BoundedReplacement_Accepted(t *testing.T) {
+	dogfood(t)
+	var stop, done chan struct{}
+	var file *os.File
+	closeResources := func() {
+		if stop != nil {
+			close(stop)
+			<-done
+		}
+		if file != nil {
+			require.NoError(t, file.Close())
+		}
+	}
+	defer closeResources()
+	f := newFakeTB(t)
+	CheckGrowth(f, Growth{Iterations: 10, Settle: failingSettle}, func(int) {
+		closeResources()
+		stop, done = make(chan struct{}), make(chan struct{})
+		go func(stop, done chan struct{}) {
+			defer close(done)
+			leakyWorker(stop)
+		}(stop, done)
+		var err error
+		file, err = os.CreateTemp(t.TempDir(), "replacement")
+		require.NoError(t, err)
+	})
+	f.requireNoErrors(t)
+}
