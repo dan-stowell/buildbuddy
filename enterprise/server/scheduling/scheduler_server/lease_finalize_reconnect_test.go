@@ -132,6 +132,11 @@ func (s *twoReplicaSetup) shutDownApp1() {
 	s.router.setTarget(s.app2.GetSchedulerClient())
 	s.app1.GetHealthChecker().Shutdown()
 	s.app1.GetHealthChecker().WaitForGracefulShutdown()
+	// The test health checker does not stop the gRPC server, so do what
+	// grpc_server.GRPCShutdown does once the shutdown deadline is (nearly)
+	// up: hard-stop it. This breaks lease streams that are still open. Stop
+	// waits for the handlers to return (grpc.WaitForHandlers).
+	s.app1.GetGRPCServer().Stop()
 }
 
 func (s *twoReplicaSetup) taskExists(t *testing.T, taskID string) bool {
