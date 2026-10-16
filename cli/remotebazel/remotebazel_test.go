@@ -1249,3 +1249,30 @@ func TestUntrackedUnicodePatch(t *testing.T) {
 	_, err = generatePatches(base)
 	require.NoError(t, err, "an untracked Unicode filename must be mirrored")
 }
+
+func TestDirtySubmodulePatch(t *testing.T) {
+	old, err := os.Getwd()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.Chdir(old)) })
+	child, _ := testgit.MakeTempRepo(t, map[string]string{"child": "original\n"})
+	remote, _ := testgit.MakeTempRepo(t, map[string]string{"file": "base\n"})
+	testshell.Run(t, remote, fmt.Sprintf("git -c protocol.file.allow=always submodule add %q module; git commit -am submodule", child))
+	local := testgit.MakeTempRepoClone(t, remote)
+	testshell.Run(t, local, "git -c protocol.file.allow=always submodule update --init")
+	require.NoError(t, os.Chdir(local))
+	require.NoError(t, os.WriteFile("module/child", []byte("dirty\n"), 0644))
+	base, err := getHeadCommitForLocalBranch("HEAD")
+	require.NoError(t, err)
+	patches, err := generatePatches(base)
+	require.NoError(t, err)
+	runner := testgit.MakeTempRepoClone(t, remote)
+	testshell.Run(t, runner, "git -c protocol.file.allow=always submodule update --init")
+	for _, patch := range patches {
+		path := filepath.Join(t.TempDir(), "change.patch")
+		require.NoError(t, os.WriteFile(path, patch, 0644))
+		testshell.Run(t, runner, fmt.Sprintf("git apply --verbose %q", path))
+	}
+	got, err := os.ReadFile(filepath.Join(runner, "module/child"))
+	require.NoError(t, err)
+	require.Equal(t, "dirty\n", string(got), "successful patch application must preserve submodule working tree edits")
+}
