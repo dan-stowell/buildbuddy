@@ -123,7 +123,9 @@ func TestRun_BackgroundChildHoldsStdout_NoTimeout(t *testing.T) {
 	// Waiting for EOF does not kill background processes; here the child
 	// closes the streams by exiting on its own.
 	pid := readPid(t, pidFile)
-	assert.False(t, pidAlive(pid), "pipe-holding child should have exited before EOF")
+	// The kernel may close the child's descriptors just before marking it
+	// dead, so observing EOF does not require signal 0 to fail immediately.
+	require.Eventually(t, func() bool { return !pidAlive(pid) }, time.Second, time.Millisecond)
 	require.NoError(t, res.Error)
 }
 
