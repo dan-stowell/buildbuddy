@@ -1402,6 +1402,18 @@ func (s *ExecutionServer) waitExecution(ctx context.Context, req *repb.WaitExecu
 		select {
 		case msg, ok = <-streamPubSubChan:
 		case <-taskLost:
+			// A hedge may remove the canonical task before its publication is read.
+			if data, err := action_merger.CompletedOperation(ctx, s.rdb, req.GetName()); err != nil {
+				return err
+			} else if len(data) > 0 {
+				op := new(longrunningpb.Operation)
+				if err := proto.Unmarshal(data, op); err != nil {
+					return err
+				}
+				op.Name = req.GetName()
+				_, err := e.processOpUpdate(ctx, op)
+				return err
+			}
 			pending, err := action_merger.HasPendingCopy(ctx, s.rdb, req.GetName())
 			if err != nil {
 				return err

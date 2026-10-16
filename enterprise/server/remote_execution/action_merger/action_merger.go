@@ -113,38 +113,32 @@ func RecordClaimedExecution(ctx context.Context, rdb redis.UniversalClient, exec
 	if !*enableActionMerging {
 		return nil
 	}
-
-	if *hedgedActionCount > 0 {
-		canonical, err := rdb.HGet(ctx, copyKey(executionID), "canonical").Result()
-		if err != nil && err != redis.Nil {
-			return err
-		}
-		if canonical != "" {
-			pipe := rdb.TxPipeline()
-			pipe.Expire(ctx, copyKey(executionID), 24*time.Hour)
-			pipe.Expire(ctx, copyKey(canonical), 24*time.Hour)
-			if _, err := pipe.Exec(ctx); err != nil {
-				return err
-			}
-			executionID = canonical
-		}
-	}
-	// Use the execution ID to lookup the action digest and insert the forward
-	// entry (from action digest to execution ID).
 	reverseKey := redisKeyForPendingExecutionDigest(executionID)
-	forwardKey, err := rdb.Get(ctx, reverseKey).Result()
+	mapping, err := rdb.Get(ctx, reverseKey).Result()
 	if err == redis.Nil {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-
+	forwardKey, canonical, paired := strings.Cut(mapping, "\n")
+	if paired {
+		// Keep the pair's fencing state alive for as long as either copy runs.
+		pipe := rdb.TxPipeline()
+		pipe.Expire(ctx, copyKey(executionID), 24*time.Hour)
+		pipe.Expire(ctx, copyKey(canonical), 24*time.Hour)
+		pipe.Expire(ctx, reverseKey, 24*time.Hour)
+		pipe.Expire(ctx, redisKeyForPendingExecutionDigest(canonical), 24*time.Hour)
+		if _, err := pipe.Exec(ctx); err != nil {
+			return err
+		}
+		executionID = canonical
+	}
 	_, err = rdb.Eval(ctx, `
-    if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
-    redis.call('PEXPIRE', KEYS[1], ARGV[3])
-    redis.call('PEXPIRE', KEYS[2], ARGV[3])
-    return 1`, []string{forwardKey, reverseKey}, executionIDKey, executionID, ttl.Milliseconds()).Result()
+ if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
+ redis.call('PEXPIRE', KEYS[1], ARGV[3])
+ if ARGV[4] == '0' then redis.call('PEXPIRE', KEYS[2], ARGV[3]) end
+ return 1`, []string{forwardKey, reverseKey}, executionIDKey, executionID, ttl.Milliseconds(), boolInt(paired)).Result()
 	return err
 }
 
@@ -427,6 +421,8 @@ func DeletePendingExecution(ctx context.Context, rdb redis.UniversalClient, exec
 	if err != nil {
 		return err
 	}
+	forward, _, paired := strings.Cut(pendingExecutionKey, "\n")
+	pendingExecutionKey = forward
 	if *hedgedActionCount == 0 {
 		if err := rdb.Del(ctx, pendingExecutionKey).Err(); err != nil {
 			return err
@@ -436,8 +432,8 @@ func DeletePendingExecution(ctx context.Context, rdb redis.UniversalClient, exec
 	_, err = rdb.Eval(ctx, `
  if redis.call('EXISTS', KEYS[3]) == 1 and redis.call('HEXISTS', KEYS[3], 'winner') == 0 then return 0 end
  if redis.call('HGET', KEYS[1], ARGV[1]) == ARGV[2] then redis.call('DEL', KEYS[1]) end
- redis.call('DEL', KEYS[2])
- return 1`, []string{pendingExecutionKey, pendingExecutionDigestKey, copyKey(executionID)}, executionIDKey, executionID).Result()
+ if ARGV[3] == '0' then redis.call('DEL', KEYS[2]) end
+ return 1`, []string{pendingExecutionKey, pendingExecutionDigestKey, copyKey(executionID)}, executionIDKey, executionID, boolInt(paired)).Result()
 	return err
 }
 
@@ -454,7 +450,16 @@ func copyKey(id string) string {
 // RegisterHedge creates copy state only when a hedge is about to be dispatched.
 // Registration and completion serialize on the canonical copy hash.
 func RegisterHedge(ctx context.Context, rdb redis.UniversalClient, canonical, id string) error {
-	_, err := rdb.Eval(ctx, `
+	rn, err := digest.ParseUploadResourceName(canonical)
+	if err != nil {
+		return err
+	}
+	forward, err := redisKeyForPendingExecutionID(ctx, rn)
+	if err != nil {
+		return err
+	}
+	_, err = rdb.Eval(ctx, `
+ if redis.call('HGET', KEYS[3], 'execution-id') ~= ARGV[1] then return redis.error_reply('execution no longer pending') end
  if redis.call('HEXISTS', KEYS[1], 'winner') == 1 then return redis.error_reply('execution already completed') end
  redis.call('HSET', KEYS[1], 'canonical', ARGV[1])
  redis.call('HSETNX', KEYS[1], 'copy:' .. ARGV[1], 'pending')
@@ -462,7 +467,9 @@ func RegisterHedge(ctx context.Context, rdb redis.UniversalClient, canonical, id
  redis.call('HSET', KEYS[2], 'canonical', ARGV[1])
  redis.call('EXPIRE', KEYS[1], 86400)
  redis.call('EXPIRE', KEYS[2], 86400)
- return 1`, []string{copyKey(canonical), copyKey(id)}, canonical, id).Result()
+ redis.call('SET', KEYS[4], KEYS[3] .. '\n' .. ARGV[1], 'EX', 86400)
+ redis.call('SET', KEYS[5], KEYS[3] .. '\n' .. ARGV[1], 'EX', 86400)
+ return 1`, []string{copyKey(canonical), copyKey(id), forward, redisKeyForPendingExecutionDigest(canonical), redisKeyForPendingExecutionDigest(id)}, canonical, id).Result()
 	return err
 }
 
@@ -472,18 +479,32 @@ func CompleteCopy(ctx context.Context, rdb redis.UniversalClient, id string, suc
 	if *hedgedActionCount == 0 {
 		return id, true, nil, nil
 	}
-	canonical, err := rdb.HGet(ctx, copyKey(id), "canonical").Result()
+	// This replaces the existing pending-execution cleanup lookup. Pair metadata
+	// is added to that mapping only by RegisterHedge, never by ordinary Execute.
+	reverseKey := redisKeyForPendingExecutionDigest(id)
+	mapping, err := rdb.Get(ctx, reverseKey).Result()
 	if err == redis.Nil {
 		return id, true, nil, nil
 	}
 	if err != nil {
 		return "", false, nil, err
 	}
+	forward, canonical, paired := strings.Cut(mapping, "\n")
+	if !paired {
+		canonical = id
+	}
 	var operation []byte
 	if len(serializedOperation) > 0 {
 		operation = serializedOperation[0]
 	}
 	result, err := rdb.Eval(ctx, `
+ -- Registration may have happened after the mapping lookup. Inspect the
+ -- canonical copy hash and remove the unpaired pending mapping atomically.
+ if redis.call('EXISTS', KEYS[1]) == 0 then
+   if redis.call('HGET', KEYS[2], 'execution-id') == ARGV[1] then redis.call('DEL', KEYS[2]) end
+   redis.call('DEL', KEYS[3])
+   return {1}
+ end
  local winner = redis.call('HGET', KEYS[1], 'winner')
  if winner and (winner ~= ARGV[1] or redis.call('HGET', KEYS[1], 'success') ~= ARGV[2]) then return {0} end
  if not winner then redis.call('HSET', KEYS[1], 'copy:' .. ARGV[1], 'failed') end
@@ -502,7 +523,7 @@ func CompleteCopy(ctx context.Context, rdb redis.UniversalClient, id string, suc
  redis.call('EXPIRE', KEYS[1], 86400)
  local result = {1}
  for _, id in ipairs(copies) do table.insert(result,id) end
- return result`, []string{copyKey(canonical)}, id, boolInt(success), operation).Slice()
+ return result`, []string{copyKey(canonical), forward, reverseKey}, id, boolInt(success), operation).Slice()
 	if err != nil {
 		return "", false, nil, err
 	}
