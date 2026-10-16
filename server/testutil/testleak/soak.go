@@ -1,7 +1,7 @@
 package testleak
 
 import (
-	"fmt"
+	"maps"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -11,12 +11,17 @@ import (
 
 // Soak runs warmup batches followed by measured batches. It reports all resource
 // groups, ranked by net growth, and fails on monotone growth of at least one
-// resource per measured batch. Owners may remain running; flags are candidates
+// resource per measured batch, with increases in at least two thirds of batches.
+// A single pool expansion followed by a plateau is only reported in the series.
+// Owners may remain running; flags are candidates
 // requiring ownership investigation, not proof of leaks. Do not run in parallel.
 // Each sample polls for a stable count vector (three equal observations), with
 // a five second deadline. Periodic background work can prevent convergence.
 func Soak(t testing.TB, warmup, batches int, op func(int)) {
 	t.Helper()
+	if warmup < 0 || batches < 3 {
+		t.Fatal("soak needs nonnegative warmup and at least three measured batches")
+	}
 	warmNetpoller()
 	snapshot := func() map[string]int {
 		m := map[string]int{}
@@ -50,7 +55,9 @@ func Soak(t testing.TB, warmup, batches int, op func(int)) {
 			case strings.HasPrefix(k, "pipe:"):
 				k = "pipe"
 			case strings.HasPrefix(k, "/"):
-				k = "file " + digitsRegexp.ReplaceAllString(filepath.Dir(k), "#")
+				parts := strings.Split(strings.TrimPrefix(filepath.Dir(k), "/"), "/")
+				k = "file /" + strings.Join(parts[:min(2, len(parts))], "/")
+				k = digitsRegexp.ReplaceAllString(k, "#")
 			}
 			m["fd: "+k]++
 		}
@@ -65,7 +72,7 @@ func Soak(t testing.TB, warmup, batches int, op func(int)) {
 		for time.Now().Before(deadline) {
 			<-ticker.C
 			next := snapshot()
-			if fmt.Sprint(next) == fmt.Sprint(last) {
+			if maps.Equal(next, last) {
 				stable++
 			} else {
 				stable = 0
@@ -78,11 +85,11 @@ func Soak(t testing.TB, warmup, batches int, op func(int)) {
 		t.Log("soak sample reached settle deadline")
 		return last
 	}
-	for i := 0; i < warmup; i++ {
+	for i := range warmup {
 		op(i)
 	}
 	samples := []map[string]int{settle()}
-	for i := 0; i < batches; i++ {
+	for i := range batches {
 		op(warmup + i)
 		samples = append(samples, settle())
 	}
@@ -106,14 +113,18 @@ func Soak(t testing.TB, warmup, batches int, op func(int)) {
 	for _, k := range ranked {
 		series := []int{}
 		monotone := true
+		growing := 0
 		for i, s := range samples {
 			series = append(series, s[k])
+			if i > 0 && s[k] > samples[i-1][k] {
+				growing++
+			}
 			if i > 0 && s[k] < samples[i-1][k] {
 				monotone = false
 			}
 		}
 		t.Logf("soak delta=%+d series=%v group=%s", delta(k), series, k)
-		if monotone && delta(k) >= batches {
+		if monotone && growing >= (2*batches+2)/3 && delta(k) >= batches {
 			t.Errorf("SOAK GROWTH candidate: %s series=%v", k, series)
 		}
 	}

@@ -3,8 +3,6 @@ package remote_execution_test
 import (
 	"context"
 	"fmt"
-	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
-	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"io"
 	"os"
 	"runtime"
@@ -16,6 +14,8 @@ import (
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/build_event_handler"
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_publisher"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/stretchr/testify/require"
@@ -35,7 +35,7 @@ func TestResourceSoak(t *testing.T) {
 	stop := make(chan struct{})
 	defer close(stop)
 	testleak.Soak(t, 2, 10, func(batch int) {
-		for i := 0; i < 17; i++ {
+		for i := range 17 {
 			script := "cp blob out"
 			exit := 0
 			if i%5 == 0 {
@@ -50,7 +50,12 @@ func TestResourceSoak(t *testing.T) {
 				}
 			}
 			if os.Getenv("SOAK_INJECT_LEAK") == "1" {
+				// Deliberately retain resources until after all samples to validate
+				// the detector. Production paths never enable this switch.
 				go func() { <-stop }()
+				f, err := os.Open("/dev/null")
+				require.NoError(t, err)
+				t.Cleanup(func() { f.Close() })
 			}
 		}
 		rbe.Execute(command("sleep 30"), &rbetest.ExecuteOpts{InputRootDir: root, ActionTimeout: 100 * time.Millisecond}).MustTerminateAbnormally()
