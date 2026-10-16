@@ -12,6 +12,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/persistentworker"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/workspace"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
 	"github.com/stretchr/testify/require"
 
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
@@ -76,4 +77,14 @@ func TestWorkerExec_Stderr(t *testing.T) {
 			require.Contains(t, result.Error.Error(), "persistent worker stderr:\n"+test.wantStderr)
 		})
 	}
+}
+
+// Argument boundaries are part of worker identity.
+func TestKeyPreservesArgumentBoundaries(t *testing.T) {
+	props := &platform.Properties{PersistentWorker: true}
+	a, ok := persistentworker.Key(props, []string{"tool", "--mode=a b", "@first"})
+	require.True(t, ok)
+	b, ok := persistentworker.Key(props, []string{"tool", "--mode=a", "b", "@second"})
+	require.True(t, ok)
+	require.NotEqual(t, a, b, "different startup argv must not share a worker")
 }
