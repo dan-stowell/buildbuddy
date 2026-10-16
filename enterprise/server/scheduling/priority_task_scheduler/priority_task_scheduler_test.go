@@ -1407,3 +1407,61 @@ func TestShutdownCancelsInFlightTasks_NoDeadline(t *testing.T) {
 	require.NoError(t, q.Shutdown(context.Background()))
 	require.ErrorIs(t, q.rootContext.Err(), context.Canceled)
 }
+
+// cancellationAwareExecutor exercises the real scheduling, lease, execution,
+// and untracking path, while leaving container implementation out of this test.
+type cancellationAwareExecutor struct {
+	*FakeExecutor
+	started chan struct{}
+}
+
+func (e *cancellationAwareExecutor) ExecuteTaskAndStreamResults(ctx context.Context, _ *repb.ScheduledTask, _ interfaces.Publisher) (bool, error) {
+	e.started <- struct{}{}
+	<-ctx.Done()
+	return true, ctx.Err()
+}
+
+func TestShutdownCancellationEvidence(t *testing.T) {
+	for _, n := range []int{1, 10, 50} {
+		t.Run(fmt.Sprintf("N=%d", n), func(t *testing.T) {
+			testleak.Check(t)
+			flags.Set(t, "executor.shutdown_cleanup_duration", 20*time.Millisecond)
+			env := testenv.GetTestEnv(t)
+			env.SetClock(clockwork.NewFakeClockAt(time.Now()))
+			env.SetRemoteExecutionClient(&FakeExecutionClient{})
+			exec := &cancellationAwareExecutor{FakeExecutor: NewFakeExecutor(), started: make(chan struct{}, n)}
+			q, err := NewPriorityTaskScheduler(env, exec, &FakeRunnerPool{}, NewFakeTaskLeaser(), &Options{})
+			require.NoError(t, err)
+			require.NoError(t, q.Start())
+			t.Cleanup(func() { q.rootCancel(); require.NoError(t, q.Stop()) })
+			for range n {
+				_, err := q.EnqueueTaskReservation(context.Background(), &scpb.EnqueueTaskReservationRequest{TaskId: fakeTaskID("shutdown")})
+				require.NoError(t, err)
+			}
+			for range n {
+				select {
+				case <-exec.started:
+				case <-time.After(5 * time.Second):
+					t.Fatal("task did not start")
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			done := make(chan struct{})
+			go func() { defer close(done); assert.NoError(t, q.Shutdown(ctx)) }()
+			<-ctx.Done()
+			select {
+			case <-done:
+			case <-time.After(100 * time.Millisecond):
+			}
+			t.Logf("N=%d active=%d rootErr=%v", n, q.ActiveTaskCount(), q.rootContext.Err())
+			assert.Zero(t, q.ActiveTaskCount())
+			q.rootCancel()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("rescue failed")
+			}
+		})
+	}
+}
