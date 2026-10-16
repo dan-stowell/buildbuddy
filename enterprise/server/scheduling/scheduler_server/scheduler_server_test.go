@@ -2855,3 +2855,17 @@ func TestRedisRetryIdempotency_NoLostReply(t *testing.T) {
 	require.NoError(t, s.deleteClaimedTask(ctx, "control"))
 	require.Zero(t, rdb.Exists(ctx, s.redisKeyForTask("control")).Val())
 }
+
+func TestRedisRetryIdempotency_TransactionNotReplayed(t *testing.T) {
+	ctx := t.Context()
+	rdb, drop := redisWithLostReply(t)
+	pipe := rdb.TxPipeline()
+	pipe.Incr(ctx, "transaction-counter")
+	drop.Store(true)
+	_, err := pipe.Exec(ctx)
+	require.ErrorIs(t, err, io.EOF)
+	require.False(t, drop.Load())
+	// A transaction reply-read failure is ambiguous, but go-redis does not
+	// replay it. Replaying the transaction would increment the counter twice.
+	require.Equal(t, "1", rdb.Get(ctx, "transaction-counter").Val())
+}
