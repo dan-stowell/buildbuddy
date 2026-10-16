@@ -65,7 +65,7 @@ go_library(
 go_test(
     name = "build_event_handler_test",
     size = "small",
-    srcs = ["build_event_handler_test.go", "finalization_test.go"],
+    srcs = ["build_event_handler_test.go", "finalization_test.go", "target_finalization_test.go"],
     deps = [
         ":build_event_handler",
         "//server/build_event_protocol/build_event_server",
@@ -76,6 +76,8 @@ go_test(
         "//proto:invocation_go_proto",
         "//proto:invocation_status_go_proto",
         "//proto:publish_build_event_go_proto",
+        "//proto:target_go_proto",
+        "//proto/api/v1:common_go_proto",
         "//server/backends/chunkstore",
         "//server/backends/github",
         "//server/eventlog",
@@ -84,6 +86,7 @@ go_test(
         "//server/tables",
         "//server/testutil/testauth",
         "//server/testutil/testenv",
+        "//server/testutil/testclickhouse",
         "//server/testutil/testolapdb",
         "//server/testutil/testusage",
         "//server/usage/sku",
