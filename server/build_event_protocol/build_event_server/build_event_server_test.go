@@ -4,12 +4,15 @@ import (
 	"context"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/build_event_server"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testbes"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/buildbuddy-io/buildbuddy/server/util/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -145,3 +148,42 @@ func (c *TestBuildEventChannel) GetInitialSequenceNumber() int64              { 
 func (c *TestBuildEventChannel) Context() context.Context                     { return c.ctx }
 func (c *TestBuildEventChannel) FinalizeInvocation(invocationID string) error { return nil }
 func (c *TestBuildEventChannel) Close()                                       {}
+
+func TestBESRPCCancellationGrowth(t *testing.T) {
+	flags.Set(t, "grpc_server_worker_multiplier", 0)
+	env := testenv.GetTestEnv(t)
+	opened := make(chan struct{}, 1)
+	env.SetBuildEventHandler(&notifyingBESHandler{opened: opened})
+	server, err := build_event_server.NewBuildEventProtocolServer(env, false)
+	require.NoError(t, err)
+	grpcServer, run, lis := testenv.RegisterLocalGRPCServer(t, env)
+	pepb.RegisterPublishBuildEventServer(grpcServer, server)
+	go run()
+	conn, err := testenv.LocalGRPCConn(t, context.Background(), lis)
+	require.NoError(t, err)
+	client := pepb.NewPublishBuildEventClient(conn)
+	testleak.CheckGrowth(t, testleak.Growth{Iterations: 20}, func(int) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		stream, err := client.PublishBuildToolEventStream(ctx)
+		require.NoError(t, err)
+		require.NoError(t, stream.Send(&pepb.PublishBuildToolEventStreamRequest{
+			OrderedBuildEvent: &pepb.OrderedBuildEvent{StreamId: &bepb.StreamId{InvocationId: uuid.New()}, SequenceNumber: 1},
+		}))
+		select {
+		case <-opened:
+		case <-ctx.Done():
+			t.Fatal("channel did not open")
+		}
+		cancel()
+		_, err = stream.Recv()
+		require.Error(t, err)
+	})
+}
+
+type notifyingBESHandler struct{ opened chan struct{} }
+
+func (h *notifyingBESHandler) OpenChannel(ctx context.Context, id string) (interfaces.BuildEventChannel, error) {
+	h.opened <- struct{}{}
+	return &TestBuildEventChannel{ctx: ctx}, nil
+}
