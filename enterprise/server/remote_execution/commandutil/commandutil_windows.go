@@ -50,9 +50,8 @@ const (
 // process to the job object. When the job object is closed, the process
 // tree is killed.
 type process struct {
-	cmd         *exec.Cmd
-	terminated  chan struct{}
-	cleanupDone chan struct{}
+	cmd        *exec.Cmd
+	terminated chan struct{}
 
 	jobMu     sync.Mutex
 	jobHandle windows.Handle
