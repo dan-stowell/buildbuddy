@@ -1126,3 +1126,96 @@ func runPrintLogsWithCapturedStdout(t *testing.T, client bbspb.BuildBuddyService
 	require.NoError(t, err)
 	return string(out), printErr
 }
+
+// TestWorkspaceRoundTrip compares filesystem bytes and modes after the same git
+// apply operation used by ci_runner. All remotes are local temporary repos.
+func TestWorkspaceRoundTrip(t *testing.T) {
+	cases := []struct{ name, script string }{
+		{"modify", "printf changed > file"},
+		{"untracked", "printf added > added"},
+		{"empty_untracked", "touch empty"},
+		{"delete", "rm file"},
+		{"rename", "git mv file renamed"},
+		{"executable", "chmod +x file"},
+		{"symlink_add", "ln -s file link"},
+		{"symlink_change", "rm link; ln -s other link"},
+		{"binary_add", "printf '\\000\\001' > added"},
+		{"binary_modify", "printf '\\000\\002' > file"},
+		{"no_newline", "printf nonewline > file"},
+		{"crlf", "printf 'a\\r\\nb\\r\\n' > file"},
+		{"space_path", "printf added > 'a b'"},
+		{"unicode_path", "printf added > 'café'"},
+		{"large", "head -c 8388608 /dev/zero > file"},
+		{"ignored", "printf ignored > ignored"},
+		{"staged_and_unstaged", "printf staged > file; git add file; printf unstaged > file"},
+		{"staged_delete_recreate", "git rm file; printf recreated > file"},
+		{"ahead", "printf committed > file; git add file; git commit -m local"},
+		{"unpublished_branch", "git checkout -b local; printf committed > file; git add file; git commit -m local"},
+		{"no_upstream", "git branch --unset-upstream; printf changed > file"},
+		{"detached", "git checkout --detach; printf changed > file"},
+		{"behind", "git checkout -b future; printf future > file; git add file; git commit -m future; git update-ref refs/remotes/origin/master HEAD; git checkout master"},
+		{"merge_conflict", "git checkout -b side; printf side > file; git add file; git commit -m side; git checkout master; printf main > file; git add file; git commit -m main; git merge side || test -f .git/MERGE_HEAD"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			old, err := os.Getwd()
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, os.Chdir(old)) })
+			remote, _ := testgit.MakeTempRepo(t, map[string]string{"file": "original\n", "other": "other\n", ".gitignore": "ignored\n"})
+			testshell.Run(t, remote, "ln -s file link; git add link; git commit -m symlink")
+			local := testgit.MakeTempRepoClone(t, remote)
+			require.NoError(t, os.Chdir(local))
+			resetRepoRootPathForTest(t)
+			testshell.Run(t, local, tc.script)
+			config, err := Config()
+			require.NoError(t, err)
+			runner := testgit.MakeTempRepoClone(t, remote)
+			// The selected commit must actually be available from the remote.
+			testshell.Run(t, runner, "git checkout --detach "+config.CommitSHA)
+			for i, patch := range config.Patches {
+				path := filepath.Join(t.TempDir(), fmt.Sprintf("%d.patch", i))
+				require.NoError(t, os.WriteFile(path, patch, 0644))
+				testshell.Run(t, runner, fmt.Sprintf("git apply --verbose %q", path))
+			}
+			snapshot := func(root string) map[string]string {
+				result := map[string]string{}
+				require.NoError(t, filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+					if err != nil {
+						return err
+					}
+					rel, err := filepath.Rel(root, path)
+					if err != nil {
+						return err
+					}
+					if rel == ".git" {
+						return filepath.SkipDir
+					}
+					if entry.IsDir() || rel == "ignored" {
+						return nil
+					}
+					info, err := entry.Info()
+					if err != nil {
+						return err
+					}
+					var data []byte
+					if info.Mode()&os.ModeSymlink != 0 {
+						target, err := os.Readlink(path)
+						if err != nil {
+							return err
+						}
+						data = []byte(target)
+					} else {
+						data, err = os.ReadFile(path)
+						if err != nil {
+							return err
+						}
+					}
+					result[rel] = fmt.Sprintf("%s:%s", info.Mode(), data)
+					return nil
+				}))
+				return result
+			}
+			require.Equal(t, snapshot(local), snapshot(runner), "runner must reproduce local bytes, symlink targets, and modes")
+		})
+	}
+}
