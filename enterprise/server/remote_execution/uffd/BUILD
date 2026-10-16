@@ -24,13 +24,14 @@ go_library(
 
 go_test(
     name = "uffd_test",
-    srcs = ["uffd_test.go"],
+    srcs = ["uffd_test.go", "lifecycle_test.go"],
     embed = [":uffd"],
     target_compatible_with = [
         "@platforms//os:linux",
     ],
     deps = [
         "//enterprise/server/remote_execution/copy_on_write",
+        "//server/testutil/testleak",
         "@com_github_stretchr_testify//require",
         "@org_golang_x_sys//unix",
     ],
