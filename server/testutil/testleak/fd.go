@@ -19,8 +19,9 @@ import (
 type FDOption func(*fdConfig)
 
 type fdConfig struct {
-	settle time.Duration
-	ignore []*regexp.Regexp
+	settle  time.Duration
+	ignore  []*regexp.Regexp
+	allowGC bool
 }
 
 // IgnoreFDs makes CheckFDs ignore new file descriptors whose description
@@ -38,6 +39,19 @@ func IgnoreFDs(pattern string) FDOption {
 // closed before reporting a leak. The default is DefaultSettle.
 func FDSettle(d time.Duration) FDOption {
 	return func(c *fdConfig) { c.settle = d }
+}
+
+// AllowGC lets the garbage collector run normally while CheckFDs is in
+// progress. By default, CheckFDs holds the garbage collector (see below), so
+// that file descriptors that are dropped without being closed are reported
+// even though a finalizer would eventually close them. With AllowGC, such
+// leaks are only reported if no garbage collection happens to run before the
+// check. Use it only for tests that allocate so much that holding the GC is a
+// problem, or whose code under test depends on finalizers running, and say
+// why next to the call. It has no effect while another check (e.g. an
+// enclosing CheckFDs) is holding the GC.
+func AllowGC() FDOption {
+	return func(c *fdConfig) { c.allowGC = true }
 }
 
 // CheckFDs fails the test if any file descriptor opened after CheckFDs is
@@ -60,6 +74,15 @@ func FDSettle(d time.Duration) FDOption {
 // package, so in practice it has usually happened before a test starts, but
 // not always. CheckFDs makes sure the poller is initialized before taking its
 // snapshot, so these are never reported.
+//
+// *os.File, network connections and *os.Process (a pidfd) close their file
+// descriptor in a finalizer or cleanup when they are garbage collected. A
+// descriptor that is only closed that way is reported as a leak: from the
+// call to CheckFDs until the end of the check, the garbage collector is turned
+// off (with a memory limit of 1 GiB more than in use at the start, as a safety
+// net) and finalizers are held, so the result doesn't depend on GC timing.
+// The report says which leaked descriptors a forced GC closed afterwards. Use
+// AllowGC to opt out.
 func CheckFDs(t testing.TB, opts ...FDOption) {
 	t.Helper()
 	cfg := fdConfig{settle: DefaultSettle}
@@ -69,13 +92,27 @@ func CheckFDs(t testing.TB, opts ...FDOption) {
 	if !fdsSupported() {
 		return
 	}
+	var hold *gcHold
+	if !cfg.allowGC {
+		hold = holdGC()
+	}
+	releaseGC := func() {
+		if hold == nil {
+			return
+		}
+		if note := gcNote(hold.release()); note != "" {
+			t.Logf("%s", note)
+		}
+	}
 	warmNetpoller()
 	before, err := readFDs()
 	if err != nil {
+		releaseGC()
 		t.Logf("testleak: not checking file descriptors: %s", err)
 		return
 	}
 	t.Cleanup(func() {
+		defer releaseGC()
 		start := time.Now()
 		var leaked []fdEntry
 		for {
@@ -93,8 +130,10 @@ func CheckFDs(t testing.TB, opts ...FDOption) {
 			}
 			time.Sleep(20 * time.Millisecond)
 		}
-		t.Errorf("%s leaked file descriptors still open %s after the test (and its later-registered cleanups) finished:\n%s",
-			t.Name(), time.Since(start).Round(time.Millisecond), describeFDs(leaked))
+		elapsed := time.Since(start)
+		closedByGC := fdsClosedByGC(leaked)
+		t.Errorf("%s leaked file descriptors still open %s after the test (and its later-registered cleanups) finished:\n%s%s",
+			t.Name(), elapsed.Round(time.Millisecond), gcClosedNote(closedByGC), describeFDs(leaked, closedByGC))
 	})
 }
 
@@ -185,7 +224,8 @@ func (c *fdConfig) filter(fds []fdEntry) []fdEntry {
 
 const maxFDsReported = 100
 
-func describeFDs(fds []fdEntry) string {
+// describeFDs describes fds, marking the ones in closedByGC.
+func describeFDs(fds []fdEntry, closedByGC map[int]bool) string {
 	counts := map[string]int{}
 	for _, e := range fds {
 		counts[fdKind(e.target)]++
@@ -202,7 +242,11 @@ func describeFDs(fds []fdEntry) string {
 			fmt.Fprintf(&b, "  ... and %d more\n", len(fds)-i)
 			break
 		}
-		fmt.Fprintf(&b, "  fd %d -> %s\n", e.fd, e.desc)
+		fmt.Fprintf(&b, "  fd %d -> %s", e.fd, e.desc)
+		if closedByGC[e.fd] {
+			b.WriteString(" (closed by GC)")
+		}
+		b.WriteByte('\n')
 	}
 	return b.String()
 }
