@@ -1196,6 +1196,24 @@ func (s *ExecutionServer) execute(req *repb.ExecuteRequest, stream streamLike) e
 
 	// Check if there's already an identical action pending execution that this request can be merged into.
 	executionID, op := action_merger.GetOrCreateExecutionID(ctx, s.rdb, s.env.GetSchedulerService(), adInstanceDigest, action.DoNotCache)
+	for attempt := 1; op != action_merger.New; attempt++ {
+		// Record the merge before waiting on the execution. If the execution
+		// is being cancelled, this fails and a new execution is needed.
+		merged, err := action_merger.RecordMergedExecution(ctx, s.rdb, adInstanceDigest, executionID, s.getGroupIDForMetrics(ctx))
+		if err != nil {
+			log.CtxDebugf(ctx, "Error recording merged execution in Redis: %s", err)
+			break
+		}
+		if merged {
+			break
+		}
+		log.CtxInfof(ctx, "Execution %q was cancelled before execution request %q for invocation %q could be merged into it", executionID, downloadString, invocationID)
+		if attempt >= 2 {
+			executionID, op = adInstanceDigest.NewUploadString(), action_merger.New
+			break
+		}
+		executionID, op = action_merger.GetOrCreateExecutionID(ctx, s.rdb, s.env.GetSchedulerService(), adInstanceDigest, action.DoNotCache)
+	}
 	if op == action_merger.New {
 		log.CtxDebugf(ctx, "Scheduling new execution %s for %q for invocation %q", executionID, downloadString, invocationID)
 
@@ -1227,10 +1245,6 @@ func (s *ExecutionServer) execute(req *repb.ExecuteRequest, stream streamLike) e
 		metrics.RemoteExecutionMergedActions.With(prometheus.Labels{metrics.GroupID: s.getGroupIDForMetrics(ctx)}).Inc()
 		if err := s.insertInvocationLink(ctx, executionID, invocationID, sipb.StoredInvocationLink_MERGED); err != nil {
 			return status.UnavailableErrorf("link merged execution to invocation: %s", err)
-		}
-		err = action_merger.RecordMergedExecution(ctx, s.rdb, adInstanceDigest, s.getGroupIDForMetrics(ctx))
-		if err != nil {
-			log.Debugf("Error recording merged execution in Redis: %s", err)
 		}
 		if op == action_merger.Hedge {
 			// If the action_merger said to hedge this action, run another execution
@@ -2133,7 +2147,10 @@ func (s *ExecutionServer) Cancel(ctx context.Context, invocationID string) error
 
 		rn, err := digest.ParseUploadResourceName(id)
 		if err == nil {
-			merged, err := action_merger.CheckMerged(ctx, s.rdb, rn)
+			// Atomically check whether another request has merged into
+			// this execution and, if not, prevent further merges, so that no
+			// request merges into it before it is cancelled below.
+			merged, err := action_merger.StopMergingUnlessMerged(ctx, s.rdb, rn, id)
 			if err != nil {
 				log.CtxWarningf(ctx, "Error checking merge status of %q: %s", id, err)
 			}
