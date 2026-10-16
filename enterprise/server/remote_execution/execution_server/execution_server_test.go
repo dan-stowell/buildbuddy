@@ -3199,3 +3199,49 @@ func TestExecute_HedgingDisabledAvoidsCopyRegistry(t *testing.T) { testExecuteAv
 func TestExecute_NoHedgeDispatchedAvoidsCopyRegistry(t *testing.T) {
 	testExecuteAvoidsCopyRegistry(t, 1)
 }
+
+// Count merge-state commands on failure of an ordinary execution. Hedging is
+// enabled, but no second Execute (and hence no hedge dispatch) occurs.
+type mergeFailureRedisHook struct{ commands chan string }
+
+func (h *mergeFailureRedisHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
+	for _, arg := range cmd.Args() {
+		if strings.HasPrefix(fmt.Sprint(arg), "pendingExecution") || strings.HasPrefix(fmt.Sprint(arg), "executionCopies/") {
+			h.commands <- cmd.Name()
+			break
+		}
+	}
+	return ctx, nil
+}
+func (*mergeFailureRedisHook) AfterProcess(context.Context, redis.Cmder) error { return nil }
+func (h *mergeFailureRedisHook) BeforeProcessPipeline(ctx context.Context, cmds []redis.Cmder) (context.Context, error) {
+	for _, cmd := range cmds {
+		h.BeforeProcess(ctx, cmd)
+	}
+	return ctx, nil
+}
+func (*mergeFailureRedisHook) AfterProcessPipeline(context.Context, []redis.Cmder) error { return nil }
+
+func TestNoHedgeFailurePreservesBaselineMergeRedisWork(t *testing.T) {
+	flags.Set(t, "remote_execution.enable_action_merging", true)
+	flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
+	flags.Set(t, "remote_execution.action_merging_hedge_delay", time.Hour)
+	env, conn, _ := setupEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	arn := uploadAction(ctx, t, env, "", repb.DigestFunction_SHA256, &repb.Action{})
+	stream, err := repb.NewExecutionClient(conn).Execute(ctx, &repb.ExecuteRequest{ActionDigest: arn.GetDigest(), DigestFunction: arn.GetDigestFunction()})
+	require.NoError(t, err)
+	accepted, err := stream.Recv()
+	require.NoError(t, err)
+	require.Len(t, env.GetSchedulerService().(*schedulerServerMock).scheduleReqs, 1)
+	hook := &mergeFailureRedisHook{commands: make(chan string, 100)}
+	env.GetRemoteExecutionRedisClient().AddHook(hook)
+	require.NoError(t, env.GetRemoteExecutionService().MarkExecutionFailed(ctx, accepted.GetName(), status.UnavailableError("task lost")))
+	var commands []string
+	for len(hook.commands) > 0 {
+		commands = append(commands, <-hook.commands)
+	}
+	t.Logf("no-hedge failure merge Redis commands: %v", commands)
+	require.Empty(t, commands, "ordinary failure must preserve baseline merge-state Redis work")
+}
