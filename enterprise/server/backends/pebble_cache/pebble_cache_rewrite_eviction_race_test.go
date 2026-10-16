@@ -1,31 +1,26 @@
 package pebble_cache
 
-// This is an internal (white-box) test for the race described in task
-// repro-pebble-eviction: a blob rewrite publishes its backing (external) file
-// to the shared, key-derived path *before* it writes metadata under the
-// per-key lock. If eviction of the previous entry for the same key runs in
-// that window, it deletes the (now rewritten) shared file, and the rewrite
-// then publishes metadata that points at a file that no longer exists.
-//
-// The test uses the nil-in-production beforeWriteMetadataHook barrier to run
-// eviction deterministically inside that window, using the real doEvict code
-// path (which takes the per-key lock, validates the old atime, then deletes
-// the key and its backing file).
+// These tests attempt eviction after backing data publication. Local file
+// commits must keep the key locked until metadata publication completes.
 
 import (
 	"context"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
+	"github.com/buildbuddy-io/buildbuddy/server/util/lockmap"
+	"github.com/jonboulle/clockwork"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/filestore"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
-	"github.com/buildbuddy-io/buildbuddy/server/testutil/testdigest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
 	"github.com/buildbuddy-io/buildbuddy/server/util/approxlru"
 	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
 	"github.com/stretchr/testify/require"
 
+	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 	sgpb "github.com/buildbuddy-io/buildbuddy/proto/storage"
 )
 
@@ -36,10 +31,49 @@ func anonCtx(t *testing.T, env *testenv.TestEnv) context.Context {
 	return ctx
 }
 
-// evictOldEntryInWindow runs the real doEvict path against whatever metadata
-// is currently stored under key (which, when called from the write-commit
-// barrier, is the *old* entry for the digest being rewritten).
-func evictOldEntryInWindow(t *testing.T, pc *PebbleCache, ctx context.Context, key filestore.PebbleKey) {
+// observedCommitLocker lets the barrier distinguish eviction that can complete
+// synchronously from eviction blocked by the writer. No sleeps are needed.
+type observedCommitLocker struct {
+	lockmap.Locker[string]
+	held      atomic.Bool
+	attempted chan struct{}
+	armed     atomic.Bool
+}
+
+func (l *observedCommitLocker) Lock(key string) func() {
+	if l.armed.Swap(false) {
+		l.attempted <- struct{}{}
+	}
+	unlock := l.Locker.Lock(key)
+	l.held.Store(true)
+	return func() { l.held.Store(false); unlock() }
+}
+
+func observeCommitLock(pc *PebbleCache) *observedCommitLocker {
+	l := &observedCommitLocker{Locker: pc.locker, attempted: make(chan struct{}, 1)}
+	pc.locker = l
+	for _, e := range pc.evictors {
+		e.locker = l
+	}
+	return l
+}
+
+// Start eviction of an old sample from the data/metadata barrier. On baseline
+// it finishes inside the barrier and deletes the new file. With serialization
+// it reaches Lock and waits until Commit releases the key.
+func evictionAtCommitBarrier(l *observedCommitLocker, evict func()) <-chan struct{} {
+	held := l.held.Load()
+	l.armed.Store(true)
+	done := make(chan struct{})
+	go func() { evict(); close(done) }()
+	<-l.attempted
+	if !held {
+		<-done
+	}
+	return done
+}
+
+func oldEntryEviction(t *testing.T, pc *PebbleCache, ctx context.Context, key filestore.PebbleKey) func() {
 	db, err := pc.leaser.DB()
 	require.NoError(t, err)
 	defer db.Close()
@@ -56,7 +90,7 @@ func evictOldEntryInWindow(t *testing.T, pc *PebbleCache, ctx context.Context, k
 		Timestamp: time.UnixMicro(md.GetLastAccessUsec()),
 	}
 	require.Len(t, pc.evictors, 1)
-	pc.evictors[0].doEvict(sample)
+	return func() { pc.evictors[0].doEvict(sample) }
 }
 
 // TestRewriteEvictionRace_External FAILS on baseline: it demonstrates the bug.
@@ -80,7 +114,10 @@ func runRewriteEvictionRace(t *testing.T, blobSize int64) {
 	env := testenv.GetTestEnv(t)
 	ctx := anonCtx(t, env)
 
+	clock := clockwork.NewFakeClock()
 	opts := &Options{
+		Clock:                  clock,
+		MinEvictionAge:         new(time.Hour),
 		RootDirectory:          testfs.MakeTempDir(t),
 		MaxSizeBytes:           int64(1_000_000_000),
 		MaxInlineFileSizeBytes: 1024,
@@ -92,21 +129,24 @@ func runRewriteEvictionRace(t *testing.T, blobSize int64) {
 
 	// Same content => same digest => same key and same backing file path for
 	// both the initial write and the rewrite.
-	r, buf := testdigest.RandomCASResourceBuf(t, blobSize)
+	t.Log("seed=20261016")
+	d, buf, err := digest.UniformRandomGenerator(20261016).RandomDigestBuf(blobSize)
+	require.NoError(t, err)
+	r := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256).ToProto()
 
 	// Initial write of the entry ("v1").
 	require.NoError(t, pc.Set(ctx, r, buf))
 
-	// Arm the barrier so the next write's commit evicts the old entry in the
-	// window between publishing the backing file and writing metadata. It
-	// fires once.
+	clock.Advance(2 * time.Hour)
+	l := observeCommitLock(pc)
+	var evicted <-chan struct{}
 	beforeWriteMetadataHook = func(key filestore.PebbleKey) {
 		beforeWriteMetadataHook = nil
-		evictOldEntryInWindow(t, pc, ctx, key)
+		evict := oldEntryEviction(t, pc, ctx, key)
+		evicted = evictionAtCommitBarrier(l, evict)
 	}
-
-	// Rewrite the same digest ("v2"). Commit returns success.
 	require.NoError(t, pc.Set(ctx, r, buf))
+	<-evicted
 
 	// What a Bazel client sees first: FindMissing / Contains report the blob
 	// present (they only consult metadata, never the backing file). This holds

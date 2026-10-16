@@ -322,10 +322,8 @@ func BenchmarkSampleGenerator(b *testing.B) {
 	})
 }
 
-// Exercise the ordering allowed by wrapWriter: the data commit finishes,
-// eviction removes the old entry, then writeMetadata publishes the new entry.
-// The callback is the same metadata callback used by newWrappedWriter, with a
-// barrier inserted before it; no production implementation is replaced.
+// Attempt eviction between publication of backing data and metadata, using
+// the production writer path. Local file commits must serialize this eviction.
 func TestEvictionBetweenDataAndMetadataCommit(t *testing.T) {
 	for _, size := range []int64{128, 4096} {
 		t.Run(fmt.Sprint(size), func(t *testing.T) {
@@ -357,26 +355,20 @@ func TestEvictionBetweenDataAndMetadataCommit(t *testing.T) {
 			require.NoError(t, err)
 			sample := &approxlru.Sample[*evictionKey]{Key: &evictionKey{bytes: raw}, Timestamp: time.UnixMicro(old.GetLastAccessUsec()), SizeBytes: getSizeOnLocalDisk(raw, old, pc.includeMetadataSize)}
 			clock.Advance(2 * time.Hour)
-			var storage interfaces.MetadataWriteCloser
-			if size < 1024 {
-				storage = pc.fileStorer.InlineWriter(ctx, size)
-			} else {
-				storage, err = pc.fileStorer.FileWriter(ctx, pc.blobDirectory, record)
-				require.NoError(t, err)
+			l := observeCommitLock(pc)
+			var evicted <-chan struct{}
+			t.Cleanup(func() { beforeWriteMetadataHook = nil })
+			beforeWriteMetadataHook = func(_ filestore.PebbleKey) {
+				beforeWriteMetadataHook = nil
+				evicted = evictionAtCommitBarrier(l, func() { pc.evictors[0].doEvict(sample) })
 			}
-			committed := make(chan struct{})
-			evicted := make(chan struct{})
-			go func() { <-committed; pc.evictors[0].doEvict(sample); close(evicted) }()
-			writer, err := pc.wrapWriter(ctx, record, storage, false, nil, nil, func(md *sgpb.FileMetadata) error {
-				close(committed)
-				<-evicted
-				return pc.writeMetadata(ctx, db, key, md)
-			})
+			writer, err := pc.newWrappedWriter(ctx, record, key, false, nil)
 			require.NoError(t, err)
 			defer writer.Close()
 			_, err = writer.Write(data)
 			require.NoError(t, err)
 			require.NoError(t, writer.Commit())
+			<-evicted
 			present, err := pc.Contains(ctx, r)
 			require.NoError(t, err)
 			require.True(t, present)
