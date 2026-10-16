@@ -2757,3 +2757,39 @@ func TestWatchTaskLiveness_StopsWhenWatchersAreDone(t *testing.T) {
 	defer s.livenessMu.Unlock()
 	require.Empty(t, s.livenessWatches)
 }
+
+// A scheduler with a warm cache can offer an obsolete reservation. Redis lease
+// ownership must still prevent it from executing a claimed or completed task.
+func TestUnclaimedTaskStaleCacheLeaseSafety(t *testing.T) {
+	for _, shards := range []int{1, 3} {
+		t.Run(fmt.Sprintf("shards=%d", shards), func(t *testing.T) {
+			flags.Set(t, "remote_execution.unclaimed_tasks_shard_count", shards)
+			flags.Set(t, "remote_execution.unclaimed_tasks_cache_ttl", time.Hour)
+			env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+			s := env.GetSchedulerService().(*SchedulerServer)
+			ex := newFakeExecutor(ctx, t, env.GetSchedulerClient())
+			ex.Register()
+			id := scheduleTask(ctx, t, env, map[string]string{})
+			nextReservation(t, ex, id)
+			task, err := s.readTask(ctx, id)
+			require.NoError(t, err)
+			np := s.getOrCreatePool(nodePoolKey{os: task.metadata.GetOs(), arch: task.metadata.GetArch(), pool: task.metadata.GetPool(), groupID: task.metadata.GetExecutorGroupId()})
+			ids, err := np.SampleUnclaimedTasks(ctx, 100)
+			require.NoError(t, err)
+			require.Contains(t, ids, id)
+			lease := ex.Claim(id)
+			// Warm cache intentionally still contains the claimed task.
+			ids, err = np.SampleUnclaimedTasks(ctx, 100)
+			require.NoError(t, err)
+			require.Contains(t, ids, id)
+			_, err = ex.leaseTask(id, "")
+			require.Error(t, err, "stale reservation must not obtain a second lease")
+			require.NoError(t, lease.Finalize())
+			_, err = ex.leaseTask(id, "")
+			require.True(t, status.IsNotFoundError(err), "completed task must not be leased: %v", err)
+			members, err := env.GetRemoteExecutionRedisClient().ZRange(ctx, np.unclaimedTasksKey(id), 0, -1).Result()
+			require.NoError(t, err)
+			require.NotContains(t, members, id)
+		})
+	}
+}
