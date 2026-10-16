@@ -1240,6 +1240,16 @@ func testExecuteAndPublishOperation(t *testing.T, test publishTest) {
 			UsageStats:               usageStats,
 		},
 	}
+	// Use contiguous, fixed phase timestamps: fetch=1s, execute=3s,
+	// upload=1s. These must survive finalization without changing units.
+	md := actionResult.ExecutionMetadata
+	md.InputFetchStartTimestamp = tspb.New(workerStartTime)
+	md.InputFetchCompletedTimestamp = tspb.New(workerStartTime.Add(time.Second))
+	md.ExecutionStartTimestamp = md.InputFetchCompletedTimestamp
+	md.ExecutionCompletedTimestamp = tspb.New(workerStartTime.Add(4 * time.Second))
+	md.OutputUploadStartTimestamp = md.ExecutionCompletedTimestamp
+	md.OutputUploadCompletedTimestamp = tspb.New(workerEndTime)
+
 	if test.flexibleCompute {
 		// Memory-dominant size: 10 GiB memory => 4 BCU, which beats 1.5 CPU
 		// and tiny disk. Drives the flexible-compute SKU to a non-zero value.
@@ -1436,6 +1446,26 @@ func testExecuteAndPublishOperation(t *testing.T, test publishTest) {
 		WorkerStartTimestampUsec:     workerStartTime.UnixMicro(),
 		WorkerCompletedTimestampUsec: workerEndTime.UnixMicro(),
 	}
+	expectedExecution.InputFetchStartTimestampUsec = workerStartTime.UnixMicro()
+	expectedExecution.InputFetchCompletedTimestampUsec = workerStartTime.Add(time.Second).UnixMicro()
+	expectedExecution.ExecutionStartTimestampUsec = workerStartTime.Add(time.Second).UnixMicro()
+	expectedExecution.ExecutionCompletedTimestampUsec = workerStartTime.Add(4 * time.Second).UnixMicro()
+	expectedExecution.OutputUploadStartTimestampUsec = workerStartTime.Add(4 * time.Second).UnixMicro()
+	expectedExecution.OutputUploadCompletedTimestampUsec = workerEndTime.UnixMicro()
+	primaryRows := getExecutions(t, env)
+	if test.flagOverrides["remote_execution.write_executions_to_primary_db"] != false {
+		require.Len(t, primaryRows, 1)
+		assert.Equal(t, expectedExecution.InputFetchStartTimestampUsec, primaryRows[0].InputFetchStartTimestampUsec)
+		assert.Equal(t, expectedExecution.InputFetchCompletedTimestampUsec, primaryRows[0].InputFetchCompletedTimestampUsec)
+		assert.Equal(t, expectedExecution.ExecutionStartTimestampUsec, primaryRows[0].ExecutionStartTimestampUsec)
+		assert.Equal(t, expectedExecution.ExecutionCompletedTimestampUsec, primaryRows[0].ExecutionCompletedTimestampUsec)
+		assert.Equal(t, expectedExecution.OutputUploadStartTimestampUsec, primaryRows[0].OutputUploadStartTimestampUsec)
+		assert.Equal(t, expectedExecution.OutputUploadCompletedTimestampUsec, primaryRows[0].OutputUploadCompletedTimestampUsec)
+
+	} else {
+		assert.Empty(t, primaryRows)
+	}
+
 	if !test.flexibleCompute {
 		expectedExecution.RequestedComputeUnits = 2.5
 	} else {
