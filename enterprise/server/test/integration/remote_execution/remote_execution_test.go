@@ -3234,5 +3234,3 @@ func TestActionMerging_HedgeResultReachesWaitingClients(t *testing.T) {
 	assert.Equal(t, hb1, hb2, "canonical execution kept running after the hedge succeeded")
 }
 
-// Cancelling every invocation that is waiting on a merged+hedged action should
-// stop both copies of the action.

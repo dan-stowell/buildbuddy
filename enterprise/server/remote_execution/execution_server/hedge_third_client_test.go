@@ -11,10 +11,6 @@ import (
 	"time"
 )
 
-type hedgeSchedulerMock struct{ *schedulerServerMock }
-
-func (*hedgeSchedulerMock) ExistsTask(context.Context, string) (bool, error) { return true, nil }
-
 func TestHedgeWinnerCompletesThirdMergedClient(t *testing.T) {
 	flags.Set(t, "remote_execution.enable_action_merging", true)
 	flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
