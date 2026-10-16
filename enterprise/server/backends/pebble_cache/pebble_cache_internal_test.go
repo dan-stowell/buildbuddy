@@ -9,11 +9,16 @@ import (
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/filestore"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/pebble"
+	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/mockgcs"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/util/approxlru"
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
 	"github.com/buildbuddy-io/buildbuddy/server/util/lockmap"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/jonboulle/clockwork"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -315,4 +320,72 @@ func BenchmarkSampleGenerator(b *testing.B) {
 		for range e.samples {
 		}
 	})
+}
+
+// Exercise the ordering allowed by wrapWriter: the data commit finishes,
+// eviction removes the old entry, then writeMetadata publishes the new entry.
+// The callback is the same metadata callback used by newWrappedWriter, with a
+// barrier inserted before it; no production implementation is replaced.
+func TestEvictionBetweenDataAndMetadataCommit(t *testing.T) {
+	for _, size := range []int64{128, 4096} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			env := testenv.GetTestEnv(t)
+			ctx, err := prefix.AttachUserPrefixToContext(context.Background(), env.GetAuthenticator())
+			require.NoError(t, err)
+			clock := clockwork.NewFakeClock()
+			pc, err := NewPebbleCache(env, &Options{RootDirectory: t.TempDir(), MaxSizeBytes: 100_000_000, Clock: clock, MaxInlineFileSizeBytes: 1024, MinEvictionAge: new(time.Hour), MinBytesAutoZstdCompression: new(int64(1 << 60))})
+			require.NoError(t, err)
+			require.NoError(t, pc.Start())
+			defer pc.Stop()
+			gen := digest.UniformRandomGenerator(20261016)
+			t.Log("seed=20261016")
+			d, data, err := gen.RandomDigestBuf(size)
+			require.NoError(t, err)
+			r := digest.NewResourceName(d, "", rspb.CacheType_CAS, repb.DigestFunction_SHA256).ToProto()
+			require.NoError(t, pc.Set(ctx, r, data))
+			record, err := pc.makeFileRecord(pc.userGroupID(ctx), nil, r)
+			require.NoError(t, err)
+			key, err := pc.fileStorer.PebbleKey(record)
+			require.NoError(t, err)
+			db, err := pc.leaser.DB()
+			require.NoError(t, err)
+			defer db.Close()
+			old := &sgpb.FileMetadata{}
+			version, err := pc.lookupFileMetadataAndVersion(ctx, db, key, old)
+			require.NoError(t, err)
+			raw, err := key.Bytes(version)
+			require.NoError(t, err)
+			sample := &approxlru.Sample[*evictionKey]{Key: &evictionKey{bytes: raw}, Timestamp: time.UnixMicro(old.GetLastAccessUsec()), SizeBytes: getSizeOnLocalDisk(raw, old, pc.includeMetadataSize)}
+			clock.Advance(2 * time.Hour)
+			var storage interfaces.MetadataWriteCloser
+			if size < 1024 {
+				storage = pc.fileStorer.InlineWriter(ctx, size)
+			} else {
+				storage, err = pc.fileStorer.FileWriter(ctx, pc.blobDirectory, record)
+				require.NoError(t, err)
+			}
+			committed := make(chan struct{})
+			evicted := make(chan struct{})
+			go func() { <-committed; pc.evictors[0].doEvict(sample); close(evicted) }()
+			writer, err := pc.wrapWriter(ctx, record, storage, false, nil, nil, func(md *sgpb.FileMetadata) error {
+				close(committed)
+				<-evicted
+				return pc.writeMetadata(ctx, db, key, md)
+			})
+			require.NoError(t, err)
+			defer writer.Close()
+			_, err = writer.Write(data)
+			require.NoError(t, err)
+			require.NoError(t, writer.Commit())
+			present, err := pc.Contains(ctx, r)
+			require.NoError(t, err)
+			require.True(t, present)
+			missing, err := pc.FindMissing(ctx, []*rspb.ResourceName{r})
+			require.NoError(t, err)
+			require.Empty(t, missing)
+			got, err := pc.Get(ctx, r)
+			require.NoError(t, err, "successful write must remain readable after old-entry eviction")
+			require.Equal(t, data, got)
+		})
+	}
 }
