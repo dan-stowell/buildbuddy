@@ -22,6 +22,7 @@ go_test(
     deps = [
         ":compression",
         "//server/testutil/testdigest",
+        "//server/testutil/testleak",
         "//server/util/bytebufferpool",
         "//server/util/ioutil",
         "@com_github_google_go_cmp//cmp",

@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
+	"runtime"
 	"strconv"
 	"testing"
 
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testdigest"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/bytebufferpool"
 	"github.com/buildbuddy-io/buildbuddy/server/util/compression"
 	"github.com/buildbuddy-io/buildbuddy/server/util/ioutil"
@@ -382,4 +385,32 @@ func TestNewZstdCompressingWriteCommiter(t *testing.T) {
 	require.Greater(t, len(src), int(commited))
 	require.NoError(t, compressWC.Close())
 	require.True(t, closed)
+}
+
+func TestZstdErrorCleanupGrowth(t *testing.T) {
+	path := t.TempDir() + "/corrupt.zstd"
+	require.NoError(t, os.WriteFile(path, []byte("invalid zstd"), 0600))
+	// Keep closed readers reachable so GC cannot mask a missing Close.
+	var closedReaders []io.ReadCloser
+	testleak.CheckGrowth(t, testleak.Growth{Iterations: 20}, func(int) {
+		f, err := os.Open(path)
+		require.NoError(t, err)
+		r, err := compression.NewZstdDecompressingReader(f)
+		require.NoError(t, err)
+		_, err = io.Copy(io.Discard, r)
+		require.Error(t, err)
+		require.NoError(t, r.Close())
+		closedReaders = append(closedReaders, r)
+		d, err := compression.NewZstdDecompressor(io.Discard)
+		require.NoError(t, err)
+		_, writeErr := d.Write([]byte("invalid zstd"))
+		closeErr := d.Close()
+		require.True(t, writeErr != nil || closeErr != nil)
+		w, err := compression.NewZstdCompressingWriter(&erroringWriter{}, bufPool, 4)
+		require.NoError(t, err)
+		_, err = w.Write([]byte("data"))
+		require.Error(t, err)
+		require.Error(t, w.Close())
+	})
+	runtime.KeepAlive(closedReaders)
 }
