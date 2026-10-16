@@ -22,7 +22,7 @@ go_library(
 
 go_test(
     name = "action_merger_test",
-    srcs = ["action_merger_test.go"],
+    srcs = ["action_merger_test.go", "lease_race_test.go"],
     embed = [":action_merger"],
     deps = [
         "@com_github_go_redis_redis_v8//:redis",
