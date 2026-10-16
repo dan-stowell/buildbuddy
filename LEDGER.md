@@ -82,13 +82,14 @@ Branch convention: `leak/det-*` detector work, `leak/repro-*` reproducers (no fi
 | V16-x | Process stats monitor opens a pidfd per process per poll, closed only by GC (bounded churn, not leak) — possible executor FD-churn follow-up | bounded by GC |
 | HARNESS-4 | Warmup must complete server-side connection setup (one full RPC) before CheckGrowth baseline; tests sharing a binary with tests that leave processes running see GC-reclaimed pidfds → isolate lifecycle tests in their own target | test design |
 | V17-x | uffd: setup msg that fails to parse leaks the FDs it carried (SCM_RIGHTS) | unverified follow-up |
+| V19-x | ociruntime existing TestCreateFailureHasStderr flaked 1/30 (crun error message check) | unrelated pre-existing flake |
 | I5-fp1 | runner pool Wait() before Shutdown hangs | pendingRemovals counts cached runners — intentional reuse |
 | I1-fp1 | 1 extra goroutine in count polling | testify `Eventually` spawns predicate goroutine — harness artifact; use synchronous polling |
 
 ## Enforcement progress
 | Test target | Check enabled | Stable runs | Notes |
 |---|---|---|---|
-| **Round 2 (E2 Codex → V19 Claude review/rebase)**: pebble blob lifecycle, pubsub live-log cancel, ociruntime image unlock, execution waiter cleanup, scheduler registration, gcs reader/writer, BES RPC cancel, ByteStream zstd write cancel, compression error cleanup | CheckGrowth (+ Redis/XREAD/eviction assertions) | 20/20 each (pre --config=remote); each with production mutation caught | `leak/enforce-v2` aae09d58 → rebasing as `leak/pr-enforce2` on #66 |
+| **Round 2 (E2 Codex → V19 Claude review/rebase)**: pebble blob lifecycle, pubsub live-log cancel, ociruntime image unlock, execution waiter cleanup, scheduler registration, gcs reader/writer, BES RPC cancel, ByteStream zstd write cancel, compression error cleanup | CheckGrowth (+ Redis/XREAD/eviction assertions) | **30/30 each with --config=remote** (Claude V19; fixed OCI test GC-timing flake from testregistry port-lock FD; 4 mutations independently re-checked) | **Draft PR #84 (stacked on #66)** `leak/pr-enforce2` 811733ff |
 | grpc_client, healthcheck, db, pubsub, scheduler_server | +CheckFDs (Check existed) | 30/30 each | `leak/enforce-v1` (one commit each) |
 | operation (publisher lifecycle), task_leaser:lifecycle_test | Check+CheckFDs | 30/30 | from I5 audit |
 | grpc_client TestPoolRepeatedLifecycleResources | Check+CheckFDs+CheckGrowth | 30/30 | from I3 |
