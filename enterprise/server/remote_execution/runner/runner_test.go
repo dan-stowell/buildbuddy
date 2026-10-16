@@ -1315,3 +1315,82 @@ func TestTransientErrorExitCodes(t *testing.T) {
 		})
 	}
 }
+
+// recordingProvider records the platform properties that each container was
+// created with.
+type recordingProvider struct {
+	mu    sync.Mutex
+	props []*platform.Properties
+}
+
+func (p *recordingProvider) New(ctx context.Context, args *container.Init) (container.CommandContainer, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.props = append(p.props, args.Props)
+	return NewFakeContainer(), nil
+}
+
+// Platform properties can be set either in the Action/Command platform or via
+// remote headers (x-buildbuddy-platform.<name>), which are stored in
+// ExecutionTask.PlatformOverrides. Container-level properties such as
+// dockerUser / dockerNetwork are only applied when the container is created,
+// so a recycled runner must not be handed to a task that requests different
+// container-level properties, regardless of where the property was set.
+func TestRunnerPool_CannotTakeRunnerWithDifferentContainerProps(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		viaHeader bool
+	}{
+		{name: "ViaCommandPlatform", viaHeader: false},
+		{name: "ViaRemoteHeaderOverride", viaHeader: true},
+	} {
+		for _, prop := range []struct{ name, v1, v2 string }{
+			{"dockerUser", "1000", "root"},
+			{"dockerNetwork", "off", "bridge"},
+		} {
+			t.Run(tc.name+"/"+prop.name, func(t *testing.T) {
+				env := newTestEnv(t)
+				provider := &recordingProvider{}
+				cfg := noLimitsCfg()
+				cfg.PoolOptions = &PoolOptions{ContainerProvider: provider}
+				pool := newRunnerPool(t, env, cfg)
+				ctx := withAuthenticatedUser(t, context.Background(), env, "US1")
+
+				mk := func(v string) *repb.ScheduledTask {
+					task := newTask()
+					p := &repb.Platform_Property{Name: prop.name, Value: v}
+					if tc.viaHeader {
+						task.ExecutionTask.PlatformOverrides = &repb.Platform{
+							Properties: []*repb.Platform_Property{p},
+						}
+					} else {
+						task.ExecutionTask.Command.Platform.Properties = append(
+							task.ExecutionTask.Command.Platform.Properties, p)
+					}
+					return task
+				}
+
+				r1 := mustGet(t, ctx, pool, mk(prop.v1))
+				pool.TryRecycle(ctx, r1, true)
+				require.Equal(t, 1, pool.PausedRunnerCount())
+
+				task2 := mk(prop.v2)
+				r2, err := get(ctx, pool, task2)
+				require.NoError(t, err)
+				mustRun(t, r2)
+				defer pool.TryRecycle(ctx, r2, true)
+
+				provider.mu.Lock()
+				created := len(provider.props)
+				firstUser, firstNet := provider.props[0].DockerUser, provider.props[0].DockerNetwork
+				provider.mu.Unlock()
+				t.Logf("task2 requested %s=%q; containers created=%d; first container DockerUser=%q DockerNetwork=%q",
+					prop.name, prop.v2, created, firstUser, firstNet)
+				assert.NotSame(t, r1, r2,
+					"task requesting %s=%q was given a recycled runner whose container was created with %s=%q",
+					prop.name, prop.v2, prop.name, prop.v1)
+				assert.Equal(t, 2, created, "expected a new container for task with different %s", prop.name)
+			})
+		}
+	}
+}
