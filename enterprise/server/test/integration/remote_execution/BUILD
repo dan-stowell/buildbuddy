@@ -60,3 +60,28 @@ go_test(
         "@org_golang_x_sync//errgroup",
     ],
 )
+
+go_test(
+    name = "lease_hard_stop_test",
+    size = "large",
+    srcs = ["lease_hard_stop_test.go"],
+    exec_properties = {
+        "test.EstimatedComputeUnits": "8",
+    },
+    tags = ["cpu:4"],
+    deps = [
+        "//enterprise/server/remote_execution/operation",
+        "//enterprise/server/scheduling/scheduler_server",
+        "//enterprise/server/test/integration/remote_execution/rbeclient",
+        "//enterprise/server/test/integration/remote_execution/rbetest",
+        "//proto:remote_execution_go_proto",
+        "//server/interfaces",
+        "//server/util/grpc_client",
+        "//server/util/log",
+        "//server/util/testing/flags",
+        "@com_github_google_uuid//:uuid",
+        "@com_github_stretchr_testify//require",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//metadata",
+    ],
+)

@@ -114,7 +114,12 @@ type schedulerOpts struct {
 
 func getEnv(t *testing.T, opts *schedulerOpts, user string) (*testenv.TestEnv, context.Context) {
 	testleak.Check(t)
-	redisTarget := testredis.Start(t).Target
+	return getEnvWithRedis(t, opts, user, testredis.Start(t).Target)
+}
+
+// getEnvWithRedis is like getEnv, but uses the given Redis, so that several
+// scheduler servers (app replicas) can share one Redis.
+func getEnvWithRedis(t *testing.T, opts *schedulerOpts, user, redisTarget string) (*testenv.TestEnv, context.Context) {
 	env := enterprise_testenv.GetCustomTestEnv(t, &enterprise_testenv.Options{
 		RedisTarget: redisTarget,
 	})

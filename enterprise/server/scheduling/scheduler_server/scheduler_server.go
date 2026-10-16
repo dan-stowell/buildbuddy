@@ -2054,10 +2054,12 @@ func (s *SchedulerServer) deleteClaimedTask(ctx context.Context, taskID string) 
 	return nil
 }
 
-func (s *SchedulerServer) unclaimTask(ctx context.Context, taskID, leaseID, reconnectToken string) error {
+// unclaimTask releases the claim on a task. If reconnectToken is set, only the
+// lease holder can reclaim the task (using the token) for reconnectGrace.
+func (s *SchedulerServer) unclaimTask(ctx context.Context, taskID, leaseID, reconnectToken string, reconnectGrace time.Duration) error {
 	var reconnectPeriodEnd time.Time
 	if reconnectToken != "" {
-		reconnectPeriodEnd = time.Now().Add(*leaseReconnectGracePeriod)
+		reconnectPeriodEnd = time.Now().Add(reconnectGrace)
 	}
 	// The script will return 1 if the task is claimed & claim has been released.
 	r, err := redisReleaseClaim.Run(
@@ -2364,6 +2366,7 @@ func (s *SchedulerServer) LeaseTask(stream scpb.Scheduler_LeaseTaskServer) error
 		ctx, cancel := background.ExtendContextForFinalization(ctx, 3*time.Second)
 		defer cancel()
 		reEnqueueReason := "stream closed with task still claimed"
+		reconnectGrace := *leaseReconnectGracePeriod
 		if !schedulerShuttingDown {
 			// TODO: figure out if we can reliably detect whether the executor
 			// gave up on the lease due to an executor shutdown vs. a transient
@@ -2371,8 +2374,15 @@ func (s *SchedulerServer) LeaseTask(stream scpb.Scheduler_LeaseTaskServer) error
 			// get a reconnect grace period, since the executor should quickly
 			// retry them.
 			reconnectToken = ""
+		} else {
+			// If the stream ended without the executor seeing a "shutting
+			// down" response (e.g. the server was hard-stopped), the executor
+			// only notices when it next sends a message: at its next lease
+			// renewal at the latest. Hold the task for it until then.
+			untilRenewal := s.leaseDuration - s.clock.Since(lastCheckin)
+			reconnectGrace += max(0, min(untilRenewal, s.leaseDuration))
 		}
-		if err := s.reEnqueueTask(ctx, taskID, leaseID, reconnectToken, probesPerTask, reEnqueueReason); err != nil {
+		if err := s.reEnqueueTaskWithReconnectGrace(ctx, taskID, leaseID, reconnectToken, reconnectGrace, probesPerTask, reEnqueueReason); err != nil {
 			log.CtxErrorf(ctx, "LeaseTask %q tried to re-enqueue task but failed with err: %s", taskID, err.Error())
 		} // Success case will be logged by ReEnqueueTask flow.
 	}()
@@ -2515,7 +2525,7 @@ func (s *SchedulerServer) LeaseTask(stream scpb.Scheduler_LeaseTaskServer) error
 			// "release" was deprecated in favor of "reEnqueue" but remains
 			// for backwards compatibility with older executors.
 
-			err := s.unclaimTask(ctx, taskID, leaseID, "" /*reconnectToken*/)
+			err := s.unclaimTask(ctx, taskID, leaseID, "" /*reconnectToken*/, 0 /*=reconnectGrace*/)
 			// a "permission denied" error means that the lease is already owned
 			// by someone else.
 			if err == nil || status.IsPermissionDeniedError(err) {
@@ -3185,6 +3195,13 @@ func (s *SchedulerServer) EnqueueTaskReservation(ctx context.Context, req *scpb.
 }
 
 func (s *SchedulerServer) reEnqueueTask(ctx context.Context, taskID, leaseID, reconnectToken string, numReplicas int, reason string) error {
+	return s.reEnqueueTaskWithReconnectGrace(ctx, taskID, leaseID, reconnectToken, *leaseReconnectGracePeriod, numReplicas, reason)
+}
+
+// reEnqueueTaskWithReconnectGrace is like reEnqueueTask, but if reconnectToken
+// is set, the task is held for the lease holder to reconnect for the given
+// grace period (instead of the default) before it's offered to other executors.
+func (s *SchedulerServer) reEnqueueTaskWithReconnectGrace(ctx context.Context, taskID, leaseID, reconnectToken string, reconnectGrace time.Duration, numReplicas int, reason string) error {
 	if taskID == "" {
 		return status.FailedPreconditionError("A task_id is required")
 	}
@@ -3228,7 +3245,7 @@ func (s *SchedulerServer) reEnqueueTask(ctx context.Context, taskID, leaseID, re
 		return nil
 	}
 
-	if err := s.unclaimTask(ctx, taskID, leaseID, reconnectToken); err != nil {
+	if err := s.unclaimTask(ctx, taskID, leaseID, reconnectToken, reconnectGrace); err != nil {
 		// A "permission denied" error means the task is already claimed
 		// by a different leaseholder so we shouldn't touch it.
 		if status.IsPermissionDeniedError(err) {
@@ -3252,7 +3269,7 @@ func (s *SchedulerServer) reEnqueueTask(ctx context.Context, taskID, leaseID, re
 
 	delay := time.Duration(0)
 	if reconnectToken != "" {
-		delay = *leaseReconnectGracePeriod
+		delay = reconnectGrace
 	}
 	enqueueRequest := &scpb.EnqueueTaskReservationRequest{
 		TaskId:             taskID,
