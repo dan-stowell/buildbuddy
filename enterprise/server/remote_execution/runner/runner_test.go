@@ -1330,8 +1330,8 @@ func diagFDs() map[string]string {
 		if strings.Contains(tgt, "pidfd") {
 			info, _ := os.ReadFile("/proc/self/fdinfo/" + e.Name())
 			for l := range strings.SplitSeq(string(info), "\n") {
-				if strings.HasPrefix(l, "Pid:") {
-					pid := strings.TrimSpace(strings.TrimPrefix(l, "Pid:"))
+				if rest, ok := strings.CutPrefix(l, "Pid:"); ok {
+					pid := strings.TrimSpace(rest)
 					cmd, _ := os.ReadFile("/proc/" + pid + "/cmdline")
 					st, _ := os.ReadFile("/proc/" + pid + "/stat")
 					tgt += " pid=" + pid + " cmd=" + strings.ReplaceAll(string(cmd), "\x00", " ") + " stat=" + string(st)
