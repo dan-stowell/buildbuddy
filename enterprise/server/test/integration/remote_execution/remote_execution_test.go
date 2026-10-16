@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -2883,6 +2884,17 @@ func workerStderr(t *testing.T, rbe *rbetest.Env, res *rbeclient.CommandResult) 
 	return stderr
 }
 
+// unresponsiveWorkerHangSeconds returns how long the test worker hangs, which
+// can be overridden with UNRESPONSIVE_WORKER_HANG_SECONDS.
+func unresponsiveWorkerHangSeconds(t *testing.T) int {
+	if v := os.Getenv("UNRESPONSIVE_WORKER_HANG_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		require.NoError(t, err)
+		return n
+	}
+	return 12
+}
+
 func hangInputRoot(t *testing.T, seconds int) string {
 	dir := testfs.MakeTempDir(t)
 	testfs.WriteAllFileContents(t, dir, map[string]string{"hang": fmt.Sprintf("%d", seconds)})
@@ -2902,8 +2914,8 @@ func receiveRunRecord(t *testing.T, records <-chan *runRecord, timeout time.Dura
 func TestPersistentWorker_UnresponsiveWorker_ActionTimeout(t *testing.T) {
 	const (
 		actionTimeout = 2 * time.Second
-		workerHang    = 12 // seconds; bounded so the worker always exits
 	)
+	workerHang := unresponsiveWorkerHangSeconds(t) // bounded so the worker always exits
 	rbe := rbetest.NewRBETestEnv(t)
 	rbe.AddBuildBuddyServer()
 	started := make(chan time.Time, 10)
@@ -2942,7 +2954,7 @@ func TestPersistentWorker_UnresponsiveWorker_ActionTimeout(t *testing.T) {
 }
 
 func TestPersistentWorker_UnresponsiveWorker_InvocationCancellation(t *testing.T) {
-	const workerHang = 12 // seconds; bounded so the worker always exits
+	workerHang := unresponsiveWorkerHangSeconds(t) // bounded so the worker always exits
 	rbe := rbetest.NewRBETestEnv(t)
 	bbServer := rbe.AddBuildBuddyServer()
 	started := make(chan time.Time, 10)
