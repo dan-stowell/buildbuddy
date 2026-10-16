@@ -213,7 +213,7 @@ func (c *tfObservedChannel) HandleEvent(req *pepb.PublishBuildToolEventStreamReq
 	return nil
 }
 
-func runTargetStatusFlush(t *testing.T, ending streamEnding, olap bool) {
+func runTargetStatusFlush(t *testing.T, ending streamEnding, olap bool, partial ...bool) {
 	te := testenv.GetTestEnv(t)
 	flags.Set(t, "app.enable_target_tracking", true)
 	flags.Set(t, "app.enable_write_test_target_statuses_to_olap_db", olap)
@@ -242,6 +242,17 @@ func runTargetStatusFlush(t *testing.T, ending streamEnding, olap bool) {
 
 	iid := uuid.New()
 	events := tfEventsThroughFinished()
+	if len(partial) > 0 && partial[0] {
+		// A TestResult (including a failing shard) is not a TestSummary.
+		// Preserve configured/completed targets, but omit their summaries.
+		filtered := make([]*bspb.BuildEvent, 0, len(events))
+		for _, ev := range events {
+			if ev.GetTestSummary() == nil {
+				filtered = append(filtered, ev)
+			}
+		}
+		events = filtered
+	}
 	if ending == endWithLastMessage {
 		events = append(events, tfTrailingEvents()...)
 	}
@@ -302,10 +313,20 @@ func runTargetStatusFlush(t *testing.T, ending streamEnding, olap bool) {
 	}
 	require.NoError(t, err)
 	t.Logf("ending=%s olap=%t stored target statuses: %v", ending, olap, rows)
-	require.Equal(t, []tfStatusRow{
+	expected := []tfStatusRow{
 		{Label: "//pkg:fail_test", Status: int32(bspb.TestStatus_FAILED)},
 		{Label: "//pkg:pass_test", Status: int32(bspb.TestStatus_PASSED)},
-	}, rows, "COMPLETE invocation %s (ending=%s) should have its test target statuses stored", iid, ending)
+	}
+	if len(partial) > 0 && partial[0] {
+		if olap {
+			expected = nil // OLAP deliberately excludes NO_STATUS targets.
+		} else {
+			for i := range expected {
+				expected[i].Status = int32(bspb.TestStatus_NO_STATUS)
+			}
+		}
+	}
+	require.Equal(t, expected, rows, "invocation %s ending=%s", iid, ending)
 }
 
 func TestTargetStatusFlushOnStreamEnd(t *testing.T) {
@@ -403,6 +424,18 @@ func TestTargetStatusFlushRetry(t *testing.T) {
 					wantAttempt = 1
 				}
 				require.Equal(t, wantAttempt, inv.Attempt)
+			})
+		}
+	}
+}
+
+// Both end paths must preserve the existing semantics for missing summaries:
+// individual shard results cannot establish the overall status of a target.
+func TestTargetStatusFlushMissingSummary(t *testing.T) {
+	for _, olap := range []bool{false, true} {
+		for _, ending := range []streamEnding{endWithLastMessage, endWithEOFAfterFinished, endWithCancelAfterFinished} {
+			t.Run(fmt.Sprintf("%s/olap=%t", ending, olap), func(t *testing.T) {
+				runTargetStatusFlush(t, ending, olap, true)
 			})
 		}
 	}
