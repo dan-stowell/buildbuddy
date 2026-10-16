@@ -250,6 +250,13 @@ func startNewProcess(ctx context.Context, cmd *exec.Cmd) (*process, error) {
 		case <-p.terminated:
 			return
 		case <-ctx.Done():
+			// If both channels are ready, prefer not to signal: once Wait has
+			// returned, the pids may have been reused.
+			select {
+			case <-p.terminated:
+				return
+			default:
+			}
 			if err := p.killProcessTree(); err != nil {
 				log.Warningf("Failed to kill process tree: %s", err)
 			}
@@ -335,6 +342,8 @@ func forwardSignals(ctx context.Context, process *process, ch <-chan syscall.Sig
 			if err := process.signal(s); err != nil {
 				log.CtxWarningf(ctx, "Failed to send signal %q: %s", s, err)
 			}
+		case <-process.terminated:
+			return
 		case <-ctx.Done():
 			return
 		}

@@ -125,7 +125,27 @@ func (p *process) killProcessTree() error {
 		}
 	}
 
+	// The root may already have exited and been reaped by exec.Cmd.Wait while
+	// Wait is still draining output pipes inherited by background children.
+	// Such children have been reparented and cannot be discovered by the BFS.
+	// Kill the original process group as well, to release their pipe handles.
+	// Only do this if the root was started as a process group leader: then
+	// the group ID cannot be reused while any of the command's processes
+	// remain in the group. Otherwise -pid does not name the command's group
+	// and, once the root is reaped, could name an unrelated one.
+	if p.isProcessGroupLeader() {
+		if err := syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+			lastErr = err
+		}
+	}
 	return lastErr
+}
+
+// isProcessGroupLeader returns whether the command was started in a new
+// process group whose ID equals the root pid.
+func (p *process) isProcessGroupLeader() bool {
+	attr := p.cmd.SysProcAttr
+	return attr != nil && (attr.Setsid || (attr.Setpgid && attr.Pgid == 0))
 }
 
 // SetCredential adds credentials to the cmd by resolving a "USER[:GROUP]"
