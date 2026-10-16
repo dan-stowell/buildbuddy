@@ -1390,6 +1390,9 @@ func (s *ExecutionServer) waitExecution(ctx context.Context, req *repb.WaitExecu
 				return err
 			}
 			if pending {
+				if err := s.MarkExecutionFailed(ctx, req.GetName(), status.NotFoundError("canonical task lost")); err != nil {
+					return err
+				}
 				taskLost = nil
 				continue
 			}

@@ -72,6 +72,7 @@ go_test(
     size = "small",
     srcs = ["execution_server_test.go"],
     deps = [
+ "@com_google_cloud_go_longrunning//autogen/longrunningpb",
         ":execution_server",
         "//enterprise/server/backends/redis_execution_collector",
         "//enterprise/server/experiments",

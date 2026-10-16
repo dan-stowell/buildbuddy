@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"cloud.google.com/go/longrunning/autogen/longrunningpb"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/backends/redis_execution_collector"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/experiments"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/execution_server"
@@ -3075,4 +3076,86 @@ func TestHedgeCancelLastMergedInvocation(t *testing.T) {
 	require.Equal(t, 0, scheduler.canceledCount, "other invocation still needs the original and hedge")
 	require.NoError(t, env.GetRemoteExecutionService().Cancel(ctx, invocations[1]))
 	require.Equal(t, 2, scheduler.canceledCount, "last invocation cancellation must cancel both original and hedge")
+}
+
+func TestHedgeFailureOrderingAndReconnect(t *testing.T) {
+	for _, tc := range []struct {
+		name                                  string
+		firstHedge, firstSuccess, lastSuccess bool
+	}{
+		{"failed original then successful hedge", false, false, true},
+		{"failed hedge then successful original", true, false, true},
+		{"original failure is last", true, false, false},
+		{"hedge failure is last", false, false, false},
+		{"successful original then failed hedge", false, true, false},
+		{"successful hedge then failed original", true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			flags.Set(t, "remote_execution.enable_action_merging", true)
+			flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
+			flags.Set(t, "remote_execution.action_merging_hedge_delay", time.Microsecond)
+			env, conn, _ := setupEnv(t)
+			scheduler := &hedgeSchedulerMock{env.GetSchedulerService().(*schedulerServerMock)}
+			env.SetSchedulerService(scheduler)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			client := repb.NewExecutionClient(conn)
+			arn := uploadAction(ctx, t, env, "", repb.DigestFunction_SHA256, &repb.Action{})
+			req := &repb.ExecuteRequest{ActionDigest: arn.GetDigest(), DigestFunction: arn.GetDigestFunction()}
+			original, err := client.Execute(ctx, req)
+			require.NoError(t, err)
+			accepted, err := original.Recv()
+			require.NoError(t, err)
+			merged, err := client.Execute(ctx, req)
+			require.NoError(t, err)
+			mergedAccepted, err := merged.Recv()
+			require.NoError(t, err)
+			require.Equal(t, accepted.GetName(), mergedAccepted.GetName())
+			require.Len(t, scheduler.scheduleReqs, 2)
+			first, last := scheduler.scheduleReqs[0].GetTaskId(), scheduler.scheduleReqs[1].GetTaskId()
+			if tc.firstHedge {
+				first, last = last, first
+			}
+			publish := func(id, message string, success bool) {
+				t.Helper()
+				response := &repb.ExecuteResponse{Result: &repb.ActionResult{StdoutRaw: []byte(message)}}
+				if !success {
+					response.Status = gstatus.New(codes.Internal, message).Proto()
+				}
+				op, err := operation.Assemble(id, operation.Metadata(repb.ExecutionStage_COMPLETED, arn.GetDigest()), response)
+				require.NoError(t, err)
+				stream, err := client.PublishOperation(ctx)
+				require.NoError(t, err)
+				require.NoError(t, stream.Send(op))
+				_, err = stream.CloseAndRecv()
+				require.NoError(t, err)
+			}
+			publish(first, "first", tc.firstSuccess)
+			publish(last, "last", tc.lastSuccess)
+			expected := "last"
+			success := tc.lastSuccess
+			if tc.firstSuccess {
+				expected = "first"
+				success = true
+			}
+			reconnect, err := client.WaitExecution(ctx, &repb.WaitExecutionRequest{Name: accepted.GetName()})
+			require.NoError(t, err)
+			for _, stream := range []interface {
+				Recv() (*longrunningpb.Operation, error)
+			}{original, merged, reconnect} {
+				for {
+					op, err := stream.Recv()
+					require.NoError(t, err)
+					require.Equal(t, accepted.GetName(), op.GetName())
+					if operation.ExtractStage(op) != repb.ExecutionStage_COMPLETED {
+						continue
+					}
+					response := operation.ExtractExecuteResponse(op)
+					require.Equal(t, expected, string(response.GetResult().GetStdoutRaw()))
+					require.Equal(t, success, response.GetStatus().GetCode() == 0)
+					break
+				}
+			}
+		})
+	}
 }
