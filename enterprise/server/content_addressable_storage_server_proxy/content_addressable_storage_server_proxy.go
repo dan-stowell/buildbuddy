@@ -1,12 +1,15 @@
 package content_addressable_storage_server_proxy
 
 import (
+	"container/list"
 	"context"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_crypter"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/proxy_util"
@@ -35,6 +38,7 @@ import (
 )
 
 var (
+	findMissingBlobsTombstoneTTL     = flag.Duration("cache_proxy.find_missing_blobs_tombstone_ttl", 3*time.Minute, "Suppress presence cache fills after a failed read for this long. Zero disables tombstones; in-flight invalidation protection remains enabled. Tombstones are bounded and may be evicted earlier under churn.")
 	enableGetTreeCaching             = flag.Bool("cache_proxy.enable_get_tree_caching", false, "If true, the Cache Proxy attempts to serve GetTree requests out of the local cache. If false, GetTree requests are always proxied to the remote, authoritative cache.")
 	findMissingBlobsRefreshInterval  = flag.Duration("cache_proxy.find_missing_blobs_refresh_interval", 0, "Optional maximum interval between backend presence checks for hot digests; 0 disables refresh and preserves find_missing_blobs_cache_ttl. When enabled, entries expire after the smaller of this interval and the TTL. To refresh backend access times, choose an interval above the backend atime update threshold and safely below its expected eviction horizon.")
 	findMissingBlobsCacheTTL         = flag.Duration("cache_proxy.find_missing_blobs_cache_ttl", 0, "If greater than 0, the proxy caches digests reported by the backing cache as 'present' locally for FindMissingBlobs requests for this long.")
@@ -60,59 +64,94 @@ type CASServerProxy struct {
 	//    remote-return path (local cache didn't have the digest, remote cache
 	//    did).
 	// TODO(go/b/7780): fix those issues.
-	// Track only active backend lookups. Entries cannot be evicted while a
-	// lookup holds a reference, so even arbitrarily delayed RPCs cannot revive
-	// invalidated presence. At capacity, new keys bypass cache insertion.
-	presenceMu                        sync.Mutex
-	presenceLookups                   map[string]*presenceLookup
+	// Shards bound tracking memory and avoid serializing unrelated digests.
+	presenceShards                    [presenceShardCount]presenceShard
+	now                               func() time.Time
+	tombstoneTTL                      time.Duration
 	findMissingBlobsCache             lru.LRU[struct{}]
 	findMissingChunksCache            lru.LRU[struct{}]
 	findMissingCacheCountersByChunked map[bool]findMissingCacheCounters
 }
 
-// Bound auxiliary memory independently of request concurrency and digest churn.
+// Active lookups cannot be evicted: their sequence guards arbitrarily delayed RPCs.
+// Tombstones have a separate bounded LRU, so invalidation churn cannot consume
+// lookup capacity. Limits are per shard (100,000 entries total in each table).
 const maxPresenceLookups = 100_000
+const presenceShardCount = 100
+const presenceShardCapacity = maxPresenceLookups / presenceShardCount
 
 type presenceLookup struct {
 	refs     int
 	sequence uint64
 }
+type presenceTombstone struct {
+	key   string
+	until time.Time
+}
+type presenceShard struct {
+	sync.Mutex
+	lookups    map[string]*presenceLookup
+	tombstones map[string]*list.Element
+	order      list.List
+}
 
-// beginPresenceLookups returns a snapshot for each key admitted for caching.
-func (s *CASServerProxy) beginPresenceLookups(keys map[digest.Key]string) map[string]uint64 {
-	s.presenceMu.Lock()
-	defer s.presenceMu.Unlock()
-	if s.presenceLookups == nil {
-		s.presenceLookups = make(map[string]*presenceLookup)
+func (s *CASServerProxy) presenceShard(key string) *presenceShard {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return &s.presenceShards[h.Sum32()%presenceShardCount]
+}
+func (sh *presenceShard) tombstoned(key string, now time.Time) bool {
+	e := sh.tombstones[key]
+	if e == nil {
+		return false
 	}
+	if !now.Before(e.Value.(presenceTombstone).until) {
+		delete(sh.tombstones, key)
+		sh.order.Remove(e)
+		return false
+	}
+	sh.order.MoveToFront(e)
+	return true
+}
+
+// Only backend misses participate. Cache hits never consume tracking capacity.
+func (s *CASServerProxy) beginPresenceLookups(keys map[digest.Key]string) map[string]uint64 {
 	snapshot := make(map[string]uint64, len(keys))
 	for _, key := range keys {
 		if _, ok := snapshot[key]; ok {
 			continue
 		}
-		entry := s.presenceLookups[key]
+		sh := s.presenceShard(key)
+		sh.Lock()
+		if sh.lookups == nil {
+			sh.lookups = make(map[string]*presenceLookup)
+		}
+		entry := sh.lookups[key]
 		if entry == nil {
-			if len(s.presenceLookups) >= maxPresenceLookups {
+			if len(sh.lookups) >= presenceShardCapacity {
+				metrics.FindMissingBlobsTrackingSaturation.Inc()
+				sh.Unlock()
 				continue
 			}
 			entry = &presenceLookup{}
-			s.presenceLookups[key] = entry
+			sh.lookups[key] = entry
 		}
 		entry.refs++
 		snapshot[key] = entry.sequence
+		sh.Unlock()
 	}
 	return snapshot
 }
-
 func (s *CASServerProxy) endPresenceLookups(snapshot map[string]uint64) {
-	s.presenceMu.Lock()
-	defer s.presenceMu.Unlock()
 	for key := range snapshot {
-		entry := s.presenceLookups[key]
+		sh := s.presenceShard(key)
+		sh.Lock()
+		entry := sh.lookups[key]
 		entry.refs--
 		if entry.refs == 0 {
-			delete(s.presenceLookups, key)
+			delete(sh.lookups, key)
 		}
+		sh.Unlock()
 	}
 }
 
@@ -156,8 +195,13 @@ func New(env environment.Env) (*CASServerProxy, error) {
 		local:              local,
 		remote:             remote,
 		localCache:         env.GetCache(),
+		now:                env.GetClock().Now,
+		tombstoneTTL:       *findMissingBlobsTombstoneTTL,
 	}
 	if *findMissingBlobsCacheTTL > 0 {
+		if *findMissingBlobsTombstoneTTL < 0 {
+			return nil, status.InvalidArgumentError("find_missing_blobs_tombstone_ttl must be nonnegative")
+		}
 		if *findMissingBlobsRefreshInterval < 0 {
 			return nil, status.InvalidArgumentError("find_missing_blobs_refresh_interval must be nonnegative")
 		}
@@ -354,7 +398,12 @@ func (s *CASServerProxy) FindMissingBlobs(ctx context.Context, req *repb.FindMis
 		DigestFunction: req.GetDigestFunction(),
 		Purpose:        repb.FindMissingBlobsRequest_CACHE_PROXY_CAS_PASSTHROUGH,
 	}
-	snapshot := s.beginPresenceLookups(cacheKeys)
+	lookupKeys := make(map[digest.Key]string, len(misses))
+	for _, d := range misses {
+		k := digest.NewKey(d)
+		lookupKeys[k] = cacheKeys[k]
+	}
+	snapshot := s.beginPresenceLookups(lookupKeys)
 	defer s.endPresenceLookups(snapshot)
 	rsp, err := s.remote.FindMissingBlobs(ctx, remoteReq)
 	if err != nil {
@@ -367,14 +416,15 @@ func (s *CASServerProxy) FindMissingBlobs(ctx context.Context, req *repb.FindMis
 	for _, d := range rsp.GetMissingBlobDigests() {
 		missing[cacheKeys[digest.NewKey(d)]] = struct{}{}
 	}
-	s.presenceMu.Lock()
-	defer s.presenceMu.Unlock()
 	presentRemotely := 0
 	for _, d := range remoteReq.GetBlobDigests() {
 		key := cacheKeys[digest.NewKey(d)]
 		if _, ok := missing[key]; !ok {
 			presentRemotely++
-			if sequence, ok := snapshot[key]; !ok || sequence != s.presenceLookups[key].sequence {
+			sh := s.presenceShard(key)
+			sh.Lock()
+			if sequence, ok := snapshot[key]; !ok || sequence != sh.lookups[key].sequence || sh.tombstoned(key, s.now()) {
+				sh.Unlock()
 				continue
 			}
 			if chunked {
@@ -382,6 +432,7 @@ func (s *CASServerProxy) FindMissingBlobs(ctx context.Context, req *repb.FindMis
 			} else {
 				s.findMissingBlobsCache.Add(key, struct{}{})
 			}
+			sh.Unlock()
 		}
 	}
 	counters.misses.Add(float64(presentRemotely))
@@ -419,9 +470,24 @@ func (s *CASServerProxy) InvalidatePresence(ctx context.Context, rn *digest.CASR
 		return
 	}
 	key := groupID + "/" + digest.NewCASResourceName(rn.GetDigest(), rn.GetInstanceName(), rn.GetDigestFunction()).DownloadString()
-	s.presenceMu.Lock()
-	defer s.presenceMu.Unlock()
-	if entry := s.presenceLookups[key]; entry != nil {
+	sh := s.presenceShard(key)
+	sh.Lock()
+	defer sh.Unlock()
+	if s.tombstoneTTL > 0 {
+		if sh.tombstones == nil {
+			sh.tombstones = make(map[string]*list.Element)
+		}
+		if e := sh.tombstones[key]; e != nil {
+			sh.order.Remove(e)
+		}
+		sh.tombstones[key] = sh.order.PushFront(presenceTombstone{key: key, until: s.now().Add(s.tombstoneTTL)})
+		if sh.order.Len() > presenceShardCapacity {
+			e := sh.order.Back()
+			delete(sh.tombstones, e.Value.(presenceTombstone).key)
+			sh.order.Remove(e)
+		}
+	}
+	if entry := sh.lookups[key]; entry != nil {
 		entry.sequence++
 	}
 	s.findMissingBlobsCache.Remove(key)
