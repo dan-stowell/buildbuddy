@@ -38,6 +38,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testdigest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testmetrics"
 	"github.com/buildbuddy-io/buildbuddy/server/util/compression"
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
@@ -4660,4 +4661,97 @@ func TestWriteReference(t *testing.T) {
 		require.Error(t, err)
 		require.True(t, status.IsFailedPreconditionError(err), "expected FailedPreconditionError, got %s", err)
 	})
+}
+
+// blobFDTargets deliberately excludes the DB's WAL, manifest and table cache.
+func blobFDTargets(t *testing.T, root string) []string {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	require.NoError(t, err)
+	var targets []string
+	for _, entry := range entries {
+		target, err := os.Readlink(filepath.Join("/proc/self/fd", entry.Name()))
+		if err == nil && strings.HasPrefix(target, root) && strings.Contains(target, "/blobs/") {
+			targets = append(targets, target)
+		}
+	}
+	sort.Strings(targets)
+	return targets
+}
+
+func TestBlobResourceLifecycle(t *testing.T) {
+	testleak.Check(t)
+	for _, compressed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("compressed=%t", compressed), func(t *testing.T) {
+			te := testenv.GetTestEnv(t)
+			te.SetAuthenticator(testauth.NewTestAuthenticator(t, emptyUserMap))
+			ctx := getAnonContext(t, te)
+			root := testfs.MakeTempDir(t)
+			noAutoCompression := int64(1 << 60)
+			pc, err := pebble_cache.NewPebbleCache(te, &pebble_cache.Options{RootDirectory: root, MaxSizeBytes: 1_000_000_000, MaxInlineFileSizeBytes: 1024, MinBytesAutoZstdCompression: &noAutoCompression})
+			require.NoError(t, err)
+			require.NoError(t, pc.Start())
+			t.Cleanup(func() { require.NoError(t, pc.Stop()) })
+			rn, data := testdigest.RandomCompressibleCASResourceBuf(t, 256*1024, "")
+			storedRN := proto.Clone(rn).(*rspb.ResourceName)
+			storedData := data
+			if compressed {
+				storedRN.Compressor = repb.Compressor_ZSTD
+				storedData = compression.CompressZstd(nil, data)
+			}
+			require.NoError(t, pc.Set(ctx, storedRN, storedData))
+			baseline := blobFDTargets(t, root)
+			require.Empty(t, baseline)
+			countFiles := func() int {
+				count := 0
+				require.NoError(t, filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+					if err != nil {
+						return err
+					}
+					if !entry.IsDir() && (strings.HasPrefix(path, filepath.Join(root, "blobs")+"/") || strings.HasPrefix(path, filepath.Join(root, "tmp")+"/")) {
+						count++
+					}
+					return nil
+				}))
+				return count
+			}
+			baselineFiles := countFiles()
+			for _, mode := range []string{"full", "partial", "cancel_read", "abandon_write_close", "cancel_before_commit"} {
+				for _, n := range []int{1, 10, 50} {
+					for range n {
+						opCtx, cancel := context.WithCancel(ctx)
+						if mode == "abandon_write_close" || mode == "cancel_before_commit" {
+							w, err := pc.Writer(opCtx, storedRN)
+							require.NoError(t, err)
+							_, err = w.Write(storedData)
+							require.NoError(t, err)
+							cancel()
+							if mode == "cancel_before_commit" {
+								// Cancellation can race with quota acquisition, so Commit may
+								// succeed. Both outcomes must be safe to Close.
+								_ = w.Commit()
+							}
+							require.NoError(t, w.Close())
+						} else {
+							r, err := pc.Reader(opCtx, rn, 0, 0)
+							require.NoError(t, err)
+							if mode == "full" {
+								_, err = io.Copy(io.Discard, r)
+							} else {
+								_, err = io.ReadFull(r, make([]byte, 17))
+							}
+							require.NoError(t, err)
+							cancel()
+							require.NoError(t, r.Close())
+						}
+						cancel()
+					}
+					targets := blobFDTargets(t, root)
+					t.Logf("mode=%s N=%d blob_FDs=%d blob_and_temp_files=%d targets=%v", mode, n, len(targets), countFiles(), targets)
+					require.Equal(t, baselineFiles, countFiles())
+					require.Equal(t, baseline, targets)
+				}
+			}
+		})
+	}
 }
