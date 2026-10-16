@@ -3,6 +3,7 @@ package priority_task_scheduler
 import (
 	"context"
 	"fmt"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"math/rand"
 	"testing"
 	"time"
@@ -1340,4 +1341,61 @@ func TestStopCancelsDelayedEnqueue(t *testing.T) {
 	// delayed enqueue's goroutine is still running.
 	require.NoError(t, scheduler.Stop())
 	require.Empty(t, scheduler.GetQueuedTaskReservations())
+}
+
+// cancellationExecutor models a running action that obeys its task context.
+type cancellationExecutor struct {
+	*FakeExecutor
+	started chan struct{}
+}
+
+func (e *cancellationExecutor) ExecuteTaskAndStreamResults(ctx context.Context, _ *repb.ScheduledTask, _ interfaces.Publisher) (bool, error) {
+	e.started <- struct{}{}
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+func TestShutdownCancelsInFlightTasks(t *testing.T) {
+	for _, n := range []int{10} {
+		t.Run(fmt.Sprintf("N=%d", n), func(t *testing.T) {
+			testleak.Check(t)
+			testleak.CheckFDs(t)
+			flags.Set(t, "executor.shutdown_cleanup_duration", 20*time.Millisecond)
+			env := testenv.GetTestEnv(t)
+			env.SetRemoteExecutionClient(&FakeExecutionClient{})
+			exec := &cancellationExecutor{FakeExecutor: NewFakeExecutor(), started: make(chan struct{}, n)}
+			scheduler, err := NewPriorityTaskScheduler(env, exec, &FakeRunnerPool{}, NewFakeTaskLeaser(), &Options{})
+			require.NoError(t, err)
+			require.NoError(t, scheduler.Start())
+			// On failure, explicitly rescue stuck tasks so later cases remain independent.
+			t.Cleanup(func() { scheduler.rootCancel(); require.NoError(t, scheduler.Stop()) })
+			for range n {
+				_, err := scheduler.EnqueueTaskReservation(context.Background(), &scpb.EnqueueTaskReservationRequest{TaskId: fakeTaskID("shutdown")})
+				require.NoError(t, err)
+			}
+			for range n {
+				select {
+				case <-exec.started:
+				case <-time.After(3 * time.Second):
+					t.Fatal("task not started")
+				}
+			}
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- scheduler.Shutdown(shutdownCtx) }()
+			select {
+			case err := <-done:
+				require.NoError(t, err)
+			case <-time.After(300 * time.Millisecond):
+				t.Errorf("shutdown failed to cancel %d in-flight tasks: rootErr=%v active=%d", n, scheduler.rootContext.Err(), scheduler.activeCancelFuncsCount.Load())
+				scheduler.rootCancel()
+				select {
+				case <-done:
+				case <-time.After(3 * time.Second):
+					t.Fatal("shutdown did not finish after explicit root cancellation")
+				}
+			}
+		})
+	}
 }
