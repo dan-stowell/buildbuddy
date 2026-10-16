@@ -2059,3 +2059,42 @@ func TestExecutorInputCacheMutationIsolation(t *testing.T) {
 		})
 	}
 }
+
+func TestExecutorInputCachePublicationAndEviction(t *testing.T) {
+	ctx := t.Context()
+	fc, err := filecache.NewFileCache(testfs.MakeTempDir(t), 4096, false)
+	require.NoError(t, err)
+	t.Cleanup(func() { fc.Close() })
+	fc.WaitForDirectoryScanToComplete()
+	const content = "complete input"
+	node := nodeFromString(content, false)
+	// Interleave two fetches at explicit publication boundaries: neither partial
+	// writer may be visible, and replacing a committed entry must preserve links.
+	w1, err := fc.Writer(ctx, node, repb.DigestFunction_SHA256)
+	require.NoError(t, err)
+	defer w1.Close()
+	w2, err := fc.Writer(ctx, node, repb.DigestFunction_SHA256)
+	require.NoError(t, err)
+	defer w2.Close()
+	_, err = w1.Write([]byte(content[:4]))
+	require.NoError(t, err)
+	_, err = w2.Write([]byte(content[:4]))
+	require.NoError(t, err)
+	dir := testfs.MakeTempDir(t)
+	require.False(t, fc.FastLinkFile(ctx, node, filepath.Join(dir, "partial")))
+	_, err = w1.Write([]byte(content[4:]))
+	require.NoError(t, err)
+	require.NoError(t, w1.Commit())
+	live := filepath.Join(dir, "live")
+	require.True(t, fc.FastLinkFile(ctx, node, live))
+	_, err = w2.Write([]byte(content[4:]))
+	require.NoError(t, err)
+	require.NoError(t, w2.Commit())
+	assertFileContents(t, live, content)
+	require.True(t, fc.FastLinkFile(ctx, node, filepath.Join(dir, "after-replace")))
+	assertFileContents(t, filepath.Join(dir, "after-replace"), content)
+	other := writeFileContent(t, dir, "other", "evict", false)
+	require.NoError(t, fc.AddFile(ctx, nodeFromString("evict", false), other))
+	require.False(t, fc.FastLinkFile(ctx, node, filepath.Join(dir, "evicted")))
+	assertFileContents(t, live, content)
+}
