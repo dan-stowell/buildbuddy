@@ -1341,3 +1341,23 @@ func TestStopCancelsDelayedEnqueue(t *testing.T) {
 	require.NoError(t, scheduler.Stop())
 	require.Empty(t, scheduler.GetQueuedTaskReservations())
 }
+
+func TestCancelTaskReservationStopsRunningCopy(t *testing.T) {
+	q, err := NewPriorityTaskScheduler(testenv.GetTestEnv(t), NewFakeExecutor(), &FakeRunnerPool{}, NewFakeTaskLeaser(), &Options{RAMBytesCapacityOverride: 100, CPUMillisCapacityOverride: 100})
+	require.NoError(t, err)
+	t.Cleanup(q.rootCancel)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	otherCtx, otherCancel := context.WithCancel(t.Context())
+	defer otherCancel()
+	running := &scpb.EnqueueTaskReservationRequest{TaskId: "loser"}
+	other := &scpb.EnqueueTaskReservationRequest{TaskId: "other"}
+	q.trackTask(running, &cancel)
+	q.trackTask(other, &otherCancel)
+	q.CancelTaskReservation(t.Context(), "loser")
+	require.ErrorIs(t, ctx.Err(), context.Canceled)
+	require.NoError(t, otherCtx.Err(), "cancellation must only stop the named copy")
+	q.untrackTask(running, &cancel)
+	q.untrackTask(other, &otherCancel)
+	q.CancelTaskReservation(t.Context(), "loser") // idempotent after cleanup
+}

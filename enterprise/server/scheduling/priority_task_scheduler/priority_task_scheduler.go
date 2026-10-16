@@ -706,7 +706,9 @@ func (q *PriorityTaskScheduler) trackTask(res *scpb.EnqueueTaskReservationReques
 	if q.activeTaskCancels == nil {
 		q.activeTaskCancels = make(map[string]context.CancelFunc)
 	}
-	q.activeTaskCancels[res.GetTaskId()] = *cancel
+	if cancel != nil {
+		q.activeTaskCancels[res.GetTaskId()] = *cancel
+	}
 	q.resourcesUsed.Concurrency++
 	if size := res.GetTaskSize(); size != nil {
 		q.resourcesUsed.RAMBytes += size.GetEstimatedMemoryBytes()
