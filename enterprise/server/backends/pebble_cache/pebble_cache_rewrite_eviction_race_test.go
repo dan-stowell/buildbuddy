@@ -38,9 +38,13 @@ type observedCommitLocker struct {
 	held      atomic.Bool
 	attempted chan struct{}
 	armed     atomic.Bool
+	target    atomic.Value
 }
 
 func (l *observedCommitLocker) Lock(key string) func() {
+	if key != l.target.Load().(string) {
+		return l.Locker.Lock(key)
+	}
 	if l.armed.Swap(false) {
 		l.attempted <- struct{}{}
 	}
@@ -51,6 +55,7 @@ func (l *observedCommitLocker) Lock(key string) func() {
 
 func observeCommitLock(pc *PebbleCache) *observedCommitLocker {
 	l := &observedCommitLocker{Locker: pc.locker, attempted: make(chan struct{}, 1)}
+	l.target.Store("")
 	pc.locker = l
 	for _, e := range pc.evictors {
 		e.locker = l
@@ -124,6 +129,7 @@ func runRewriteEvictionRace(t *testing.T, blobSize int64) {
 	}
 	pc, err := NewPebbleCache(env, opts)
 	require.NoError(t, err)
+	l := observeCommitLock(pc)
 	require.NoError(t, pc.Start())
 	defer pc.Stop()
 
@@ -138,7 +144,11 @@ func runRewriteEvictionRace(t *testing.T, blobSize int64) {
 	require.NoError(t, pc.Set(ctx, r, buf))
 
 	clock.Advance(2 * time.Hour)
-	l := observeCommitLock(pc)
+	record, err := pc.makeFileRecord(pc.userGroupID(ctx), nil, r)
+	require.NoError(t, err)
+	key, err := pc.fileStorer.PebbleKey(record)
+	require.NoError(t, err)
+	l.target.Store(key.LockID())
 	var evicted <-chan struct{}
 	beforeWriteMetadataHook = func(key filestore.PebbleKey) {
 		beforeWriteMetadataHook = nil

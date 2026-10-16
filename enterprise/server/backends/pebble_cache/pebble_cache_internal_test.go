@@ -332,6 +332,7 @@ func TestEvictionBetweenDataAndMetadataCommit(t *testing.T) {
 			clock := clockwork.NewFakeClock()
 			pc, err := NewPebbleCache(env, &Options{RootDirectory: t.TempDir(), MaxSizeBytes: 100_000_000, Clock: clock, MaxInlineFileSizeBytes: 1024, MinEvictionAge: new(time.Hour), MinBytesAutoZstdCompression: new(int64(1 << 60))})
 			require.NoError(t, err)
+			l := observeCommitLock(pc)
 			require.NoError(t, pc.Start())
 			defer pc.Stop()
 			gen := digest.UniformRandomGenerator(20261016)
@@ -354,7 +355,7 @@ func TestEvictionBetweenDataAndMetadataCommit(t *testing.T) {
 			require.NoError(t, err)
 			sample := &approxlru.Sample[*evictionKey]{Key: &evictionKey{bytes: raw}, Timestamp: time.UnixMicro(old.GetLastAccessUsec()), SizeBytes: getSizeOnLocalDisk(raw, old, pc.includeMetadataSize)}
 			clock.Advance(2 * time.Hour)
-			l := observeCommitLock(pc)
+			l.target.Store(key.LockID())
 			var evicted <-chan struct{}
 			t.Cleanup(func() { beforeWriteMetadataHook = nil })
 			beforeWriteMetadataHook = func(_ filestore.PebbleKey) {
