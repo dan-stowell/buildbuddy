@@ -789,3 +789,43 @@ func TestExecuteTaskAndStreamResults_Timeout(t *testing.T) {
 		})
 	}
 }
+
+func TestExecuteTaskAndStreamResults_AboveMaxTimeout(t *testing.T) {
+	flags.Set(t, "executor.max_task_timeout", time.Hour)
+	exec, _, client, server, _ := getExecutor(t, nil)
+	task := getTask()
+	task.ExecutionTask.Action.Timeout = durationpb.New(time.Hour + time.Second)
+	publisher, err := operation.Publish(t.Context(), client, task.ExecutionTask.ExecutionId)
+	require.NoError(t, err)
+	_, err = exec.ExecuteTaskAndStreamResults(t.Context(), task, publisher)
+	require.True(t, status.IsInvalidArgumentError(err), "%v", err)
+	<-server.finished
+}
+
+// Exercise real bare execution and output upload, rather than returning a
+// synthetic runner result. Partial outputs may be useful for debugging, but
+// they must be accompanied by a non-success status and must not enter the AC.
+func TestExecuteTaskAndStreamResults_BareTimeoutPartialOutput(t *testing.T) {
+	exec, env, client, server, _ := getExecutor(t, func(ctx context.Context, original rbetest.RunFunc) *interfaces.CommandResult {
+		return original(ctx, &repb.IOStats{})
+	})
+	task := getTask()
+	task.ExecutionTask.Action.Timeout = durationpb.New(time.Second)
+	task.ExecutionTask.Command.Arguments = []string{"sh", "-c", "echo partial > output; echo stdout; echo stderr >&2; sleep 30"}
+	task.ExecutionTask.Command.OutputPaths = []string{"output"}
+	publisher, err := operation.Publish(t.Context(), client, task.ExecutionTask.ExecutionId)
+	require.NoError(t, err)
+	start := time.Now()
+	retry, err := exec.ExecuteTaskAndStreamResults(t.Context(), task, publisher)
+	require.NoError(t, err)
+	require.False(t, retry)
+	require.Less(t, time.Since(start), 10*time.Second)
+	<-server.finished
+	ops := server.getOperations()
+	rsp, err := rexec.UnpackOperation(ops[len(ops)-1])
+	require.NoError(t, err)
+	require.Equal(t, int32(codes.DeadlineExceeded), rsp.ExecuteResponse.GetStatus().GetCode())
+	require.NotEqual(t, int32(0), rsp.ExecuteResponse.GetResult().GetExitCode())
+	_, err = env.GetActionCacheClient().GetActionResult(t.Context(), &repb.GetActionResultRequest{ActionDigest: task.ExecutionTask.ExecuteRequest.ActionDigest, DigestFunction: repb.DigestFunction_SHA256})
+	require.True(t, status.IsNotFoundError(err), "%v", err)
+}
