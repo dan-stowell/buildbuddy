@@ -31,6 +31,11 @@ const (
 	// never started, or its actual exit code could not be determined because of an
 	// error.
 	NoExitCode = -2
+
+	// OutputDrainTimeout bounds the final drain of inherited stdout/stderr
+	// pipes after the main process exits. Allow buffered output to be copied,
+	// without waiting indefinitely for background processes to close the pipes.
+	OutputDrainTimeout = 100 * time.Millisecond
 )
 
 var (
@@ -244,18 +249,24 @@ func startNewProcess(ctx context.Context, cmd *exec.Cmd) (*process, error) {
 		return nil, fmt.Errorf("fail to setup postStart: %w", err)
 	}
 
+	// Join cancellation cleanup before returning, so it cannot signal an old
+	// process group after the caller has moved on to another action.
+	pCleanupDone := make(chan struct{})
 	// Cleanup goroutine: kill the process tree when the context is canceled.
 	go func() {
+		defer close(pCleanupDone)
 		select {
 		case <-p.terminated:
-			return
 		case <-ctx.Done():
+		}
+		if ctx.Err() != nil {
 			if err := p.killProcessTree(); err != nil {
 				log.Warningf("Failed to kill process tree: %s", err)
 			}
 		}
 	}()
 
+	p.cleanupDone = pCleanupDone
 	return p, nil
 }
 
@@ -289,6 +300,13 @@ func RunWithProcessTreeCleanup(ctx context.Context, cmd *exec.Cmd, opts *RunOpts
 		opts = &RunOpts{}
 	}
 
+	// As in the OCI runtime path, a bounded WaitDelay closes inherited pipes
+	// without changing the main process's exit status. Do not kill background
+	// processes on success: callers may intentionally retain daemons across
+	// actions or use a persistent worker with a longer-lived context.
+	if cmd.WaitDelay == 0 {
+		cmd.WaitDelay = OutputDrainTimeout
+	}
 	p, err := startNewProcess(ctx, cmd)
 	if err != nil {
 		return nil, err
@@ -300,6 +318,11 @@ func RunWithProcessTreeCleanup(ctx context.Context, cmd *exec.Cmd, opts *RunOpts
 	}
 
 	rusage, err := p.wait()
+	<-p.cleanupDone
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// Wait returns this only if the main process exited successfully.
+		err = nil
+	}
 	stats := <-statsCh
 	p.finalizeUsage(stats)
 	if cleanupErr := p.cleanup(); cleanupErr != nil {
@@ -336,6 +359,8 @@ func forwardSignals(ctx context.Context, process *process, ch <-chan syscall.Sig
 				log.CtxWarningf(ctx, "Failed to send signal %q: %s", s, err)
 			}
 		case <-ctx.Done():
+			return
+		case <-process.terminated:
 			return
 		}
 	}
@@ -382,6 +407,14 @@ func splitExecutableArgs(commandTokens []string) (executable string, args []stri
 // exitCode returns the exit code from the given command, based on the error returned.
 // If the command could not be started or did not exit cleanly, an error is returned.
 func ExitCode(ctx context.Context, cmd *exec.Cmd, err error) (int, error) {
+	// The main process can exit successfully before its pipes finish draining.
+	// Cancellation/deadline must take precedence over that successful status.
+	if ctx.Err() == context.Canceled {
+		return KilledExitCode, status.CanceledError("command was canceled")
+	}
+	if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
+		return KilledExitCode, status.DeadlineExceededError("command timed out")
+	}
 	if err == nil {
 		return 0, nil
 	}
