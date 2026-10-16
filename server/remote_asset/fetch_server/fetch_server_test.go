@@ -32,6 +32,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testmetrics"
 	"github.com/buildbuddy-io/buildbuddy/server/util/bazel_request"
 	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
@@ -1870,5 +1871,43 @@ func TestFetchBlob_DigestConversionClosesScratchFile(t *testing.T) {
 		}
 		require.NoError(t, err)
 		assert.NotContains(t, target, scratchRoot, "digest conversion must close its temporary file, not just unlink it")
+	}
+}
+
+// Each FetchBlob owns a fresh HTTP transport. Keep the origin alive while
+// measuring so its shutdown cannot hide idle connections abandoned by RPCs.
+func TestFetchBlob_HTTPTransportLifecycle(t *testing.T) {
+	for _, keepAlive := range []bool{true, false} {
+		for _, n := range []int{10, 50} {
+			t.Run(fmt.Sprintf("keepalive=%t/N=%d", keepAlive, n), func(t *testing.T) {
+				testleak.Check(t)
+				testleak.CheckFDs(t)
+				scratchRoot := t.TempDir()
+				flags.Set(t, "storage.tempdir", scratchRoot)
+				require.NoError(t, scratchspace.Init())
+				te := testenv.GetTestEnv(t)
+				client := rapb.NewFetchClient(runFetchServer(context.Background(), t, te))
+				origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if !keepAlive {
+						w.Header().Set("Connection", "close")
+					}
+					if r.URL.Path == "/missing" {
+						http.Error(w, "missing", http.StatusNotFound)
+						return
+					}
+					fmt.Fprint(w, "lifecycle asset")
+				}))
+				t.Cleanup(origin.Close)
+				testleak.CheckGrowth(t, testleak.Growth{Iterations: n, Warmup: 3}, func(i int) {
+					// No checksum means every RPC downloads, even when the CAS is warm.
+					resp, err := client.FetchBlob(context.Background(), &rapb.FetchBlobRequest{Uris: []string{origin.URL + "/missing", origin.URL + "/ok"}})
+					require.NoError(t, err)
+					require.Equal(t, int32(gcodes.OK), resp.GetStatus().GetCode())
+					entries, err := os.ReadDir(filepath.Join(scratchRoot, "buildbuddy-scratch"))
+					require.NoError(t, err)
+					require.Empty(t, entries)
+				})
+			})
+		}
 	}
 }
