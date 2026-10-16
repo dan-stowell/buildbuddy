@@ -31,6 +31,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/action_cache_server"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/mockgcs"
@@ -4674,4 +4675,58 @@ func TestWriteReference(t *testing.T) {
 		require.Error(t, err)
 		require.True(t, status.IsFailedPreconditionError(err), "expected FailedPreconditionError, got %s", err)
 	})
+}
+
+// Verify persisted atime, rather than reading the blob (which itself refreshes it).
+func TestPresenceLifetime_PebbleAtime(t *testing.T) {
+	for _, op := range []string{"FindMissing", "Get", "Reader", "ACValidation"} {
+		t.Run(op, func(t *testing.T) {
+			flags.Set(t, "cache.pebble.presence_cache.max_entries", int64(0))
+			te := testenv.GetTestEnv(t)
+			te.SetAuthenticator(testauth.NewTestAuthenticator(t, emptyUserMap))
+			ctx := getAnonContext(t, te)
+			// Keep fake time in the past: sendAtimeUpdate uses wall time for its
+			// initial threshold check, whereas updateAtime uses the injected clock.
+			clock := clockwork.NewFakeClockAt(time.Unix(1700000000, 0))
+			pc, err := pebble_cache.NewPebbleCache(te, &pebble_cache.Options{
+				RootDirectory: testfs.MakeTempDir(t), MaxSizeBytes: 100_000,
+				Clock: clock, AtimeUpdateThreshold: new(time.Duration(0)), AtimeBufferSize: new(0),
+			})
+			require.NoError(t, err)
+			require.NoError(t, pc.Start())
+			defer pc.Stop()
+			buf := []byte("presence-lifetime")
+			d, err := digest.Compute(bytes.NewReader(buf), repb.DigestFunction_SHA256)
+			require.NoError(t, err)
+			rn := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256).ToProto()
+			require.NoError(t, pc.Set(ctx, rn, buf))
+			for range 2 {
+				clock.Advance(time.Hour)
+				switch op {
+				case "FindMissing":
+					missing, err := pc.FindMissing(ctx, []*rspb.ResourceName{rn})
+					require.NoError(t, err)
+					require.Empty(t, missing)
+				case "Get":
+					got, err := pc.Get(ctx, rn)
+					require.NoError(t, err)
+					require.Equal(t, buf, got)
+				case "Reader":
+					r, err := pc.Reader(ctx, rn, 0, 0)
+					require.NoError(t, err)
+					got, err := io.ReadAll(r)
+					require.NoError(t, err)
+					require.NoError(t, r.Close())
+					require.Equal(t, buf, got)
+				case "ACValidation":
+					require.NoError(t, action_cache_server.ValidateActionResult(ctx, pc, "", repb.DigestFunction_SHA256,
+						&repb.ActionResult{OutputFiles: []*repb.OutputFile{{Path: "out", Digest: d}}}))
+				}
+				require.Eventually(t, func() bool {
+					md, err := pc.Metadata(ctx, rn)
+					return err == nil && md.LastAccessTimeUsec == clock.Now().UnixMicro()
+				}, 5*time.Second, time.Millisecond, "successful access must persist the new atime")
+			}
+		})
+	}
 }

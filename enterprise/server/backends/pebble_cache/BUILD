@@ -61,6 +61,7 @@ go_test(
     ],
     embed = [":pebble_cache"],
     deps = [
+        "//server/remote_cache/action_cache_server",
         "//enterprise/server/backends/kms",
         "//enterprise/server/crypter_service",
         "//enterprise/server/experiments",
