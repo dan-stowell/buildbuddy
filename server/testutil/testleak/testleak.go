@@ -17,6 +17,10 @@
 // call t.Parallel, or whose package has parallel tests that could run at the
 // same time.
 //
+// When measuring counts yourself, avoid assert.Eventually or require.Eventually:
+// their condition runs in an extra goroutine, adding one to runtime.NumGoroutine.
+// CheckGrowth samples synchronously and avoids that counting pitfall.
+//
 // Ordering matters: t.Cleanup functions run in reverse order of registration,
 // so call Check and CheckFDs before setting up anything that registers a
 // cleanup (servers, test environments, temp dirs), so that the leak check runs
