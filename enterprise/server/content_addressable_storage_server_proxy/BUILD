@@ -34,7 +34,7 @@ go_library(
 go_test(
     name = "content_addressable_storage_server_proxy_test",
     size = "small",
-    srcs = ["content_addressable_storage_server_proxy_test.go"],
+    srcs = ["content_addressable_storage_server_proxy_test.go", "presence_v4_review_test.go"],
     embed = [":content_addressable_storage_server_proxy"],
     deps = [
         "//enterprise/server/atime_updater",
