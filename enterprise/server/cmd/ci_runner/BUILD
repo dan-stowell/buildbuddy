@@ -84,6 +84,9 @@ go_test(
     deps = [
         "//enterprise/server/workflow/config",
         "//server/testutil/testgit",
+        "//server/testutil/testleak",
+        "//proto:remote_execution_go_proto",
+        "@org_golang_google_grpc//:grpc",
         "//server/testutil/testshell",
         "//server/util/platform",
         "//server/util/testing/flags",

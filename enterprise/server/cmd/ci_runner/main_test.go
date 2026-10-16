@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -17,12 +19,15 @@ import (
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/workflow/config"
+	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testgit"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testshell"
 	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 )
 
 func TestIsBazelCommandToken(t *testing.T) {
@@ -614,5 +619,45 @@ not json at all
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.want, parseGitFetchedBytes(strings.NewReader(tc.trace2Log)))
 		})
+	}
+}
+
+type presentRunfilesCAS struct {
+	repb.UnimplementedContentAddressableStorageServer
+}
+
+func (*presentRunfilesCAS) FindMissingBlobs(context.Context, *repb.FindMissingBlobsRequest) (*repb.FindMissingBlobsResponse, error) {
+	return &repb.FindMissingBlobsResponse{}, nil
+}
+
+func TestUploadRunfilesResourceGrowth(t *testing.T) {
+	flags.Set(t, "grpc_client.pool_size", 1)
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := grpc.NewServer()
+	repb.RegisterContentAddressableStorageServer(server, &presentRunfilesCAS{})
+	go server.Serve(lis)
+	t.Cleanup(server.Stop)
+	flags.Set(t, "cache_backend", "grpc://"+lis.Addr().String())
+	root := t.TempDir()
+	executable := filepath.Join(root, "binary")
+	require.NoError(t, os.WriteFile(executable, []byte("executable"), 0755))
+	for _, fail := range []bool{false, true} {
+		for _, n := range []int{10, 50} {
+			t.Run(fmt.Sprintf("error=%v/N=%d", fail, n), func(t *testing.T) {
+				testleak.CheckGrowth(t, testleak.Growth{Iterations: n}, func(i int) {
+					path := executable
+					if fail {
+						path = filepath.Join(root, "missing")
+					}
+					_, _, _, err := uploadRunfiles(t.Context(), root, filepath.Join(root, "no.runfiles"), path)
+					if fail {
+						require.Error(t, err)
+					} else {
+						require.NoError(t, err)
+					}
+				})
+			})
+		}
 	}
 }
