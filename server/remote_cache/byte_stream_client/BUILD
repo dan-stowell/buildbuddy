@@ -41,7 +41,7 @@ go_test(
         "tooManyFilesRunfilePath": "$(rlocationpath too_many_files.zip)",
     },
     deps = [
- "//server/testutil/testenv",
+ "//server/real_environment",
  "//server/testutil/testleak",
  "//server/util/testing/flags",
         "//proto:zip_go_proto",

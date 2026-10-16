@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"io"
@@ -13,7 +13,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/bazelbuild/rules_go/go/runfiles"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
@@ -135,7 +134,7 @@ func TestV4DistinctPermittedTargets(t *testing.T) {
 	for _, n := range []int{1, 10, 50} {
 		t.Run(fmt.Sprint(n), func(t *testing.T) {
 			testleak.Check(t)
-			env := testenv.GetTestEnv(t)
+			env := real_environment.NewRealEnv(nil)
 			flags.Set(t, "app.restrict_bytestream_dialing", true)
 			flags.Set(t, "app.cache_api_url", "grpcs://cache.example.com")
 			p := NewPooledByteStreamClient(env)
@@ -150,7 +149,6 @@ func TestV4DistinctPermittedTargets(t *testing.T) {
 			}
 			t.Logf("N=%d cached=%d goroutine_delta=%d", n, len(p.connPoolMap), runtime.NumGoroutine()-before)
 			// Polling cannot release these pools: there is no baseline cleanup path.
-			_ = time.Second
 		})
 	}
 }
