@@ -3028,3 +3028,8 @@ func (c *failOnceAppendCollector) AppendExecution(ctx context.Context, invocatio
 	}
 	return c.ExecutionCollector.AppendExecution(ctx, invocationID, execution)
 }
+
+// A transient collector outage must not make the final row unrecoverable.
+func TestExecutionOLAP_TransientHandoffFailure(t *testing.T) {
+	testExecutionOLAPHandoff(t, true)
+}
