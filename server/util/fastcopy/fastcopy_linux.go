@@ -3,7 +3,6 @@
 package fastcopy
 
 import (
-	"errors"
 	"os"
 
 	"golang.org/x/sys/unix"
@@ -74,19 +73,4 @@ func reflink(source, destination string) error {
 	}
 	reflinkWasSuccessful = true
 	return nil
-}
-
-// CloneOrCopy creates an independent inode, using a reflink when enabled and
-// supported. Unlike Clone and FastCopy, it never falls back to a hardlink.
-func CloneOrCopy(source, destination string) error {
-	if *enableFastcopyReflinking {
-		err := reflink(source, destination)
-		if err == nil {
-			return nil
-		}
-		if !errors.Is(err, unix.EOPNOTSUPP) && !errors.Is(err, unix.EXDEV) && !errors.Is(err, unix.EINVAL) && !errors.Is(err, unix.ENOSYS) && !errors.Is(err, unix.ENOTTY) {
-			return err
-		}
-	}
-	return copyFile(source, destination)
 }

@@ -71,7 +71,7 @@ const (
 type sharedDirectoryContextKey struct{}
 
 var (
-	_                                = flag.Bool("executor.local_cache_always_clone", false, "File cache transfers always use independent inodes.", flag.Deprecated("File cache transfers always use independent inodes."))
+	enableAlwaysClone                = flag.Bool("executor.local_cache_always_clone", false, "If true, files from the filecache will always be cloned instead of hardlinked")
 	includeSubdirPrefix              = flag.Bool("executor.include_subdir_prefix", true, "If true, store files under subdirs named by a short prefix of the file digest. This can help improve throughput on systems with high core counts. The prefix length is controlled by subdir_prefix_length.")
 	subdirPrefixLength               = flag.Int("executor.subdir_prefix_length", 2, "The length of the subdir prefix to use if include_subdir_prefix is true.")
 	enableDiskFallbackOnStartup      = flag.Bool("executor.local_cache_enable_disk_fallback_during_startup_scan", true, "If true, fallback to disk lookups while initial local cache scan is in progress.", flag.Internal)
@@ -703,7 +703,7 @@ func (c *fileCache) FastLinkFile(ctx context.Context, node *repb.FileNode, outpu
 		return false
 	}
 	start := time.Now()
-	if err := fastcopy.CloneOrCopy(filecachePath(c.rootDir, key), outputPath); err != nil && !os.IsExist(err) {
+	if err := cloneOrLink(keyPrefix, filecachePath(c.rootDir, key), outputPath); err != nil {
 		log.Warningf("Failed to link file from cache: %s", err)
 		return false
 	}
@@ -764,22 +764,6 @@ func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, 
 		c.createParentDirLatency.Observe(float64(time.Since(start).Microseconds()))
 	}
 
-	// Copy outside the cache-wide lock. Byte copies can be much slower than
-	// links, and must not block unrelated cache lookups or admissions. Publish
-	// the completed file atomically so readers never see a partial copy.
-	var stagedPath string
-	if !existingFileIsInPlace {
-		stagedPath, err = c.tempPath(node.GetDigest().GetHash())
-		if err != nil {
-			return err
-		}
-		defer os.Remove(stagedPath)
-		start := time.Now()
-		if err := fastcopy.CloneOrCopy(existingFilePath, stagedPath); err != nil {
-			return err
-		}
-		c.linkIntoFileCacheLatency.Observe(float64(time.Since(start).Microseconds()))
-	}
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -794,12 +778,14 @@ func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, 
 	} else {
 		// If the file being added is not already at the path where we expect it
 		// (i.e. it's being added from some action workspace), then remove and
-		// unlink any existing entry, then publish the completed clone.
+		// unlink any existing entry, then hardlink to the destination path.
 		c.l.Remove(k)
 
-		if err := os.Rename(stagedPath, fp); err != nil {
+		start := time.Now()
+		if err := cloneOrLink(keyPrefix, existingFilePath, fp); err != nil {
 			return err
 		}
+		c.linkIntoFileCacheLatency.Observe(float64(time.Since(start).Microseconds()))
 
 		// If the file being added is inside the filecache dir, and it
 		// is stored in an "old-style" location, then remove it.
@@ -1150,6 +1136,19 @@ func (c *fileCache) tempPath(name string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(c.TempDir(), fmt.Sprintf("%s.%s.tmp", name, randStr)), nil
+}
+
+func cloneOrLink(keyPrefix, source, destination string) error {
+	if keyPrefix == interfaces.AuthAnonymousUser || *enableAlwaysClone {
+		if err := fastcopy.Clone(source, destination); err != nil {
+			return wrapOSError(err, "clone")
+		}
+	} else {
+		if err := fastcopy.FastCopy(source, destination); err != nil {
+			return wrapOSError(err, "fastcopy")
+		}
+	}
+	return nil
 }
 
 // containsWithStatFallback checks if the given key is in the cache. If the

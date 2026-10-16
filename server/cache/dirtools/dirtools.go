@@ -721,16 +721,10 @@ func (ff *BatchFileFetcher) writeToFileCache(fileNode *repb.FileNode, data []byt
 }
 
 func copyFile(src *FilePointer, dest *FilePointer, opts *DownloadTreeOpts) error {
-	// The dedupe leader may already have materialized this exact path.
-	if filepath.Clean(src.FullPath) == filepath.Clean(dest.FullPath) {
-		return nil
-	}
 	if err := removeExisting(dest, opts); err != nil {
 		return err
 	}
-	// A deduplicated download can be shared by concurrent actions. Keep each
-	// workspace independent even when reflinking is unavailable.
-	return fastcopy.CloneOrCopy(src.FullPath, dest.FullPath)
+	return fastcopy.FastCopy(src.FullPath, dest.FullPath)
 }
 
 // linkFileFromFileCache attempts to link the given file path from the local
