@@ -195,7 +195,8 @@ func TestExecutorReconnect_SameReplicaKeepsRoutingToOldStream(t *testing.T) {
 	newStream.register(t, reconnectTestNode("e1", 64_000))
 	// Wait for the registration to be processed (Redis is updated first).
 	waitFor(t, "re-registration in redis", func() bool {
-		b, err := s.rdb.HGet(context.Background(), reconnectTestPoolKey().redisPoolKey(), "e1").Bytes()
+		key := reconnectTestPoolKey()
+		b, err := s.rdb.HGet(context.Background(), key.redisPoolKey(), "e1").Bytes()
 		if err != nil {
 			return false
 		}
