@@ -15,6 +15,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/byte_stream_server_proxy"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/experiments"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/proxy_util"
+	"github.com/buildbuddy-io/buildbuddy/server/backends/memory_cache"
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/byte_stream_server"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
@@ -104,6 +105,7 @@ func runCASProxy(ctx context.Context, clientConn *grpc.ClientConn, env *testenv.
 	env.SetLocalCASServer(cas)
 	casServer, err := New(env)
 	require.NoError(t, err)
+	env.SetCASServer(casServer)
 	bsServer, err := byte_stream_server_proxy.New(env)
 	require.NoError(t, err)
 	grpcServer, runFunc, lis := testenv.RegisterLocalGRPCServer(t, env)
@@ -1067,4 +1069,409 @@ func TestFindMissingBlobs_QuorumBypassesPresenceCache(t *testing.T) {
 		findMissing(findmissing.WithQuorum(ctx), proxy, []*repb.Digest{d}, nil, t)
 		require.Equal(t, i, requestCount.Load())
 	}
+}
+
+// A presence check must keep a hot blob ahead of cold blobs in the backing LRU.
+func TestPresenceLifetime_ProxyRefreshBeforeEviction(t *testing.T) {
+	flags.Set(t, "cache_proxy.find_missing_blobs_refresh_interval", time.Second)
+	for _, ttl := range []time.Duration{0, time.Minute} {
+		t.Run(ttl.String(), func(t *testing.T) {
+			flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", ttl)
+			ctx := testContext()
+			remoteEnv := testenv.GetTestEnv(t)
+			backing, err := memory_cache.NewMemoryCache(6) // two three-byte blobs
+			require.NoError(t, err)
+			remoteEnv.SetCache(backing)
+			conn, _, _ := runRemoteCASS(ctx, remoteEnv, t)
+			remote := repb.NewContentAddressableStorageClient(conn)
+			proxyEnv := testenv.GetTestEnv(t)
+			clock := clockwork.NewFakeClockAt(time.Unix(1700000000, 0))
+			proxyEnv.SetClock(clock)
+			proxyEnv.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+			proxyEnv.SetContentAddressableStorageClient(remote)
+			require.NoError(t, atime_updater.Register(proxyEnv))
+			proxy := repb.NewContentAddressableStorageClient(runCASProxy(ctx, conn, proxyEnv, t))
+			ctx = metadata.AppendToOutgoingContext(ctx, authutil.APIKeyHeader, "US1")
+			hot := digestProto(fooDigest, 3)
+			cold := digestProto(barDigest, 3)
+			next := digestProto(bazDigest, 3)
+			// Write remotely so no local data copy can mask a backing-cache miss.
+			update(ctx, remote, map[*repb.Digest]string{hot: "foo"}, t)
+			findMissing(ctx, proxy, []*repb.Digest{hot}, nil, t)
+			update(ctx, remote, map[*repb.Digest]string{cold: "bar"}, t)
+			clock.Advance(time.Second)
+			findMissing(ctx, proxy, []*repb.Digest{hot}, nil, t)
+			// With a real refresh, cold is now LRU. A skipped refresh evicts hot.
+			update(ctx, remote, map[*repb.Digest]string{next: "baz"}, t)
+			findMissing(ctx, proxy, []*repb.Digest{hot}, nil, t)
+			rsp, err := remote.BatchReadBlobs(ctx, readBlobsRequest([]*repb.Digest{hot}))
+			require.NoError(t, err)
+			require.Len(t, rsp.GetResponses(), 1)
+			require.Equal(t, int32(codes.OK), rsp.GetResponses()[0].GetStatus().GetCode(),
+				"proxy reported present immediately before backend read; TTL=%s", ttl)
+			require.Equal(t, []byte("foo"), rsp.GetResponses()[0].GetData())
+		})
+	}
+}
+
+// A delayed presence response must not undo a newer backend read miss.
+// The callback orders the two overlapping RPC responses without sleeps.
+type delayedPresenceClient struct {
+	repb.ContentAddressableStorageClient
+	beforePresenceResponse func()
+	calls                  int
+}
+
+func (c *delayedPresenceClient) FindMissingBlobs(ctx context.Context, req *repb.FindMissingBlobsRequest, opts ...grpc.CallOption) (*repb.FindMissingBlobsResponse, error) {
+	c.calls++
+	if c.calls == 1 {
+		c.beforePresenceResponse()
+		return &repb.FindMissingBlobsResponse{}, nil // Snapshot taken before eviction.
+	}
+	return &repb.FindMissingBlobsResponse{MissingBlobDigests: req.GetBlobDigests()}, nil
+}
+
+func (c *delayedPresenceClient) BatchReadBlobs(ctx context.Context, req *repb.BatchReadBlobsRequest, opts ...grpc.CallOption) (*repb.BatchReadBlobsResponse, error) {
+	return nil, status.Error(codes.NotFound, "blob evicted after presence snapshot")
+}
+
+func TestPresenceInvalidation_DelayedLookupCannotResurrect(t *testing.T) {
+	for _, chunked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("chunked=%t", chunked), func(t *testing.T) {
+			flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+			ctx := testContext()
+			if chunked {
+				ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(cdc.ChunkedHeaderName, cdc.ChunkedHeaderValue))
+				require.True(t, cdc.IsChunked(ctx))
+			}
+			env := testenv.GetTestEnv(t)
+			env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+			env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+			remote := &delayedPresenceClient{}
+			env.SetContentAddressableStorageClient(remote)
+			proxy, err := New(env)
+			require.NoError(t, err)
+			d := digestProto(fooDigest, 3)
+			remote.beforePresenceResponse = func() {
+				_, err := proxy.batchReadBlobsRemote(ctx, readBlobsRequest([]*repb.Digest{d}))
+				require.Equal(t, codes.NotFound, status.Code(err))
+			}
+			_, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+			require.NoError(t, err)
+			rsp, err := proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+			require.NoError(t, err)
+			require.Equal(t, []*repb.Digest{d}, rsp.GetMissingBlobDigests(), "older presence response resurrected an entry after a backend NotFound")
+		})
+	}
+}
+
+func TestPresenceLifetime_DefaultPreservesConfiguredTTL(t *testing.T) {
+	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+	ctx := testContext()
+	env := testenv.GetTestEnv(t)
+	clock := clockwork.NewFakeClockAt(time.Unix(1700000000, 0))
+	env.SetClock(clock)
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+	remote := &delayedPresenceClient{beforePresenceResponse: func() {}}
+	env.SetContentAddressableStorageClient(remote)
+	proxy, err := New(env)
+	require.NoError(t, err)
+	d := digestProto(fooDigest, 3)
+	_, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+	require.NoError(t, err)
+	clock.Advance(time.Minute)
+	rsp, err := proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+	require.NoError(t, err)
+	require.Empty(t, rsp.GetMissingBlobDigests(), "default must preserve the configured hour TTL")
+	clock.Advance(time.Hour)
+	rsp, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+	require.NoError(t, err)
+	require.Equal(t, []*repb.Digest{d}, rsp.GetMissingBlobDigests())
+}
+
+// Unidentified descendants must not cause a scan or clear unrelated entries.
+func (c *delayedPresenceClient) GetTree(ctx context.Context, req *repb.GetTreeRequest, opts ...grpc.CallOption) (repb.ContentAddressableStorage_GetTreeClient, error) {
+	return nil, status.Error(codes.NotFound, "directory missing")
+}
+
+func TestGetTree_NotFoundInvalidatesOnlyRoot(t *testing.T) {
+	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+	ctx := testContext()
+	env := testenv.GetTestEnv(t)
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+	remote := &delayedPresenceClient{beforePresenceResponse: func() {}}
+	env.SetContentAddressableStorageClient(remote)
+	proxy, err := New(env)
+	require.NoError(t, err)
+	root := digestProto(fooDigest, 3)
+	other := digestProto(barDigest, 3)
+	_, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{root, other}))
+	require.NoError(t, err)
+	err = proxy.getTreeWithoutCaching(&repb.GetTreeRequest{RootDigest: root, DigestFunction: repb.DigestFunction_SHA256}, &presenceTreeStream{ctx: ctx})
+	require.Equal(t, codes.NotFound, status.Code(err))
+	rsp, err := proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{root, other}))
+	require.NoError(t, err)
+	require.Equal(t, []*repb.Digest{root}, rsp.GetMissingBlobDigests())
+}
+
+type presenceTreeStream struct {
+	repb.ContentAddressableStorage_GetTreeServer
+	ctx context.Context
+}
+
+func (s *presenceTreeStream) Context() context.Context { return s.ctx }
+
+// This client always has the requested blob, but can overlap each presence
+// lookup with a read miss for a different digest. No sleeps or random ordering.
+type unrelatedInvalidationClient struct {
+	repb.ContentAddressableStorageClient
+	beforeResponse func()
+	calls          int
+}
+
+func (c *unrelatedInvalidationClient) FindMissingBlobs(ctx context.Context, req *repb.FindMissingBlobsRequest, opts ...grpc.CallOption) (*repb.FindMissingBlobsResponse, error) {
+	c.calls++
+	if c.beforeResponse != nil {
+		c.beforeResponse()
+	}
+	return &repb.FindMissingBlobsResponse{}, nil
+}
+func (c *unrelatedInvalidationClient) BatchReadBlobs(ctx context.Context, req *repb.BatchReadBlobsRequest, opts ...grpc.CallOption) (*repb.BatchReadBlobsResponse, error) {
+	return nil, status.Error(codes.NotFound, "unrelated blob missing")
+}
+
+// An unrelated read miss must not disable caching for a healthy hot digest.
+func TestPresenceInvalidation_UnrelatedMissesDoNotStarveFills(t *testing.T) {
+	for _, chunked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("chunked=%t", chunked), func(t *testing.T) {
+			flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+			ctx := testContext()
+			if chunked {
+				ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(cdc.ChunkedHeaderName, cdc.ChunkedHeaderValue))
+			}
+			env := testenv.GetTestEnv(t)
+			env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+			env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+			remote := &unrelatedInvalidationClient{}
+			env.SetContentAddressableStorageClient(remote)
+			proxy, err := New(env)
+			require.NoError(t, err)
+			remote.beforeResponse = func() {
+				_, err := proxy.batchReadBlobsRemote(ctx, readBlobsRequest([]*repb.Digest{digestProto(barDigest, 3)}))
+				require.Equal(t, codes.NotFound, status.Code(err))
+			}
+			req := findMissingBlobsRequest([]*repb.Digest{digestProto(fooDigest, 3)})
+			for range 20 {
+				rsp, err := proxy.FindMissingBlobs(ctx, req)
+				require.NoError(t, err)
+				require.Empty(t, rsp.GetMissingBlobDigests())
+			}
+			during := remote.calls
+			// Once invalidations stop, one lookup must populate the cache again.
+			remote.beforeResponse = nil
+			for range 20 {
+				_, err := proxy.FindMissingBlobs(ctx, req)
+				require.NoError(t, err)
+			}
+			t.Logf("deterministic schedule: backend calls during invalidations=%d/20; after=%d/20", during, remote.calls-during)
+			require.LessOrEqual(t, remote.calls-during, 1, "fills must recover when invalidations stop")
+			require.Equal(t, 1, during, "unrelated missing digest prevented healthy digest from being cached")
+		})
+	}
+}
+
+func TestPresenceLookupTracking_BoundedAndReleased(t *testing.T) {
+	s := &CASServerProxy{}
+	// Saturate every shard without evicting active lookup records.
+	for i := range s.presenceShards {
+		sh := &s.presenceShards[i]
+		sh.lookups = make(map[string]*presenceLookup)
+		for j := range presenceShardCapacity {
+			sh.lookups[fmt.Sprint(j)] = &presenceLookup{refs: 1}
+		}
+	}
+	key := digest.NewKey(&repb.Digest{Hash: "a", SizeBytes: 1})
+	before := testutil.ToFloat64(metrics.FindMissingBlobsTrackingSaturation)
+	require.Empty(t, s.beginPresenceLookups(map[digest.Key]string{key: "overflow"}))
+	require.Equal(t, before+1, testutil.ToFloat64(metrics.FindMissingBlobsTrackingSaturation))
+	sh := s.presenceShard("0")
+	require.Len(t, sh.lookups, presenceShardCapacity)
+	snapshot := s.beginPresenceLookups(map[digest.Key]string{key: "0"})
+	require.Contains(t, snapshot, "0")
+	sh.lookups["0"].sequence++
+	require.NotEqual(t, snapshot["0"], sh.lookups["0"].sequence)
+	s.endPresenceLookups(snapshot)
+	require.Equal(t, 1, sh.lookups["0"].refs)
+	s.endPresenceLookups(map[string]uint64{"0": 0})
+	require.NotContains(t, sh.lookups, "0")
+	snapshot = s.beginPresenceLookups(map[digest.Key]string{key: "0"})
+	require.Contains(t, snapshot, "0")
+	s.endPresenceLookups(snapshot)
+	require.NotContains(t, sh.lookups, "0")
+}
+
+// A lagging replica (or an upstream presence cache) can answer from a snapshot
+// older than a completed read miss, even when the presence RPC starts later.
+func TestPresenceInvalidation_LaterLookupWithStaleBackendSnapshot(t *testing.T) {
+	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+	ctx := testContext()
+	env := testenv.GetTestEnv(t)
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+	remote := &delayedPresenceClient{beforePresenceResponse: func() {}}
+	env.SetContentAddressableStorageClient(remote)
+	proxy, err := New(env)
+	require.NoError(t, err)
+	d := digestProto(fooDigest, 3)
+	// No FindMissing RPC is active when this authoritative read fails.
+	_, err = proxy.batchReadBlobsRemote(ctx, readBlobsRequest([]*repb.Digest{d}))
+	require.Equal(t, codes.NotFound, status.Code(err))
+	// The first presence response is stale. The backend has converged by the
+	// second request; the proxy should not extend the stale answer for an hour.
+	_, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+	require.NoError(t, err)
+	rsp, err := proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+	require.NoError(t, err)
+	require.Equal(t, []*repb.Digest{d}, rsp.GetMissingBlobDigests(), "post-invalidation stale snapshot was cached for the configured TTL")
+}
+
+// A recovered blob is passed through during suppression, then cached normally
+// at the window boundary. Repeated invalidations extend the window.
+func TestPresenceTombstone_ExpiryAndRenewal(t *testing.T) {
+	for _, chunked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("chunked=%t", chunked), func(t *testing.T) {
+			flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+			flags.Set(t, "cache_proxy.find_missing_blobs_tombstone_ttl", 3*time.Minute)
+			ctx := testauth.WithAuthenticatedUserInfo(testContext(), testauth.TestUsers("US1", "GR1")["US1"])
+			if chunked {
+				ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(cdc.ChunkedHeaderName, cdc.ChunkedHeaderValue))
+			}
+			env := testenv.GetTestEnv(t)
+			clock := clockwork.NewFakeClock()
+			env.SetClock(clock)
+			env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+			env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+			remote := &delayedPresenceClient{beforePresenceResponse: func() {}}
+			env.SetContentAddressableStorageClient(remote)
+			proxy, err := New(env)
+			require.NoError(t, err)
+			d := digestProto(fooDigest, 3)
+			rn := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256)
+			key := proxy.findMissingBlobsCacheKey("GR1", findMissingBlobsRequest([]*repb.Digest{d}), d)
+			proxy.InvalidatePresence(ctx, rn)
+			check := func(cached bool) {
+				// This client returns a positive snapshot once, then missing; reset it so
+				// every backend lookup in this test reports a recovered blob.
+				remote.calls = 0
+				remote.beforePresenceResponse = func() {}
+				rsp, err := proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+				require.NoError(t, err)
+				require.Empty(t, rsp.GetMissingBlobDigests())
+				require.Equal(t, cached, proxy.findMissingBlobsCache.Contains(key) || proxy.findMissingChunksCache.Contains(key))
+			}
+			check(false)
+			clock.Advance(2 * time.Minute)
+			proxy.InvalidatePresence(ctx, rn)
+			clock.Advance(time.Minute)
+			check(false)
+			clock.Advance(2 * time.Minute)
+			check(true)
+		})
+	}
+}
+
+func TestPresenceTombstone_BoundedLRU(t *testing.T) {
+	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+	ctx := testauth.WithAuthenticatedUserInfo(testContext(), testauth.TestUsers("US1", "GR1")["US1"])
+	env := testenv.GetTestEnv(t)
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+	env.SetContentAddressableStorageClient(&delayedPresenceClient{})
+	proxy, err := New(env)
+	require.NoError(t, err)
+	// Generate deterministic colliding keys to exercise a single shard's limit.
+	var keys []string
+	var rns []*digest.CASResourceName
+	for i := 0; len(keys) < presenceShardCapacity+1; i++ {
+		d := &repb.Digest{Hash: fmt.Sprintf("%064x", i), SizeBytes: 1}
+		rn := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256)
+		key := "GR1/" + rn.DownloadString()
+		if proxy.presenceShard(key) != &proxy.presenceShards[0] {
+			continue
+		}
+		keys = append(keys, key)
+		rns = append(rns, rn)
+	}
+	for _, rn := range rns[:presenceShardCapacity] {
+		proxy.InvalidatePresence(ctx, rn)
+	}
+	sh := &proxy.presenceShards[0]
+	require.True(t, sh.tombstoned(keys[0], proxy.now())) // touch oldest
+	proxy.InvalidatePresence(ctx, rns[presenceShardCapacity])
+	require.Len(t, sh.tombstones, presenceShardCapacity)
+	require.Equal(t, presenceShardCapacity, sh.order.Len())
+	require.Contains(t, sh.tombstones, keys[0])
+	require.NotContains(t, sh.tombstones, keys[1])
+	require.Empty(t, sh.lookups)
+}
+
+func TestPresenceLookupTracking_OnlyMisses(t *testing.T) {
+	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+	ctx := testauth.WithAuthenticatedUserInfo(testContext(), testauth.TestUsers("US1", "GR1")["US1"])
+	env := testenv.GetTestEnv(t)
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+	remote := &delayedPresenceClient{beforePresenceResponse: func() {}}
+	env.SetContentAddressableStorageClient(remote)
+	proxy, err := New(env)
+	require.NoError(t, err)
+	hit := digestProto(fooDigest, 3)
+	miss := digestProto(barDigest, 3)
+	_, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{hit}))
+	require.NoError(t, err)
+	remote.calls = 0
+	remote.beforePresenceResponse = func() {
+		hitKey := proxy.findMissingBlobsCacheKey("GR1", findMissingBlobsRequest(nil), hit)
+		missKey := proxy.findMissingBlobsCacheKey("GR1", findMissingBlobsRequest(nil), miss)
+		require.NotContains(t, proxy.presenceShard(hitKey).lookups, hitKey)
+		require.Contains(t, proxy.presenceShard(missKey).lookups, missKey)
+		count := 0
+		for i := range proxy.presenceShards {
+			count += len(proxy.presenceShards[i].lookups)
+		}
+		require.Equal(t, 1, count)
+	}
+	_, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{hit, miss, hit, miss}))
+	require.NoError(t, err)
+	for i := range proxy.presenceShards {
+		require.Empty(t, proxy.presenceShards[i].lookups)
+	}
+}
+
+// Expiring tombstones must not weaken the sequence guard for an older RPC.
+func TestPresenceInvalidation_OverlapOutlivesTombstone(t *testing.T) {
+	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+	flags.Set(t, "cache_proxy.find_missing_blobs_tombstone_ttl", time.Minute)
+	ctx := testauth.WithAuthenticatedUserInfo(testContext(), testauth.TestUsers("US1", "GR1")["US1"])
+	env := testenv.GetTestEnv(t)
+	clock := clockwork.NewFakeClock()
+	env.SetClock(clock)
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+	remote := &delayedPresenceClient{}
+	env.SetContentAddressableStorageClient(remote)
+	proxy, err := New(env)
+	require.NoError(t, err)
+	d := digestProto(fooDigest, 3)
+	remote.beforePresenceResponse = func() {
+		proxy.InvalidatePresence(ctx, digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256))
+		clock.Advance(2 * time.Minute)
+	}
+	_, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+	require.NoError(t, err)
+	rsp, err := proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+	require.NoError(t, err)
+	require.Equal(t, []*repb.Digest{d}, rsp.GetMissingBlobDigests())
 }

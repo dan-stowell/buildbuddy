@@ -1,11 +1,15 @@
 package content_addressable_storage_server_proxy
 
 import (
+	"container/list"
 	"context"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_crypter"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/proxy_util"
@@ -26,13 +30,17 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/tracing"
 	"github.com/prometheus/client_golang/prometheus"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
+	gstatus "google.golang.org/grpc/status"
 
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 )
 
 var (
+	findMissingBlobsTombstoneTTL     = flag.Duration("cache_proxy.find_missing_blobs_tombstone_ttl", 3*time.Minute, "Suppress presence cache fills after a failed read for this long. Zero disables tombstones; in-flight invalidation protection remains enabled. Tombstones are bounded and may be evicted earlier under churn.")
 	enableGetTreeCaching             = flag.Bool("cache_proxy.enable_get_tree_caching", false, "If true, the Cache Proxy attempts to serve GetTree requests out of the local cache. If false, GetTree requests are always proxied to the remote, authoritative cache.")
+	findMissingBlobsRefreshInterval  = flag.Duration("cache_proxy.find_missing_blobs_refresh_interval", 0, "Optional maximum interval between backend presence checks for hot digests; 0 disables refresh and preserves find_missing_blobs_cache_ttl. When enabled, entries expire after the smaller of this interval and the TTL. To refresh backend access times, choose an interval above the backend atime update threshold and safely below its expected eviction horizon.")
 	findMissingBlobsCacheTTL         = flag.Duration("cache_proxy.find_missing_blobs_cache_ttl", 0, "If greater than 0, the proxy caches digests reported by the backing cache as 'present' locally for FindMissingBlobs requests for this long.")
 	findMissingBlobsCacheSizeEntries = flag.Int64("cache_proxy.find_missing_blobs_cache_size_entries", 500*1000, "The number of digests to hold in each in-memory FindMissingBlobs digest cache. Only used if cache_proxy.find_missing_blobs_cache_ttl is greater than 0.")
 )
@@ -56,9 +64,95 @@ type CASServerProxy struct {
 	//    remote-return path (local cache didn't have the digest, remote cache
 	//    did).
 	// TODO(go/b/7780): fix those issues.
+	// Shards bound tracking memory and avoid serializing unrelated digests.
+	presenceShards                    [presenceShardCount]presenceShard
+	now                               func() time.Time
+	tombstoneTTL                      time.Duration
 	findMissingBlobsCache             lru.LRU[struct{}]
 	findMissingChunksCache            lru.LRU[struct{}]
 	findMissingCacheCountersByChunked map[bool]findMissingCacheCounters
+}
+
+// Active lookups cannot be evicted: their sequence guards arbitrarily delayed RPCs.
+// Tombstones have a separate bounded LRU, so invalidation churn cannot consume
+// lookup capacity. Limits are per shard (100,000 entries total in each table).
+const maxPresenceLookups = 100_000
+const presenceShardCount = 100
+const presenceShardCapacity = maxPresenceLookups / presenceShardCount
+
+type presenceLookup struct {
+	refs     int
+	sequence uint64
+}
+type presenceTombstone struct {
+	key   string
+	until time.Time
+}
+type presenceShard struct {
+	sync.Mutex
+	lookups    map[string]*presenceLookup
+	tombstones map[string]*list.Element
+	order      list.List
+}
+
+func (s *CASServerProxy) presenceShard(key string) *presenceShard {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return &s.presenceShards[h.Sum32()%presenceShardCount]
+}
+func (sh *presenceShard) tombstoned(key string, now time.Time) bool {
+	e := sh.tombstones[key]
+	if e == nil {
+		return false
+	}
+	if !now.Before(e.Value.(presenceTombstone).until) {
+		delete(sh.tombstones, key)
+		sh.order.Remove(e)
+		return false
+	}
+	sh.order.MoveToFront(e)
+	return true
+}
+
+// Only backend misses participate. Cache hits never consume tracking capacity.
+func (s *CASServerProxy) beginPresenceLookups(keys map[digest.Key]string) map[string]uint64 {
+	snapshot := make(map[string]uint64, len(keys))
+	for _, key := range keys {
+		if _, ok := snapshot[key]; ok {
+			continue
+		}
+		sh := s.presenceShard(key)
+		sh.Lock()
+		if sh.lookups == nil {
+			sh.lookups = make(map[string]*presenceLookup)
+		}
+		entry := sh.lookups[key]
+		if entry == nil {
+			if len(sh.lookups) >= presenceShardCapacity {
+				metrics.FindMissingBlobsTrackingSaturation.Inc()
+				sh.Unlock()
+				continue
+			}
+			entry = &presenceLookup{}
+			sh.lookups[key] = entry
+		}
+		entry.refs++
+		snapshot[key] = entry.sequence
+		sh.Unlock()
+	}
+	return snapshot
+}
+func (s *CASServerProxy) endPresenceLookups(snapshot map[string]uint64) {
+	for key := range snapshot {
+		sh := s.presenceShard(key)
+		sh.Lock()
+		entry := sh.lookups[key]
+		entry.refs--
+		if entry.refs == 0 {
+			delete(sh.lookups, key)
+		}
+		sh.Unlock()
+	}
 }
 
 type findMissingCacheCounters struct {
@@ -101,14 +195,29 @@ func New(env environment.Env) (*CASServerProxy, error) {
 		local:              local,
 		remote:             remote,
 		localCache:         env.GetCache(),
+		now:                env.GetClock().Now,
+		tombstoneTTL:       *findMissingBlobsTombstoneTTL,
 	}
 	if *findMissingBlobsCacheTTL > 0 {
+		if *findMissingBlobsTombstoneTTL < 0 {
+			return nil, status.InvalidArgumentError("find_missing_blobs_tombstone_ttl must be nonnegative")
+		}
+		if *findMissingBlobsRefreshInterval < 0 {
+			return nil, status.InvalidArgumentError("find_missing_blobs_refresh_interval must be nonnegative")
+		}
+		// Expiration is based on insertion, not hits. Revalidate hot entries in
+		// batches on the request path to refresh backend access times without
+		// a backend call on every hit or an unbounded background work queue.
+		ttl := *findMissingBlobsCacheTTL
+		if *findMissingBlobsRefreshInterval > 0 {
+			ttl = min(ttl, *findMissingBlobsRefreshInterval)
+		}
 		newCache := func() (lru.LRU[struct{}], error) {
 			return lru.New[struct{}](&lru.Config[struct{}]{
 				MaxSize:    *findMissingBlobsCacheSizeEntries,
 				SizeFn:     func(struct{}) int64 { return 1 },
 				ThreadSafe: true,
-				TTL:        *findMissingBlobsCacheTTL,
+				TTL:        ttl,
 				Clock:      env.GetClock(),
 			})
 		}
@@ -289,6 +398,13 @@ func (s *CASServerProxy) FindMissingBlobs(ctx context.Context, req *repb.FindMis
 		DigestFunction: req.GetDigestFunction(),
 		Purpose:        repb.FindMissingBlobsRequest_CACHE_PROXY_CAS_PASSTHROUGH,
 	}
+	lookupKeys := make(map[digest.Key]string, len(misses))
+	for _, d := range misses {
+		k := digest.NewKey(d)
+		lookupKeys[k] = cacheKeys[k]
+	}
+	snapshot := s.beginPresenceLookups(lookupKeys)
+	defer s.endPresenceLookups(snapshot)
 	rsp, err := s.remote.FindMissingBlobs(ctx, remoteReq)
 	if err != nil {
 		return rsp, err
@@ -305,11 +421,18 @@ func (s *CASServerProxy) FindMissingBlobs(ctx context.Context, req *repb.FindMis
 		key := cacheKeys[digest.NewKey(d)]
 		if _, ok := missing[key]; !ok {
 			presentRemotely++
+			sh := s.presenceShard(key)
+			sh.Lock()
+			if sequence, ok := snapshot[key]; !ok || sequence != sh.lookups[key].sequence || sh.tombstoned(key, s.now()) {
+				sh.Unlock()
+				continue
+			}
 			if chunked {
 				s.findMissingChunksCache.Add(key, struct{}{})
 			} else {
 				s.findMissingBlobsCache.Add(key, struct{}{})
 			}
+			sh.Unlock()
 		}
 	}
 	counters.misses.Add(float64(presentRemotely))
@@ -327,6 +450,48 @@ func findMissingBlobsCacheLookups(status string, chunked bool, resultSource stri
 
 func (s *CASServerProxy) findMissingBlobsCacheKey(groupID string, req *repb.FindMissingBlobsRequest, d *repb.Digest) string {
 	return groupID + "/" + digest.NewCASResourceName(d, req.GetInstanceName(), req.GetDigestFunction()).DownloadString()
+}
+
+// InvalidatePresence removes cached presence after a backend read fails. Both
+// representations must be removed: neither a raw blob nor a chunked lookup
+// should keep reporting a blob that could not be read.
+func (s *CASServerProxy) InvalidatePresence(ctx context.Context, rn *digest.CASResourceName) {
+	if s.findMissingBlobsCache == nil {
+		return
+	}
+	user, err := s.authenticator.AuthenticatedUser(ctx)
+	groupID := interfaces.AuthAnonymousUser
+	if err == nil {
+		groupID = user.GetGroupID()
+	} else if !authutil.IsAnonymousUserError(err) {
+		return
+	}
+	if rn == nil {
+		return
+	}
+	key := groupID + "/" + digest.NewCASResourceName(rn.GetDigest(), rn.GetInstanceName(), rn.GetDigestFunction()).DownloadString()
+	sh := s.presenceShard(key)
+	sh.Lock()
+	defer sh.Unlock()
+	if s.tombstoneTTL > 0 {
+		if sh.tombstones == nil {
+			sh.tombstones = make(map[string]*list.Element)
+		}
+		if e := sh.tombstones[key]; e != nil {
+			sh.order.Remove(e)
+		}
+		sh.tombstones[key] = sh.order.PushFront(presenceTombstone{key: key, until: s.now().Add(s.tombstoneTTL)})
+		if sh.order.Len() > presenceShardCapacity {
+			e := sh.order.Back()
+			delete(sh.tombstones, e.Value.(presenceTombstone).key)
+			sh.order.Remove(e)
+		}
+	}
+	if entry := sh.lookups[key]; entry != nil {
+		entry.sequence++
+	}
+	s.findMissingBlobsCache.Remove(key)
+	s.findMissingChunksCache.Remove(key)
 }
 
 func (s *CASServerProxy) BatchUpdateBlobs(ctx context.Context, req *repb.BatchUpdateBlobsRequest) (*repb.BatchUpdateBlobsResponse, error) {
@@ -473,6 +638,11 @@ func (s *CASServerProxy) batchReadBlobsRemote(ctx context.Context, readReq *repb
 	defer spn.End()
 	tracing.AddStringAttributeToCurrentSpan(ctx, "requested-blobs", strconv.Itoa(len(readReq.Digests)))
 	readResp, err := s.remote.BatchReadBlobs(ctx, readReq)
+	if status.IsNotFoundError(err) {
+		for _, d := range readReq.GetDigests() {
+			s.InvalidatePresence(ctx, digest.NewCASResourceName(d, readReq.GetInstanceName(), readReq.GetDigestFunction()))
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -481,6 +651,9 @@ func (s *CASServerProxy) batchReadBlobsRemote(ctx context.Context, readReq *repb
 		DigestFunction: readReq.DigestFunction,
 	}
 	for _, response := range readResp.Responses {
+		if response.GetStatus().GetCode() == int32(codes.NotFound) {
+			s.InvalidatePresence(ctx, digest.NewCASResourceName(response.GetDigest(), readReq.GetInstanceName(), readReq.GetDigestFunction()))
+		}
 		if response.Status.Code != int32(codes.OK) {
 			continue
 		}
@@ -512,7 +685,28 @@ func (s *CASServerProxy) GetTree(req *repb.GetTreeRequest, stream repb.ContentAd
 	return s.getTreeWithoutCaching(req, stream)
 }
 
-func (s *CASServerProxy) getTreeWithoutCaching(req *repb.GetTreeRequest, stream repb.ContentAddressableStorage_GetTreeServer) error {
+func (s *CASServerProxy) getTreeWithoutCaching(req *repb.GetTreeRequest, stream repb.ContentAddressableStorage_GetTreeServer) (err error) {
+	defer func() {
+		if status.IsNotFoundError(err) {
+			s.InvalidatePresence(stream.Context(), digest.NewCASResourceName(req.GetRootDigest(), req.GetInstanceName(), req.GetDigestFunction()))
+		}
+		if status.IsNotFoundError(err) || status.IsFailedPreconditionError(err) {
+			// The backend also reports missing directories as REAPI MISSING
+			// precondition violations, with digest subjects but no instance.
+			for _, detail := range gstatus.Convert(err).Details() {
+				if pf, ok := detail.(*errdetails.PreconditionFailure); ok {
+					for _, v := range pf.GetViolations() {
+						if v.GetType() != "MISSING" {
+							continue
+						}
+						if rn, parseErr := digest.ParseDownloadResourceName(v.GetSubject()); parseErr == nil {
+							s.InvalidatePresence(stream.Context(), digest.NewCASResourceName(rn.GetDigest(), req.GetInstanceName(), req.GetDigestFunction()))
+						}
+					}
+				}
+			}
+		}
+	}()
 	digests := 0
 	bytes := 0
 	defer func() {
@@ -562,6 +756,9 @@ func (s *CASServerProxy) getTree(req *repb.GetTreeRequest, stream repb.ContentAd
 
 		dirsToGet = []*repb.Digest{}
 		for _, brbresp := range brbresps.Responses {
+			if brbresp.GetStatus().GetCode() != int32(codes.OK) {
+				return gstatus.ErrorProto(brbresp.GetStatus())
+			}
 			dir := &repb.Directory{}
 			if err := proto.Unmarshal(brbresp.Data, dir); err != nil {
 				return err

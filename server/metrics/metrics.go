@@ -4596,6 +4596,13 @@ var (
 		CompressionType,
 	})
 
+	FindMissingBlobsTrackingSaturation = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "proxy",
+		Name:      "find_missing_blobs_tracking_saturation",
+		Help:      "The number of presence lookup keys denied cache-fill tracking because their shard was at capacity.",
+	})
+
 	FindMissingBlobsCacheLookups = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: bbNamespace,
 		Subsystem: "proxy",

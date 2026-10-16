@@ -27,16 +27,22 @@ go_library(
         "//server/util/status",
         "//server/util/tracing",
         "@com_github_prometheus_client_golang//prometheus",
+        "@org_golang_google_genproto_googleapis_rpc//errdetails",
         "@org_golang_google_grpc//codes",
+        "@org_golang_google_grpc//status",
     ],
 )
 
 go_test(
     name = "content_addressable_storage_server_proxy_test",
     size = "small",
-    srcs = ["content_addressable_storage_server_proxy_test.go"],
+    srcs = [
+        "content_addressable_storage_server_proxy_test.go",
+        "find_missing_cache_eviction_test.go",
+    ],
     embed = [":content_addressable_storage_server_proxy"],
     deps = [
+        "//server/backends/memory_cache",
         "//enterprise/server/atime_updater",
         "//enterprise/server/byte_stream_server_proxy",
         "//enterprise/server/experiments",
@@ -53,6 +59,8 @@ go_test(
         "//server/util/authutil",
         "//server/util/cdc",
         "//server/util/findmissing",
+        "//server/util/prefix",
+        "//server/util/proto",
         "//server/util/testing/flags",
         "//server/util/uuid",
         "@com_github_jonboulle_clockwork//:clockwork",
