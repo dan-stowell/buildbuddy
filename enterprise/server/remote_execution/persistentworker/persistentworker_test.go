@@ -170,3 +170,54 @@ func TestWorkerExec_CancellationUnblocksIO(t *testing.T) {
 		}
 	}
 }
+
+// cancelBeforeResponseContainer makes cancellation happen before a complete
+// successful response is available. No timer or scheduler ordering is required.
+type cancelBeforeResponseContainer struct {
+	container.CommandContainer
+	protocol string
+	cancel   context.CancelFunc
+}
+
+func (c *cancelBeforeResponseContainer) Exec(ctx context.Context, command *repb.Command, stdio *interfaces.Stdio) *interfaces.CommandResult {
+	if c.protocol == "json" {
+		var req json.RawMessage
+		if err := json.NewDecoder(stdio.Stdin).Decode(&req); err != nil {
+			return &interfaces.CommandResult{Error: err}
+		}
+	} else {
+		r := bufio.NewReader(stdio.Stdin)
+		n, err := binary.ReadUvarint(r)
+		if err != nil {
+			return &interfaces.CommandResult{Error: err}
+		}
+		if _, err := io.CopyN(io.Discard, r, int64(n)); err != nil {
+			return &interfaces.CommandResult{Error: err}
+		}
+	}
+	c.cancel()
+	if c.protocol == "json" {
+		_, _ = io.WriteString(stdio.Stdout, "{\"exitCode\":0}\n")
+	} else {
+		// An empty WorkResponse is a successful response, framed with size 0.
+		_, _ = stdio.Stdout.Write([]byte{0})
+	}
+	return &interfaces.CommandResult{ExitCode: 0}
+}
+
+func TestWorkerExec_CancellationPrecedesSuccessfulResponse(t *testing.T) {
+	for _, protocol := range []string{"proto", "json"} {
+		t.Run(protocol, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			ctr := &cancelBeforeResponseContainer{protocol: protocol, cancel: cancel}
+			cmd := &repb.Command{Arguments: []string{"worker"}}
+			w, err := persistentworker.Start(t.Context(), &workspace.Workspace{}, ctr, protocol, cmd)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, w.Stop()) })
+			res := w.Exec(ctx, cmd)
+			require.True(t, status.IsCanceledError(res.Error), "successful response after cancellation: %+v", res)
+			require.Less(t, res.ExitCode, 0)
+		})
+	}
+}
