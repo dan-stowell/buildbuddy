@@ -98,7 +98,7 @@ Branch convention: `leak/det-*` detector work, `leak/repro-*` reproducers (no fi
 | byte_stream_server_proxy, cas_server_proxy cancelled lifecycle | Check+CheckFDs | 30/30 | from I1 audit |
 | commandutil RepeatedLifecycle, runner lifecycle | Check+CheckFDs | 30/30 | from I4/I5 |
 | priority_task_scheduler shutdown | DROPPED (2/30) | — | flake → real bug lead I10 |
-| **Round 3 (E3 Codex → V21 Claude review)**: dirtools cancel ×3 (own target), snaploader/COW incl. mmap count, MCP tool disconnect, protolet bridge disconnect, /file/download disconnect, OCI exec/cancel w/ real crun | CheckGrowth + custom counts | 30/30 each --config=remote; mutations caught (writer Close, uploader Close, Unmap, HTTP ctx detach, OCI bundle removal) | **Draft PR #86 (stacked on #84)** `leak/pr-enforce3` 6a290dba — V21 fixed download flake (upstream handler exit race) and a dirtools false negative (GC finalizers closed leaked upload files within settle window → immediate per-file FD check) |
+| **Round 3 (E3 Codex → V21 Claude review)**: dirtools cancel ×3 (own target), snaploader/COW incl. mmap count, MCP tool disconnect, protolet bridge disconnect, /file/download disconnect, OCI exec/cancel w/ real crun | CheckGrowth + custom counts | 30/30 each --config=remote; mutations caught (writer Close, uploader Close, Unmap, HTTP ctx detach, OCI bundle removal) | **Draft PR #89 (stacked on #84)** `leak/pr-enforce3` 6a290dba — V21 fixed download flake (upstream handler exit race) and a dirtools false negative (GC finalizers closed leaked upload files within settle window → immediate per-file FD check) |
 
 ## Process notes
 - 2026-10-16: lk-w1 VM deleted after I26 (all worker VMs reclaimed).
