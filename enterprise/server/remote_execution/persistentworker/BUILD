@@ -28,7 +28,10 @@ go_library(
 
 go_test(
     name = "persistentworker_test",
-    srcs = ["persistentworker_test.go"],
+    srcs = [
+        "persistentworker_test.go",
+        "verify_test.go",
+    ],
     deps = [
         ":persistentworker",
         "//enterprise/server/remote_execution/container",
