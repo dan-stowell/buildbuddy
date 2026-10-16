@@ -1652,3 +1652,23 @@ func TestCompressionInterruptedWriteCanResume(t *testing.T) {
 		})
 	}
 }
+
+func TestCompressionReadBeyondEnd(t *testing.T) {
+	flags.Set(t, "cache.zstd_transcoding_enabled", true)
+	for _, c := range []repb.Compressor_Value{repb.Compressor_IDENTITY, repb.Compressor_ZSTD} {
+		t.Run(c.String(), func(t *testing.T) {
+			ctx := context.Background()
+			te := testenv.GetTestEnv(t)
+			client := bspb.NewByteStreamClient(runByteStreamServer(ctx, t, te))
+			blob := []byte("boundary")
+			d, err := cachetools.UploadBlob(ctx, client, "", repb.DigestFunction_SHA256, bytes.NewReader(blob))
+			require.NoError(t, err)
+			rn := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256)
+			rn.SetCompressor(c)
+			stream, err := client.Read(ctx, &bspb.ReadRequest{ResourceName: rn.DownloadString(), ReadOffset: int64(len(blob) + 1)})
+			require.NoError(t, err)
+			_, err = stream.Recv()
+			require.Equal(t, codes.OutOfRange, gstatus.Code(err), "terminal read error: %v", err)
+		})
+	}
+}
