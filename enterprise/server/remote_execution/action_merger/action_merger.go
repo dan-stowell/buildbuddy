@@ -125,11 +125,11 @@ func RecordClaimedExecution(ctx context.Context, rdb redis.UniversalClient, exec
 		return err
 	}
 
-	pipe := rdb.TxPipeline()
-	pipe.HSet(ctx, forwardKey, executionIDKey, executionID)
-	pipe.Expire(ctx, forwardKey, ttl)
-	pipe.Set(ctx, reverseKey, forwardKey, ttl)
-	_, err = pipe.Exec(ctx)
+	_, err = rdb.Eval(ctx, `
+    if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
+    redis.call('EXPIRE', KEYS[1], ARGV[3])
+    redis.call('EXPIRE', KEYS[2], ARGV[3])
+    return 1`, []string{forwardKey, reverseKey}, executionIDKey, executionID, int(ttl.Seconds())).Result()
 	return err
 }
 
@@ -412,11 +412,76 @@ func DeletePendingExecution(ctx context.Context, rdb redis.UniversalClient, exec
 	if err != nil {
 		return err
 	}
-	if err := rdb.Del(ctx, pendingExecutionKey).Err(); err != nil {
-		log.CtxWarningf(ctx, "could not delete pending execution key %q: %s", pendingExecutionKey, err)
+	_, err = rdb.Eval(ctx, `
+    if redis.call('EXISTS', KEYS[3]) == 1 and redis.call('HEXISTS', KEYS[3], 'winner') == 0 then return 0 end
+    if redis.call('HGET', KEYS[1], ARGV[1]) == ARGV[2] then redis.call('DEL', KEYS[1]) end
+    redis.call('DEL', KEYS[2])
+    return 1`, []string{pendingExecutionKey, pendingExecutionDigestKey, copyKey(executionID)}, executionIDKey, executionID).Result()
+	return err
+}
+
+// Copy state outlives the digest-to-pending mapping so late completions cannot
+// replace a winner, including after a new execution of the same action starts.
+func copyKey(id string) string {
+	s, _ := executionIDWithDigestSharding(id)
+	return "executionCopies/1/" + s
+}
+
+func RegisterCopy(ctx context.Context, rdb redis.UniversalClient, canonical, id string) error {
+	_, err := rdb.Eval(ctx, `
+ redis.call('HSET', KEYS[1], 'canonical', ARGV[1])
+ redis.call('EXPIRE', KEYS[1], 86400)
+ if redis.call('HEXISTS', KEYS[2], 'winner') == 1 then return redis.error_reply('execution already completed') end
+ redis.call('HSETNX', KEYS[2], 'copy:' .. ARGV[2], 'pending')
+ redis.call('EXPIRE', KEYS[2], 86400)
+ return 1`, []string{copyKey(id), copyKey(canonical)}, canonical, id).Result()
+	return err
+}
+
+// CompleteCopy atomically elects the first success. Failures are withheld until
+// every registered copy has failed. Replays by the winner are safe to publish.
+func CompleteCopy(ctx context.Context, rdb redis.UniversalClient, id string, success bool) (string, bool, []string, error) {
+	canonical, err := rdb.HGet(ctx, copyKey(id), "canonical").Result()
+	if err == redis.Nil {
+		return id, true, nil, nil
 	}
-	if err := rdb.Del(ctx, pendingExecutionDigestKey).Err(); err != nil {
-		log.CtxWarningf(ctx, "could not delete pending execution digest key %q: %s", pendingExecutionDigestKey, err)
+	if err != nil {
+		return "", false, nil, err
 	}
-	return nil
+	result, err := rdb.Eval(ctx, `
+ local winner = redis.call('HGET', KEYS[1], 'winner')
+ if winner then
+   if winner == ARGV[1] then return {1} else return {0} end
+ end
+ redis.call('HSET', KEYS[1], 'copy:' .. ARGV[1], 'failed')
+ local fields = redis.call('HKEYS', KEYS[1])
+ local copies = {}
+ local pending = false
+ for _, f in ipairs(fields) do
+   if string.sub(f,1,5) == 'copy:' then
+     table.insert(copies, string.sub(f,6))
+     if redis.call('HGET', KEYS[1], f) == 'pending' then pending = true end
+   end
+ end
+ if ARGV[2] ~= '1' and pending then return {0} end
+ redis.call('HSET', KEYS[1], 'winner', ARGV[1])
+ redis.call('EXPIRE', KEYS[1], 86400)
+ local result = {1}
+ for _, id in ipairs(copies) do table.insert(result,id) end
+ return result`, []string{copyKey(canonical)}, id, boolInt(success)).Slice()
+	if err != nil {
+		return "", false, nil, err
+	}
+	copies := make([]string, 0, len(result)-1)
+	for _, v := range result[1:] {
+		copies = append(copies, v.(string))
+	}
+	return canonical, result[0].(int64) == 1, copies, nil
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

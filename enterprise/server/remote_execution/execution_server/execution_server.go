@@ -1208,6 +1208,9 @@ func (s *ExecutionServer) execute(req *repb.ExecuteRequest, stream streamLike) e
 			}
 		}
 
+		if err := action_merger.RegisterCopy(ctx, s.rdb, executionID, executionID); err != nil {
+			return err
+		}
 		if err := s.Dispatch(ctx, req, action, executionID); err != nil {
 			log.CtxWarningf(ctx, "Error dispatching execution for %q: %s", downloadString, err)
 			if err := s.MarkExecutionFailed(ctx, executionID, err); err != nil {
@@ -1237,7 +1240,11 @@ func (s *ExecutionServer) execute(req *repb.ExecuteRequest, stream streamLike) e
 			// in the background.
 			action_merger.RecordHedgedExecution(ctx, s.rdb, adInstanceDigest, s.getGroupIDForMetrics(ctx))
 			hedgedExecutionID := adInstanceDigest.NewUploadString()
+			if err := action_merger.RegisterCopy(ctx, s.rdb, executionID, hedgedExecutionID); err != nil {
+				return err
+			}
 			if err := s.dispatchHedge(ctx, req, action, hedgedExecutionID); err != nil {
+				s.MarkExecutionFailed(ctx, hedgedExecutionID, err)
 				return status.WrapError(err, "dispatch hedged execution")
 			}
 			log.CtxInfof(ctx, "Dispatched new hedged execution %q for action %q and invocation %q", hedgedExecutionID, downloadString, invocationID)
@@ -1438,6 +1445,20 @@ func (s *ExecutionServer) MarkExecutionFailed(ctx context.Context, taskID string
 		log.CtxWarningf(ctx, "Could not parse taskID: %s", err)
 		return err
 	}
+	canonical, publish, copies, err := action_merger.CompleteCopy(ctx, s.rdb, taskID, false)
+	if err != nil {
+		return err
+	}
+	if !publish {
+		return nil
+	}
+	taskID = canonical
+	for _, id := range copies {
+		if id != taskID {
+			s.env.GetSchedulerService().CancelTask(ctx, id)
+		}
+	}
+	action_merger.DeletePendingExecution(ctx, s.rdb, canonical)
 	rsp := operation.ErrorResponse(reason)
 	op, err := operation.Assemble(taskID, operation.Metadata(repb.ExecutionStage_COMPLETED, r.GetDigest()), rsp)
 	if err != nil {
@@ -1562,7 +1583,7 @@ func (s *ExecutionServer) PublishOperation(stream repb.Execution_PublishOperatio
 			log.CtxWarningf(ctx, "could not delete pending execution %q: %s", taskID, err)
 		}
 	})
-	defer deletePendingExecutionOnce()
+	// Completion owns merge-state cleanup; a failed stream may reconnect.
 
 	flushExecutionsOnEOF := false
 	if *writeExecutionProgressStateToRedis {
@@ -1644,6 +1665,16 @@ func (s *ExecutionServer) PublishOperation(stream repb.Execution_PublishOperatio
 
 		log.CtxDebugf(ctx, "PublishOperation: stage: %s", stage)
 
+		publishID := taskID
+		publishResult := true
+		var otherCopies []string
+		if stage == repb.ExecutionStage_COMPLETED {
+			var err error
+			publishID, publishResult, otherCopies, err = action_merger.CompleteCopy(ctx, s.rdb, taskID, response != nil && response.GetStatus().GetCode() == 0 && response.GetResult() != nil && response.GetResult().GetExitCode() == 0)
+			if err != nil {
+				return err
+			}
+		}
 		var auxMeta *espb.ExecutionAuxiliaryMetadata
 		var properties *platform.Properties
 		var action *repb.Action
@@ -1672,10 +1703,15 @@ func (s *ExecutionServer) PublishOperation(stream repb.Execution_PublishOperatio
 			// may specify skip_cache_lookup, we need to ensure that the result is not visible in the cache before the
 			// action is merged. At the same time, we don't want the window between the calls to be too large to avoid
 			// reducing the effectiveness of merging.
-			deletePendingExecutionOnce()
+			if publishResult {
+				action_merger.DeletePendingExecution(ctx, s.rdb, publishID)
+				deletePendingExecutionOnce()
+			}
 			actionRN := digest.NewACResourceName(actionCASRN.GetDigest(), actionCASRN.GetInstanceName(), actionCASRN.GetDigestFunction())
-			if err := s.cacheActionResult(ctx, actionRN, trimmedResponse, action); err != nil {
-				return status.UnavailableErrorf("Error uploading action result: %s", err.Error())
+			if publishResult {
+				if err := s.cacheActionResult(ctx, actionRN, trimmedResponse, action); err != nil {
+					return status.UnavailableErrorf("Error uploading action result: %s", err.Error())
+				}
 			}
 			if err := s.markTaskComplete(ctx, actionRN, response, auxMeta, action, cmd, properties, flushExecutionsOnEOF); err != nil {
 				// Errors updating the router or recording usage are non-fatal.
@@ -1684,16 +1720,38 @@ func (s *ExecutionServer) PublishOperation(stream repb.Execution_PublishOperatio
 
 			recordResponseMetrics(response, auxMeta, s.getGroupIDForMetrics(ctx))
 		}
+		if !publishResult {
+			continue
+		}
+		if publishID != taskID {
+			op = proto.Clone(op).(*longrunningpb.Operation)
+			op.Name = publishID
+		}
 		data, err := proto.Marshal(op)
 		if err != nil {
 			return status.InternalErrorf("Failed to marshal Operation: %s", err)
 		}
-		if err := s.streamPubSub.Publish(ctx, s.pubSubChannelForExecutionID(taskID), base64.StdEncoding.EncodeToString(data)); err != nil {
+		if err := s.streamPubSub.Publish(ctx, s.pubSubChannelForExecutionID(publishID), base64.StdEncoding.EncodeToString(data)); err != nil {
 			log.CtxWarningf(ctx, "Error publishing task on stream pubsub: %s", err)
 			return status.InternalErrorf("Error publishing task %q on stream pubsub: %s", taskID, err)
 		}
 
 		if stage == repb.ExecutionStage_COMPLETED {
+			if publishID != taskID {
+				if err := s.cacheExecuteResponse(ctx, publishID, response); err != nil {
+					return err
+				}
+				if err := s.updateExecution(ctx, publishID, stage, response, auxMeta, properties, action, cmd); err != nil {
+					return err
+				}
+			}
+			for _, copyID := range otherCopies {
+				if copyID != taskID {
+					if _, err := s.env.GetSchedulerService().CancelTask(ctx, copyID); err != nil {
+						return err
+					}
+				}
+			}
 			err := func() error {
 				mu.Lock()
 				defer mu.Unlock()

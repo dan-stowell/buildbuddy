@@ -3038,7 +3038,14 @@ func (s *SchedulerServer) ScheduleTask(ctx context.Context, req *scpb.ScheduleTa
 }
 
 func (s *SchedulerServer) CancelTask(ctx context.Context, taskID string) (bool, error) {
-	return s.deleteTask(ctx, taskID)
+	deleted, err := s.deleteTask(ctx, taskID)
+	if err != nil {
+		return deleted, err
+	}
+	if err := s.sendCancellationRequests(ctx, taskID); err != nil {
+		return deleted, err
+	}
+	return deleted, nil
 }
 
 func (s *SchedulerServer) ExistsTask(ctx context.Context, taskID string) (bool, error) {
