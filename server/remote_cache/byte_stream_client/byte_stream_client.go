@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/server/endpoint_urls/cache_api_url"
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
@@ -32,12 +33,21 @@ import (
 var (
 	restrictBytestreamDialing = flag.Bool("app.restrict_bytestream_dialing", false, "If true, only allow dialing localhost or the configured cache backend for bytestream requests.")
 	enablePoolCache           = flag.Bool("grpc_client.enable_pool_cache", true, "Whether or not to enable the connection pool cache.")
+	poolCacheIdleTimeout      = flag.Duration("grpc_client.pool_cache_idle_timeout", 15*time.Minute, "Cached connection pools that have not been used for this long, and have no RPCs in flight, are closed. If <= 0, cached pools are never closed.")
 )
 
 type pooledByteStreamClient struct {
 	env         environment.Env
 	connMutex   sync.Mutex
-	connPoolMap map[string]grpc.ClientConnInterface
+	connPoolMap map[string]*cachedConnPool
+}
+
+// cachedConnPool is a connection pool in the pool cache. Its fields are
+// guarded by pooledByteStreamClient.connMutex.
+type cachedConnPool struct {
+	pool     *grpc_client.ClientConnPool
+	lastUse  time.Time
+	inFlight int
 }
 
 func RegisterPooledBytestreamClient(env *real_environment.RealEnv) {
@@ -48,7 +58,7 @@ func RegisterPooledBytestreamClient(env *real_environment.RealEnv) {
 func NewPooledByteStreamClient(env environment.Env) *pooledByteStreamClient {
 	return &pooledByteStreamClient{
 		env:         env,
-		connPoolMap: make(map[string]grpc.ClientConnInterface),
+		connPoolMap: make(map[string]*cachedConnPool),
 	}
 }
 
@@ -241,10 +251,12 @@ func (p *pooledByteStreamClient) streamFromUrl(ctx context.Context, url *url.URL
 
 	var conn grpc.ClientConnInterface
 	if *enablePoolCache {
-		conn, err = p.getGrpcClientConnPoolForURL(target)
+		var release func()
+		conn, release, err = p.getGrpcClientConnPoolForURL(target)
 		if err != nil {
 			return err
 		}
+		defer release()
 	} else {
 		closeableConn, err := grpc_client.DialInternalWithoutPooling(p.env, target)
 		if err != nil {
@@ -310,20 +322,59 @@ func (p *pooledByteStreamClient) streamFromUrl(ctx context.Context, url *url.URL
 	return nil
 }
 
-func (p *pooledByteStreamClient) getGrpcClientConnPoolForURL(target string) (conn grpc.ClientConnInterface, err error) {
+// getGrpcClientConnPoolForURL returns a cached connection pool for target,
+// dialing one if needed. The caller must call release once it is done using
+// the pool. Pools that have been unused for longer than
+// grpc_client.pool_cache_idle_timeout are closed.
+func (p *pooledByteStreamClient) getGrpcClientConnPoolForURL(target string) (conn grpc.ClientConnInterface, release func(), err error) {
 	p.connMutex.Lock()
 	defer p.connMutex.Unlock()
-	connPool, ok := p.connPoolMap[target]
-	if ok && connPool != nil {
-		return connPool, nil
-	}
+	now := p.env.GetClock().Now()
+	defer p.closeIdlePoolsLocked(now)
 
-	// We didn't find a connection pool, so we'll make one.
-	connPool, err = grpc_client.DialInternalWithPoolSize(p.env, target, 2)
-	if err != nil {
-		return nil, err
+	cp, ok := p.connPoolMap[target]
+	if !ok {
+		// We didn't find a connection pool, so we'll make one.
+		pool, err := grpc_client.DialInternalWithPoolSize(p.env, target, 2)
+		if err != nil {
+			return nil, nil, err
+		}
+		cp = &cachedConnPool{pool: pool}
+		p.connPoolMap[target] = cp
+		log.Infof("Cached connection pool for target: %s, %d targets cached so far", target, len(p.connPoolMap))
 	}
-	p.connPoolMap[target] = connPool
-	log.Infof("Cached connection pool for target: %s, %d targets cached so far", target, len(p.connPoolMap))
-	return connPool, nil
+	cp.lastUse = now
+	cp.inFlight++
+	release = sync.OnceFunc(func() {
+		p.connMutex.Lock()
+		defer p.connMutex.Unlock()
+		cp.inFlight--
+		cp.lastUse = p.env.GetClock().Now()
+	})
+	return cp.pool, release, nil
+}
+
+// closeIdlePoolsLocked removes and closes cached pools that have no RPCs in
+// flight and have not been used since before now - idle timeout.
+func (p *pooledByteStreamClient) closeIdlePoolsLocked(now time.Time) {
+	if *poolCacheIdleTimeout <= 0 {
+		return
+	}
+	for target, cp := range p.connPoolMap {
+		if cp.inFlight > 0 || now.Sub(cp.lastUse) <= *poolCacheIdleTimeout {
+			continue
+		}
+		delete(p.connPoolMap, target)
+		// Closing is non-blocking.
+		cp.pool.Close()
+		log.Infof("Closed idle cached connection pool for target: %s", stripUserFromTarget(target))
+	}
+}
+
+func stripUserFromTarget(target string) string {
+	u, err := url.Parse(target)
+	if err != nil {
+		return "<unparsable target>"
+	}
+	return stripUser(u).String()
 }
