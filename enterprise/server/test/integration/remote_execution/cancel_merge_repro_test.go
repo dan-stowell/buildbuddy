@@ -117,7 +117,7 @@ func TestCancelMergeRepro_RunningTask(t *testing.T) {
 
 	// Poll for executor-side / PublishOperation cleanup.
 	var keysAfter []string
-	for i := 0; i < 30; i++ {
+	for i := range 30 {
 		keysAfter = pendingExecutionKeys(t, rbe)
 		if len(keysAfter) == 0 {
 			t.Logf("keys cleaned up %s after process termination", time.Duration(i)*500*time.Millisecond)
