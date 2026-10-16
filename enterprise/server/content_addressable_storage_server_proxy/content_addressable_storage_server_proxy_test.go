@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"maps"
 	"slices"
 	"strings"
@@ -1066,5 +1067,40 @@ func TestFindMissingBlobs_QuorumBypassesPresenceCache(t *testing.T) {
 	for i := int32(2); i <= 4; i++ {
 		findMissing(findmissing.WithQuorum(ctx), proxy, []*repb.Digest{d}, nil, t)
 		require.Equal(t, i, requestCount.Load())
+	}
+}
+
+type cancelledTreeRemote struct {
+	repb.UnimplementedContentAddressableStorageServer
+}
+
+func (*cancelledTreeRemote) GetTree(_ *repb.GetTreeRequest, stream repb.ContentAddressableStorage_GetTreeServer) error {
+	if err := stream.Send(&repb.GetTreeResponse{Directories: []*repb.Directory{{}}}); err != nil {
+		return err
+	}
+	<-stream.Context().Done()
+	return stream.Context().Err()
+}
+func TestCancelledGetTreeLifecycleResources(t *testing.T) {
+	testleak.Check(t)
+	testleak.CheckFDs(t)
+	flags.Set(t, "cache_proxy.enable_get_tree_caching", false)
+	remoteEnv, proxyEnv := testenv.GetTestEnv(t), testenv.GetTestEnv(t)
+	server, run, lis := testenv.RegisterLocalGRPCServer(t, remoteEnv)
+	repb.RegisterContentAddressableStorageServer(server, &cancelledTreeRemote{})
+	go run()
+	conn, err := testenv.LocalGRPCConn(t, context.Background(), lis)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	proxy := repb.NewContentAddressableStorageClient(runCASProxy(context.Background(), conn, proxyEnv, t))
+	for range 10 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		stream, err := proxy.GetTree(ctx, &repb.GetTreeRequest{RootDigest: &repb.Digest{Hash: fooDigest, SizeBytes: 100}, DigestFunction: repb.DigestFunction_SHA256})
+		require.NoError(t, err)
+		_, err = stream.Recv()
+		require.NoError(t, err)
+		cancel()
+		_, err = stream.Recv()
+		require.Error(t, err)
 	}
 }

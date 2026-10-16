@@ -37,6 +37,7 @@ go_test(
     srcs = ["content_addressable_storage_server_proxy_test.go"],
     embed = [":content_addressable_storage_server_proxy"],
     deps = [
+        "//server/testutil/testleak",
         "//enterprise/server/atime_updater",
         "//enterprise/server/byte_stream_server_proxy",
         "//enterprise/server/experiments",
