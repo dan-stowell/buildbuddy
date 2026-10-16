@@ -515,7 +515,11 @@ func boolInt(b bool) int {
 // invocation count as one interested client. Empty IDs remain protected because
 // they cannot be cancelled by invocation ID.
 func AddInvocation(ctx context.Context, rdb redis.UniversalClient, canonical, invocation string) error {
-	return rdb.HSet(ctx, copyKey(canonical), "invocation:"+invocation, "1").Err()
+	return rdb.Eval(ctx, `
+    if redis.call('HGET', KEYS[1], 'winner') == 'cancelled' then return redis.error_reply('execution cancelled') end
+    redis.call('HSET', KEYS[1], 'invocation:' .. ARGV[1], '1')
+    redis.call('EXPIRE', KEYS[1], 86400)
+    return 1`, []string{copyKey(canonical)}, invocation).Err()
 }
 
 // RemoveInvocation returns all copies only when no invocation still needs them.
@@ -558,4 +562,24 @@ func HasPendingCopy(ctx context.Context, rdb redis.UniversalClient, canonical st
 		}
 	}
 	return false, nil
+}
+
+// CopyShouldStop closes the race between registration and scheduling: a winner
+// or cancellation can be recorded while ScheduleTask is in flight.
+func CopyShouldStop(ctx context.Context, rdb redis.UniversalClient, id string) (bool, error) {
+	canonical, err := rdb.HGet(ctx, copyKey(id), "canonical").Result()
+	if err == redis.Nil {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	winner, err := rdb.HGet(ctx, copyKey(canonical), "winner").Result()
+	if err == redis.Nil {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return winner != "" && winner != id, nil
 }

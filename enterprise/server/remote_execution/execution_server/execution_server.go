@@ -1128,6 +1128,13 @@ func (s *ExecutionServer) dispatch(ctx context.Context, req *repb.ExecuteRequest
 		}
 		return nil, status.UnavailableErrorf("Error scheduling execution task %q: %s", executionID, err)
 	}
+	if stop, err := action_merger.CopyShouldStop(ctx, s.rdb, executionID); err != nil {
+		return nil, err
+	} else if stop {
+		if _, err := scheduler.CancelTask(ctx, executionID); err != nil {
+			return nil, err
+		}
+	}
 
 	return pool, nil
 }

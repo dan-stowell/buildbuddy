@@ -391,6 +391,7 @@ type PriorityTaskScheduler struct {
 	// activeTaskStartTimes contains, for each currently running task, the
 	// time at which the task started executing.
 	activeTaskStartTimes map[string]time.Time
+	activeTaskCancels    map[string]context.CancelFunc
 }
 
 func NewPriorityTaskScheduler(env environment.Env, exec IExecutor, runnerPool interfaces.RunnerPool, taskLeaser interfaces.TaskLeaser, options *Options) (*PriorityTaskScheduler, error) {
@@ -612,6 +613,12 @@ func (q *PriorityTaskScheduler) remove(taskID string) bool {
 func (q *PriorityTaskScheduler) CancelTaskReservation(ctx context.Context, taskID string) {
 	ctx = q.enrichContext(ctx)
 	ctx = log.EnrichContext(ctx, log.ExecutionIDKey, taskID)
+	q.mu.Lock()
+	cancel := q.activeTaskCancels[taskID]
+	q.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	if removed := q.remove(taskID); removed {
 		log.CtxInfof(ctx, "Removed completed task from queue")
 		// If the task we removed was at the head of the queue, the task behind
@@ -696,6 +703,10 @@ func (q *PriorityTaskScheduler) runTask(ctx context.Context, st *repb.ScheduledT
 func (q *PriorityTaskScheduler) trackTask(res *scpb.EnqueueTaskReservationRequest, cancel *context.CancelFunc) {
 	q.activeCancelFuncsCount.Add(1)
 	q.activeTaskStartTimes[res.GetTaskId()] = q.clock.Now()
+	if q.activeTaskCancels == nil {
+		q.activeTaskCancels = make(map[string]context.CancelFunc)
+	}
+	q.activeTaskCancels[res.GetTaskId()] = *cancel
 	q.resourcesUsed.Concurrency++
 	if size := res.GetTaskSize(); size != nil {
 		q.resourcesUsed.RAMBytes += size.GetEstimatedMemoryBytes()
@@ -720,6 +731,7 @@ func (q *PriorityTaskScheduler) trackTask(res *scpb.EnqueueTaskReservationReques
 func (q *PriorityTaskScheduler) untrackTask(res *scpb.EnqueueTaskReservationRequest, cancel *context.CancelFunc) {
 	q.activeCancelFuncsCount.Add(-1)
 	delete(q.activeTaskStartTimes, res.GetTaskId())
+	delete(q.activeTaskCancels, res.GetTaskId())
 	q.resourcesUsed.Concurrency--
 	if size := res.GetTaskSize(); size != nil {
 		q.resourcesUsed.RAMBytes -= size.GetEstimatedMemoryBytes()
