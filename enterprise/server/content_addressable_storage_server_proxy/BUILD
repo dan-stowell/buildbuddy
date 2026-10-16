@@ -40,6 +40,7 @@ go_test(
         "content_addressable_storage_server_proxy_test.go",
         "find_missing_cache_eviction_test.go",
         "presence_v4_review_test.go",
+        "review_compat_test.go",
     ],
     embed = [":content_addressable_storage_server_proxy"],
     deps = [
