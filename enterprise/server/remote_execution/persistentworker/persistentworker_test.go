@@ -9,9 +9,11 @@ import (
 	"unicode/utf8"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/container"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/containers/bare"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/persistentworker"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/workspace"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/stretchr/testify/require"
 
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
@@ -76,4 +78,26 @@ func TestWorkerExec_Stderr(t *testing.T) {
 			require.Contains(t, result.Error.Error(), "persistent worker stderr:\n"+test.wantStderr)
 		})
 	}
+}
+
+func TestWorkerStop_UnreadOutputAfterInvalidResponse(t *testing.T) {
+	testleak.Check(t)
+	testleak.CheckFDs(t)
+
+	ctx := context.Background()
+	ctr := bare.NewBareCommandContainer(&bare.Opts{})
+	require.NoError(t, ctr.Create(ctx, t.TempDir()))
+	// After receiving a request, the worker writes 4000 NUL bytes in a single
+	// write (atomic, since it is less than PIPE_BUF) and keeps running. The
+	// JSON decoder fails on the first byte without reading the rest, so the
+	// stdout copy goroutine is left with unread output.
+	script := `head -c 1 >/dev/null; dd if=/dev/zero bs=4000 count=1 2>/dev/null; exec sleep 300`
+	cmd := &repb.Command{Arguments: []string{"sh", "-c", script}}
+	w, err := persistentworker.Start(ctx, &workspace.Workspace{}, ctr, "json", cmd)
+	require.NoError(t, err)
+
+	res := w.Exec(ctx, cmd)
+	require.ErrorContains(t, res.Error, "invalid character")
+
+	require.NoError(t, w.Stop())
 }

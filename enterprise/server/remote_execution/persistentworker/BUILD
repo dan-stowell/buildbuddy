@@ -32,9 +32,11 @@ go_test(
     deps = [
         ":persistentworker",
         "//enterprise/server/remote_execution/container",
+        "//enterprise/server/remote_execution/containers/bare",
         "//enterprise/server/remote_execution/workspace",
         "//proto:remote_execution_go_proto",
         "//server/interfaces",
+        "//server/testutil/testleak",
         "@com_github_stretchr_testify//require",
     ],
 )

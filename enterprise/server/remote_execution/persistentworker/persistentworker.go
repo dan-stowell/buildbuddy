@@ -111,6 +111,9 @@ func Start(ctx context.Context, workspace *workspace.Workspace, container contai
 		// worker exec process.
 		cancel()
 		_ = stdinWriter.Close()
+		// A failed response may leave unread output. Unblock any stdout copy
+		// goroutine before waiting for Exec, which waits for output copying.
+		_ = stdoutReader.Close()
 		// Wait for the worker to terminate. This is needed since canceling the
 		// context doesn't block until the worker is killed. This helps ensure that
 		// the worker is killed if we are shutting down. The shutdown case is also
