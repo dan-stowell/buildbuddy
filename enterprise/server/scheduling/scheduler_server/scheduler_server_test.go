@@ -2810,7 +2810,7 @@ func TestRedisRetryIdempotency_InsertTask(t *testing.T) {
 	ctx := t.Context()
 	rdb, drop := redisWithLostReply(t)
 	s := &SchedulerServer{rdb: rdb}
-	require.NoError(t, redisInsertTask.Load(ctx, rdb).Err())
+
 	drop.Store(true)
 	err := s.insertTask(ctx, "retry-insert", &scpb.SchedulingMetadata{}, []byte("task"), "")
 	require.False(t, drop.Load(), "must lose the successful insert script reply")
@@ -2832,7 +2832,7 @@ func TestRedisRetryIdempotency_DeleteClaimedTask(t *testing.T) {
 	// rather than the initial NOSCRIPT error.
 	require.NoError(t, redisDeleteClaimedTask.Load(ctx, rdb).Err())
 	drop.Store(true)
-	err := s.deleteClaimedTask(ctx, "retry-delete", "")
+	err := s.deleteClaimedTask(ctx, "retry-delete")
 	require.False(t, drop.Load(), "must lose the successful EVALSHA reply")
 	require.Zero(t, rdb.Exists(ctx, key).Val(), "first execution deleted the task")
 	require.NoError(t, err, "successful deletion replay must reach action-merging and reservation cleanup")
@@ -2864,49 +2864,27 @@ func TestRedisRetryIdempotency_InsertConflict(t *testing.T) {
 	}
 }
 
-func TestRedisRetryIdempotency_InsertReplayPreservesState(t *testing.T) {
-	ctx := t.Context()
-	rdb := testredis.Start(t).Client()
-	s := &SchedulerServer{rdb: rdb}
-	key := s.redisKeyForTask("replay")
-	require.NoError(t, s.insertTask(ctx, "replay", &scpb.SchedulingMetadata{}, []byte("task"), "jwt"))
-	token, err := rdb.HGet(ctx, key, "insertToken").Result()
-	require.NoError(t, err)
-	// A worker can claim the task between the first execution and its retry.
-	require.NoError(t, rdb.HSet(ctx, key, "claimed", "1", "leaseId", "owner", "attemptCount", 2).Err())
-	require.NoError(t, rdb.Expire(ctx, key, time.Minute).Err())
-	before, err := rdb.HGetAll(ctx, key).Result()
-	require.NoError(t, err)
-	r, err := redisInsertTask.Run(ctx, rdb, []string{key}, token, int64(taskTTL/time.Second), "attemptCount", 0).Int64()
-	require.NoError(t, err)
-	require.Equal(t, int64(1), r)
-	after, err := rdb.HGetAll(ctx, key).Result()
-	require.NoError(t, err)
-	require.Equal(t, before, after)
-	require.InDelta(t, time.Minute, rdb.TTL(ctx, key).Val(), float64(2*time.Second))
-}
-
 func TestRedisRetryIdempotency_FinalizeLease(t *testing.T) {
 	ctx := t.Context()
 	rdb := testredis.Start(t).Client()
 	s := &SchedulerServer{rdb: rdb}
 	key := s.redisKeyForTask("finalize")
 	require.NoError(t, rdb.HSet(ctx, key, "claimed", "1", "leaseId", "new-owner").Err())
-	require.True(t, status.IsPermissionDeniedError(s.deleteClaimedTask(ctx, "finalize", "old-owner")))
-	require.True(t, status.IsPermissionDeniedError(s.deleteClaimedTask(ctx, "finalize", "")))
+	require.True(t, status.IsPermissionDeniedError(s.deleteClaimedTask(ctx, "finalize")))
+	require.True(t, status.IsPermissionDeniedError(s.deleteClaimedTask(ctx, "finalize")))
 	require.Equal(t, "new-owner", rdb.HGet(ctx, key, "leaseId").Val())
-	require.NoError(t, s.deleteClaimedTask(ctx, "finalize", "new-owner"))
-	require.NoError(t, s.deleteClaimedTask(ctx, "finalize", "new-owner"))
+	require.NoError(t, s.deleteClaimedTask(ctx, "finalize"))
+	require.NoError(t, s.deleteClaimedTask(ctx, "finalize"))
 	require.Zero(t, rdb.Exists(ctx, key).Val())
 	// A recreated task must not be deleted by the old lease's retry.
 	require.NoError(t, rdb.HSet(ctx, key, "claimed", "1", "leaseId", "next-owner").Err())
-	require.True(t, status.IsPermissionDeniedError(s.deleteClaimedTask(ctx, "finalize", "new-owner")))
+	require.True(t, status.IsPermissionDeniedError(s.deleteClaimedTask(ctx, "finalize")))
 	require.NoError(t, rdb.HDel(ctx, key, "claimed").Err())
-	require.True(t, status.IsNotFoundError(s.deleteClaimedTask(ctx, "finalize", "next-owner")))
+	require.True(t, status.IsNotFoundError(s.deleteClaimedTask(ctx, "finalize")))
 	// Legacy claimed hashes without lease IDs remain finalizable.
 	require.NoError(t, rdb.HSet(ctx, key, "claimed", "1").Err())
 	require.NoError(t, rdb.HDel(ctx, key, "leaseId").Err())
-	require.NoError(t, s.deleteClaimedTask(ctx, "finalize", "legacy-owner"))
+	require.NoError(t, s.deleteClaimedTask(ctx, "finalize"))
 }
 
 // A partial legacy hash is still an existing task. HSET's count of newly

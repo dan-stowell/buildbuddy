@@ -327,12 +327,7 @@ func TestRedisLostReply_ScheduleTask(t *testing.T) {
 		taskID := req.GetTaskId()
 		taskKey := s.redisKeyForTask(taskID)
 		injector.arm(numDrops, func(args []string) bool {
-			if len(args) < 4 || args[3] != taskKey {
-				return false
-			}
-			cmd := strings.ToLower(args[0])
-			return (cmd == "evalsha" && args[1] == redisInsertTask.Hash()) ||
-				(cmd == "eval" && strings.Contains(args[1], `"insertToken"`))
+			return len(args) > 1 && strings.EqualFold(args[0], "hset") && args[1] == taskKey
 		})
 
 		_, scheduleErr := s.ScheduleTask(ctx, req)
