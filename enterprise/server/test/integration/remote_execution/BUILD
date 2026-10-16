@@ -72,6 +72,7 @@ go_test(
     deps = [
         "//enterprise/server/test/integration/remote_execution/rbetest",
         "//proto:build_event_stream_go_proto",
+        "//proto:remote_execution_go_proto",
         "//server/build_event_protocol/build_event_handler",
         "//server/build_event_publisher",
         "@com_github_google_uuid//:uuid",
