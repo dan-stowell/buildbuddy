@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -230,4 +231,24 @@ func TestBareExec_WorkingDirectory(t *testing.T) {
 	require.NoError(t, result.Error)
 	assert.Equal(t, 0, result.ExitCode)
 	assert.Equal(t, "hello", string(result.Stdout))
+}
+
+// A signal sent after a task's command has exited (e.g. a graceful
+// termination timer firing while outputs are uploaded) must not be delivered
+// to the next task's command on a recycled container.
+func TestSignalAfterCommandExit_NotDeliveredToNextCommand(t *testing.T) {
+	c := bare.NewBareCommandContainer(&bare.Opts{})
+	wd := testfs.MakeTempDir(t)
+	require.NoError(t, c.Create(context.Background(), wd))
+
+	task1Ctx, cancelTask1 := context.WithCancel(context.Background())
+	res := c.Exec(task1Ctx, &repb.Command{Arguments: []string{"true"}}, nil)
+	require.NoError(t, res.Error)
+	// Task 1 is still finishing up when the graceful termination signal is sent.
+	require.NoError(t, c.Signal(task1Ctx, syscall.SIGTERM))
+	cancelTask1()
+
+	res = c.Exec(context.Background(), &repb.Command{Arguments: []string{"sh", "-c", "sleep 0.5"}}, nil)
+	require.NoError(t, res.Error)
+	require.Equal(t, 0, res.ExitCode)
 }
