@@ -38,7 +38,10 @@ go_library(
 
 go_test(
     name = "fetch_server_test",
-    srcs = ["fetch_server_test.go"],
+    srcs = [
+        "fetch_server_test.go",
+        "v9_explore_test.go",
+    ],
     deps = [
         ":fetch_server",
         "//proto:buildbuddy_service_go_proto",
