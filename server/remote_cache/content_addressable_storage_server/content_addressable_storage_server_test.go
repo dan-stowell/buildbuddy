@@ -1724,6 +1724,8 @@ func reachableDirs(g *randomDirGraph, root *repb.Digest) map[string]bool {
 	return out
 }
 
+var resolvedSplitChildren int
+
 func resolveTreeCacheBlob(t *testing.T, ctx context.Context, bsClient bspb.ByteStreamClient, rn *digest.CASResourceName) []*repb.Directory {
 	tc := &capb.TreeCache{}
 	require.NoError(t, cachetools.GetBlobAsProto(ctx, bsClient, rn, tc))
@@ -1732,6 +1734,7 @@ func resolveTreeCacheBlob(t *testing.T, ctx context.Context, bsClient bspb.ByteS
 		out = append(out, c.GetDirectory())
 	}
 	for _, child := range tc.GetTreeCacheChildren() {
+		resolvedSplitChildren++
 		crn, err := digest.CASResourceNameFromProto(child)
 		require.NoError(t, err)
 		out = append(out, resolveTreeCacheBlob(t, ctx, bsClient, crn)...)
@@ -1770,6 +1773,13 @@ func TestGetTreeRandomizedMatchesReachableDirs(t *testing.T) {
 			g := makeRandomDirGraph(t, ctx, bsClient, rng, 3+rng.Intn(4), 3+rng.Intn(5))
 			// Roots: everything in the top two levels, plus a few random dirs.
 			roots := g.digests[len(g.digests)/2:]
+			metrics.TreeCacheLookupCount.Reset()
+			metrics.TreeCacheSplitLookupCount.Reset()
+			resolvedSplitChildren = 0
+			subtreesReceived := 0
+			defer func() {
+				t.Logf("dirs=%d roots=%d subtreesReceived=%d resolvedSplitChildren=%d lookups=%v splitLookups=%v", len(g.digests), len(roots), subtreesReceived, resolvedSplitChildren, testmetrics.CounterValues(t, metrics.TreeCacheLookupCount), testmetrics.CounterValues(t, metrics.TreeCacheSplitLookupCount))
+			}()
 
 			for round := range 4 {
 				order := rng.Perm(len(roots))
@@ -1794,6 +1804,7 @@ func TestGetTreeRandomizedMatchesReachableDirs(t *testing.T) {
 							if !sendSubtrees {
 								t.Fatalf("received subtrees without requesting them")
 							}
+							subtreesReceived++
 							rn := digest.NewCASResourceName(st.GetDigest(), st.GetInstanceName(), st.GetDigestFunction())
 							rn.SetCompressor(st.GetCompressor())
 							dirs = append(dirs, resolveTreeCacheBlob(t, ctx, bsClient, rn)...)
