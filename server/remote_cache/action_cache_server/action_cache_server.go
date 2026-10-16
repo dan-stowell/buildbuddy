@@ -152,7 +152,7 @@ func readOutputTree(ctx context.Context, cache interfaces.Cache, instanceName st
 
 func ValidateActionResult(ctx context.Context, cache interfaces.Cache, remoteInstanceName string, digestFunction repb.DigestFunction_Value, r *repb.ActionResult) error {
 	maxChunkSizeBytes := chunking.MaxChunkSizeBytes()
-	outputFileDigests := make([]*rspb.ResourceName, 0, len(r.OutputFiles))
+	outputFileDigests := make([]*rspb.ResourceName, 0, len(r.OutputFiles)+2)
 	mu := &sync.Mutex{}
 	appendDigest := func(d *repb.Digest) {
 		if d != nil && d.GetSizeBytes() > 0 {
@@ -162,6 +162,8 @@ func ValidateActionResult(ctx context.Context, cache interfaces.Cache, remoteIns
 			mu.Unlock()
 		}
 	}
+	appendDigest(r.GetStdoutDigest())
+	appendDigest(r.GetStderrDigest())
 	for _, f := range r.OutputFiles {
 		appendDigest(f.GetDigest())
 	}
