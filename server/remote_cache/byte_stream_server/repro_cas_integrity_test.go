@@ -33,7 +33,11 @@ import (
 type failingReader struct {
 	data    []byte
 	tailErr error
-	reads   int
+	// If oneShot, tailErr is returned once and io.EOF afterwards
+	// (a non-sticky error); otherwise tailErr is returned forever.
+	oneShot  bool
+	reported bool
+	reads    int
 }
 
 func (r *failingReader) Read(p []byte) (int, error) {
@@ -43,6 +47,10 @@ func (r *failingReader) Read(p []byte) (int, error) {
 		r.data = r.data[n:]
 		return n, nil
 	}
+	if r.oneShot && r.reported {
+		return 0, io.EOF
+	}
+	r.reported = true
 	return 0, r.tailErr
 }
 
@@ -120,34 +128,33 @@ func TestReproCAS_PartialThenErrUnexpectedEOF(t *testing.T) {
 		name      string
 		size      int
 		goodBytes int
+		oneShot   bool
 	}{
-		{"small_10000_half", 10000, 5000},
-		{"large_3MB_multi_message", 3_000_000, 1_234_567},
+		{"small_10000_half_sticky", 10000, 5000, false},
+		{"small_10000_half_oneshot", 10000, 5000, true},
+		{"large_3MB_multi_message_sticky", 3_000_000, 1_234_567, false},
+		{"large_3MB_multi_message_oneshot", 3_000_000, 1_234_567, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			blob, d := randomBlob(t, 1, tc.size)
 			ctx, client := setupFaultyBS(t, func() io.Reader {
-				return &failingReader{data: blob[:tc.goodBytes], tailErr: io.ErrUnexpectedEOF}
+				return &failingReader{data: blob[:tc.goodBytes], tailErr: io.ErrUnexpectedEOF, oneShot: tc.oneShot}
 			})
-			ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			defer cancel()
-			res := rawBSRead(ctx, client, resourceName(d, repb.Compressor_IDENTITY))
-			t.Logf("IDENTITY read of %d-byte blob (reader fails after %d bytes with io.ErrUnexpectedEOF): err=%v code=%s bytes=%d msgs=%d empty=%d elapsed=%s",
-				tc.size, tc.goodBytes, res.err, gstatus.Code(res.err), len(res.data), res.msgs, res.emptyMsgs, res.elapsed)
-			assert.Error(t, res.err, "client got status OK with %d of %d bytes", len(res.data), tc.size)
-
-			// Also ZSTD-requested read (server compresses since memory cache
-			// passthrough is not used here).
-			res = rawBSRead(ctx, client, resourceName(d, repb.Compressor_ZSTD))
-			var dec []byte
-			if res.err == nil {
-				var derr error
-				dec, derr = compression.DecompressZstd(nil, res.data)
-				t.Logf("zstd decompress err=%v", derr)
+			for _, c := range []repb.Compressor_Value{repb.Compressor_IDENTITY, repb.Compressor_ZSTD} {
+				rctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+				res := rawBSRead(rctx, client, resourceName(d, c))
+				cancel()
+				data := res.data
+				if c == repb.Compressor_ZSTD && res.err == nil {
+					var derr error
+					data, derr = compression.DecompressZstd(nil, res.data)
+					t.Logf("zstd decompress err=%v", derr)
+				}
+				t.Logf("%s read of %d-byte blob (reader returns %d bytes then io.ErrUnexpectedEOF, oneShot=%v): err=%v code=%s bytes=%d msgs=%d empty=%d elapsed=%s",
+					c, tc.size, tc.goodBytes, tc.oneShot, res.err, gstatus.Code(res.err), len(data), res.msgs, res.emptyMsgs, res.elapsed)
+				assert.Error(t, res.err, "%s: client got status OK with %d of %d bytes", c, len(data), tc.size)
+				assert.NotEqual(t, codes.DeadlineExceeded, gstatus.Code(res.err), "%s: server spun until client deadline (%d empty msgs)", c, res.emptyMsgs)
 			}
-			t.Logf("ZSTD read: err=%v code=%s compressedBytes=%d decompressedBytes=%d msgs=%d elapsed=%s",
-				res.err, gstatus.Code(res.err), len(res.data), len(dec), res.msgs, res.elapsed)
-			assert.Error(t, res.err, "ZSTD read: client got status OK with %d of %d decompressed bytes", len(dec), tc.size)
 		})
 	}
 }
