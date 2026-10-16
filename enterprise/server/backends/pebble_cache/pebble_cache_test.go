@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,6 +39,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testdigest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testmetrics"
 	"github.com/buildbuddy-io/buildbuddy/server/util/compression"
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
@@ -4674,4 +4676,36 @@ func TestWriteReference(t *testing.T) {
 		require.Error(t, err)
 		require.True(t, status.IsFailedPreconditionError(err), "expected FailedPreconditionError, got %s", err)
 	})
+}
+
+// Check while the cache is alive: Stop would also close leaked external files.
+func TestBlobLifecycleGrowth(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	ctx := getAnonContext(t, te)
+	noCompression := int64(1 << 60)
+	pc, err := pebble_cache.NewPebbleCache(te, &pebble_cache.Options{
+		RootDirectory: testfs.MakeTempDir(t), MaxSizeBytes: 1_000_000_000,
+		MaxInlineFileSizeBytes: 1024, MinBytesAutoZstdCompression: &noCompression,
+	})
+	require.NoError(t, err)
+	require.NoError(t, pc.Start())
+	t.Cleanup(func() { require.NoError(t, pc.Stop()) })
+	rn, data := testdigest.RandomCASResourceBuf(t, 256*1024)
+	require.NoError(t, pc.Set(ctx, rn, data))
+	// Keep closed readers reachable so GC cannot mask a missing Close.
+	var closedReaders []io.ReadCloser
+	testleak.CheckGrowth(t, testleak.Growth{Iterations: 20}, func(int) {
+		r, err := pc.Reader(ctx, rn, 0, 0)
+		require.NoError(t, err)
+		_, err = io.ReadFull(r, make([]byte, 17))
+		require.NoError(t, err)
+		require.NoError(t, r.Close())
+		closedReaders = append(closedReaders, r)
+		w, err := pc.Writer(ctx, rn)
+		require.NoError(t, err)
+		_, err = w.Write(data)
+		require.NoError(t, err)
+		require.NoError(t, w.Close()) // Abandon without Commit.
+	})
+	runtime.KeepAlive(closedReaders)
 }

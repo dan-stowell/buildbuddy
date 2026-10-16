@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"cloud.google.com/go/longrunning/autogen/longrunningpb"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/backends/redis_execution_collector"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/experiments"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/execution_server"
@@ -29,6 +30,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testcache"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testusage"
 	"github.com/buildbuddy-io/buildbuddy/server/usage/sku"
 	"github.com/buildbuddy-io/buildbuddy/server/util/bazel_request"
@@ -2976,3 +2978,83 @@ func TestRedactCachedExecuteResponse(t *testing.T) {
 		})
 	}
 }
+
+// Count XREAD clients (not PUBSUB subscriptions): Execute and WaitExecution
+// each own a blocking Redis stream reader, including merged Execute requests.
+func TestExecutionWaiterCleanupGrowth(t *testing.T) {
+	flags.Set(t, "grpc_server_worker_multiplier", 0)
+	env, conn, r := setupEnv(t)
+	rdb := env.GetRemoteExecutionRedisClient().(*redis.Client)
+	t.Cleanup(func() { require.NoError(t, rdb.Close()) })
+	env.SetSchedulerService(&mergingLifecycleScheduler{env.GetSchedulerService().(*schedulerServerMock)})
+	ctx := t.Context()
+	observer := r.Client()
+	client := repb.NewExecutionClient(conn)
+	blocked := func() int {
+		clients, err := observer.ClientList(ctx).Result()
+		require.NoError(t, err)
+		count := 0
+		for line := range strings.SplitSeq(clients, "\n") {
+			if strings.Contains(line, "cmd=xread") && strings.Contains(line, "flags=b") {
+				count++
+			}
+		}
+		return count
+	}
+	op := func(i int) {
+		arn := uploadAction(ctx, t, env, "", repb.DigestFunction_SHA256, &repb.Action{Timeout: durationpb.New(time.Duration(i+1) * time.Second)})
+		streamCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		first, err := client.Execute(streamCtx, &repb.ExecuteRequest{ActionDigest: arn.GetDigest(), DigestFunction: arn.GetDigestFunction()})
+		require.NoError(t, err)
+		op, err := first.Recv()
+		require.NoError(t, err)
+		second, err := client.Execute(ctx, &repb.ExecuteRequest{ActionDigest: arn.GetDigest(), DigestFunction: arn.GetDigestFunction()})
+		require.NoError(t, err)
+		merged, err := second.Recv()
+		require.NoError(t, err)
+		require.Equal(t, op.GetName(), merged.GetName())
+		waitCtx, cancelWait := context.WithCancel(ctx)
+		defer cancelWait()
+		wait, err := client.WaitExecution(waitCtx, &repb.WaitExecutionRequest{Name: op.GetName()})
+		require.NoError(t, err)
+		require.Eventually(t, func() bool { return blocked() == 3 }, 5*time.Second, time.Millisecond)
+		cancel()
+		_, err = first.Recv()
+		require.Error(t, err)
+		require.Eventually(t, func() bool { return blocked() == 2 }, 5*time.Second, time.Millisecond)
+		cancelWait()
+		_, err = wait.Recv()
+		require.Error(t, err)
+		require.Eventually(t, func() bool { return blocked() == 1 }, 5*time.Second, time.Millisecond)
+		wait, err = client.WaitExecution(ctx, &repb.WaitExecutionRequest{Name: op.GetName()})
+		require.NoError(t, err)
+		require.Eventually(t, func() bool { return blocked() == 2 }, 5*time.Second, time.Millisecond)
+		require.NoError(t, env.GetRemoteExecutionService().MarkExecutionFailed(ctx, op.GetName(), status.CanceledError("test completion")))
+		for _, recv := range []func() (*longrunningpb.Operation, error){second.Recv, wait.Recv} {
+			done, err := recv()
+			require.NoError(t, err)
+			require.True(t, done.GetDone())
+			_, err = recv()
+			require.Equal(t, io.EOF, err)
+		}
+		require.Eventually(t, func() bool { return blocked() == 0 }, 5*time.Second, time.Millisecond)
+	}
+	op(-1) // Warm the RPCs before filling the Redis command pool.
+	// Warm concurrent command connections as well as the stream operations.
+	var conns []*redis.Conn
+	for range 8 {
+		c := rdb.Conn(ctx)
+		require.NoError(t, c.Ping(ctx).Err())
+		conns = append(conns, c)
+	}
+	for _, c := range conns {
+		require.NoError(t, c.Close())
+	}
+
+	testleak.CheckGrowth(t, testleak.Growth{Iterations: 20, Warmup: -1}, op)
+}
+
+type mergingLifecycleScheduler struct{ *schedulerServerMock }
+
+func (*mergingLifecycleScheduler) ExistsTask(context.Context, string) (bool, error) { return true, nil }
