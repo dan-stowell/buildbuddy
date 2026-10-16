@@ -17,6 +17,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -247,6 +248,8 @@ func (w *exitSynchronizedWriter) Write(p []byte) (int, error) {
 }
 
 func TestRun_MainOutputSlowConsumer(t *testing.T) {
+	// A successful drain must remain lossless even beyond the cancellation grace.
+	flags.Set(t, "executor.output_drain_timeout", 100*time.Millisecond)
 	wd := testfs.MakeTempDir(t)
 	writer := &exitSynchronizedWriter{dir: wd}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
