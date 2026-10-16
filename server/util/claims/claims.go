@@ -629,7 +629,6 @@ func NewClaimsParser(keyProvider KeyProvider) (*ClaimsParser, error) {
 	config := &lru.Config[*Claims]{
 		MaxSize: claimsCacheSize,
 		SizeFn:  func(v *Claims) int64 { return 1 },
-		TTL:     *claimsCacheTTL,
 	}
 	lru, err := lru.New[*Claims](config)
 	if err != nil {
