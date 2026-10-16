@@ -739,7 +739,7 @@ func linkFileFromFileCache(ctx context.Context, fp *FilePointer, fc interfaces.F
 	if err := removeExisting(fp, opts); err != nil {
 		return false, err
 	}
-	return fc.FastLinkFile(ctx, fp.FileNode, fp.FullPath), nil
+	return fc.MaterializeWritable(ctx, fp.FileNode, fp.FullPath), nil
 }
 
 // fetchKey identifies an artifact to be fetched from a remote cache.
@@ -1265,6 +1265,31 @@ func (ff *BatchFileFetcher) publishDownloadedFile(ctx context.Context, fp *FileP
 // The blob is optionally added to the file cache, if the file cache
 // is enabled.
 func (ff *BatchFileFetcher) bytestreamReadToFilesystem(ctx context.Context, bsClient bspb.ByteStreamClient, dedupeKey downloadDedupeKey, fps []*FilePointer, opts *DownloadTreeOpts) error {
+	// Publish to cache before releasing the deduper. A follower must never
+	// depend on another action's workspace lifetime or mutable input bytes.
+	if fc := ff.env.GetFileCache(); fc != nil {
+		if err := ff.bytestreamReadToFilecache(ctx, bsClient, dedupeKey, fps); err != nil {
+			return err
+		}
+		for _, dest := range fps {
+			hit, err := linkFileFromFileCache(ctx, dest, fc, opts)
+			if err != nil {
+				return err
+			}
+			if !hit {
+				// Eviction is allowed between publication and materialization.
+				mode := os.FileMode(0644)
+				if dest.FileNode.GetIsExecutable() {
+					mode = 0755
+				}
+				if err := ff.downloadBlobToFile(ctx, bsClient, dest.FileNode, dest.FullPath, mode); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
 	fp, _, err := DownloadDeduper.Do(ctx, dedupeKey, func(ctx context.Context) (*FilePointer, error) {
 		// Only the deduped call takes a slot, since waiting tasks do no I/O.
 		release, err := inputDownloadLimit.acquire(ctx, 1)

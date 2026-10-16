@@ -71,7 +71,8 @@ const (
 type sharedDirectoryContextKey struct{}
 
 var (
-	_                                = flag.Bool("executor.local_cache_always_clone", false, "File cache transfers always use independent inodes.", flag.Deprecated("File cache transfers always use independent inodes."))
+	alwaysClone                      = flag.Bool("executor.local_cache_always_clone", false, "Use reflink-or-copy even for read-only file-cache links.")
+	unsafeWorkspaceHardlinks         = flag.Bool("executor.local_cache_trusted_workspace_hardlinks", false, "Opt out of input mutation protection for trusted workloads. Actions must never modify inputs in place; otherwise cache corruption is possible.")
 	includeSubdirPrefix              = flag.Bool("executor.include_subdir_prefix", true, "If true, store files under subdirs named by a short prefix of the file digest. This can help improve throughput on systems with high core counts. The prefix length is controlled by subdir_prefix_length.")
 	subdirPrefixLength               = flag.Int("executor.subdir_prefix_length", 2, "The length of the subdir prefix to use if include_subdir_prefix is true.")
 	enableDiskFallbackOnStartup      = flag.Bool("executor.local_cache_enable_disk_fallback_during_startup_scan", true, "If true, fallback to disk lookups while initial local cache scan is in progress.", flag.Internal)
@@ -82,31 +83,10 @@ var (
 	testOnlyDisableInitialDirectoryScan bool
 )
 
-// fileCache implements a fixed-size, filesystem backed, LRU cache.
-//
-// The gist of it is that fileCache maintains an LRU of files recently
-// requested, but rather than store the file bytes directly in memory
-// or on disk, fileCache just keeps hardlinks to them. This ensures
-// that when a previously downloaded temp file is deleted, if it is
-// tracked in filecache, the underlying bytes are not deleted from the
-// filesystem. When items are evicted from the LRU, the hardlinks owned
-// by fileCache are unlinked, possibly freeing the OS to delete the file if
-// no other references to it remain.
-//
-// Usage:
-// When files are downloaded, clients notify fileCache by calling:
-//
-//	AddFile(d *repb.Digest, existingFilePath string)
-//
-// at which point they are tracked by digest in the fileCache LRU.
-//
-// When clients need to download a file, they can do so by calling:
-//
-//	FastLinkFile(d *repb.Digest, outputPath string)
-//
-// which will, if the file is present in fileCache, create a hardlink at
-// outputPath and return true. If no file is found in the cache, fileCache
-// will return false.
+// fileCache is a filesystem-backed LRU. Workspace transfers use independent
+// inodes by default. Read-only consumers may share inodes with cache entries.
+// Without reflinks, workspace isolation requires additional disk space roughly
+// equal to the live workspace inputs, in addition to the cache budget.
 type fileCache struct {
 	rootDir      string
 	lock         sync.Mutex
@@ -688,7 +668,22 @@ func (c *fileCache) checkClosed() bool {
 	return c.isClosed.Load()
 }
 
-func (c *fileCache) FastLinkFile(ctx context.Context, node *repb.FileNode, outputPath string) (hit bool) {
+// FastLinkFile is the compatibility alias for MaterializeWritable.
+func (c *fileCache) FastLinkFile(ctx context.Context, node *repb.FileNode, outputPath string) bool {
+	return c.MaterializeWritable(ctx, node, outputPath)
+}
+
+// MaterializeWritable isolates bytes that an action may modify in place.
+func (c *fileCache) MaterializeWritable(ctx context.Context, node *repb.FileNode, outputPath string) bool {
+	return c.materialize(ctx, node, outputPath, !*unsafeWorkspaceHardlinks || *alwaysClone)
+}
+
+// LinkReadOnly shares storage. The caller must never modify the linked inode.
+func (c *fileCache) LinkReadOnly(ctx context.Context, node *repb.FileNode, outputPath string) bool {
+	return c.materialize(ctx, node, outputPath, *alwaysClone)
+}
+
+func (c *fileCache) materialize(ctx context.Context, node *repb.FileNode, outputPath string, independent bool) (hit bool) {
 	defer func() {
 		c.requestCounter[hit].Inc()
 	}()
@@ -703,7 +698,11 @@ func (c *fileCache) FastLinkFile(ctx context.Context, node *repb.FileNode, outpu
 		return false
 	}
 	start := time.Now()
-	if err := fastcopy.CloneOrCopy(filecachePath(c.rootDir, key), outputPath); err != nil && !os.IsExist(err) {
+	transfer := fastcopy.FastCopy
+	if independent {
+		transfer = fastcopy.CloneOrCopy
+	}
+	if err := transfer(filecachePath(c.rootDir, key), outputPath); err != nil && !os.IsExist(err) {
 		log.Warningf("Failed to link file from cache: %s", err)
 		return false
 	}
@@ -729,7 +728,18 @@ func (c *fileCache) Open(ctx context.Context, node *repb.FileNode) (f *os.File, 
 	return os.Open(filecachePath(c.rootDir, key))
 }
 
-func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, existingFilePath string) error {
+func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, existingFilePath string, modes ...string) error {
+	mode := "writable"
+	if len(modes) > 0 {
+		mode = modes[0]
+	}
+	k0, err := namespacedKey(keyPrefix, node)
+	if err != nil {
+		return err
+	}
+	if c.containsWithStatFallback(k0) {
+		return nil
+	}
 	// Remove any existing entry. We can't update in-place because if we
 	// overwrite an existing link with different contents, all pointers
 	// to the old link would suddenly change to point to the new content,
@@ -775,7 +785,13 @@ func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, 
 		}
 		defer os.Remove(stagedPath)
 		start := time.Now()
-		if err := fastcopy.CloneOrCopy(existingFilePath, stagedPath); err != nil {
+		transfer := fastcopy.CloneOrCopy
+		if mode == "owned" {
+			transfer = os.Rename
+		} else if (mode == "readonly" || *unsafeWorkspaceHardlinks) && !*alwaysClone {
+			transfer = fastcopy.FastCopy
+		}
+		if err := transfer(existingFilePath, stagedPath); err != nil {
 			return err
 		}
 		c.linkIntoFileCacheLatency.Observe(float64(time.Since(start).Microseconds()))
@@ -787,6 +803,9 @@ func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, 
 	// (i.e. during the initial directory scan), and if it's already tracked in
 	// the LRU (i.e. another action added it concurrently with the scan), then
 	// short-circuit to avoid evicting the file.
+	if c.l.Contains(k) {
+		return nil
+	}
 	if existingFileIsInPlace {
 		if c.l.Contains(k) {
 			return nil
@@ -824,6 +843,14 @@ func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, 
 		return status.InternalErrorf("could not add key %s to filecache lru", k)
 	}
 	return nil
+}
+
+// AddReadOnly admits a file whose inode will never be modified by the caller.
+func (c *fileCache) AddReadOnly(ctx context.Context, node *repb.FileNode, path string) error {
+	if c.checkClosed() {
+		return nil
+	}
+	return c.addFileWithKeyPrefix(keyPrefixFromContext(ctx), node, path, "readonly")
 }
 
 func (c *fileCache) AddFile(ctx context.Context, node *repb.FileNode, existingFilePath string) error {
@@ -995,7 +1022,7 @@ func (c *fileCache) Read(ctx context.Context, node *repb.FileNode) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
-	if !c.FastLinkFile(ctx, node, tmp) {
+	if !c.LinkReadOnly(ctx, node, tmp) {
 		return nil, status.NotFoundErrorf("digest %s not found", node.GetDigest().GetHash())
 	}
 	defer func() {
@@ -1029,7 +1056,7 @@ func (c *fileCache) Write(ctx context.Context, node *repb.FileNode, b []byte) (n
 	if err := os.WriteFile(tmp, b, 0o666); err != nil {
 		return 0, status.InternalErrorf("filecache temp file write failed: %s", err)
 	}
-	if err := c.AddFile(ctx, node, tmp); err != nil {
+	if err := c.addFileWithKeyPrefix(keyPrefixFromContext(ctx), node, tmp, "owned"); err != nil {
 		return 0, err
 	}
 	return len(b), nil
@@ -1104,7 +1131,7 @@ func (v *verifiedWriter) Commit() error {
 		return status.DataLossErrorf("data checksum %q does not match expected checksum %q", hashStr, v.node.GetDigest().GetHash())
 	}
 	defer v.Close()
-	return v.fc.AddFile(v.ctx, v.node, v.file.Name())
+	return v.fc.addFileWithKeyPrefix(keyPrefixFromContext(v.ctx), v.node, v.file.Name(), "owned")
 }
 
 func (v *verifiedWriter) Close() error {
@@ -1112,7 +1139,7 @@ func (v *verifiedWriter) Close() error {
 		return nil
 	}
 	defer func() {
-		if err := os.Remove(v.file.Name()); err != nil {
+		if err := os.Remove(v.file.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
 			log.Warningf("Failed to remove filecache temp file: %s", err)
 		}
 		v.file = nil
