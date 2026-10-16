@@ -3,11 +3,18 @@ package byte_stream_client
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
+	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
+	"github.com/jonboulle/clockwork"
 	"io"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bazelbuild/rules_go/go/runfiles"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
@@ -121,4 +128,52 @@ func TestReadZipFileContents(t *testing.T) {
 	validateZipContents(t, ctx, manifest.GetEntry()[0], "bazel", streamer)
 	validateZipContents(t, ctx, manifest.GetEntry()[1], "buildbuddy", streamer)
 	validateZipContents(t, ctx, manifest.GetEntry()[2], "san dimas high school football rules", streamer)
+}
+
+// TestV4DistinctPermittedTargets measures resources after every request has
+// returned. Synthetic userinfo is deliberately not a credential.
+func TestV4DistinctPermittedTargets(t *testing.T) {
+	for _, n := range []int{1, 10, 50} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			testleak.Check(t)
+			env := real_environment.NewRealEnv(nil)
+			flags.Set(t, "app.restrict_bytestream_dialing", true)
+			flags.Set(t, "app.cache_api_url", url.URL{Scheme: "grpcs", Host: "cache.example.com"})
+			clock := clockwork.NewFakeClock()
+			env.SetClock(clock)
+			p := NewPooledByteStreamClient(env)
+			t.Cleanup(func() { p.close(context.Background()) })
+			before := runtime.NumGoroutine()
+			for i := range n {
+				u, err := url.Parse(fmt.Sprintf("bytestream://synthetic-%d@localhost:1/blobs/abc/1", i))
+				require.NoError(t, err)
+				require.True(t, isPermittedForDial(getTargetForURL(u, true)))
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				require.Error(t, p.StreamBytestreamFile(ctx, u, io.Discard))
+			}
+			t.Logf("N=%d cached=%d goroutine_delta=%d", n, len(p.connPoolMap), runtime.NumGoroutine()-before)
+
+			for _, cp := range p.connPoolMap {
+				require.Zero(t, cp.inFlight)
+			}
+			clock.Advance(*poolCacheIdleTimeout + time.Second)
+			conn, release, err := p.getGrpcClientConnPoolForURL("grpcs://localhost:1")
+			require.NoError(t, err)
+			require.NotNil(t, conn)
+			require.Len(t, p.connPoolMap, 1, "expired pools should close on the next fetch")
+			// Acquiring the same active pool while sweeping must not close it.
+			clock.Advance(*poolCacheIdleTimeout + time.Second)
+			_, releaseOther, err := p.getGrpcClientConnPoolForURL("grpcs://localhost:2")
+			require.NoError(t, err)
+			require.Len(t, p.connPoolMap, 2, "in-flight pool must survive sweep")
+			releaseOther()
+			release()
+			require.NoError(t, p.close(context.Background()))
+			require.Empty(t, p.connPoolMap)
+			_, _, err = p.getGrpcClientConnPoolForURL("grpcs://localhost:1")
+			require.Error(t, err)
+
+		})
+	}
 }
