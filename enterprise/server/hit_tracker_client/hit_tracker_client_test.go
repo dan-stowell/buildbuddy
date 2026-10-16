@@ -2,6 +2,9 @@ package hit_tracker_client
 
 import (
 	"context"
+	"fmt"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testhealthcheck"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"net"
 	"strings"
 	"sync"
@@ -520,6 +523,7 @@ func BenchmarkEnqueue(b *testing.B) {
 }
 
 func TestRegister(t *testing.T) {
+	testleak.Check(t)
 	for _, tc := range []struct {
 		name       string
 		target     string
@@ -1013,4 +1017,151 @@ func TestHungTrackTimesOut(t *testing.T) {
 	}, 10*time.Second, 10*time.Millisecond)
 	_, held := retainedHits(h.factory)
 	require.Equal(t, 0, held)
+}
+
+// v4BlockingConn models an accepted RPC that only returns on client cancellation.
+type v4BlockingConn struct {
+	grpc.ClientConnInterface
+	entered chan struct{}
+	release chan struct{}
+	active  atomic.Int64
+}
+
+func (c *v4BlockingConn) Invoke(ctx context.Context, method string, args, reply any, opts ...grpc.CallOption) error {
+	c.active.Add(1)
+	defer c.active.Add(-1)
+	c.entered <- struct{}{}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.release:
+		return nil
+	}
+}
+
+func TestV4ShutdownDeadline(t *testing.T) {
+	for _, n := range []int{1, 3, 10, 50} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			testleak.Check(t)
+			env := real_environment.NewRealEnv(testhealthcheck.NewTestingHealthChecker())
+			flags.Set(t, "cache_proxy.remote_hit_tracker.workers", n)
+			flags.Set(t, "cache_proxy.remote_hit_tracker.remote_hit_queue_size", 10)
+			flags.Set(t, "cache_proxy.remote_hit_tracker.update_interval", time.Millisecond)
+			conn := &v4BlockingConn{entered: make(chan struct{}, n), release: make(chan struct{})}
+			h := newHitTrackerClient(context.Background(), env, conn)
+			for i := range n {
+				h.batch(&enqueuedCacheHit{collection: &usageutil.Collection{GroupID: fmt.Sprint("synthetic-", i)}, hit: &hitpb.CacheHit{}})
+			}
+			for range n {
+				select {
+				case <-conn.entered:
+				case <-time.After(5 * time.Second):
+					t.Fatal("sender never entered Track")
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel()
+			done := make(chan struct{})
+			go func() { h.shutdown(ctx); close(done) }()
+			select {
+			case <-done:
+				t.Logf("N=%d active_after_shutdown=%d", n, conn.active.Load())
+				require.Zero(t, conn.active.Load())
+			case <-time.After(time.Second):
+				t.Logf("N=%d active_after_expired_deadline=%d", n, conn.active.Load())
+				close(conn.release)
+				<-done
+				t.Fatal("shutdown retained sender beyond expired deadline")
+			}
+		})
+	}
+}
+
+func TestV4ShutdownFlushesPendingHits(t *testing.T) {
+	testleak.Check(t)
+	env := real_environment.NewRealEnv(testhealthcheck.NewTestingHealthChecker())
+	flags.Set(t, "cache_proxy.remote_hit_tracker.workers", 1)
+	flags.Set(t, "cache_proxy.remote_hit_tracker.remote_hit_queue_size", 10)
+	flags.Set(t, "cache_proxy.remote_hit_tracker.update_interval", time.Hour)
+	conn := &v4BlockingConn{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	close(conn.release)
+	h := newHitTrackerClient(context.Background(), env, conn)
+	h.batch(&enqueuedCacheHit{collection: &usageutil.Collection{GroupID: interfaces.AuthAnonymousUser}, hit: &hitpb.CacheHit{}})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.NoError(t, h.shutdown(ctx))
+	require.Len(t, conn.entered, 1, "pending hit should flush while deadline permits")
+	require.Zero(t, conn.active.Load())
+}
+
+type v4HangingService struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *v4HangingService) Track(ctx context.Context, req *hitpb.TrackRequest) (*hitpb.TrackResponse, error) {
+	s.entered <- struct{}{}
+	// Deliberately ignore ctx: client shutdown must not require a cooperative
+	// remote application handler.
+	<-s.release
+	return &hitpb.TrackResponse{}, nil
+}
+func TestV4ShutdownCancelsRealTrackRPC(t *testing.T) {
+	testleak.Check(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := grpc.NewServer()
+	service := &v4HangingService{entered: make(chan struct{}, 3), release: make(chan struct{})}
+	hitpb.RegisterHitTrackerServiceServer(server, service)
+	go server.Serve(listener)
+	t.Cleanup(server.Stop)
+	t.Cleanup(func() { close(service.release) })
+	conn, err := grpc.Dial(listener.Addr().String(), grpc.WithInsecure())
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	flags.Set(t, "cache_proxy.remote_hit_tracker.workers", 3)
+	flags.Set(t, "cache_proxy.remote_hit_tracker.remote_hit_queue_size", 10)
+	flags.Set(t, "cache_proxy.remote_hit_tracker.update_interval", time.Millisecond)
+	env := real_environment.NewRealEnv(testhealthcheck.NewTestingHealthChecker())
+	h := newHitTrackerClient(context.Background(), env, conn)
+	for i := range 3 {
+		h.batch(&enqueuedCacheHit{collection: &usageutil.Collection{GroupID: fmt.Sprint("synthetic-", i)}, hit: &hitpb.CacheHit{}})
+	}
+	for range 3 {
+		select {
+		case <-service.entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Track not accepted")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { h.shutdown(ctx); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("real Track RPC pinned shutdown after deadline")
+	}
+}
+
+func TestV4ExpiredShutdownDoesNotDrainQueue(t *testing.T) {
+	testleak.Check(t)
+	env := real_environment.NewRealEnv(testhealthcheck.NewTestingHealthChecker())
+	flags.Set(t, "cache_proxy.remote_hit_tracker.workers", 1)
+	flags.Set(t, "cache_proxy.remote_hit_tracker.remote_hit_queue_size", 10)
+	flags.Set(t, "cache_proxy.remote_hit_tracker.update_interval", time.Millisecond)
+	conn := &v4BlockingConn{entered: make(chan struct{}, 2), release: make(chan struct{})}
+	h := newHitTrackerClient(context.Background(), env, conn)
+	h.batch(&enqueuedCacheHit{collection: &usageutil.Collection{GroupID: "first"}, hit: &hitpb.CacheHit{}})
+	select {
+	case <-conn.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sender not started")
+	}
+	h.batch(&enqueuedCacheHit{collection: &usageutil.Collection{GroupID: "pending"}, hit: &hitpb.CacheHit{}})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.NoError(t, h.shutdown(ctx))
+	require.Empty(t, conn.entered, "no additional RPC should start after shutdown context expires")
 }
