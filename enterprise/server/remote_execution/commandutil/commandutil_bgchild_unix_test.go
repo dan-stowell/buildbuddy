@@ -3,6 +3,7 @@
 package commandutil_test
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -192,4 +193,63 @@ func TestRun_OrphanedGrandchildNoStdout_Timeout(t *testing.T) {
 	assert.True(t, status.IsDeadlineExceededError(res.Error), "expected DeadlineExceeded, got %v", res.Error)
 	assert.Less(t, elapsed, timeout+5*time.Second)
 	assert.False(t, alive, "orphaned grandchild should be killed by the timeout kill")
+}
+
+// Exercise output larger than the kernel pipe buffer immediately before exit.
+func TestRun_MainLargeOutputWithBackgroundPipe(t *testing.T) {
+	wd := testfs.MakeTempDir(t)
+	killOnCleanup(t, filepath.Join(wd, "bg.pid"))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res := commandutil.Run(ctx, &repb.Command{Arguments: []string{"sh", "-c",
+		"sh -c 'echo $$ > bg.pid; exec sleep 3' & head -c 4194304 /dev/zero"}},
+		wd, nil, &interfaces.Stdio{})
+	require.NoError(t, res.Error)
+	require.Equal(t, 0, res.ExitCode)
+	require.Equal(t, 4*1024*1024, len(res.Stdout))
+	require.Equal(t, make([]byte, 4*1024*1024), res.Stdout)
+}
+
+// A writer can be slower than WaitDelay (for example an io.Pipe consumer).
+// Synchronize the first Write with the shell so the remaining output is in
+// the OS pipe when the main process exits, rather than relying on scheduling.
+type exitSynchronizedWriter struct {
+	dir   string
+	first bool
+	buf   bytes.Buffer
+}
+
+func (w *exitSynchronizedWriter) Write(p []byte) (int, error) {
+	if !w.first {
+		w.first = true
+		if err := os.WriteFile(filepath.Join(w.dir, "reader-ready"), nil, 0600); err != nil {
+			return 0, err
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			if _, err := os.Stat(filepath.Join(w.dir, "root-exiting")); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				return 0, os.ErrDeadlineExceeded
+			}
+			time.Sleep(time.Millisecond)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return w.buf.Write(p)
+}
+
+func TestRun_MainOutputSlowConsumer(t *testing.T) {
+	wd := testfs.MakeTempDir(t)
+	writer := &exitSynchronizedWriter{dir: wd}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	res := commandutil.Run(ctx, &repb.Command{Arguments: []string{"sh", "-c",
+		"printf a; while [ ! -f reader-ready ]; do sleep 0.01; done; head -c 4096 /dev/zero; touch root-exiting"}},
+		wd, nil, &interfaces.Stdio{Stdout: writer})
+	require.NoError(t, res.Error)
+	require.Equal(t, 0, res.ExitCode)
+	t.Logf("captured=%d expected=4097 exitCode=%d", writer.buf.Len(), res.ExitCode)
+	require.Equal(t, 4097, writer.buf.Len(), "all output written by main process must be captured")
 }
