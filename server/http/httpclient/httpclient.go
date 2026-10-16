@@ -27,6 +27,10 @@ func New(allowedPrivateIPNets []*net.IPNet, clientName string) *http.Client {
 			Timeout: 30 * time.Second,
 			Control: blockingDialerControl(allowedPrivateIPNets),
 		}).DialContext,
+		// Same as http.DefaultTransport. Without a timeout, idle connections
+		// (and their goroutines) outlive clients that are no longer used,
+		// until the server closes them.
+		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
 		Proxy:               http.ProxyFromEnvironment,
 	}
@@ -86,6 +90,14 @@ func HostLabel(host string) string {
 		return "[UNKNOWN]"
 	}
 	return etld1
+}
+
+// CloseIdleConnections preserves http.Client.CloseIdleConnections through the
+// metrics wrapper so callers can release transports they no longer need.
+func (t *metricsTransport) CloseIdleConnections() {
+	if closer, ok := t.inner.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
 }
 
 func (t *metricsTransport) RoundTrip(in *http.Request) (out *http.Response, err error) {
