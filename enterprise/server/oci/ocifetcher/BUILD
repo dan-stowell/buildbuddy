@@ -34,7 +34,7 @@ go_library(
 
 go_test(
     name = "ocifetcher_test",
-    srcs = ["ocifetcher_test.go"],
+    srcs = ["ocifetcher_test.go", "mirror_leak_verify_test.go"],
     deps = [
         ":ocifetcher",
         "//enterprise/server/oci/ocicache",
@@ -46,6 +46,7 @@ go_test(
         "//proto:remote_execution_go_proto",
         "//server/http/httpclient",
         "//server/interfaces",
+        "//server/testutil/testleak",
         "//server/testutil/testauth",
         "//server/testutil/testcache",
         "//server/testutil/testenv",
