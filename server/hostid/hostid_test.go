@@ -3,7 +3,6 @@ package hostid
 import (
 	"os"
 	"path/filepath"
-	"runtime/debug"
 	"testing"
 
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
@@ -13,7 +12,6 @@ import (
 func TestGetOrCreateHostIDClosesFile(t *testing.T) {
 	// An unclosed *os.File is eventually closed by its finalizer. Disable GC
 	// so that the check doesn't depend on whether a GC happens to run.
-	defer debug.SetGCPercent(debug.SetGCPercent(-1))
 
 	for _, tc := range []struct {
 		name     string
