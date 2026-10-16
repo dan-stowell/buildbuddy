@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"slices"
 	"sort"
 	"sync"
@@ -2756,4 +2757,54 @@ func TestWatchTaskLiveness_StopsWhenWatchersAreDone(t *testing.T) {
 	s.livenessMu.Lock()
 	defer s.livenessMu.Unlock()
 	require.Empty(t, s.livenessWatches)
+}
+
+// lostRedisReplyConn consumes a successful integer reply before returning EOF.
+// Redis has applied the command, but go-redis must reconnect and retry it.
+type lostRedisReplyConn struct {
+	net.Conn
+	armed *atomic.Bool
+}
+
+func (c *lostRedisReplyConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 && c.armed.CompareAndSwap(true, false) {
+		_ = c.Conn.Close()
+		return 0, io.EOF
+	}
+	return n, err
+}
+
+func redisWithLostReply(t *testing.T) (*redis.Client, *atomic.Bool) {
+	t.Helper()
+	base := testredis.Start(t).Client().(*redis.Client)
+	opts := *base.Options()
+	dial := opts.Dialer
+	armed := &atomic.Bool{}
+	opts.Dialer = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &lostRedisReplyConn{Conn: conn, armed: armed}, nil
+	}
+	rdb := redis.NewClient(&opts)
+	t.Cleanup(func() { _ = rdb.Close() })
+	require.NoError(t, rdb.Ping(t.Context()).Err())
+	return rdb, armed
+}
+
+func TestRedisRetryIdempotency_InsertTask(t *testing.T) {
+	ctx := t.Context()
+	rdb, drop := redisWithLostReply(t)
+	s := &SchedulerServer{rdb: rdb}
+	drop.Store(true)
+	err := s.insertTask(ctx, "retry-insert", &scpb.SchedulingMetadata{}, []byte("task"), "")
+	require.False(t, drop.Load(), "must lose the first successful HSET reply")
+	require.True(t, rdb.Exists(ctx, s.redisKeyForTask("retry-insert")).Val() == 1)
+	ttl, ttlErr := rdb.TTL(ctx, s.redisKeyForTask("retry-insert")).Result()
+	require.NoError(t, ttlErr)
+	t.Logf("insertTask returned %v; stored task TTL=%s", err, ttl)
+	require.NoError(t, err, "successful HSET replay must allow insertion to finish and set the TTL")
+	require.Positive(t, ttl)
 }
