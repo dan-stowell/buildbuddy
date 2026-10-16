@@ -88,6 +88,14 @@ func HostLabel(host string) string {
 	return etld1
 }
 
+// CloseIdleConnections preserves http.Client.CloseIdleConnections through the
+// metrics wrapper so callers can release transports they no longer need.
+func (t *metricsTransport) CloseIdleConnections() {
+	if closer, ok := t.inner.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
+}
+
 func (t *metricsTransport) RoundTrip(in *http.Request) (out *http.Response, err error) {
 	hostLabel := HostLabel(in.URL.Hostname())
 	metrics.HTTPClientRequestCount.With(prometheus.Labels{

@@ -619,6 +619,10 @@ func mirrorToCache(
 	storageFunc repb.DigestFunction_Value,
 	checksums []checksum,
 ) (*repb.Digest, error) {
+	// FetchBlob creates a dedicated client rather than a shared connection pool.
+	// Release idle connections when the attempt ends. This must run here rather
+	// than at RPC return: singleflight work may outlive its initiating caller.
+	defer httpClient.CloseIdleConnections()
 	safeURI := redactedURI(uri)
 	log.CtxDebugf(ctx, "Fetching %s", safeURI)
 	req, err := http.NewRequestWithContext(ctx, "GET", uri, nil)
