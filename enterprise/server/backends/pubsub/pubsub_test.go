@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -11,6 +12,15 @@ import (
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testredis"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/redisutil"
+	bbspb "github.com/buildbuddy-io/buildbuddy/proto/buildbuddy_service"
+	elpb "github.com/buildbuddy-io/buildbuddy/proto/eventlog"
+	inspb "github.com/buildbuddy-io/buildbuddy/proto/invocation_status"
+	"github.com/buildbuddy-io/buildbuddy/server/backends/chunkstore"
+	"github.com/buildbuddy-io/buildbuddy/server/backends/memory_kvstore"
+	"github.com/buildbuddy-io/buildbuddy/server/buildbuddy_server"
+	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+	"github.com/buildbuddy-io/buildbuddy/server/tables"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
@@ -439,5 +449,48 @@ func requireError(t *testing.T, subscriber *StreamSubscription) error {
 	case <-time.After(2 * time.Second):
 		assert.FailNow(t, "expected to receive an error but none received")
 	}
+	return nil
+}
+
+func TestLiveLogViewerCancellationGrowth(t *testing.T) {
+	rdb := testredis.Start(t).Client()
+	env := testenv.GetTestEnv(t)
+	env.SetPubSub(NewPubSub(rdb))
+	kv, err := memory_kvstore.NewMemoryKeyValStore()
+	require.NoError(t, err)
+	env.SetKeyValStore(kv)
+	env.SetInvocationDB(&liveLogInvocationDB{})
+	server, err := buildbuddy_server.NewBuildBuddyServer(env, nil)
+	require.NoError(t, err)
+	testleak.CheckGrowth(t, testleak.Growth{Iterations: 20}, func(int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		stream := &disconnectingLogStream{ctx: ctx, cancel: cancel}
+		require.NoError(t, server.GetEventLog(&elpb.GetEventLogChunkRequest{InvocationId: "live-log", ChunkId: "0000"}, stream))
+		require.True(t, stream.sent)
+		require.Eventually(t, func() bool {
+			counts, err := rdb.PubSubNumSub(context.Background(), "eventlog/live-log/updates").Result()
+			return err == nil && counts["eventlog/live-log/updates"] == 0
+		}, 5*time.Second, time.Millisecond)
+	})
+}
+
+type liveLogInvocationDB struct{ interfaces.InvocationDB }
+
+func (*liveLogInvocationDB) LookupInvocation(context.Context, string) (*tables.Invocation, error) {
+	return &tables.Invocation{InvocationID: "live-log", LastChunkId: chunkstore.ChunkIndexAsStringId(math.MaxUint16), InvocationStatus: int64(inspb.InvocationStatus_PARTIAL_INVOCATION_STATUS)}, nil
+}
+
+type disconnectingLogStream struct {
+	bbspb.BuildBuddyService_GetEventLogServer
+	ctx    context.Context
+	cancel context.CancelFunc
+	sent   bool
+}
+
+func (s *disconnectingLogStream) Context() context.Context { return s.ctx }
+func (s *disconnectingLogStream) Send(*elpb.GetEventLogChunkResponse) error {
+	s.sent = true
+	s.cancel()
 	return nil
 }
