@@ -1,4 +1,4 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "gcs",
@@ -24,5 +24,20 @@ go_library(
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//status",
+    ],
+)
+
+
+go_test(
+    name = "gcs_test",
+    size = "medium",
+    srcs = ["gcs_test.go"],
+    embed = [":gcs"],
+    deps = [
+        "//server/testutil/testleak",
+        "//server/interfaces",
+        "@com_google_cloud_go_storage//:storage",
+        "@com_github_stretchr_testify//require",
+        "@org_golang_google_api//option",
     ],
 )
