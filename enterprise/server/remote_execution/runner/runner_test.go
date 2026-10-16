@@ -1319,7 +1319,51 @@ func TestTransientErrorExitCodes(t *testing.T) {
 
 // Recycling runners through a bounded pool and shutting the pool down must
 // remove every workspace and leave no goroutines or FDs behind.
+func diagFDs() map[string]string {
+	out := map[string]string{}
+	ents, _ := os.ReadDir("/proc/self/fd")
+	for _, e := range ents {
+		tgt, err := os.Readlink("/proc/self/fd/" + e.Name())
+		if err != nil {
+			continue
+		}
+		if strings.Contains(tgt, "pidfd") {
+			info, _ := os.ReadFile("/proc/self/fdinfo/" + e.Name())
+			for l := range strings.SplitSeq(string(info), "\n") {
+				if strings.HasPrefix(l, "Pid:") {
+					pid := strings.TrimSpace(strings.TrimPrefix(l, "Pid:"))
+					cmd, _ := os.ReadFile("/proc/" + pid + "/cmdline")
+					st, _ := os.ReadFile("/proc/" + pid + "/stat")
+					tgt += " pid=" + pid + " cmd=" + strings.ReplaceAll(string(cmd), "\x00", " ") + " stat=" + string(st)
+				}
+			}
+		}
+		out[e.Name()] = tgt
+	}
+	return out
+}
+
 func TestRunnerLifecycleResources(t *testing.T) {
+	before := diagFDs()
+	t.Logf("DIAG pid=%d baseline fds: %v", os.Getpid(), before)
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		after := diagFDs()
+		for k, v := range after {
+			if before[k] != v {
+				t.Logf("DIAG fd %s: before=%q after=%q", k, before[k], v)
+			}
+		}
+		buf := make([]byte, 4<<20)
+		buf = buf[:runtime.Stack(buf, true)]
+		for blk := range strings.SplitSeq(string(buf), "\n\n") {
+			if strings.Contains(blk, "os.(*Process)") || strings.Contains(blk, "os/exec") || strings.Contains(blk, "pidfd") {
+				t.Logf("DIAG goroutine: %s", blk)
+			}
+		}
+	})
 	testleak.Check(t)
 	testleak.CheckFDs(t)
 	env := newTestEnv(t)
