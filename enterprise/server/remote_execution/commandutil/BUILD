@@ -49,6 +49,7 @@ go_test(
         },
     }),
     deps = [
+        "//server/testutil/testleak",
         "//proto:remote_execution_go_proto",
         "//server/interfaces",
         "//server/util/status",
