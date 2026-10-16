@@ -139,7 +139,7 @@ func TestV4DistinctPermittedTargets(t *testing.T) {
 			flags.Set(t, "app.cache_api_url", "grpcs://cache.example.com")
 			p := NewPooledByteStreamClient(env)
 			before := runtime.NumGoroutine()
-			for i := 0; i < n; i++ {
+			for i := range n {
 				u, err := url.Parse(fmt.Sprintf("bytestream://synthetic-%d@localhost:1/blobs/abc/1", i))
 				require.NoError(t, err)
 				require.True(t, isPermittedForDial(getTargetForURL(u, true)))
