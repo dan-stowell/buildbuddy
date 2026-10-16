@@ -168,7 +168,6 @@ type TargetTracker struct {
 	buildEventAccumulator accumulator.Accumulator
 	targets               map[string]*target
 	errGroup              *errgroup.Group
-	finalized             bool
 }
 
 func NewTargetTracker(env environment.Env, buildEventAccumulator accumulator.Accumulator) *TargetTracker {
@@ -418,7 +417,7 @@ func (t *TargetTracker) TrackTargetsForEvent(ctx context.Context, event *build_e
 	}
 
 	if event.GetLastMessage() {
-		t.Finalize(ctx)
+		t.handleLastEvent(ctx)
 	}
 }
 
@@ -469,14 +468,7 @@ func (t *TargetTracker) handleWorkspaceStatusEvent(ctx context.Context) {
 	t.errGroup.Go(func() error { return t.writeTestTargets(gctx, permissions) })
 }
 
-// Finalize flushes the observed target statuses at most once. The caller must
-// serialize this with event processing and only call it when the invocation
-// will not be retried (or when the last-message event has arrived).
-func (t *TargetTracker) Finalize(ctx context.Context) {
-	if !*enableTargetTracking || t.finalized {
-		return
-	}
-	t.finalized = true
+func (t *TargetTracker) handleLastEvent(ctx context.Context) {
 	ctx = log.EnrichContext(ctx, log.InvocationIDKey, t.invocationID())
 	if !isTestCommand(t.buildEventAccumulator.Invocation().GetCommand()) {
 		log.Debugf("Not tracking targets statuses for %q because it's not a test", t.invocationID())
