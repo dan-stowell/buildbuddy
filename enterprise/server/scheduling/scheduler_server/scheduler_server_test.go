@@ -8,6 +8,8 @@ import (
 	"slices"
 	"sort"
 	"sync"
+ "sync/atomic"
+ "net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -2765,4 +2767,142 @@ func TestWatchTaskLiveness_StopsWhenWatchersAreDone(t *testing.T) {
 	s.livenessMu.Lock()
 	defer s.livenessMu.Unlock()
 	require.Empty(t, s.livenessWatches)
+}
+
+// lostRedisReplyConn consumes a successful integer reply before returning EOF.
+// Redis has applied the command, but go-redis must reconnect and retry it.
+type lostRedisReplyConn struct {
+	net.Conn
+	armed *atomic.Bool
+}
+
+func (c *lostRedisReplyConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 && c.armed.CompareAndSwap(true, false) {
+		_ = c.Conn.Close()
+		return 0, io.EOF
+	}
+	return n, err
+}
+
+func redisWithLostReply(t *testing.T) (*redis.Client, *atomic.Bool) {
+	t.Helper()
+	base := testredis.Start(t).Client().(*redis.Client)
+	opts := *base.Options()
+	dial := opts.Dialer
+	armed := &atomic.Bool{}
+	opts.Dialer = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &lostRedisReplyConn{Conn: conn, armed: armed}, nil
+	}
+	rdb := redis.NewClient(&opts)
+	t.Cleanup(func() { _ = rdb.Close() })
+	require.NoError(t, rdb.Ping(t.Context()).Err())
+	return rdb, armed
+}
+
+func TestRedisRetryIdempotency_InsertTask(t *testing.T) {
+	ctx := t.Context()
+	rdb, drop := redisWithLostReply(t)
+	s := &SchedulerServer{rdb: rdb}
+	require.NoError(t, redisInsertTask.Load(ctx, rdb).Err())
+	drop.Store(true)
+	err := s.insertTask(ctx, "retry-insert", &scpb.SchedulingMetadata{}, []byte("task"), "")
+	require.False(t, drop.Load(), "must lose the successful insert script reply")
+	require.True(t, rdb.Exists(ctx, s.redisKeyForTask("retry-insert")).Val() == 1)
+	ttl, ttlErr := rdb.TTL(ctx, s.redisKeyForTask("retry-insert")).Result()
+	require.NoError(t, ttlErr)
+	t.Logf("insertTask returned %v; stored task TTL=%s", err, ttl)
+	require.NoError(t, err, "successful insert replay must preserve the task and TTL")
+	require.Positive(t, ttl)
+}
+
+func TestRedisRetryIdempotency_DeleteClaimedTask(t *testing.T) {
+	ctx := t.Context()
+	rdb, drop := redisWithLostReply(t)
+	s := &SchedulerServer{rdb: rdb}
+	key := s.redisKeyForTask("retry-delete")
+	require.NoError(t, rdb.HSet(ctx, key, "claimed", "1").Err())
+	// Preload the script so the lost reply is EVALSHA's successful deletion,
+	// rather than the initial NOSCRIPT error.
+	require.NoError(t, redisDeleteClaimedTask.Load(ctx, rdb).Err())
+	drop.Store(true)
+	err := s.deleteClaimedTask(ctx, "retry-delete", "")
+	require.False(t, drop.Load(), "must lose the successful EVALSHA reply")
+	require.Zero(t, rdb.Exists(ctx, key).Val(), "first execution deleted the task")
+	require.NoError(t, err, "successful deletion replay must reach action-merging and reservation cleanup")
+}
+
+// Both legacy and new tasks must survive a conflicting insert unchanged.
+func TestRedisRetryIdempotency_InsertConflict(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy=%t", legacy), func(t *testing.T) {
+			ctx := t.Context()
+			rdb := testredis.Start(t).Client()
+			s := &SchedulerServer{rdb: rdb}
+			key := s.redisKeyForTask("conflict")
+			require.NoError(t, s.insertTask(ctx, "conflict", &scpb.SchedulingMetadata{}, []byte("original"), "jwt"))
+			if legacy {
+				require.NoError(t, rdb.HDel(ctx, key, "insertToken").Err())
+			}
+			require.NoError(t, rdb.HSet(ctx, key, "claimed", "1", "leaseId", "owner", "attemptCount", 3).Err())
+			require.NoError(t, rdb.Expire(ctx, key, time.Minute).Err())
+			before, err := rdb.HGetAll(ctx, key).Result()
+			require.NoError(t, err)
+			err = s.insertTask(ctx, "conflict", &scpb.SchedulingMetadata{}, []byte("replacement"), "different jwt")
+			require.True(t, status.IsAlreadyExistsError(err), "%v", err)
+			after, err := rdb.HGetAll(ctx, key).Result()
+			require.NoError(t, err)
+			require.Equal(t, before, after)
+			require.InDelta(t, time.Minute, rdb.TTL(ctx, key).Val(), float64(2*time.Second))
+		})
+	}
+}
+
+func TestRedisRetryIdempotency_InsertReplayPreservesState(t *testing.T) {
+	ctx := t.Context()
+	rdb := testredis.Start(t).Client()
+	s := &SchedulerServer{rdb: rdb}
+	key := s.redisKeyForTask("replay")
+	require.NoError(t, s.insertTask(ctx, "replay", &scpb.SchedulingMetadata{}, []byte("task"), "jwt"))
+	token, err := rdb.HGet(ctx, key, "insertToken").Result()
+	require.NoError(t, err)
+	// A worker can claim the task between the first execution and its retry.
+	require.NoError(t, rdb.HSet(ctx, key, "claimed", "1", "leaseId", "owner", "attemptCount", 2).Err())
+	require.NoError(t, rdb.Expire(ctx, key, time.Minute).Err())
+	before, err := rdb.HGetAll(ctx, key).Result()
+	require.NoError(t, err)
+	r, err := redisInsertTask.Run(ctx, rdb, []string{key}, token, int64(taskTTL/time.Second), "attemptCount", 0).Int64()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), r)
+	after, err := rdb.HGetAll(ctx, key).Result()
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+	require.InDelta(t, time.Minute, rdb.TTL(ctx, key).Val(), float64(2*time.Second))
+}
+
+func TestRedisRetryIdempotency_FinalizeLease(t *testing.T) {
+	ctx := t.Context()
+	rdb := testredis.Start(t).Client()
+	s := &SchedulerServer{rdb: rdb}
+	key := s.redisKeyForTask("finalize")
+	require.NoError(t, rdb.HSet(ctx, key, "claimed", "1", "leaseId", "new-owner").Err())
+	require.True(t, status.IsPermissionDeniedError(s.deleteClaimedTask(ctx, "finalize", "old-owner")))
+	require.True(t, status.IsPermissionDeniedError(s.deleteClaimedTask(ctx, "finalize", "")))
+	require.Equal(t, "new-owner", rdb.HGet(ctx, key, "leaseId").Val())
+	require.NoError(t, s.deleteClaimedTask(ctx, "finalize", "new-owner"))
+	require.NoError(t, s.deleteClaimedTask(ctx, "finalize", "new-owner"))
+	require.Zero(t, rdb.Exists(ctx, key).Val())
+	// A recreated task must not be deleted by the old lease's retry.
+	require.NoError(t, rdb.HSet(ctx, key, "claimed", "1", "leaseId", "next-owner").Err())
+	require.True(t, status.IsPermissionDeniedError(s.deleteClaimedTask(ctx, "finalize", "new-owner")))
+	require.NoError(t, rdb.HDel(ctx, key, "claimed").Err())
+	require.True(t, status.IsNotFoundError(s.deleteClaimedTask(ctx, "finalize", "next-owner")))
+	// Legacy claimed hashes without lease IDs remain finalizable.
+	require.NoError(t, rdb.HSet(ctx, key, "claimed", "1").Err())
+	require.NoError(t, rdb.HDel(ctx, key, "leaseId").Err())
+	require.NoError(t, s.deleteClaimedTask(ctx, "finalize", "legacy-owner"))
 }
