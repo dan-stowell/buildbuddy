@@ -45,6 +45,7 @@ import (
 	"github.com/open-feature/go-sdk/openfeature"
 	"github.com/open-feature/go-sdk/openfeature/memprovider"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/goleak"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -110,14 +111,22 @@ type schedulerOpts struct {
 	userOwnedEnabled   bool
 	groupOwnedEnabled  bool
 	preferredExecutors []string
+	// If set, returns the Redis client used by the scheduler instead of a
+	// client for a fresh test Redis. It is called after leak checking starts.
+	redisClientFactory func(t *testing.T) redis.UniversalClient
+	// Known goroutine leaks to ignore.
+	leakOptions []goleak.Option
 }
 
 func getEnv(t *testing.T, opts *schedulerOpts, user string) (*testenv.TestEnv, context.Context) {
-	testleak.Check(t)
-	redisTarget := testredis.Start(t).Target
-	env := enterprise_testenv.GetCustomTestEnv(t, &enterprise_testenv.Options{
-		RedisTarget: redisTarget,
-	})
+	testleak.Check(t, opts.leakOptions...)
+	envOpts := &enterprise_testenv.Options{}
+	if opts.redisClientFactory != nil {
+		envOpts.RedisClient = opts.redisClientFactory(t)
+	} else {
+		envOpts.RedisTarget = testredis.Start(t).Target
+	}
+	env := enterprise_testenv.GetCustomTestEnv(t, envOpts)
 	if opts.options.Clock != nil {
 		env.SetClock(opts.options.Clock)
 	}
