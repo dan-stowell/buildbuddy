@@ -33,6 +33,7 @@ go_test(
     srcs = [
         "commandutil_internal_windows_test.go",
         "commandutil_test.go",
+        "commandutil_review_unix_test.go",
         "commandutil_unix_test.go",
         "commandutil_windows_test.go",
     ],
