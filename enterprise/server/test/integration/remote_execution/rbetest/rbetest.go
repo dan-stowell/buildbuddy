@@ -841,6 +841,17 @@ func (e *Executor) ShutdownTaskScheduler() {
 	e.taskScheduler.Shutdown(ctx)
 }
 
+// HasQueuedTask reports whether the executor currently has a queued
+// reservation for the given task ID.
+func (e *Executor) HasQueuedTask(taskID string) bool {
+	for _, r := range e.taskScheduler.GetQueuedTaskReservations() {
+		if r.GetTaskId() == taskID {
+			return true
+		}
+	}
+	return false
+}
+
 // QueueLength returns the current number of tasks in the executor's queue.
 func (e *Executor) QueueLength() int {
 	return e.taskScheduler.QueueLength()
