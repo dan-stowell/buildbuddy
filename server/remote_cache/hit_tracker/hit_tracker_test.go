@@ -420,3 +420,74 @@ func (f *fakeIdentityService) CachedIdentityHeader(si *interfaces.ClientIdentity
 func (f *fakeIdentityService) ValidateIncomingIdentity(ctx context.Context) (context.Context, error) {
 	return ctx, nil
 }
+
+// Exercise event-to-summary and event-to-scorecard accounting together. Clock
+// derived durations are deliberately excluded from this deterministic oracle.
+func TestGeneratedCacheEventAccounting(t *testing.T) {
+	t.Log("deterministic event fixture; seed=none")
+	env := testenv.GetTestEnv(t)
+	flags.Set(t, "cache.detailed_stats_enabled", true)
+	mc, err := memory_metrics_collector.NewMemoryMetricsCollector()
+	require.NoError(t, err)
+	env.SetMetricsCollector(mc)
+	ctx := context.Background()
+	iid := "d42f4cd1-6963-4a5a-9680-cb77cfaad9bd"
+	want := map[string]*capb.ScoreCard_Result{}
+	var download, upload, downloadTransferred, uploadTransferred int64
+	counts := [2][3]int64{}
+	for cache := 0; cache < 2; cache++ {
+		for event := 0; event < 3; event++ {
+			for n := 0; n < event+2; n++ {
+				id := strings.Repeat(string(rune('a'+cache*3+event)), 63) + string(rune('0'+n))
+				md := &repb.RequestMetadata{ToolInvocationId: iid, ActionId: id, ActionMnemonic: "Compile", TargetId: "//generated:target"}
+				var ht interfaces.HitTracker
+				ct := rspb.CacheType_AC
+				if cache == 0 {
+					ht = env.GetHitTrackerFactory().NewACHitTracker(ctx, md)
+				} else {
+					ht = env.GetHitTrackerFactory().NewCASHitTracker(ctx, md)
+					ct = rspb.CacheType_CAS
+				}
+				d := &repb.Digest{Hash: id, SizeBytes: int64(100 + n)}
+				request := capb.RequestType_READ
+				switch event {
+				case 0:
+					require.NoError(t, ht.TrackDownload(d).CloseWithBytesTransferred(10, 10, repb.Compressor_ZSTD, "test"))
+					download += d.SizeBytes
+					downloadTransferred += 10
+				case 1:
+					require.NoError(t, ht.TrackMiss(d))
+				case 2:
+					require.NoError(t, ht.TrackUpload(d).CloseWithBytesTransferred(20, 20, repb.Compressor_ZSTD, "test"))
+					upload += d.SizeBytes
+					uploadTransferred += 20
+					request = capb.RequestType_WRITE
+				}
+				counts[cache][event]++
+				want[id] = &capb.ScoreCard_Result{ActionId: id, CacheType: ct, RequestType: request, Digest: d}
+			}
+		}
+	}
+	stats := hit_tracker.CollectCacheStats(ctx, env, iid)
+	require.Equal(t, []int64{counts[0][0], counts[0][1], counts[0][2], counts[1][0], counts[1][1], counts[1][2], download, upload, downloadTransferred, uploadTransferred}, []int64{stats.GetActionCacheHits(), stats.GetActionCacheMisses(), stats.GetActionCacheUploads(), stats.GetCasCacheHits(), stats.GetCasCacheMisses(), stats.GetCasCacheUploads(), stats.GetTotalDownloadSizeBytes(), stats.GetTotalUploadSizeBytes(), stats.GetTotalDownloadTransferredSizeBytes(), stats.GetTotalUploadTransferredSizeBytes()})
+	sc := hit_tracker.ScoreCard(ctx, env, iid)
+	require.Len(t, sc.Results, len(want))
+	for _, r := range sc.Results {
+		w := want[r.ActionId]
+		require.NotNil(t, w)
+		delete(want, r.ActionId)
+		require.Equal(t, w.CacheType, r.CacheType)
+		require.Equal(t, w.RequestType, r.RequestType)
+		require.Equal(t, w.Digest.Hash, r.GetDigest().GetHash())
+		require.Equal(t, w.Digest.SizeBytes, r.GetDigest().GetSizeBytes())
+		require.Equal(t, "Compile", r.ActionMnemonic)
+		require.Equal(t, "//generated:target", r.TargetId)
+		expectedCode := int32(0)
+		if r.ActionId[0] == 'b' || r.ActionId[0] == 'e' {
+			expectedCode = 5
+		}
+		require.Equal(t, expectedCode, r.GetStatus().GetCode())
+	}
+	require.Empty(t, want)
+	require.Zero(t, hit_tracker.CollectCacheStats(ctx, env, "absent").GetActionCacheHits())
+}
