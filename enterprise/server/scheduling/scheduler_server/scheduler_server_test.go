@@ -115,7 +115,8 @@ type schedulerOpts struct {
 	preferredExecutors []string
 	// If set, returns the Redis client used by the scheduler instead of a
 	// client for a fresh test Redis. It is called after leak checking starts.
-	redisClientFactory func(t *testing.T) redis.UniversalClient
+	redisClient redis.UniversalClient
+ redisClientFactory func(t *testing.T) redis.UniversalClient
 	// Known goroutine leaks to ignore.
 	leakOptions []goleak.Option
 }
@@ -125,7 +126,9 @@ func getEnv(t *testing.T, opts *schedulerOpts, user string) (*testenv.TestEnv, c
 	envOpts := &enterprise_testenv.Options{}
 	if opts.redisClientFactory != nil {
 		envOpts.RedisClient = opts.redisClientFactory(t)
-	} else {
+	} else if opts.redisClient != nil {
+ envOpts.RedisClient = opts.redisClient
+ } else {
 		envOpts.RedisTarget = testredis.Start(t).Target
 	}
 	env := enterprise_testenv.GetCustomTestEnv(t, envOpts)
