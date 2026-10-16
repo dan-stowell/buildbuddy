@@ -35,6 +35,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testbazel"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testgrpc"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testmetrics"
 	"github.com/buildbuddy-io/buildbuddy/server/util/bazel"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_client"
@@ -2962,6 +2963,14 @@ fi`, marker)},
 }
 
 func TestActionMerging_HedgeWinnerRemovesQueuedOriginalReservation(t *testing.T) {
+	testHedgeWinnerRemovesQueuedOriginalReservation(t, false)
+}
+
+func TestActionMerging_HedgeWinnerCancelsReservationsOnPeerScheduler(t *testing.T) {
+	testHedgeWinnerRemovesQueuedOriginalReservation(t, true)
+}
+
+func testHedgeWinnerRemovesQueuedOriginalReservation(t *testing.T, peerScheduler bool) {
 	flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
 	flags.Set(t, "remote_execution.action_merging_hedge_delay", time.Microsecond)
 	flags.Set(t, "remote_execution.proactive_cancellation_enabled", true)
@@ -3004,6 +3013,13 @@ func TestActionMerging_HedgeWinnerRemovesQueuedOriginalReservation(t *testing.T)
 				}
 			},
 		}))
+	}
+	if peerScheduler {
+		// Registration streams stay attached to the first scheduler. Route
+		// execution and completion through a second scheduler which owns no
+		// executor connections, forcing cancellation to cross the peer RPC.
+		completionServer := rbe.AddBuildBuddyServer()
+		rbe.AppProxy.SetDirector(testgrpc.RandomDialer([]string{completionServer.GRPCAddress()}))
 	}
 	blocker := rbe.ExecuteControlledCommand("blocker", &rbetest.ExecuteControlledOpts{})
 	blocker.WaitStarted()

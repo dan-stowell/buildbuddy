@@ -364,6 +364,19 @@ func GetOrCreateExecutionID(ctx context.Context, rdb redis.UniversalClient, sche
 			return retry.NonRetryableError(err)
 		}
 		if !existsInScheduler {
+			// A canonical copy may fail while a hedge is still making progress.
+			for key := range hash {
+				if !strings.HasPrefix(key, "hedge:") {
+					continue
+				}
+				exists, err := schedulerService.ExistsTask(ctx, strings.TrimPrefix(key, "hedge:"))
+				if err != nil {
+					return retry.NonRetryableError(err)
+				}
+				if exists {
+					return nil
+				}
+			}
 			return fmt.Errorf("pending execution does not exist in the scheduler yet")
 		}
 		return nil
@@ -460,7 +473,10 @@ func RegisterHedge(ctx context.Context, rdb redis.UniversalClient, canonical, id
 	}
 	_, err = rdb.Eval(ctx, `
  if redis.call('HGET', KEYS[3], 'execution-id') ~= ARGV[1] then return redis.error_reply('execution no longer pending') end
+ if tonumber(redis.call('HGET', KEYS[3], 'hedged-execution-count') or '0') >= tonumber(ARGV[3]) then return redis.error_reply('hedge budget exhausted') end
  if redis.call('HEXISTS', KEYS[1], 'winner') == 1 then return redis.error_reply('execution already completed') end
+ redis.call('HINCRBY', KEYS[3], 'hedged-execution-count', 1)
+ redis.call('HSET', KEYS[3], 'last-execution-submit-time', ARGV[4], 'hedge:' .. ARGV[2], '1')
  redis.call('HSET', KEYS[1], 'canonical', ARGV[1])
  redis.call('HSETNX', KEYS[1], 'copy:' .. ARGV[1], 'pending')
  redis.call('HSETNX', KEYS[1], 'copy:' .. ARGV[2], 'pending')
@@ -469,7 +485,7 @@ func RegisterHedge(ctx context.Context, rdb redis.UniversalClient, canonical, id
  redis.call('EXPIRE', KEYS[2], 86400)
  redis.call('SET', KEYS[4], KEYS[3] .. '\n' .. ARGV[1], 'EX', 86400)
  redis.call('SET', KEYS[5], KEYS[3] .. '\n' .. ARGV[1], 'EX', 86400)
- return 1`, []string{copyKey(canonical), copyKey(id), forward, redisKeyForPendingExecutionDigest(canonical), redisKeyForPendingExecutionDigest(id)}, canonical, id).Result()
+ return 1`, []string{copyKey(canonical), copyKey(id), forward, redisKeyForPendingExecutionDigest(canonical), redisKeyForPendingExecutionDigest(id)}, canonical, id, *hedgedActionCount, strconv.FormatInt(time.Now().UnixMicro(), 36)).Result()
 	return err
 }
 
