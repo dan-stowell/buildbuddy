@@ -2845,8 +2845,9 @@ func TestReproSched_HandBackDoesNotDuplicateRunningTask(t *testing.T) {
 	router.UpdateSubset([]string{"execA", "execB"})
 
 	target := rbe.ExecuteControlledCommand("target", &rbetest.ExecuteControlledOpts{})
+	taskID := target.WaitAccepted()
 	target.WaitStarted() // running on execA (execB is busy)
-	require.Eventually(t, func() bool { return b.QueueLength() == 1 }, 10*time.Second, 10*time.Millisecond,
+	require.Eventually(t, func() bool { return b.HasQueuedTask(taskID) }, 10*time.Second, 10*time.Millisecond,
 		"target's reservation should be queued on busy execB")
 
 	// Route re-enqueued work to idle execC (or execA, which is busy).
@@ -2892,8 +2893,9 @@ func TestReproSched_HandBackDoesNotFailRunningNoRetryTask(t *testing.T) {
 	router.UpdateSubset([]string{"execA", "execB"})
 
 	target := rbe.ExecuteControlledCommand("target", &rbetest.ExecuteControlledOpts{Properties: noRetryProps()})
+	taskID := target.WaitAccepted()
 	target.WaitStarted()
-	require.Eventually(t, func() bool { return b.QueueLength() == 1 }, 10*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return b.HasQueuedTask(taskID) }, 10*time.Second, 10*time.Millisecond)
 
 	resCh := asyncResult(target)
 	b.BeginShutdown()
@@ -2935,7 +2937,8 @@ func TestReproSched_HandBackDoesNotFailQueuedNoRetryTask(t *testing.T) {
 	router.UpdateSubset([]string{"execA", "execB"})
 
 	target := rbe.ExecuteControlledCommand("target", &rbetest.ExecuteControlledOpts{Properties: noRetryProps()})
-	require.Eventually(t, func() bool { return a.QueueLength() == 1 && b.QueueLength() == 1 }, 10*time.Second, 10*time.Millisecond)
+	taskID := target.WaitAccepted()
+	require.Eventually(t, func() bool { return a.HasQueuedTask(taskID) && b.HasQueuedTask(taskID) }, 10*time.Second, 10*time.Millisecond)
 
 	resCh := asyncResult(target)
 	b.BeginShutdown()
