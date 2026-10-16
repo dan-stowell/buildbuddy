@@ -160,3 +160,38 @@ func TestHedgeRollingDeployOldCompletionPreservesFence(t *testing.T) {
 		}
 	}
 }
+
+// Failure and registration must serialize even when failure is handled on a
+// replica that has never seen the task's dispatch metadata.
+func TestHedgeRegistrationFailureOrdering(t *testing.T) {
+	for _, registrationFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("registration_first=%t", registrationFirst), func(t *testing.T) {
+			flags.Set(t, "remote_execution.enable_action_merging", true)
+			flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
+			ctx, err := prefix.AttachUserPrefixToContext(t.Context(), nullauth.NewNullAuthenticator(true))
+			require.NoError(t, err)
+			rdb := testredis.Start(t).Client()
+			action := digest.NewCASResourceName(&repb.Digest{Hash: strings.Repeat("d", 64), SizeBytes: 1}, "", repb.DigestFunction_SHA256)
+			canonical, _ := GetOrCreateExecutionID(ctx, rdb, &pendingScheduler{}, action, false)
+			hedge := action.NewUploadString()
+			if registrationFirst {
+				require.NoError(t, RegisterHedge(ctx, rdb, canonical, hedge))
+			}
+			id, publish, _, err := CompleteCopy(ctx, rdb, canonical, false, []byte("failure"))
+			require.NoError(t, err)
+			require.Equal(t, canonical, id)
+			require.Equal(t, !registrationFirst, publish)
+			if !registrationFirst {
+				require.Error(t, RegisterHedge(ctx, rdb, canonical, hedge))
+				return
+			}
+			id, publish, _, err = CompleteCopy(ctx, rdb, hedge, true, []byte("winner"))
+			require.NoError(t, err)
+			require.Equal(t, canonical, id)
+			require.True(t, publish)
+			_, publish, _, err = CompleteCopy(ctx, rdb, canonical, false, []byte("late failure"))
+			require.NoError(t, err)
+			require.False(t, publish)
+		})
+	}
+}
