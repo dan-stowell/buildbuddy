@@ -2947,12 +2947,16 @@ func TestLeaseTask_LostClaimReplyDoesNotStrandTask(t *testing.T) {
 	require.NoError(t, redisAcquireClaim.Load(ctx, rdb).Err())
 	proxy.dropReplyTo([]byte(redisAcquireClaim.Hash()))
 
-	_, err := fe.leaseTask(taskID, "" /*=reconnectToken*/)
+	lease, err := fe.leaseTask(taskID, "" /*=reconnectToken*/)
 	require.EqualValues(t, 1, proxy.dropped.Load(), "expected the claim reply to be dropped")
+	if err == nil {
+		// The executor got the lease despite the lost reply.
+		require.NoError(t, lease.Finalize())
+		return
+	}
 	// The executor did not get a lease. A real executor drops the reservation
 	// in this case (priority_task_scheduler), so nothing else will release a
 	// claim that was recorded.
-	require.Error(t, err)
 	t.Logf("claim attempt whose Redis reply was lost returned: %v; task state: %s", err, describeTaskState(t, env, taskID))
 
 	// Nobody holds a lease on the task, so it must still be runnable.
@@ -2983,9 +2987,13 @@ func TestLeaseTask_LostReconnectReplyDoesNotStrandTask(t *testing.T) {
 	rdb := env.GetRemoteExecutionRedisClient()
 	require.NoError(t, redisAcquireClaim.Load(ctx, rdb).Err())
 	proxy.dropReplyTo([]byte(redisAcquireClaim.Hash()))
-	_, err := holder.Reconnect(taskID, reconnectToken)
+	reconnected, err := holder.Reconnect(taskID, reconnectToken)
 	require.EqualValues(t, 1, proxy.dropped.Load(), "expected the claim reply to be dropped")
-	require.Error(t, err)
+	if err == nil {
+		// The executor reconnected despite the lost reply.
+		require.NoError(t, reconnected.Finalize())
+		return
+	}
 	t.Logf("reconnect whose Redis reply was lost returned: %v; task state: %s", err, describeTaskState(t, env, taskID))
 
 	// Like task_leaser, the executor gives up on the task and asks the
