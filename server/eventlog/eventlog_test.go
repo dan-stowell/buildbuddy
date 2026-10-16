@@ -608,3 +608,59 @@ func TestBuildLogsRawCarriageReturn(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "old\rnew\n", string(got))
 }
+
+type flushOnReadKV struct {
+	*memory_kvstore.MemoryKeyValStore
+	beforeRead func()
+}
+
+func (s *flushOnReadKV) Get(ctx context.Context, key string) ([]byte, error) {
+	if s.beforeRead != nil {
+		f := s.beforeRead
+		s.beforeRead = nil
+		f()
+	}
+	return s.MemoryKeyValStore.Get(ctx, key)
+}
+
+// Force the documented race: disk scan sees chunk 0, then chunk 1 is flushed
+// before Redis is read. The returned cursor must still lead to chunk 1.
+func TestBuildLogsPollDuringFlush(t *testing.T) {
+	ctx := t.Context()
+	env := testenv.GetTestEnv(t)
+	blobs := mockstore.New()
+	env.SetBlobstore(blobs)
+	mem, err := memory_kvstore.NewMemoryKeyValStore()
+	require.NoError(t, err)
+	kv := &flushOnReadKV{MemoryKeyValStore: mem}
+	env.SetKeyValStore(kv)
+	inv := newInProgressInvocation("flush")
+	inv.LastChunkId = "0000"
+	env.SetInvocationDB(&mockinvocationdb.MockInvocationDB{DB: map[string]*tables.Invocation{"flush": inv}})
+	path := eventlog.GetEventLogPathFromInvocationIdAndAttempt("flush", 1)
+	blobs.Set(chunkstore.ChunkName(path, 0), []byte("zero\n"))
+	require.NoError(t, kv.Set(ctx, path+"/v2", []byte("0001one\n")))
+	kv.beforeRead = func() {
+		blobs.Set(chunkstore.ChunkName(path, 1), []byte("one\n"))
+		require.NoError(t, kv.Set(ctx, path+"/v2", []byte("0002two\n")))
+	}
+	poll := func(id string) *elpb.GetEventLogChunkResponse {
+		rsp, err := eventlog.GetEventLogChunk(ctx, env, &elpb.GetEventLogChunkRequest{InvocationId: "flush", ChunkId: id, MinLines: 100})
+		require.NoError(t, err)
+		return rsp
+	}
+	raced := poll("0001")
+	require.Empty(t, raced.Buffer)
+	require.Equal(t, "0001", raced.NextChunkId)
+	persisted := poll(raced.NextChunkId)
+	require.Equal(t, "one\n", string(persisted.Buffer))
+	live := poll(persisted.NextChunkId)
+	require.True(t, live.Live)
+	require.Equal(t, "two\n", string(live.Buffer))
+	blobs.Set(chunkstore.ChunkName(path, 2), []byte("two\n"))
+	require.NoError(t, kv.Set(ctx, path+"/v2", nil))
+	inv.InvocationStatus = int64(inspb.InvocationStatus_COMPLETE_INVOCATION_STATUS)
+	final := poll(live.NextChunkId)
+	require.False(t, final.Live)
+	require.Equal(t, "one\ntwo\n", string(persisted.Buffer)+string(final.Buffer))
+}
