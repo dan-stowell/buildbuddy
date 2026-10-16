@@ -4675,3 +4675,31 @@ func TestWriteReference(t *testing.T) {
 		require.True(t, status.IsFailedPreconditionError(err), "expected FailedPreconditionError, got %s", err)
 	})
 }
+
+func TestDigestFunctionBackendIsolation(t *testing.T) {
+	for _, cacheType := range []rspb.CacheType{rspb.CacheType_CAS, rspb.CacheType_AC} {
+		t.Run(cacheType.String(), func(t *testing.T) {
+			te := testenv.GetTestEnv(t)
+			te.SetAuthenticator(testauth.NewTestAuthenticator(t, emptyUserMap))
+			ctx := getAnonContext(t, te)
+			pc, err := pebble_cache.NewPebbleCache(te, &pebble_cache.Options{RootDirectory: testfs.MakeTempDir(t), MaxSizeBytes: 1_000_000_000})
+			require.NoError(t, err)
+			require.NoError(t, pc.Start())
+			defer pc.Stop()
+			data := []byte("digest-function-isolation")
+			d, err := digest.Compute(bytes.NewReader(data), repb.DigestFunction_SHA256)
+			require.NoError(t, err)
+			sha := digest.NewResourceName(d, "instance", cacheType, repb.DigestFunction_SHA256).ToProto()
+			blake := digest.NewResourceName(d, "instance", cacheType, repb.DigestFunction_BLAKE3).ToProto()
+			require.NoError(t, pc.Set(ctx, sha, data))
+			got, err := pc.Get(ctx, sha)
+			require.NoError(t, err)
+			require.Equal(t, data, got)
+			found, err := pc.Contains(ctx, blake)
+			require.NoError(t, err)
+			require.False(t, found)
+			_, err = pc.Get(ctx, blake)
+			require.True(t, status.IsNotFoundError(err), "cross-function Get: %v", err)
+		})
+	}
+}

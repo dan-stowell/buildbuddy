@@ -2269,3 +2269,28 @@ func (s *trackedWriteStream) CloseAndRecv() (*bspb.WriteResponse, error) {
 	defer s.done()
 	return s.ByteStream_WriteClient.CloseAndRecv()
 }
+
+func TestDigestFunctionInputOutputRoundTrip(t *testing.T) {
+	for _, df := range digest.SupportedDigestFunctions() {
+		t.Run(df.String(), func(t *testing.T) {
+			env, ctx := testEnv(t)
+			data := []byte("deterministic input and output")
+			d, err := cachetools.UploadBlobToCAS(ctx, env.GetByteStreamClient(), "instance", df, data)
+			require.NoError(t, err)
+			root := testfs.MakeTempDir(t)
+			tree := &repb.Tree{Root: &repb.Directory{Files: []*repb.FileNode{{Name: "file", Digest: d}}}}
+			_, err = dirtools.DownloadTree(ctx, env, "instance", df, tree, &dirtools.DownloadTreeOpts{RootDir: root})
+			require.NoError(t, err)
+			got, err := os.ReadFile(filepath.Join(root, "file"))
+			require.NoError(t, err)
+			require.Equal(t, data, got)
+			cmd := &repb.Command{OutputPaths: []string{"file"}}
+			result := &repb.ActionResult{}
+			helper := dirtools.NewDirHelper(root, cmd, fs.FileMode(0o755))
+			_, err = dirtools.UploadTree(ctx, env, helper, "instance", df, root, cmd, result, false, nil)
+			require.NoError(t, err)
+			require.Len(t, result.GetOutputFiles(), 1)
+			require.Equal(t, d, result.GetOutputFiles()[0].GetDigest())
+		})
+	}
+}

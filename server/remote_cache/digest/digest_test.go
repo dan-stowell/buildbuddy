@@ -758,3 +758,33 @@ func TestDigestFunctionResourceNameCase(t *testing.T) {
 		}
 	}
 }
+
+func TestDigestFunctionResourceNameRoundTrip(t *testing.T) {
+	for _, df := range digest.SupportedDigestFunctions() {
+		t.Run(df.String(), func(t *testing.T) {
+			d, err := digest.Compute(strings.NewReader("digest-function-roundtrip"), df)
+			require.NoError(t, err)
+			for _, compressor := range []repb.Compressor_Value{repb.Compressor_IDENTITY, repb.Compressor_ZSTD} {
+				rn := digest.NewCASResourceName(d, "instance", df)
+				rn.SetCompressor(compressor)
+				for _, upload := range []bool{false, true} {
+					var parsed *digest.CASResourceName
+					if upload {
+						parsed, err = digest.ParseUploadResourceName(rn.NewUploadString())
+					} else {
+						parsed, err = digest.ParseDownloadResourceName(rn.DownloadString())
+					}
+					require.NoError(t, err)
+					require.Equal(t, df, parsed.GetDigestFunction())
+					require.Equal(t, d, parsed.GetDigest())
+					require.Equal(t, compressor, parsed.GetCompressor())
+					require.Equal(t, "instance", parsed.GetInstanceName())
+				}
+			}
+		})
+	}
+	for _, segment := range []string{"vso", "murmur3", "not-a-function"} {
+		_, err := digest.ParseDownloadResourceName("instance/blobs/" + segment + "/" + strings.Repeat("a", 64) + "/1")
+		require.True(t, status.IsInvalidArgumentError(err), "%s: %v", segment, err)
+	}
+}
