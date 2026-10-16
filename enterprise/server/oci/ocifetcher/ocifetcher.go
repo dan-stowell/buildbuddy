@@ -952,7 +952,10 @@ func (t *mirrorTransport) RoundTrip(in *http.Request) (out *http.Response, err e
 				log.CtxErrorf(in.Context(), "mirror err: %s", err)
 				continue
 			}
+			// The mirror response is discarded on fallback, so release its body
+			// before issuing another request (including rewrite failures).
 			if out.StatusCode < http.StatusOK || out.StatusCode >= 300 {
+				out.Body.Close()
 				fallbackRequest, err := rewriteFallback(mirror, in)
 				if err != nil {
 					log.CtxErrorf(in.Context(), "error rewriting fallback request: %s", err)
