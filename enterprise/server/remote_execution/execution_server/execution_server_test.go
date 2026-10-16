@@ -3038,3 +3038,41 @@ func TestHedgeLateSuccessDoesNotOverwriteActionCache(t *testing.T) {
 	publish(originalID, "late loser")
 	require.Equal(t, "winner", readCache(), "late duplicate must not overwrite the winning action result")
 }
+
+func TestHedgeCancelLastMergedInvocation(t *testing.T) {
+	flags.Set(t, "remote_execution.enable_action_merging", true)
+	flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
+	flags.Set(t, "remote_execution.action_merging_hedge_delay", time.Microsecond)
+	env, conn, _ := setupEnv(t)
+	scheduler := &hedgeSchedulerMock{env.GetSchedulerService().(*schedulerServerMock)}
+	env.SetSchedulerService(scheduler)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := repb.NewExecutionClient(conn)
+	arn := uploadAction(ctx, t, env, "", repb.DigestFunction_SHA256, &repb.Action{})
+	invocations := []string{"11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"}
+	var canonicalID string
+	for _, invocationID := range invocations {
+		createInvocation(ctx, t, env.GetDBHandle(), &tables.Invocation{
+			InvocationID:     invocationID,
+			InvocationStatus: int64(invocation_status.InvocationStatus_PARTIAL_INVOCATION_STATUS),
+			Perms:            perms.OTHERS_READ,
+		})
+		invocationCtx, err := bazel_request.WithRequestMetadata(ctx, &repb.RequestMetadata{ToolInvocationId: invocationID})
+		require.NoError(t, err)
+		stream, err := client.Execute(invocationCtx, &repb.ExecuteRequest{ActionDigest: arn.GetDigest(), DigestFunction: arn.GetDigestFunction()})
+		require.NoError(t, err)
+		accepted, err := stream.Recv()
+		require.NoError(t, err)
+		if canonicalID == "" {
+			canonicalID = accepted.GetName()
+		} else {
+			require.Equal(t, canonicalID, accepted.GetName(), "second invocation must merge")
+		}
+	}
+	require.Len(t, scheduler.scheduleReqs, 2, "original and hedge dispatched")
+	require.NoError(t, env.GetRemoteExecutionService().Cancel(ctx, invocations[0]))
+	require.Equal(t, 0, scheduler.canceledCount, "other invocation still needs the original and hedge")
+	require.NoError(t, env.GetRemoteExecutionService().Cancel(ctx, invocations[1]))
+	require.Equal(t, 2, scheduler.canceledCount, "last invocation cancellation must cancel both original and hedge")
+}
