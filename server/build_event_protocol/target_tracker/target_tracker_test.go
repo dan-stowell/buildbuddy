@@ -917,3 +917,20 @@ func TestTargetTrackingAttemptsShardsAndDuplicates(t *testing.T) {
 		})
 	}
 }
+
+// BuildFinished is enough to complete an invocation, even if the connection
+// ends before the last-message event. Completed test summaries must survive.
+func TestTargetTrackingFinishedWithoutLastMessage(t *testing.T) {
+	for _, olap := range []bool{false, true} {
+		name := "primary"
+		if olap {
+			name = "olap"
+		}
+		t.Run(name, func(t *testing.T) {
+			flags.Set(t, "app.enable_write_test_target_statuses_to_olap_db", olap)
+			runTrackTargetsForEventsTransformed(t, olap, func(events []*build_event_stream.BuildEvent) []*build_event_stream.BuildEvent {
+				return append(events[:len(events)-1], &build_event_stream.BuildEvent{Payload: &build_event_stream.BuildEvent_Finished{Finished: &build_event_stream.BuildFinished{ExitCode: &build_event_stream.BuildFinished_ExitCode{}}}})
+			})
+		})
+	}
+}
