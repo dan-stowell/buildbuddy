@@ -496,8 +496,7 @@ func (q *PriorityTaskScheduler) Shutdown(ctx context.Context) error {
 	q.shuttingDown = true
 	q.mu.Unlock()
 
-	// Compute a deadline that is 1 second before our hard-kill
-	// deadline: that is when we'll cancel our own root context.
+	// Reserve time before the hard-kill deadline to cancel tasks and clean up.
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		alert.UnexpectedEvent("no_deadline_on_shutdownfunc_context")
@@ -510,14 +509,20 @@ func (q *PriorityTaskScheduler) Shutdown(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, delay)
 	defer cancel()
 
-	// Start a goroutine that will:
-	//   - log success on graceful shutdown
-	//   - cancel root context after delay has passed
+	// Completion must be distinct from context cancellation: the context also
+	// expires when the cleanup window starts, even if tasks are still running.
+	shutdownDone := make(chan struct{})
+	watcherDone := make(chan struct{})
+	defer func() {
+		close(shutdownDone)
+		<-watcherDone
+	}()
 	go func() {
+		defer close(watcherDone)
 		select {
-		case <-ctx.Done():
+		case <-shutdownDone:
 			log.CtxInfof(ctx, "Graceful stop of executor succeeded.")
-		case <-q.clock.After(delay):
+		case <-ctx.Done():
 			log.CtxWarningf(ctx, "Hard-stopping executor!")
 			q.rootCancel()
 		}
