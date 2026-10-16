@@ -2789,3 +2789,48 @@ func TestSizing_DynamicEstimatePreservesGPURequest(t *testing.T) {
 		})
 	}
 }
+
+func TestSizing_CPUAndMemoryCapacityGuards(t *testing.T) {
+	for _, resource := range []string{"cpu", "memory", "custom"} {
+		t.Run(resource, func(t *testing.T) {
+			env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+			fe := newFakeExecutor(ctx, t, env.GetSchedulerClient())
+			fe.node.AssignableCustomResources = []*scpb.CustomResource{{Name: "license", Value: 1}}
+			fe.Register()
+			req := newScheduleRequest(ctx, t, env, scheduleOpts{})
+			switch resource {
+			case "cpu":
+				req.Metadata.TaskSize.EstimatedMilliCpu = fe.node.AssignableMilliCpu + 1
+			case "memory":
+				req.Metadata.TaskSize.EstimatedMemoryBytes = fe.node.AssignableMemoryBytes + 1
+			case "custom":
+				req.Metadata.TaskSize.CustomResources = []*scpb.CustomResource{{Name: "license", Value: 2}}
+			}
+			_, err := env.GetSchedulerService().ScheduleTask(ctx, req)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "no registered executors")
+		})
+	}
+}
+
+func TestSizing_DynamicCPUAndMemoryClamped(t *testing.T) {
+	for _, source := range []string{"measured", "predicted"} {
+		t.Run(source, func(t *testing.T) {
+			h := &executorHandle{registration: &scpb.ExecutionNode{AssignableMemoryBytes: 1 << 30, AssignableMilliCpu: 1000}}
+			estimate := &scpb.TaskSize{EstimatedMemoryBytes: 1 << 62, EstimatedMilliCpu: 1 << 62}
+			requested := &scpb.TaskSize{CustomResources: []*scpb.CustomResource{{Name: "license", Value: 1}}, EstimatedFreeDiskBytes: 1234}
+			md := &scpb.SchedulingMetadata{RequestedTaskSize: requested}
+			if source == "measured" {
+				md.MeasuredTaskSize = estimate
+			} else {
+				md.PredictedTaskSize = estimate
+			}
+			got := h.getMostAccurateTaskSize(&scpb.EnqueueTaskReservationRequest{SchedulingMetadata: md})
+			require.Equal(t, int64(1<<30), got.GetEstimatedMemoryBytes())
+			require.Equal(t, int64(1000), got.GetEstimatedMilliCpu())
+			require.Equal(t, requested.CustomResources, got.CustomResources)
+			require.Equal(t, requested.EstimatedFreeDiskBytes, got.EstimatedFreeDiskBytes)
+			require.Equal(t, int64(1<<62), estimate.EstimatedMemoryBytes, "shared estimate was mutated")
+		})
+	}
+}

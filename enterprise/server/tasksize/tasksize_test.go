@@ -792,3 +792,40 @@ func TestCgroupSettings_AdditionalPIDsLimit(t *testing.T) {
 	const wantPidsMax = 10_300 // 10K base limit + (1.5*200 = 300) CPU-based limit
 	assert.Equal(t, int64(10_300), settings.GetPidsMax())
 }
+
+func TestSizing_MeasurementBoundaryValues(t *testing.T) {
+	flags.Set(t, "remote_execution.use_measured_task_sizes", true)
+	env := testenv.GetTestEnv(t)
+	env.SetRemoteExecutionRedisClient(testredis.Start(t).Client())
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers()))
+	sizer, err := tasksize.NewSizer(env)
+	require.NoError(t, err)
+	ctx := t.Context()
+	props := &platform.Properties{}
+	for _, tc := range []struct {
+		name        string
+		cpu, memory int64
+		wantNil     bool
+	}{
+		{"zero_cpu", 0, 100_000_000, true},
+		{"zero_memory", 1_000_000_000, 0, true},
+		{"tiny", 1, 1, false},
+		{"huge", math.MaxInt64, math.MaxInt64, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := &repb.Command{Arguments: []string{tc.name}}
+			start := time.Unix(1000, 0)
+			md := &repb.ExecutedActionMetadata{ExecutionStartTimestamp: timestamppb.New(start), ExecutionCompletedTimestamp: timestamppb.New(start.Add(time.Second)), UsageStats: &repb.UsageStats{CpuNanos: tc.cpu, PeakMemoryBytes: tc.memory}}
+			require.NoError(t, sizer.Update(ctx, cmd, props, md))
+			got := sizer.Get(ctx, cmd, props)
+			if tc.wantNil {
+				require.Nil(t, got)
+				return
+			}
+			require.NotNil(t, got)
+			require.GreaterOrEqual(t, got.EstimatedMilliCpu, tasksize.MinimumMilliCPU)
+			require.LessOrEqual(t, got.EstimatedMilliCpu, int64(7500))
+			require.GreaterOrEqual(t, got.EstimatedMemoryBytes, tasksize.MinimumMemoryBytes)
+		})
+	}
+}

@@ -1341,3 +1341,90 @@ func TestStopCancelsDelayedEnqueue(t *testing.T) {
 	require.NoError(t, scheduler.Stop())
 	require.Empty(t, scheduler.GetQueuedTaskReservations())
 }
+
+// sizingCancelExecutor waits for the scheduler's task context to be canceled.
+type sizingCancelExecutor struct {
+	*FakeExecutor
+	started chan struct{}
+}
+
+func (e *sizingCancelExecutor) ExecuteTaskAndStreamResults(ctx context.Context, task *repb.ScheduledTask, stream interfaces.Publisher) (bool, error) {
+	close(e.started)
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+type sizingErrorLeaser struct{}
+
+func (*sizingErrorLeaser) Lease(context.Context, string) (interfaces.TaskLease, error) {
+	return nil, status.UnavailableError("injected lease error")
+}
+
+func TestSizing_ResourceReleaseAcrossTaskOutcomes(t *testing.T) {
+	for _, outcome := range []string{"success", "error", "cancel", "lease_error"} {
+		t.Run(outcome, func(t *testing.T) {
+			env := testenv.GetTestEnv(t)
+			env.SetRemoteExecutionClient(&FakeExecutionClient{})
+			executor := NewFakeExecutor()
+			cancelExecutor := &sizingCancelExecutor{FakeExecutor: executor, started: make(chan struct{})}
+			var exec IExecutor = executor
+			if outcome == "cancel" {
+				exec = cancelExecutor
+			}
+			var leaser interfaces.TaskLeaser = NewFakeTaskLeaser()
+			if outcome == "lease_error" {
+				leaser = &sizingErrorLeaser{}
+			}
+			q, err := NewPriorityTaskScheduler(env, exec, &FakeRunnerPool{}, leaser, &Options{RAMBytesCapacityOverride: 100, CPUMillisCapacityOverride: 100})
+			require.NoError(t, err)
+			t.Cleanup(q.rootCancel)
+			q.resourceCapacity.GPUMemoryBytes = 100
+			q.resourceCapacity.Custom = map[string]customResourceCount{"license": customResource(1)}
+			q.resourcesUsed.Custom = map[string]customResourceCount{"license": 0}
+			baseline := q.resourcesUsed.Clone()
+			// Repeat on the same scheduler so a leak would shrink subsequent capacity.
+			for i := range 3 {
+				if outcome == "cancel" {
+					cancelExecutor.started = make(chan struct{})
+				}
+				req := &scpb.EnqueueTaskReservationRequest{TaskId: fakeTaskID(fmt.Sprintf("task-%d", i)), TaskSize: &scpb.TaskSize{EstimatedMemoryBytes: 100, EstimatedMilliCpu: 100, EstimatedGpuMemoryBytes: 100, CustomResources: []*scpb.CustomResource{{Name: "license", Value: 1}}}}
+				q.q.Enqueue(t.Context(), req)
+				q.handleTask()
+				if outcome == "cancel" {
+					select {
+					case <-cancelExecutor.started:
+					case <-time.After(10 * time.Second):
+						t.Fatal("task did not start")
+					}
+					q.rootCancel()
+				} else if outcome != "lease_error" {
+					var execution *FakeExecution
+					select {
+					case execution = <-executor.StartedExecutions:
+					case <-time.After(10 * time.Second):
+						t.Fatal("task did not start")
+					}
+					q.mu.Lock()
+					require.Equal(t, int64(100), q.resourcesUsed.RAMBytes)
+					require.Equal(t, customResource(1), q.resourcesUsed.Custom["license"])
+					q.mu.Unlock()
+					if outcome == "error" {
+						execution.CompleteWith(false, status.InternalError("injected execution error"))
+					} else {
+						execution.Complete()
+					}
+				}
+				done := make(chan struct{})
+				go func() { q.activeTaskCancelFuncs.Wait(); close(done) }()
+				select {
+				case <-done:
+				case <-time.After(10 * time.Second):
+					t.Fatal("task cleanup did not finish")
+				}
+				require.Equal(t, baseline, q.resourcesUsed)
+				require.Empty(t, q.activeTaskStartTimes)
+				require.Zero(t, q.activeCancelFuncsCount.Load())
+			}
+		})
+	}
+}
