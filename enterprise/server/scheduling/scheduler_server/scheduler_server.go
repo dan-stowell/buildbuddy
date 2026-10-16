@@ -272,6 +272,19 @@ var (
 		else 
 			return 0 
 		end`)
+	// Deletes a task unless it is claimed under a lease other than the
+	// given one. Return values:
+	//  - 1 if the task was deleted
+	//  - 0 if the task did not exist
+	//  - 2 if the task is claimed under a different lease ID
+	redisDeleteTaskUnlessClaimedByOther = redis.NewScript(`
+		if ARGV[1] ~= "" and redis.call("hget", KEYS[1], "claimed") == "1" then
+			local leaseId = redis.call("hget", KEYS[1], "leaseId")
+			if leaseId and leaseId ~= ARGV[1] then
+				return 2
+			end
+		end
+		return redis.call("del", KEYS[1])`)
 	// Task deleted if claim field is present.
 	redisDeleteClaimedTask = redis.NewScript(`
 		if redis.call("hget", KEYS[1], "claimed") == "1" then 
@@ -2032,6 +2045,20 @@ func (s *SchedulerServer) deleteTask(ctx context.Context, taskID string) (bool, 
 	return n == 1, err
 }
 
+// deleteTaskForLease deletes the task on behalf of the given lease, unless
+// another lease holder has since claimed it. With an empty leaseID, the task
+// is deleted unconditionally.
+func (s *SchedulerServer) deleteTaskForLease(ctx context.Context, taskID, leaseID string) error {
+	r, err := redisDeleteTaskUnlessClaimedByOther.Run(ctx, s.rdb, []string{s.redisKeyForTask(taskID)}, leaseID).Result()
+	if err != nil {
+		return err
+	}
+	if c, ok := r.(int64); ok && c == 2 {
+		return status.PermissionDeniedErrorf("task %q already been re-claimed", taskID)
+	}
+	return nil
+}
+
 func (s *SchedulerServer) deleteClaimedTask(ctx context.Context, taskID string) error {
 	// The script will return 1 if the task is claimed & has been deleted.
 	r, err := redisDeleteClaimedTask.Run(ctx, s.rdb, []string{s.redisKeyForTask(taskID)}).Result()
@@ -2529,7 +2556,10 @@ func (s *SchedulerServer) LeaseTask(stream scpb.Scheduler_LeaseTaskServer) error
 				log.CtxWarningf(ctx, "Could not release lease for task %q: %s", taskID, err)
 			}
 			if req.GetReEnqueue() {
-				if err := s.reEnqueueTask(ctx, taskID, "" /*=leaseID*/, "" /*=reconnectToken*/, probesPerTask, req.GetReEnqueueReason().GetMessage()); err != nil {
+				// Pass this stream's lease ID so that, if another executor
+				// claimed the task right after the release above, its claim
+				// is left alone.
+				if err := s.reEnqueueTask(ctx, taskID, leaseID, "" /*=reconnectToken*/, probesPerTask, req.GetReEnqueueReason().GetMessage()); err != nil {
 					log.CtxErrorf(ctx, "LeaseTask %q tried to re-enqueue task requested by executor but failed with err: %s", taskID, err)
 				}
 			}
@@ -3199,7 +3229,7 @@ func (s *SchedulerServer) reEnqueueTask(ctx context.Context, taskID, leaseID, re
 	// reconnect. A successful reconnect does not increment the attempt count.
 	isLeaseReconnect := reconnectToken != ""
 	if !isLeaseReconnect && scheduledTask.attemptCount >= maxTaskAttemptCount {
-		if _, err := s.deleteTask(ctx, taskID); err != nil {
+		if err := s.deleteTaskForLease(ctx, taskID, leaseID); err != nil {
 			return err
 		}
 		msg := fmt.Sprintf("Task %q already attempted %d times.", taskID, scheduledTask.attemptCount)
@@ -3218,7 +3248,7 @@ func (s *SchedulerServer) reEnqueueTask(ctx context.Context, taskID, leaseID, re
 	}
 	retryable := platform.Retryable(task)
 	if !isLeaseReconnect && !retryable {
-		if _, err := s.deleteTask(ctx, taskID); err != nil {
+		if err := s.deleteTaskForLease(ctx, taskID, leaseID); err != nil {
 			return err
 		}
 		log.CtxInfof(ctx, "Task %q does not have retries enabled. Not re-enqueuing.", taskID)
