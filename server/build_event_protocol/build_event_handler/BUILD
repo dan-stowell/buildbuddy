@@ -65,9 +65,10 @@ go_library(
 go_test(
     name = "build_event_handler_test",
     size = "small",
-    srcs = ["build_event_handler_test.go"],
+    srcs = ["build_event_handler_test.go", "finalization_test.go"],
     deps = [
         ":build_event_handler",
+        "//server/build_event_protocol/build_event_server",
         "//proto:build_event_stream_go_proto",
         "//proto:build_events_go_proto",
         "//proto:command_line_go_proto",
