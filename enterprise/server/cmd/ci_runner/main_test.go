@@ -784,13 +784,12 @@ func TestRunnerLeavesStaleSubmoduleContent(t *testing.T) {
 	// protocol.file.allow=always` invocations simulate the user's workflow
 	// steps against a local file:// submodule.
 	sourceDir, _ := testgit.MakeTempRepo(t, map[string]string{"root.txt": "root"})
-	commit1 := testshell.Run(t, sourceDir, fmt.Sprintf(`
+	testshell.Run(t, sourceDir, fmt.Sprintf(`
 		git -c protocol.file.allow=always submodule add %q sub
 		cd sub && git checkout -q %s && cd ..
 		git add sub .gitmodules && git commit -qm "c1 sub@A"
-		git rev-parse HEAD
 	`, "file://"+subDir, subSA))
-	commit1 = strings.TrimSpace(commit1)
+	commit1 := testgit.CurrentCommitSHA(t, sourceDir)
 	pushMaster(t, sourceDir, pushURL)
 
 	ws, checkoutDir := newRepoRunnerWorkspace(t)
@@ -805,12 +804,11 @@ func TestRunnerLeavesStaleSubmoduleContent(t *testing.T) {
 	require.Equal(t, "A", strings.TrimSpace(testshell.Run(t, checkoutDir, `cat sub/sub.txt`)))
 
 	// commit2: change the submodule pointer to B, re-push.
-	commit2 := testshell.Run(t, sourceDir, fmt.Sprintf(`
+	testshell.Run(t, sourceDir, fmt.Sprintf(`
 		cd sub && git checkout -q %s && cd ..
 		git add sub && git commit -qm "c2 sub@B"
-		git rev-parse HEAD
 	`, subSB))
-	commit2 = strings.TrimSpace(commit2)
+	commit2 := testgit.CurrentCommitSHA(t, sourceDir)
 	pushMaster(t, sourceDir, pushURL)
 
 	// --- Run 2 on the SAME runner workspace. ---
@@ -823,13 +821,12 @@ func TestRunnerLeavesStaleSubmoduleContent(t *testing.T) {
 		"submodule content is stale after a pointer-changing commit")
 
 	// commit3: remove the submodule entirely, re-push.
-	commit3 := testshell.Run(t, sourceDir, `
+	testshell.Run(t, sourceDir, `
 		git rm -q sub
 		rm -f .gitmodules
 		git add -A && git commit -qm "c3 remove sub"
-		git rev-parse HEAD
 	`)
-	commit3 = strings.TrimSpace(commit3)
+	commit3 := testgit.CurrentCommitSHA(t, sourceDir)
 	pushMaster(t, sourceDir, pushURL)
 
 	// --- Run 3 on the SAME runner workspace. ---
