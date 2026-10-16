@@ -2,6 +2,7 @@ package execution_service_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -555,6 +556,25 @@ func TestGetExecutionDownloads(t *testing.T) {
 		require.Empty(t, cmp.Diff(groupReadableDownloads[2:], secondPage.GetDownloads(), protocmp.Transform()))
 		require.Empty(t, secondPage.GetNextPageToken())
 	})
+
+	for size := 1; size <= 4; size++ {
+		t.Run(fmt.Sprintf("pagination_size_%d", size), func(t *testing.T) {
+			req := &capb.GetExecutionDownloadsRequest{InvocationId: groupReadableInvocationID, ExecutionId: groupReadableExecutionID, PageSize: int32(size)}
+			var got []*capb.ExecutionDownload
+			for page := 0; ; page++ {
+				require.Less(t, page, 5)
+				rsp, err := service.GetExecutionDownloads(groupMemberCtx, req)
+				require.NoError(t, err)
+				got = append(got, rsp.Downloads...)
+				if rsp.NextPageToken == "" {
+					break
+				}
+				require.NotEqual(t, req.PageToken, rsp.NextPageToken)
+				req.PageToken = rsp.NextPageToken
+			}
+			require.Empty(t, cmp.Diff(groupReadableDownloads, got, protocmp.Transform()))
+		})
+	}
 
 	for _, testCase := range []struct {
 		name          string
