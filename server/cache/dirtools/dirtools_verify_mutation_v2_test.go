@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -181,6 +182,28 @@ func TestVerifyV2_WarmMaterializationBench(t *testing.T) {
 				el := time.Since(start)
 				require.Equal(t, int64(0), info.FileCount, "expected all inputs to be file cache hits")
 				t.Logf("VBENCH %s round=%d files=%d logical_bytes=%d elapsed=%s", tc.name, round, tc.n, logical, el)
+				require.NoError(t, os.RemoveAll(ws))
+			}
+			// Proxy for a filesystem without extent sharing: copy every cached
+			// file with plain read/write (wrapping defeats copy_file_range).
+			for round := range 3 {
+				ws := testfs.MakeTempDir(t)
+				start := time.Now()
+				i := 0
+				for _, dir := range tree.Children {
+					for _, node := range dir.Files {
+						src, err := fc.Open(ctx, node)
+						require.NoError(t, err)
+						dst, err := os.OpenFile(filepath.Join(ws, fmt.Sprintf("p%05d", i)), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+						require.NoError(t, err)
+						_, err = io.Copy(struct{ io.Writer }{dst}, struct{ io.Reader }{src})
+						require.NoError(t, err)
+						require.NoError(t, dst.Close())
+						require.NoError(t, src.Close())
+						i++
+					}
+				}
+				t.Logf("VBENCH %s userspace_copy_proxy round=%d files=%d elapsed=%s", tc.name, round, i, time.Since(start))
 				require.NoError(t, os.RemoveAll(ws))
 			}
 		})
