@@ -65,3 +65,28 @@ func TestReplaceSuffix_MissingKey(t *testing.T) {
 	_, err = store.Get(ctx, "missing")
 	require.True(t, status.IsNotFoundError(err), "expected NotFound, got %v", err)
 }
+
+// Replay the exact Lua inputs after discarding the first successful result.
+func TestRedisRetryIdempotency_ReplaceSuffix(t *testing.T) {
+	for _, tc := range []struct{ name, suffix string }{
+		{"append", " world"}, {"truncate", "!"}, {"same_length", "HELLO"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			store := redis_kvstore.New(testredis.Start(t).Client())
+			require.NoError(t, store.Set(ctx, "key", []byte("hello")))
+			offset := int64(0)
+			if tc.name == "append" {
+				offset = 5
+			}
+			require.NoError(t, store.ReplaceSuffix(ctx, "key", 5, offset, []byte(tc.suffix)))
+			first, err := store.Get(ctx, "key")
+			require.NoError(t, err)
+			retryErr := store.ReplaceSuffix(ctx, "key", 5, offset, []byte(tc.suffix))
+			second, err := store.Get(ctx, "key")
+			require.NoError(t, err)
+			require.Equal(t, first, second)
+			require.NoError(t, retryErr, "a successfully applied suffix replacement must tolerate replay")
+		})
+	}
+}
