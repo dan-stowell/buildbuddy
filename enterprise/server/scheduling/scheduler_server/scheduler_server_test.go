@@ -2774,6 +2774,10 @@ func TestUnclaimedTaskStaleCacheLeaseSafety(t *testing.T) {
 			task, err := s.readTask(ctx, id)
 			require.NoError(t, err)
 			np := s.getOrCreatePool(nodePoolKey{os: task.metadata.GetOs(), arch: task.metadata.GetArch(), pool: task.metadata.GetPool(), groupID: task.metadata.GetExecutorGroupId()})
+			// Registration may have cached an empty pool before scheduling.
+			np.unclaimedTasksMu.Lock()
+			np.unclaimedTasksExpiry = time.Time{}
+			np.unclaimedTasksMu.Unlock()
 			ids, err := np.SampleUnclaimedTasks(ctx, 100)
 			require.NoError(t, err)
 			require.Contains(t, ids, id)
