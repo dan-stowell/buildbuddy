@@ -1911,3 +1911,99 @@ func TestFetchBlob_HTTPTransportLifecycle(t *testing.T) {
 		}
 	}
 }
+
+func TestFetchBlob_ErrorLifecycle(t *testing.T) {
+	for _, mode := range []string{"checksum-direct", "checksum-spooled", "truncated", "timeout", "timeout-shared", "cancel", "redirect-loop", "cas-error"} {
+		for _, n := range []int{10, 50} {
+			t.Run(fmt.Sprintf("%s/N=%d", mode, n), func(t *testing.T) {
+				testleak.Check(t)
+				testleak.CheckFDs(t)
+				scratchRoot := t.TempDir()
+				flags.Set(t, "storage.tempdir", scratchRoot)
+				require.NoError(t, scratchspace.Init())
+				te := testenv.GetTestEnv(t)
+				conn := runFetchServer(context.Background(), t, te)
+				te.SetCacheClient(&missingMetadataClient{})
+				if mode == "cas-error" {
+					te.SetByteStreamClient(&failingFetchByteStreamClient{})
+				}
+				client := rapb.NewFetchClient(conn)
+				started := make(chan struct{}, 1)
+				origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					switch mode {
+					case "timeout", "timeout-shared", "cancel":
+						w.WriteHeader(http.StatusOK)
+						fmt.Fprint(w, "partial")
+						w.(http.Flusher).Flush()
+						started <- struct{}{}
+						<-r.Context().Done()
+					case "truncated":
+						w.Header().Set("Content-Length", "100")
+						fmt.Fprint(w, "partial")
+					case "redirect-loop":
+						http.Redirect(w, r, "/again", http.StatusFound)
+					default:
+						fmt.Fprint(w, "wrong checksum")
+					}
+				}))
+				t.Cleanup(origin.Close)
+				testleak.CheckGrowth(t, testleak.Growth{Iterations: n, Warmup: 3}, func(i int) {
+					req := &rapb.FetchBlobRequest{Uris: []string{origin.URL}}
+					if strings.HasPrefix(mode, "checksum-") || mode == "timeout-shared" || mode == "cas-error" {
+						req.Qualifiers = []*rapb.Qualifier{{Name: fetch_server.ChecksumQualifier, Value: sha256CRI}}
+					}
+					if mode == "checksum-spooled" {
+						req.DigestFunction = repb.DigestFunction_BLAKE3
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+					var resp *rapb.FetchBlobResponse
+					var err error
+					if mode == "cancel" {
+						done := make(chan struct{})
+						go func() { defer close(done); resp, err = client.FetchBlob(ctx, req) }()
+						select {
+						case <-started:
+						case <-ctx.Done():
+							t.Fatal("origin did not start")
+						}
+						cancel()
+						select {
+						case <-done:
+						case <-time.After(10 * time.Second):
+							t.Fatal("canceled fetch did not return")
+						}
+						require.Error(t, err)
+					} else {
+						if strings.HasPrefix(mode, "timeout") {
+							req.Timeout = durationpb.New(20 * time.Millisecond)
+						}
+						resp, err = client.FetchBlob(ctx, req)
+						require.NoError(t, err)
+						require.Equal(t, int32(gcodes.NotFound), resp.GetStatus().GetCode())
+						if strings.HasPrefix(mode, "timeout") {
+							<-started
+						}
+					}
+					entries, err := os.ReadDir(filepath.Join(scratchRoot, "buildbuddy-scratch"))
+					require.NoError(t, err)
+					// Shared cancellation may finish just after the caller returns. Poll for
+					// the in-flight download to remove its file rather than racing cleanup.
+					deadline := time.Now().Add(5 * time.Second)
+					for len(entries) != 0 && time.Now().Before(deadline) {
+						time.Sleep(time.Millisecond)
+						entries, err = os.ReadDir(filepath.Join(scratchRoot, "buildbuddy-scratch"))
+						require.NoError(t, err)
+					}
+					require.Empty(t, entries)
+				})
+			})
+		}
+	}
+}
+
+type failingFetchByteStreamClient struct{ bspb.ByteStreamClient }
+
+func (*failingFetchByteStreamClient) Write(context.Context, ...grpc.CallOption) (bspb.ByteStream_WriteClient, error) {
+	return nil, gstatus.Error(gcodes.PermissionDenied, "injected CAS write failure")
+}
