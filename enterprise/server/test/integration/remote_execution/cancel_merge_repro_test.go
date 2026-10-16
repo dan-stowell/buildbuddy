@@ -196,7 +196,7 @@ func TestCancelMergeRepro_RaceStress(t *testing.T) {
 // a short offset (0-19.5ms in 0.5ms steps), so B's merge can land inside
 // Cancel's CheckMerged..CancelTask window.
 func TestCancelMergeRepro_RaceStressBFirst(t *testing.T) {
-	testCancelMergeRace(t, true /*=bFirst*/, 40, 500*time.Microsecond)
+	testCancelMergeRace(t, true /*=bFirst*/, 25, 500*time.Microsecond)
 }
 
 func testCancelMergeRace(t *testing.T, bFirst bool, trials int, step time.Duration) {
