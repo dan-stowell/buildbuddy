@@ -33,6 +33,14 @@ const (
 	// given execution.
 	DefaultClaimedExecutionLeasePeriods = 4
 
+	// TTL for the marker that prevents requests from merging into an
+	// execution that is being cancelled. The marker only needs to outlive a
+	// request that looked up the execution just before the cancellation and
+	// has yet to record its merge. That gap is normally very short, but it
+	// can include waiting for the execution to appear in the scheduler (under
+	// ten seconds), so a minute leaves ample margin.
+	cancelledExecutionMarkerTTL = 1 * time.Minute
+
 	// Redis Hash keys for storing information about action-merging.
 	//
 	// The execution ID of the canonical (first-submitted) execution
@@ -184,8 +192,12 @@ return 1
 // atomically checks whether the action has been merged against and, if not,
 // prevents any further requests from merging into the execution (see
 // RecordMergedExecution). It returns true if the action has been merged
-// against, in which case the execution should not be cancelled.
+// against, in which case the execution should not be cancelled. It does
+// nothing if action merging is disabled.
 func StopMergingUnlessMerged(ctx context.Context, rdb redis.UniversalClient, adResource *digest.CASResourceName, executionID string) (bool, error) {
+	if !*enableActionMerging {
+		return false, nil
+	}
 	forwardKey, err := redisKeyForPendingExecutionID(ctx, adResource)
 	if err != nil {
 		return false, err
@@ -195,7 +207,7 @@ func StopMergingUnlessMerged(ctx context.Context, rdb redis.UniversalClient, adR
 		redisKeyForPendingExecutionDigest(executionID),
 		redisKeyForCancelledExecution(executionID),
 	}
-	r, err := stopMergingScript.Run(ctx, rdb, keys, executionID, queuedExecutionTTL.Milliseconds()).Int64()
+	r, err := stopMergingScript.Run(ctx, rdb, keys, executionID, cancelledExecutionMarkerTTL.Milliseconds()).Int64()
 	if err != nil {
 		return false, err
 	}
