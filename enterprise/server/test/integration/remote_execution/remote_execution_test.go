@@ -148,6 +148,59 @@ func TestActionResultCacheWithFailedAction(t *testing.T) {
 	assert.True(t, status.IsNotFoundError(err))
 }
 
+// Exercise the executor's real output upload as well as server-side cache
+// eligibility. Each case has a separate environment and action cache.
+func TestExecutionResults_ExecutorUpload(t *testing.T) {
+	for _, tc := range []struct {
+		name, script string
+		opts         rbetest.ExecuteOpts
+		cacheable    bool
+		timeout      bool
+	}{
+		{name: "Success", script: "echo output > result.txt; echo stdout; echo stderr >&2", cacheable: true},
+		{name: "NonzeroExit", script: "echo output > result.txt; echo stdout; echo stderr >&2; exit 42"},
+		{name: "DoNotCache", script: "echo output > result.txt; echo stdout; echo stderr >&2", opts: rbetest.ExecuteOpts{DoNotCacheAction: true}},
+		{name: "Timeout", script: "echo output > result.txt; echo stdout; echo stderr >&2; sleep 100", opts: rbetest.ExecuteOpts{ActionTimeout: time.Second}, timeout: true},
+		{name: "MissingInput", script: "echo output > result.txt", opts: rbetest.ExecuteOpts{SimulateMissingDigest: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rbe := rbetest.NewRBETestEnv(t)
+			rbe.AddBuildBuddyServer()
+			rbe.AddExecutor(t)
+			cmd := rbe.Execute(&repb.Command{
+				Arguments: []string{"sh", "-c", tc.script}, OutputFiles: []string{"result.txt"},
+				Platform: &repb.Platform{Properties: []*repb.Platform_Property{{Name: "OSFamily", Value: runtime.GOOS}, {Name: "Arch", Value: runtime.GOARCH}}},
+			}, &tc.opts)
+			if tc.opts.SimulateMissingDigest {
+				cmd.MustFailToStart()
+			} else {
+				var res *rbetest.CommandResult
+				if tc.timeout {
+					res = cmd.MustTerminateAbnormally()
+				} else {
+					res = cmd.Wait()
+				}
+				if tc.timeout {
+					require.True(t, status.IsDeadlineExceededError(res.Err))
+				}
+				require.Equal(t, "stdout\n", res.Stdout)
+				require.Equal(t, "stderr\n", res.Stderr)
+				if tc.cacheable {
+					cached, err := cachetools.GetActionResult(context.Background(), rbe.GetActionResultStorageClient(), cmd.GetActionResourceName())
+					require.NoError(t, err)
+					assert.Empty(t, cmp.Diff(res.ActionResult, cached, protocmp.Transform()))
+					require.Len(t, cached.GetOutputFiles(), 1)
+					require.NotNil(t, cached.GetOutputFiles()[0].GetDigest())
+				}
+			}
+			if !tc.cacheable {
+				_, err := cachetools.GetActionResult(context.Background(), rbe.GetActionResultStorageClient(), cmd.GetActionResourceName())
+				require.True(t, status.IsNotFoundError(err), "uncacheable result was cached: %v", err)
+			}
+		})
+	}
+}
+
 func TestSimpleCommandWithZeroExitCode(t *testing.T) {
 	rbe := rbetest.NewRBETestEnv(t)
 
