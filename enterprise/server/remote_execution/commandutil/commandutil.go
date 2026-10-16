@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -40,7 +39,6 @@ var (
 	ErrSIGKILL = status.UnavailableErrorf("command was terminated by SIGKILL, likely due to executor shutdown or OOM")
 
 	DebugStreamCommandOutputs = flag.Bool("debug_stream_command_outputs", false, "If true, stream command outputs to the terminal. Intended for debugging purposes only and should not be used in production.")
-	OutputDrainTimeout        = flag.Duration("executor.output_drain_timeout", time.Second, "Grace period for draining command output after cancellation. Output still pending after this period may be truncated. Non-positive values use one second.")
 	StdOutErrMaxSize          = flag.Uint64("executor.stdouterr_max_size_bytes", 0, "The maximum size of stdout/stderr for each action, in bytes. If the size of stdout/stderr exceeds this limit, the command will fail with a RESOURCE_EXHAUSTED error. If set to 0, no limit is enforced.")
 )
 
@@ -230,21 +228,13 @@ func startNewProcess(ctx context.Context, cmd *exec.Cmd) (*process, error) {
 		cmd:        cmd,
 		terminated: make(chan struct{}),
 	}
-	drain, started, abort, err := prepareOutputDrain(ctx, cmd)
-	if err != nil {
-		return nil, err
-	}
-	p.drainOutput = drain
 	if err := p.preStart(); err != nil {
-		abort()
 		return nil, fmt.Errorf("fail to setup preStart: %w", err)
 	}
 	if err := p.cmd.Start(); err != nil {
-		abort()
 		_ = p.cleanup()
 		return nil, err
 	}
-	started()
 	if err := p.postStart(); err != nil {
 		// Even if Kill reports that the process is already done, Wait is still
 		// required to release exec.Cmd's parent-side resources and I/O goroutines.
@@ -254,24 +244,18 @@ func startNewProcess(ctx context.Context, cmd *exec.Cmd) (*process, error) {
 		return nil, fmt.Errorf("fail to setup postStart: %w", err)
 	}
 
-	// Join cancellation cleanup before returning, so it cannot signal an old
-	// process group after the caller has moved on to another action.
-	pCleanupDone := make(chan struct{})
 	// Cleanup goroutine: kill the process tree when the context is canceled.
 	go func() {
-		defer close(pCleanupDone)
 		select {
 		case <-p.terminated:
+			return
 		case <-ctx.Done():
-		}
-		if ctx.Err() != nil {
 			if err := p.killProcessTree(); err != nil {
 				log.Warningf("Failed to kill process tree: %s", err)
 			}
 		}
 	}()
 
-	p.cleanupDone = pCleanupDone
 	return p, nil
 }
 
@@ -305,8 +289,6 @@ func RunWithProcessTreeCleanup(ctx context.Context, cmd *exec.Cmd, opts *RunOpts
 		opts = &RunOpts{}
 	}
 
-	// Output draining is lossless until cancellation; only then may the grace
-	// timer close pipes still held by descendants outside the process group.
 	p, err := startNewProcess(ctx, cmd)
 	if err != nil {
 		return nil, err
@@ -318,7 +300,6 @@ func RunWithProcessTreeCleanup(ctx context.Context, cmd *exec.Cmd, opts *RunOpts
 	}
 
 	rusage, err := p.wait()
-	<-p.cleanupDone
 	stats := <-statsCh
 	p.finalizeUsage(stats)
 	if cleanupErr := p.cleanup(); cleanupErr != nil {
@@ -355,8 +336,6 @@ func forwardSignals(ctx context.Context, process *process, ch <-chan syscall.Sig
 				log.CtxWarningf(ctx, "Failed to send signal %q: %s", s, err)
 			}
 		case <-ctx.Done():
-			return
-		case <-process.terminated:
 			return
 		}
 	}
@@ -403,14 +382,6 @@ func splitExecutableArgs(commandTokens []string) (executable string, args []stri
 // exitCode returns the exit code from the given command, based on the error returned.
 // If the command could not be started or did not exit cleanly, an error is returned.
 func ExitCode(ctx context.Context, cmd *exec.Cmd, err error) (int, error) {
-	// The main process can exit successfully before its pipes finish draining.
-	// Cancellation/deadline must take precedence over that successful status.
-	if ctx.Err() == context.Canceled {
-		return KilledExitCode, status.CanceledErrorf("command was canceled%s", outputDrainMessage(err))
-	}
-	if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
-		return KilledExitCode, status.DeadlineExceededErrorf("command timed out%s", outputDrainMessage(err))
-	}
 	if err == nil {
 		return 0, nil
 	}
@@ -483,129 +454,4 @@ func EnvProto(env []string) ([]*repb.Command_EnvironmentVariable, error) {
 		})
 	}
 	return out, nil
-}
-
-// errOutputDrainTimeout means output may have been truncated after cancellation.
-var errOutputDrainTimeout = errors.New("output drain grace period expired; stdout/stderr may be truncated")
-
-func outputDrainMessage(err error) string {
-	if errors.Is(err, errOutputDrainTimeout) {
-		return ": " + errOutputDrainTimeout.Error()
-	}
-	return ""
-}
-
-// Own the pipes so cancellation can close them without changing Cmd.WaitDelay
-// concurrently with Wait, or starting a timer on successful process exit.
-// As with exec.Cmd, destination writers must eventually return from Write.
-func prepareOutputDrain(ctx context.Context, cmd *exec.Cmd) (drain func() error, started func(), abort func(), err error) {
-	// Respect an explicit caller-provided bound, including its ErrWaitDelay.
-	if cmd.WaitDelay != 0 {
-		return func() error { return nil }, func() {}, func() {}, nil
-	}
-	// Like exec.Cmd, give equal destinations one pipe and one copier. Serializing
-	// writes from separate pipes would still lose stdout/stderr write ordering.
-	sharedOutput := sameWriter(cmd.Stdout, cmd.Stderr)
-	var readers, writers []*os.File
-	var results []chan error
-	closeWriters := func() {
-		for _, w := range writers {
-			_ = w.Close()
-		}
-	}
-	closeReaders := func() {
-		for _, r := range readers {
-			_ = r.Close()
-		}
-	}
-	abort = func() { closeWriters(); closeReaders() }
-	for i, dst := range []*io.Writer{&cmd.Stdout, &cmd.Stderr} {
-		if i == 1 && sharedOutput {
-			cmd.Stderr = cmd.Stdout
-			continue
-		}
-		if *dst == nil {
-			continue
-		}
-		if _, ok := (*dst).(*os.File); ok {
-			continue
-		}
-		r, w, err := os.Pipe()
-		if err != nil {
-			abort()
-			return nil, nil, nil, err
-		}
-		readers = append(readers, r)
-		writers = append(writers, w)
-		result := make(chan error, 1)
-		results = append(results, result)
-		destination := *dst
-		*dst = w
-		go func() { _, err := io.Copy(destination, r); _ = r.Close(); result <- err }()
-	}
-	done := make(chan struct{})
-	copyResult := make(chan error, 1)
-	go func() {
-		var copyErr error
-		for _, result := range results {
-			if err := <-result; err != nil && copyErr == nil {
-				copyErr = err
-			}
-		}
-		copyResult <- copyErr
-		close(done)
-	}()
-	grace := *OutputDrainTimeout
-	if grace <= 0 {
-		grace = time.Second
-	}
-	watcherDone := make(chan struct{})
-	timedOut := make(chan struct{})
-	go func() {
-		defer close(watcherDone)
-		select {
-		case <-done:
-			return
-		case <-ctx.Done():
-		}
-		timer := time.NewTimer(grace)
-		defer timer.Stop()
-		select {
-		case <-done:
-		case <-timer.C:
-			close(timedOut)
-			closeReaders()
-		}
-	}()
-	drain = func() error {
-		copyErr := <-copyResult
-		<-watcherDone
-		select {
-		case <-timedOut:
-			return errOutputDrainTimeout
-		default:
-			return copyErr
-		}
-	}
-	// Startup failures must also join the copying and timer goroutines.
-	abortAll := func() { closeWriters(); closeReaders(); _ = drain() }
-	return drain, closeWriters, abortAll, nil
-}
-
-func (p *process) waitCommand() error {
-	err := p.cmd.Wait()
-	drainErr := p.drainOutput()
-	if errors.Is(drainErr, errOutputDrainTimeout) {
-		return errors.Join(err, drainErr)
-	}
-	if err != nil {
-		return err
-	}
-	return drainErr
-}
-
-// Match exec.Cmd's handling of a shared stdout/stderr destination.
-func sameWriter(a, b io.Writer) (same bool) {
-	defer func() { _ = recover() }()
-	return a == b
 }
