@@ -199,6 +199,13 @@ var (
 	
 		-- Task already claimed.
 		if redis.call("hexists", KEYS[1], "claimed") == 1 then
+			-- If the claim was made with this lease ID, this is a retry of a
+			-- claim whose reply was lost (e.g. the Redis client retried after
+			-- a connection error). Report success so the claim isn't
+			-- orphaned.
+			if redis.call("hget", KEYS[1], "leaseId") == ARGV[4] then
+				return 1
+			end
 			return 11
 		end
 
