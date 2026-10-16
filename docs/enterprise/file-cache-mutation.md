@@ -15,7 +15,9 @@ compatibility alias for `MaterializeWritable`.
 modify the shared inode. These methods serve immutable ext4 images and VM
 snapshot files/chunks; reads also use this path. Write and Writer.Commit move
 private temporary files into the cache without copying their bytes. Duplicate
-digest admissions retain the existing entry and skip the transfer. Callers
+digest admissions through AddFile, AddReadOnly, and Writer retain the existing
+entry and skip the transfer. Write retains replacement semantics for mutable
+snapshot manifest keys, publishing a new inode atomically. Callers
 must use DeleteFile before replacing a known bad digest entry.
 
 `executor.local_cache_trusted_workspace_hardlinks` defaults to false. Setting

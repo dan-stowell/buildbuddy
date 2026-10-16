@@ -734,6 +734,7 @@ const (
 	admitWritable admissionMode = iota
 	admitReadOnly
 	admitOwned
+	admitOwnedReplace // Write also serves mutable snapshot manifest keys.
 )
 
 func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, existingFilePath string, mode admissionMode) error {
@@ -744,7 +745,7 @@ func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, 
 	if err != nil {
 		return err
 	}
-	if c.containsWithStatFallback(k) {
+	if mode != admitOwnedReplace && c.containsWithStatFallback(k) {
 		return nil
 	}
 	info, err := os.Stat(existingFilePath)
@@ -784,7 +785,7 @@ func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, 
 		defer os.Remove(stagedPath)
 		start := time.Now()
 		transfer := fastcopy.CloneOrCopy
-		if mode == admitOwned {
+		if mode == admitOwned || mode == admitOwnedReplace {
 			transfer = os.Rename
 		} else if (mode == admitReadOnly || *unsafeWorkspaceHardlinks) && !*alwaysClone {
 			transfer = fastcopy.FastCopy
@@ -801,10 +802,11 @@ func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, 
 	// (i.e. during the initial directory scan), and if it's already tracked in
 	// the LRU (i.e. another action added it concurrently with the scan), then
 	// short-circuit to avoid evicting the file.
-	if c.l.Contains(k) {
+	if mode != admitOwnedReplace && c.l.Contains(k) {
 		return nil
 	}
 	if !existingFileIsInPlace {
+		c.l.Remove(k)
 		// Publish a complete inode atomically, never overwrite cached bytes.
 		if err := os.Rename(stagedPath, fp); err != nil {
 			return err
@@ -1046,7 +1048,7 @@ func (c *fileCache) Write(ctx context.Context, node *repb.FileNode, b []byte) (n
 	if err := os.WriteFile(tmp, b, 0o666); err != nil {
 		return 0, status.InternalErrorf("filecache temp file write failed: %s", err)
 	}
-	if err := c.addFileWithKeyPrefix(keyPrefixFromContext(ctx), node, tmp, admitOwned); err != nil {
+	if err := c.addFileWithKeyPrefix(keyPrefixFromContext(ctx), node, tmp, admitOwnedReplace); err != nil {
 		return 0, err
 	}
 	return len(b), nil
