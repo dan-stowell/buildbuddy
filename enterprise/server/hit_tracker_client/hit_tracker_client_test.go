@@ -968,3 +968,30 @@ func TestLongOutageKeepsRetainedHitsBounded(t *testing.T) {
 	}, 10*time.Second, time.Millisecond)
 	require.Equal(t, held, delivered())
 }
+
+// A Track RPC that the app never answers times out instead of stalling the
+// sender. The app may have recorded the batch, so it is not resent.
+func TestHungTrackTimesOut(t *testing.T) {
+	flags.Set(t, "cache_proxy.remote_hit_tracker.track_timeout", 200*time.Millisecond)
+	h := newHarness(t)
+	ctx := context.Background()
+	h.trackDownloads(ctx, 10)
+	require.Eventually(t, pendingHitsExpectation(h.factory, anonKey, 10), 10*time.Second, 10*time.Millisecond)
+	resume := h.service.pause(t)
+	h.tick(t)
+	err := h.nextTrackResult(t)
+	require.True(t, status.IsDeadlineExceededError(err), "expected DeadlineExceeded, got %v", err)
+	resume()
+
+	// The sender is free again: a later hit is reported on the next tick.
+	h.trackDownloads(authenticatedContext(user1, h.authenticator), 1)
+	require.Eventually(t, func() bool {
+		if h.service.casDownloads[group1Key].Load() == 1 {
+			return true
+		}
+		h.clock.Advance(*remoteHitTrackerPollInterval)
+		return false
+	}, 10*time.Second, 10*time.Millisecond)
+	_, held := retainedHits(h.factory)
+	require.Equal(t, 0, held)
+}

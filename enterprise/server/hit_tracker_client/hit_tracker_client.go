@@ -37,6 +37,7 @@ var (
 	maxHitsPerUpdate             = flag.Int("cache_proxy.remote_hit_tracker.max_hits_per_update", 100_000, "The maximum number of cache-hit updates to send in one request to the hit-tracking backend.")
 	maxTrackAttempts             = flag.Int("cache_proxy.remote_hit_tracker.max_track_attempts", 10, "The maximum number of times to send a batch of cache-hit updates whose Track RPC fails with Unavailable. Failed batches are retried once per update_interval.")
 	maxRetryHits                 = flag.Int("cache_proxy.remote_hit_tracker.max_retry_hits", 200_000, "The maximum number of cache-hit updates, across all keys, to hold in memory for retrying after a failed Track RPC. Updates over this limit are dropped.")
+	trackTimeout                 = flag.Duration("cache_proxy.remote_hit_tracker.track_timeout", 30*time.Second, "The timeout for each asynchronous remote cache-hit-tracking RPC.")
 	remoteHitTrackerWorkers      = flag.Int("cache_proxy.remote_hit_tracker.workers", 1, "The number of workers to use to send asynchronous remote cache-hit-tracking RPCs. Set to 0 to disable remote hit tracking.")
 )
 
@@ -84,14 +85,19 @@ func newHitTrackerClient(ctx context.Context, env *real_environment.RealEnv, con
 		maxHitsPerUpdate:     *maxHitsPerUpdate,
 		maxTrackAttempts:     *maxTrackAttempts,
 		maxRetryHits:         *maxRetryHits,
+		trackTimeout:         *trackTimeout,
 		hitsByCollection:     map[string]*cacheHits{},
 		client:               hitpb.NewHitTrackerServiceClient(conn),
 	}
+	// shutdown cancels sendCtx if its deadline passes while a sender is
+	// still in a Track RPC.
+	sendCtx, cancelSends := context.WithCancel(ctx)
+	factory.cancelSends = cancelSends
 	factory.wg.Go(factory.batcher)
 	for i := 0; i < *remoteHitTrackerWorkers; i++ {
 		factory.wg.Go(func() {
 			ticker := env.GetClock().NewTicker(*remoteHitTrackerPollInterval).Chan()
-			factory.sender(ctx, ticker)
+			factory.sender(sendCtx, ticker)
 		})
 	}
 	env.GetHealthChecker().RegisterShutdownFunction(factory.shutdown)
@@ -126,8 +132,9 @@ type enqueuedCacheHit struct {
 type HitTrackerFactory struct {
 	authenticator interfaces.Authenticator
 
-	quit chan struct{}
-	wg   sync.WaitGroup // The batcher and the senders.
+	quit        chan struct{}
+	wg          sync.WaitGroup // The batcher and the senders.
+	cancelSends context.CancelFunc
 
 	enqueueChan chan *enqueuedCacheHit
 
@@ -135,6 +142,7 @@ type HitTrackerFactory struct {
 	maxHitsPerUpdate     int
 	maxTrackAttempts     int
 	maxRetryHits         int
+	trackTimeout         time.Duration
 
 	// mu guards the fields below and every cacheHits reachable from them.
 	mu               sync.Mutex
@@ -447,6 +455,8 @@ func (h *HitTrackerFactory) sendBatch(ctx context.Context, retryLater bool) int 
 	groupID := c.GroupID
 	hitCount := len(hitsToSend.hits)
 
+	ctx, cancel := context.WithTimeout(ctx, h.trackTimeout)
+	defer cancel()
 	_, err = h.client.Track(ctx, &trackRequest)
 	metrics.RemoteHitTrackerRequests.WithLabelValues(
 		groupID,
@@ -540,6 +550,10 @@ func (h *HitTrackerFactory) requeue(failed *cacheHits, groupID string) {
 }
 
 func (h *HitTrackerFactory) shutdown(ctx context.Context) error {
+	// Senders don't use ctx, so cancel their Track RPCs if ctx expires
+	// before they return.
+	stop := context.AfterFunc(ctx, h.cancelSends)
+	defer stop()
 	close(h.quit)
 	h.wg.Wait()
 
