@@ -147,6 +147,7 @@ func TestFetchBlob_RandomizedChecksumIntegrity(t *testing.T) {
 	zstd := rng.Intn(2) == 0
 	t.Logf("zstd_transcoding=%t", zstd)
 	flags.Set(t, "cache.zstd_transcoding_enabled", zstd)
+	flags.Set(t, "cache.client.enable_upload_compression", zstd)
 
 	ctx := context.Background()
 	te := testenv.GetTestEnv(t)
@@ -294,6 +295,7 @@ func TestFetchBlob_TruncatedKnownLengthBody(t *testing.T) {
 		for _, withFallback := range []bool{false, true} {
 			t.Run(fmt.Sprintf("zstd=%t/fallback=%t", zstd, withFallback), func(t *testing.T) {
 				flags.Set(t, "cache.zstd_transcoding_enabled", zstd)
+				flags.Set(t, "cache.client.enable_upload_compression", zstd)
 				flags.Set(t, "storage.tempdir", t.TempDir())
 				require.NoError(t, scratchspace.Init())
 				ctx := context.Background()
