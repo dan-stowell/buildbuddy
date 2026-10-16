@@ -1,6 +1,7 @@
 package execution_server_test
 
 import (
+	"cloud.google.com/go/longrunning/autogen/longrunningpb"
 	"context"
 	"fmt"
 	"io"
@@ -2975,4 +2976,226 @@ func TestRedactCachedExecuteResponse(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Hedge tests control executor completion through PublishOperation, without
+// starting executor processes or depending on execution duration.
+type hedgeSchedulerMock struct{ *schedulerServerMock }
+
+func (s *hedgeSchedulerMock) ExistsTask(context.Context, string) (bool, error) {
+	return true, nil
+}
+
+func TestHedgeLateSuccessDoesNotOverwriteActionCache(t *testing.T) {
+	flags.Set(t, "remote_execution.enable_action_merging", true)
+	flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
+	flags.Set(t, "remote_execution.action_merging_hedge_delay", time.Microsecond)
+	env, conn, _ := setupEnv(t)
+	scheduler := &hedgeSchedulerMock{env.GetSchedulerService().(*schedulerServerMock)}
+	env.SetSchedulerService(scheduler)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := repb.NewExecutionClient(conn)
+	arn := uploadAction(ctx, t, env, "", repb.DigestFunction_SHA256, &repb.Action{})
+	req := &repb.ExecuteRequest{ActionDigest: arn.GetDigest(), DigestFunction: arn.GetDigestFunction()}
+	original, err := client.Execute(ctx, req)
+	require.NoError(t, err)
+	accepted, err := original.Recv()
+	require.NoError(t, err)
+	merged, err := client.Execute(ctx, req)
+	require.NoError(t, err)
+	mergedAccepted, err := merged.Recv()
+	require.NoError(t, err)
+	require.Equal(t, accepted.GetName(), mergedAccepted.GetName())
+	require.Len(t, scheduler.scheduleReqs, 2, "one original and one hedge must be dispatched")
+	originalID := scheduler.scheduleReqs[0].GetTaskId()
+	hedgeID := scheduler.scheduleReqs[1].GetTaskId()
+	require.NotEqual(t, originalID, hedgeID)
+
+	publish := func(taskID, stdout string) {
+		t.Helper()
+		op, err := operation.Assemble(taskID, operation.Metadata(repb.ExecutionStage_COMPLETED, arn.GetDigest()), &repb.ExecuteResponse{
+			Result: &repb.ActionResult{StdoutRaw: []byte(stdout), ExecutionMetadata: &repb.ExecutedActionMetadata{
+				QueuedTimestamp: tspb.New(time.Unix(100, 0)), WorkerStartTimestamp: tspb.New(time.Unix(101, 0)), WorkerCompletedTimestamp: tspb.New(time.Unix(102, 0)),
+			}},
+		})
+		require.NoError(t, err)
+		stream, err := client.PublishOperation(ctx)
+		require.NoError(t, err)
+		require.NoError(t, stream.Send(op))
+		_, err = stream.CloseAndRecv()
+		require.NoError(t, err)
+	}
+	readCache := func() string {
+		t.Helper()
+		result, err := env.GetActionCacheClient().GetActionResult(ctx, &repb.GetActionResultRequest{ActionDigest: arn.GetDigest(), DigestFunction: arn.GetDigestFunction()})
+		require.NoError(t, err)
+		return string(result.GetStdoutRaw())
+	}
+	publish(hedgeID, "winner")
+	require.Equal(t, "winner", readCache())
+	// Even a duplicate that was already finishing when cancellation arrived
+	// must not replace the result of the first successful completion.
+	publish(originalID, "late loser")
+	require.Equal(t, "winner", readCache(), "late duplicate must not overwrite the winning action result")
+}
+
+// copyRegistryHook observes commands without changing Redis responses.
+type copyRegistryHook struct{ commands chan string }
+
+func (h *copyRegistryHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
+	for _, arg := range cmd.Args() {
+		if strings.HasPrefix(fmt.Sprint(arg), "executionCopies/") {
+			h.commands <- cmd.String()
+			break
+		}
+	}
+	return ctx, nil
+}
+func (*copyRegistryHook) AfterProcess(context.Context, redis.Cmder) error { return nil }
+func (h *copyRegistryHook) BeforeProcessPipeline(ctx context.Context, cmds []redis.Cmder) (context.Context, error) {
+	for _, cmd := range cmds {
+		h.BeforeProcess(ctx, cmd)
+	}
+	return ctx, nil
+}
+func (*copyRegistryHook) AfterProcessPipeline(context.Context, []redis.Cmder) error { return nil }
+
+func testExecuteAvoidsCopyRegistry(t *testing.T, count int) {
+	flags.Set(t, "remote_execution.action_merging_hedge_count", count)
+	flags.Set(t, "remote_execution.action_merging_hedge_delay", time.Hour)
+	env, conn, _ := setupEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	arn := uploadAction(ctx, t, env, "", repb.DigestFunction_SHA256, &repb.Action{})
+	hook := &copyRegistryHook{commands: make(chan string, 100)}
+	env.GetRemoteExecutionRedisClient().AddHook(hook)
+	stream, err := repb.NewExecutionClient(conn).Execute(ctx, &repb.ExecuteRequest{
+		ActionDigest: arn.GetDigest(), DigestFunction: arn.GetDigestFunction(),
+	})
+	require.NoError(t, err)
+	_, err = stream.Recv()
+	require.NoError(t, err)
+	require.Len(t, env.GetSchedulerService().(*schedulerServerMock).scheduleReqs, 1)
+	close(hook.commands) // Initial operation is sent after dispatch and terminal-state lookup.
+	var commands []string
+	for cmd := range hook.commands {
+		commands = append(commands, cmd)
+	}
+	t.Logf("hedging disabled; copy registry commands before initial operation: %d", len(commands))
+	require.Empty(t, commands, "the common no-hedge Execute must preserve baseline Redis work")
+}
+
+func TestCancel_PreservesLegacyMergedExecution(t *testing.T) {
+	flags.Set(t, "remote_execution.enable_action_merging", true)
+	env, _, _ := setupEnv(t)
+	ctx, err := prefix.AttachUserPrefixToContext(context.Background(), env.GetAuthenticator())
+	require.NoError(t, err)
+	userPrefix, err := prefix.UserPrefixFromContext(ctx)
+	require.NoError(t, err)
+	invocationID := "11111111-1111-4111-8111-111111111111"
+	createInvocation(ctx, t, env.GetDBHandle(), &tables.Invocation{
+		InvocationID:     invocationID,
+		InvocationStatus: int64(invocation_status.InvocationStatus_PARTIAL_INVOCATION_STATUS),
+		Perms:            perms.OTHERS_READ,
+	})
+	action := digest.NewCASResourceName(&repb.Digest{Hash: strings.Repeat("a", 64), SizeBytes: 1}, "", repb.DigestFunction_SHA256)
+	id := action.NewUploadString()
+	createExecution(ctx, t, env.GetDBHandle(), &tables.Execution{
+		ExecutionID: id, InvocationID: invocationID, Stage: int64(repb.ExecutionStage_EXECUTING),
+	})
+	// Legacy writers record aggregate interest without a copy registry.
+	key := fmt.Sprintf("pendingExecution/4/%s/sha256/{%s}", userPrefix, action.GetDigest().GetHash())
+	require.NoError(t, env.GetRemoteExecutionRedisClient().HSet(ctx, key,
+		"execution-id", id, "action-count", 2).Err())
+	require.NoError(t, env.GetRemoteExecutionService().Cancel(ctx, invocationID))
+	require.Zero(t, env.GetSchedulerService().(*schedulerServerMock).canceledCount,
+		"another legacy merged invocation still needs this execution")
+}
+
+func TestHedgeFailureOrderingAndReconnect(t *testing.T) {
+	for _, tc := range []struct {
+		name                                  string
+		firstHedge, firstSuccess, lastSuccess bool
+	}{
+		{"failed original then successful hedge", false, false, true},
+		{"failed hedge then successful original", true, false, true},
+		{"original failure is last", true, false, false},
+		{"hedge failure is last", false, false, false},
+		{"successful original then failed hedge", false, true, false},
+		{"successful hedge then failed original", true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			flags.Set(t, "remote_execution.enable_action_merging", true)
+			flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
+			flags.Set(t, "remote_execution.action_merging_hedge_delay", time.Microsecond)
+			env, conn, _ := setupEnv(t)
+			scheduler := &hedgeSchedulerMock{env.GetSchedulerService().(*schedulerServerMock)}
+			env.SetSchedulerService(scheduler)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			client := repb.NewExecutionClient(conn)
+			arn := uploadAction(ctx, t, env, "", repb.DigestFunction_SHA256, &repb.Action{})
+			req := &repb.ExecuteRequest{ActionDigest: arn.GetDigest(), DigestFunction: arn.GetDigestFunction()}
+			original, err := client.Execute(ctx, req)
+			require.NoError(t, err)
+			accepted, err := original.Recv()
+			require.NoError(t, err)
+			merged, err := client.Execute(ctx, req)
+			require.NoError(t, err)
+			mergedAccepted, err := merged.Recv()
+			require.NoError(t, err)
+			require.Equal(t, accepted.GetName(), mergedAccepted.GetName())
+			require.Len(t, scheduler.scheduleReqs, 2)
+			first, last := scheduler.scheduleReqs[0].GetTaskId(), scheduler.scheduleReqs[1].GetTaskId()
+			if tc.firstHedge {
+				first, last = last, first
+			}
+			publish := func(id, message string, success bool) {
+				t.Helper()
+				response := &repb.ExecuteResponse{Result: &repb.ActionResult{StdoutRaw: []byte(message)}}
+				if !success {
+					response.Status = gstatus.New(codes.Internal, message).Proto()
+				}
+				op, err := operation.Assemble(id, operation.Metadata(repb.ExecutionStage_COMPLETED, arn.GetDigest()), response)
+				require.NoError(t, err)
+				stream, err := client.PublishOperation(ctx)
+				require.NoError(t, err)
+				require.NoError(t, stream.Send(op))
+				_, err = stream.CloseAndRecv()
+				require.NoError(t, err)
+			}
+			publish(first, "first", tc.firstSuccess)
+			publish(last, "last", tc.lastSuccess)
+			expected := "last"
+			success := tc.lastSuccess
+			if tc.firstSuccess {
+				expected = "first"
+				success = true
+			}
+			reconnect, err := client.WaitExecution(ctx, &repb.WaitExecutionRequest{Name: accepted.GetName()})
+			require.NoError(t, err)
+			for _, stream := range []interface {
+				Recv() (*longrunningpb.Operation, error)
+			}{original, merged, reconnect} {
+				for {
+					op, err := stream.Recv()
+					require.NoError(t, err)
+					require.Equal(t, accepted.GetName(), op.GetName())
+					if operation.ExtractStage(op) != repb.ExecutionStage_COMPLETED {
+						continue
+					}
+					response := operation.ExtractExecuteResponse(op)
+					require.Equal(t, expected, string(response.GetResult().GetStdoutRaw()))
+					require.Equal(t, success, response.GetStatus().GetCode() == 0)
+					break
+				}
+			}
+		})
+	}
+}
+
+func TestExecute_HedgingDisabledAvoidsCopyRegistry(t *testing.T) { testExecuteAvoidsCopyRegistry(t, 0) }
+func TestExecute_NoHedgeDispatchedAvoidsCopyRegistry(t *testing.T) {
+	testExecuteAvoidsCopyRegistry(t, 1)
 }
