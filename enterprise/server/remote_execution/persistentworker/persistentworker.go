@@ -111,6 +111,8 @@ func Start(ctx context.Context, workspace *workspace.Workspace, container contai
 		// worker exec process.
 		cancel()
 		_ = stdinWriter.Close()
+		// Unblock response reads even if container shutdown takes time.
+		_ = stdoutReader.Close()
 		// Wait for the worker to terminate. This is needed since canceling the
 		// context doesn't block until the worker is killed. This helps ensure that
 		// the worker is killed if we are shutting down. The shutdown case is also
@@ -198,6 +200,30 @@ func (w *Worker) Exec(ctx context.Context, command *repb.Command) (result *inter
 		Inputs:    inputs,
 		Arguments: expandedArguments,
 	}
+	// Both writing a request and reading its response can block indefinitely.
+	// Keep them together so cancellation also interrupts a worker that never
+	// reads stdin. Exec calls are sequential; never reuse a canceled worker.
+	done := make(chan *interfaces.CommandResult, 1)
+	go func() { done <- w.exchange(ctx, req) }()
+	var res *interfaces.CommandResult
+	select {
+	case res = <-done:
+	case <-ctx.Done():
+	}
+	// Check again if the response and cancellation became ready together.
+	if ctx.Err() != nil {
+		if err := w.Stop(); err != nil {
+			log.CtxWarningf(ctx, "Failed to stop canceled persistent worker: %s", err)
+		}
+		if res == nil {
+			<-done
+		}
+		return commandutil.ErrorResult(status.FromContextError(ctx))
+	}
+	return res
+}
+
+func (w *Worker) exchange(ctx context.Context, req *wkpb.WorkRequest) *interfaces.CommandResult {
 	if err := w.marshalWorkRequest(req); err != nil {
 		if errors.Is(err, syscall.EPIPE) {
 			// EPIPE probably means the worker stopped reading from stdin, which

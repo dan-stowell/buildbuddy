@@ -10,16 +10,19 @@ import (
 	"flag"
 	"io"
 	"os"
+	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 )
 
 var (
+	gate             = flag.String("response_gate", "", "Wait for this file before responding; create .ready after reading the request.")
 	persistentWorker = flag.Bool("persistent_worker", false, "Persistent worker flag.")
 
-	protocol       = flag.String("protocol", "proto", "Serialization protocol: 'json' or 'proto'.")
-	responseBase64 = flag.String("response_base64", "", "Base64-encoded response to return for every request. Includes varint length prefix (for proto responses).")
-	failWithStderr = flag.String("fail_with_stderr", "", "If non-empty, the worker will crash upon receiving the first request, printing the given message to stderr.")
+	protocol           = flag.String("protocol", "proto", "Serialization protocol: 'json' or 'proto'.")
+	responseBase64     = flag.String("response_base64", "", "Base64-encoded response to return for every request. Includes varint length prefix (for proto responses).")
+	failWithStderr     = flag.String("fail_with_stderr", "", "If non-empty, the worker will crash upon receiving the first request, printing the given message to stderr.")
+	firstResponseDelay = flag.Duration("first_response_delay", 0, "If set, the worker sleeps for this long after reading the first request before responding to it (simulates a hung or slow worker). Later requests are answered immediately.")
 )
 
 func main() {
@@ -42,7 +45,7 @@ func main() {
 		br = bufio.NewReader(os.Stdin)
 	}
 
-	for {
+	for n := 0; ; n++ {
 		// Note: Logging goes to stderr, so it doesn't mess with the persistent
 		// worker's output.
 		log.Info("[worker] Waiting for request...")
@@ -62,7 +65,23 @@ func main() {
 			os.Exit(1)
 		}
 
+		if n == 0 && *firstResponseDelay > 0 {
+			log.Infof("[worker] Sleeping %s before responding to the first request.", *firstResponseDelay)
+			time.Sleep(*firstResponseDelay)
+		}
+
 		log.Info("[worker] Got request! Sending response...")
+		if *gate != "" {
+			if err := os.WriteFile(*gate+".ready", nil, 0600); err != nil {
+				panic(err)
+			}
+			for {
+				if _, err := os.Stat(*gate); err == nil {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}
 
 		_, err = os.Stdout.Write(resBytes)
 		if err != nil {
