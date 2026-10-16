@@ -21,6 +21,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
+	rspb "github.com/buildbuddy-io/buildbuddy/proto/resource"
 	sgpb "github.com/buildbuddy-io/buildbuddy/proto/storage"
 )
 
@@ -172,4 +173,61 @@ func runRewriteEvictionRace(t *testing.T, blobSize int64) {
 	got, err := pc.Get(ctx, r)
 	require.NoError(t, err, "blob reported present by Contains must be readable; Get err: %v", err)
 	require.Equal(t, buf, got)
+}
+
+// Two AC writers may upload different bytes for the same key. Publishing the
+// second file must not interleave with the first writer's metadata update.
+func TestConcurrentExternalRewrites(t *testing.T) {
+	t.Cleanup(func() { beforeWriteMetadataHook = nil })
+	env := testenv.GetTestEnv(t)
+	ctx := anonCtx(t, env)
+	pc, err := NewPebbleCache(env, &Options{
+		RootDirectory: t.TempDir(), MaxSizeBytes: 100_000_000,
+		MaxInlineFileSizeBytes: 1024, MinBytesAutoZstdCompression: new(int64(1 << 60)),
+	})
+	require.NoError(t, err)
+	l := observeCommitLock(pc)
+	require.NoError(t, pc.Start())
+	defer pc.Stop()
+	t.Log("seed=20261016")
+	gen := digest.UniformRandomGenerator(20261016)
+	d, first, err := gen.RandomDigestBuf(4096)
+	require.NoError(t, err)
+	_, second, err := gen.RandomDigestBuf(8192)
+	require.NoError(t, err)
+	r := digest.NewResourceName(d, "", rspb.CacheType_AC, repb.DigestFunction_SHA256).ToProto()
+	record, err := pc.makeFileRecord(pc.userGroupID(ctx), nil, r)
+	require.NoError(t, err)
+	key, err := pc.fileStorer.PebbleKey(record)
+	require.NoError(t, err)
+	l.target.Store(key.LockID())
+	w1, err := pc.newWrappedWriter(ctx, record, key, false, nil)
+	require.NoError(t, err)
+	defer w1.Close()
+	w2, err := pc.newWrappedWriter(ctx, record, key, false, nil)
+	require.NoError(t, err)
+	defer w2.Close()
+	_, err = w1.Write(first)
+	require.NoError(t, err)
+	_, err = w2.Write(second)
+	require.NoError(t, err)
+	secondErr := make(chan error, 1)
+	var done <-chan struct{}
+	beforeWriteMetadataHook = func(_ filestore.PebbleKey) {
+		beforeWriteMetadataHook = nil
+		done = evictionAtCommitBarrier(l, func() { secondErr <- w2.Commit() })
+	}
+	require.NoError(t, w1.Commit())
+	<-done
+	require.NoError(t, <-secondErr)
+	db, err := pc.leaser.DB()
+	require.NoError(t, err)
+	defer db.Close()
+	md := &sgpb.FileMetadata{}
+	_, err = pc.lookupFileMetadataAndVersion(ctx, db, key, md)
+	require.NoError(t, err)
+	require.Equal(t, int64(len(second)), md.GetStoredSizeBytes(), "metadata must describe the last published file")
+	got, err := pc.Get(ctx, r)
+	require.NoError(t, err)
+	require.Equal(t, second, got)
 }
