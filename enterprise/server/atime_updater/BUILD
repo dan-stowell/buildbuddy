@@ -21,7 +21,7 @@ go_library(
 go_test(
     name = "atime_updater_test",
     size = "small",
-    srcs = ["atime_updater_test.go"],
+    srcs = ["atime_updater_test.go", "shutdown_lifecycle_test.go"],
     embed = [":atime_updater"],
     deps = [
         "//enterprise/server/batch_operator",
@@ -31,6 +31,7 @@ go_test(
         "//server/testutil/testauth",
         "//server/testutil/testenv",
         "//server/testutil/testhealthcheck",
+        "//server/testutil/testleak",
         "//server/util/authutil",
         "//server/util/log",
         "//server/util/status",
