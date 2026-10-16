@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -17,12 +18,16 @@ import (
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/workflow/config"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testgit"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testshell"
 	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+
+	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 )
 
 func TestIsBazelCommandToken(t *testing.T) {
@@ -54,6 +59,38 @@ func TestBazelChildProcessResult_StartError(t *testing.T) {
 	require.ErrorContains(t, err, "failed to start Bazel")
 	var result *actionResult
 	require.False(t, errors.As(err, &result))
+}
+
+// noMissingBlobsCAS reports that every blob is already in the cache.
+type noMissingBlobsCAS struct {
+	repb.UnimplementedContentAddressableStorageServer
+}
+
+func (noMissingBlobsCAS) FindMissingBlobs(ctx context.Context, req *repb.FindMissingBlobsRequest) (*repb.FindMissingBlobsResponse, error) {
+	return &repb.FindMissingBlobsResponse{}, nil
+}
+
+func TestUploadRunfiles_ReleasesResources(t *testing.T) {
+	testleak.Check(t)
+	testleak.CheckFDs(t)
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := grpc.NewServer()
+	repb.RegisterContentAddressableStorageServer(server, noMissingBlobsCAS{})
+	go server.Serve(lis)
+	t.Cleanup(server.Stop)
+	flags.Set(t, "cache_backend", "grpc://"+lis.Addr().String())
+
+	workspaceRoot := t.TempDir()
+	bin := filepath.Join(workspaceRoot, "bin")
+	require.NoError(t, os.WriteFile(bin, []byte("#!/bin/sh\n"), 0755))
+	runfilesDir := bin + ".runfiles"
+	require.NoError(t, os.Mkdir(runfilesDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(runfilesDir, "data"), []byte("data"), 0644))
+
+	_, _, _, err = uploadRunfiles(context.Background(), workspaceRoot, runfilesDir, bin)
+	require.NoError(t, err)
 }
 
 func TestCollectRunfiles_RelativeDirectorySymlink(t *testing.T) {
