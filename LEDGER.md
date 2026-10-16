@@ -1,6 +1,6 @@
 # BuildBuddy Goroutine / FD Leak Ledger
 
-Baseline: dan-stowell/buildbuddy `master` @ 770b88bc8 (upstream mirror). Coordinator: leak-coord.
+Baseline: findings measured on `master` @ 770b88bc8. Fork master fast-forwarded 2026-10-16 to 4f32b1686 (+35 upstream; touches distributed_client Shutdown race + vmexec MountWorkspace — neither fixes our findings; all leak/* branches merge cleanly). New tasks use 4f32b1686; PR branches rebased + re-verified at PR time. Coordinator: leak-coord.
 Branch convention: `leak/det-*` detector work, `leak/repro-*` reproducers (no fix), `leak/fix-*` fixes (on top of repro), `leak/ledger` this file.
 
 ## Existing detector inventory (2026-10-16)
