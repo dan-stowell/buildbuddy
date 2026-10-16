@@ -2367,6 +2367,7 @@ func TestTruncateStringSlice(t *testing.T) {
 // finalize before Close, and cancel the transport context when the RPC ends.
 // Counts are diagnostic; testleak checks all goroutines after environment shutdown.
 func TestBESLifecycleResources(t *testing.T) {
+	flags.Set(t, "grpc_server_worker_multiplier", 0)
 	for _, outcome := range []string{"finished", "unfinished", "disconnect", "replay", "finalized_replay", "db_error", "blob_error"} {
 		for _, n := range []int{1, 10, 50} {
 			t.Run(fmt.Sprintf("%s/N=%d", outcome, n), func(t *testing.T) {

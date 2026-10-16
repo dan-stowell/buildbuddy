@@ -24,6 +24,8 @@ go_test(
     name = "build_event_server_test",
     srcs = ["build_event_server_test.go"],
     deps = [
+        "@org_golang_google_grpc//:grpc",
+        "//server/util/testing/flags",
         ":build_event_server",
         "//proto:build_events_go_proto",
         "//proto:publish_build_event_go_proto",
