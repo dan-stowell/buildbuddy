@@ -1128,13 +1128,6 @@ func (s *ExecutionServer) dispatch(ctx context.Context, req *repb.ExecuteRequest
 		}
 		return nil, status.UnavailableErrorf("Error scheduling execution task %q: %s", executionID, err)
 	}
-	if stop, err := action_merger.CopyShouldStop(ctx, s.rdb, executionID); err != nil {
-		return nil, err
-	} else if stop {
-		if _, err := scheduler.CancelTask(ctx, executionID); err != nil {
-			return nil, err
-		}
-	}
 
 	return pool, nil
 }
@@ -1203,9 +1196,6 @@ func (s *ExecutionServer) execute(req *repb.ExecuteRequest, stream streamLike) e
 
 	// Check if there's already an identical action pending execution that this request can be merged into.
 	executionID, op := action_merger.GetOrCreateExecutionID(ctx, s.rdb, s.env.GetSchedulerService(), adInstanceDigest, action.DoNotCache)
-	if err := action_merger.AddInvocation(ctx, s.rdb, executionID, invocationID); err != nil {
-		return err
-	}
 	if op == action_merger.New {
 		log.CtxDebugf(ctx, "Scheduling new execution %s for %q for invocation %q", executionID, downloadString, invocationID)
 
@@ -1218,9 +1208,6 @@ func (s *ExecutionServer) execute(req *repb.ExecuteRequest, stream streamLike) e
 			}
 		}
 
-		if err := action_merger.RegisterCopy(ctx, s.rdb, executionID, executionID); err != nil {
-			return err
-		}
 		if err := s.Dispatch(ctx, req, action, executionID); err != nil {
 			log.CtxWarningf(ctx, "Error dispatching execution for %q: %s", downloadString, err)
 			if err := s.MarkExecutionFailed(ctx, executionID, err); err != nil {
@@ -1248,15 +1235,13 @@ func (s *ExecutionServer) execute(req *repb.ExecuteRequest, stream streamLike) e
 		if op == action_merger.Hedge {
 			// If the action_merger said to hedge this action, run another execution
 			// in the background.
+			action_merger.RecordHedgedExecution(ctx, s.rdb, adInstanceDigest, s.getGroupIDForMetrics(ctx))
 			hedgedExecutionID := adInstanceDigest.NewUploadString()
-			if err := action_merger.RegisterCopy(ctx, s.rdb, executionID, hedgedExecutionID); err == nil {
-				if err := s.dispatchHedge(ctx, req, action, hedgedExecutionID); err != nil {
-					s.MarkExecutionFailed(ctx, hedgedExecutionID, err)
-					log.CtxWarningf(ctx, "Failed to dispatch hedge: %s", err)
-				}
-				log.CtxInfof(ctx, "Dispatched new hedged execution %q for action %q and invocation %q", hedgedExecutionID, downloadString, invocationID)
-				metrics.RemoteExecutionHedgedActions.With(prometheus.Labels{metrics.GroupID: s.getGroupIDForMetrics(ctx)}).Inc()
+			if err := s.dispatchHedge(ctx, req, action, hedgedExecutionID); err != nil {
+				return status.WrapError(err, "dispatch hedged execution")
 			}
+			log.CtxInfof(ctx, "Dispatched new hedged execution %q for action %q and invocation %q", hedgedExecutionID, downloadString, invocationID)
+			metrics.RemoteExecutionHedgedActions.With(prometheus.Labels{metrics.GroupID: s.getGroupIDForMetrics(ctx)}).Inc()
 		}
 	}
 
@@ -1363,18 +1348,6 @@ func (s *ExecutionServer) waitExecution(ctx context.Context, req *repb.WaitExecu
 	defer subscriber.Close()
 	streamPubSubChan := subscriber.Chan()
 
-	if data, err := action_merger.CompletedOperation(ctx, s.rdb, req.GetName()); err != nil {
-		return err
-	} else if len(data) > 0 {
-		op := new(longrunningpb.Operation)
-		if err := proto.Unmarshal(data, op); err != nil {
-			return err
-		}
-		op.Name = req.GetName()
-		_, err := e.processOpUpdate(ctx, op)
-		return err
-	}
-
 	if opts.isExecuteRequest {
 		// Send a best-effort initial "in progress" update to client.
 		// Once Bazel receives the initial update, it will use WaitExecution to handle retry on error instead of
@@ -1404,17 +1377,6 @@ func (s *ExecutionServer) waitExecution(ctx context.Context, req *repb.WaitExecu
 		select {
 		case msg, ok = <-streamPubSubChan:
 		case <-taskLost:
-			pending, err := action_merger.HasPendingCopy(ctx, s.rdb, req.GetName())
-			if err != nil {
-				return err
-			}
-			if pending {
-				if err := s.MarkExecutionFailed(ctx, req.GetName(), status.NotFoundError("canonical task lost")); err != nil {
-					return err
-				}
-				taskLost = nil
-				continue
-			}
 			// select picks at random among ready cases, so before ending the
 			// wait, take any update that is already waiting, since it may be
 			// the final result.
@@ -1474,40 +1436,6 @@ func (s *ExecutionServer) MarkExecutionFailed(ctx context.Context, taskID string
 	r, err := digest.ParseUploadResourceName(taskID)
 	if err != nil {
 		log.CtxWarningf(ctx, "Could not parse taskID: %s", err)
-		return err
-	}
-	failureOp, err := operation.Assemble(taskID, operation.Metadata(repb.ExecutionStage_COMPLETED, r.GetDigest()), operation.ErrorResponse(reason))
-	if err != nil {
-		return err
-	}
-	data, err := proto.Marshal(failureOp)
-	if err != nil {
-		return err
-	}
-	canonical, publish, copies, err := action_merger.CompleteCopy(ctx, s.rdb, taskID, false, data)
-	if err != nil {
-		return err
-	}
-	if !publish {
-		return nil
-	}
-	taskID = canonical
-	for _, id := range copies {
-		if id != taskID {
-			s.env.GetSchedulerService().CancelTask(ctx, id)
-		}
-	}
-	action_merger.DeletePendingExecution(ctx, s.rdb, canonical)
-	return s.publishFailure(ctx, taskID, reason)
-}
-
-func (s *ExecutionServer) publishCancellation(ctx context.Context, taskID string) error {
-	return s.publishFailure(ctx, taskID, status.CanceledError("invocation cancelled"))
-}
-
-func (s *ExecutionServer) publishFailure(ctx context.Context, taskID string, reason error) error {
-	r, err := digest.ParseUploadResourceName(taskID)
-	if err != nil {
 		return err
 	}
 	rsp := operation.ErrorResponse(reason)
@@ -1634,7 +1562,7 @@ func (s *ExecutionServer) PublishOperation(stream repb.Execution_PublishOperatio
 			log.CtxWarningf(ctx, "could not delete pending execution %q: %s", taskID, err)
 		}
 	})
-	// Completion owns merge-state cleanup; a failed stream may reconnect.
+	defer deletePendingExecutionOnce()
 
 	flushExecutionsOnEOF := false
 	if *writeExecutionProgressStateToRedis {
@@ -1716,19 +1644,6 @@ func (s *ExecutionServer) PublishOperation(stream repb.Execution_PublishOperatio
 
 		log.CtxDebugf(ctx, "PublishOperation: stage: %s", stage)
 
-		publishID := taskID
-		publishResult := true
-		var otherCopies []string
-		if stage == repb.ExecutionStage_COMPLETED {
-			data, err := proto.Marshal(op)
-			if err != nil {
-				return err
-			}
-			publishID, publishResult, otherCopies, err = action_merger.CompleteCopy(ctx, s.rdb, taskID, response != nil && response.GetStatus().GetCode() == 0 && response.GetResult() != nil && response.GetResult().GetExitCode() == 0, data)
-			if err != nil {
-				return err
-			}
-		}
 		var auxMeta *espb.ExecutionAuxiliaryMetadata
 		var properties *platform.Properties
 		var action *repb.Action
@@ -1757,15 +1672,10 @@ func (s *ExecutionServer) PublishOperation(stream repb.Execution_PublishOperatio
 			// may specify skip_cache_lookup, we need to ensure that the result is not visible in the cache before the
 			// action is merged. At the same time, we don't want the window between the calls to be too large to avoid
 			// reducing the effectiveness of merging.
-			if publishResult {
-				action_merger.DeletePendingExecution(ctx, s.rdb, publishID)
-				deletePendingExecutionOnce()
-			}
+			deletePendingExecutionOnce()
 			actionRN := digest.NewACResourceName(actionCASRN.GetDigest(), actionCASRN.GetInstanceName(), actionCASRN.GetDigestFunction())
-			if publishResult {
-				if err := s.cacheActionResult(ctx, actionRN, trimmedResponse, action); err != nil {
-					return status.UnavailableErrorf("Error uploading action result: %s", err.Error())
-				}
+			if err := s.cacheActionResult(ctx, actionRN, trimmedResponse, action); err != nil {
+				return status.UnavailableErrorf("Error uploading action result: %s", err.Error())
 			}
 			if err := s.markTaskComplete(ctx, actionRN, response, auxMeta, action, cmd, properties, flushExecutionsOnEOF); err != nil {
 				// Errors updating the router or recording usage are non-fatal.
@@ -1774,38 +1684,16 @@ func (s *ExecutionServer) PublishOperation(stream repb.Execution_PublishOperatio
 
 			recordResponseMetrics(response, auxMeta, s.getGroupIDForMetrics(ctx))
 		}
-		if !publishResult {
-			continue
-		}
-		if publishID != taskID {
-			op = proto.Clone(op).(*longrunningpb.Operation)
-			op.Name = publishID
-		}
 		data, err := proto.Marshal(op)
 		if err != nil {
 			return status.InternalErrorf("Failed to marshal Operation: %s", err)
 		}
-		if err := s.streamPubSub.Publish(ctx, s.pubSubChannelForExecutionID(publishID), base64.StdEncoding.EncodeToString(data)); err != nil {
+		if err := s.streamPubSub.Publish(ctx, s.pubSubChannelForExecutionID(taskID), base64.StdEncoding.EncodeToString(data)); err != nil {
 			log.CtxWarningf(ctx, "Error publishing task on stream pubsub: %s", err)
 			return status.InternalErrorf("Error publishing task %q on stream pubsub: %s", taskID, err)
 		}
 
 		if stage == repb.ExecutionStage_COMPLETED {
-			if publishID != taskID {
-				if err := s.cacheExecuteResponse(ctx, publishID, response); err != nil {
-					return err
-				}
-				if err := s.updateExecution(ctx, publishID, stage, response, auxMeta, properties, action, cmd); err != nil {
-					return err
-				}
-			}
-			for _, copyID := range otherCopies {
-				if copyID != taskID {
-					if _, err := s.env.GetSchedulerService().CancelTask(ctx, copyID); err != nil {
-						return err
-					}
-				}
-			}
 			err := func() error {
 				mu.Lock()
 				defer mu.Unlock()
@@ -2240,34 +2128,38 @@ func (s *ExecutionServer) Cancel(ctx context.Context, invocationID string) error
 	}
 	log.CtxInfof(ctx, "Cancelling invocation %q with %v in-progress executions", invocationID, len(ids))
 	numCancelled := 0
-	seen := make(map[string]bool)
 	for _, id := range ids {
 		ctx := log.EnrichContext(ctx, log.ExecutionIDKey, id)
 
-		canonical, copies, err := action_merger.RemoveInvocation(ctx, s.rdb, id, invocationID)
-		if err != nil {
-			return err
-		}
-		if len(copies) == 0 || seen[canonical] {
-			continue
-		}
-		seen[canonical] = true
-		for _, copyID := range copies {
-			cancelled, err := s.env.GetSchedulerService().CancelTask(ctx, copyID)
+		rn, err := digest.ParseUploadResourceName(id)
+		if err == nil {
+			merged, err := action_merger.CheckMerged(ctx, s.rdb, rn)
 			if err != nil {
-				return err
+				log.CtxWarningf(ctx, "Error checking merge status of %q: %s", id, err)
 			}
-			if cancelled {
-				numCancelled++
+			// Don't cancel execution if it has been merged against.
+			if merged {
+				log.CtxInfof(ctx, "Skip cancellation for %q as it has been merged against.", id)
+				continue
 			}
-		}
-		// Cancellation has fenced copies; publish the canonical cancellation
-		// directly rather than entering copy completion arbitration again.
-		action_merger.DeletePendingExecution(ctx, s.rdb, canonical)
-		if err := s.publishCancellation(ctx, canonical); err != nil {
-			log.CtxWarningf(ctx, "Could not mark execution %q as cancelled: %s", canonical, err)
+		} else {
+			log.CtxWarningf(ctx, "could not parse execution ID %q: %s", id, err)
 		}
 
+		log.CtxInfof(ctx, "Cancelling execution %q due to user request for invocation %q", id, invocationID)
+		cancelled, err := s.env.GetSchedulerService().CancelTask(ctx, id)
+		if cancelled {
+			numCancelled++
+		}
+		if err != nil {
+			log.CtxWarningf(ctx, "Failed to cancel task %q: %s", id, err)
+		}
+		if err == nil && cancelled {
+			err = s.MarkExecutionFailed(ctx, id, status.CanceledError("invocation cancelled"))
+			if err != nil {
+				log.CtxWarningf(ctx, "Could not mark execution %q as cancelled: %s", id, err)
+			}
+		}
 	}
 	log.CtxInfof(ctx, "Cancelled %d executions for invocation %s", numCancelled, invocationID)
 
