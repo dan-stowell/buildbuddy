@@ -79,7 +79,7 @@ func TestClaim_LostReplyIsRetriedAndSucceeds(t *testing.T) {
 			taskID := scheduleTask(ctx, t, env, map[string]string{})
 			fe.WaitForTask(taskID)
 
-			fi.Arm([]byte(redisAcquireClaim.Hash()), 1, mode)
+			fi.Arm(1, mode, []byte(redisAcquireClaim.Hash()))
 			lease, err := fe.leaseTask(taskID, "" /*=reconnectToken*/)
 			require.Equal(t, 1, fi.Lost(), "expected exactly one claim reply to be lost")
 			require.Equal(t, 2, fi.Sent(), "expected the Redis client to retry the claim once")
@@ -109,7 +109,7 @@ func TestClaim_LostReconnectReplyIsRetriedAndSucceeds(t *testing.T) {
 	lease := fe.Claim(taskID)
 	require.NoError(t, s.reEnqueueTask(ctx, taskID, lease.leaseID, lease.leaseID /*=reconnectToken*/, 1, "server shutting down"))
 
-	fi.Arm([]byte(redisAcquireClaim.Hash()), 1, redisfault.EOF)
+	fi.Arm(1, redisfault.EOF, []byte(redisAcquireClaim.Hash()))
 	reconnected, err := fe.Reconnect(taskID, lease.leaseID)
 	require.Equal(t, 1, fi.Lost())
 	require.Equal(t, 2, fi.Sent())
@@ -131,11 +131,11 @@ func TestClaim_KnownGap_AllRetriesLost(t *testing.T) {
 	taskID := scheduleTask(ctx, t, env, map[string]string{})
 	fe.WaitForTask(taskID)
 
-	fi.Arm([]byte(redisAcquireClaim.Hash()), 100, redisfault.EOF)
+	fi.Arm(100, redisfault.EOF, []byte(redisAcquireClaim.Hash()))
 	_, err := fe.leaseTask(taskID, "" /*=reconnectToken*/)
 	t.Logf("claim returned %v after %d attempts (%d replies lost); task state: %s", err, fi.Sent(), fi.Lost(), taskState(env, taskID))
 	require.Error(t, err)
-	fi.Arm(nil, 0, redisfault.EOF)
+	fi.Arm(0, redisfault.EOF)
 	ok, otherErr := otherExecutorCanClaim(ctx, t, env, taskID, 5*time.Second)
 	require.True(t, ok, "no executor could claim the task for 5s after a claim error (last error: %v); task state: %s", otherErr, taskState(env, taskID))
 }

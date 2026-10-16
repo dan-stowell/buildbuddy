@@ -17,11 +17,14 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/oom"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/scheduling/scheduler_server"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/tasksize"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/test/integration/remote_execution/rbeclient"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/test/integration/remote_execution/rbetest"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/buildbuddy_enterprise"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/redisfault"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testexecutor"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testredis"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/execution"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/redisutil"
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/build_event_handler"
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_publisher"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
@@ -32,6 +35,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testbazel"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testhealthcheck"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testmetrics"
 	"github.com/buildbuddy-io/buildbuddy/server/util/bazel"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_client"
@@ -2802,4 +2806,84 @@ func getExecutionAuxiliaryMetadata(t testing.TB, execRes *repb.ExecuteResponse) 
 	require.NoError(t, err)
 	require.True(t, ok)
 	return auxMeta
+}
+
+// The reply to an executor's task claim is lost after Redis ran the claim
+// (connection reset). The client must still get a result. The test also
+// turns on the scheduler's task liveness check and action-merging hedging,
+// and sends an identical request later, to see whether either recovers.
+func TestLostClaimReply_ClientGetsResult(t *testing.T) {
+	flags.Set(t, "remote_execution.task_liveness_check_interval", 1*time.Second)
+	flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
+	flags.Set(t, "remote_execution.action_merging_hedge_delay", 1*time.Second)
+
+	target := testredis.Start(t).Target
+	opts := redisutil.TargetToOpts(target)
+	fi := redisfault.New()
+	opts.Dialer = fi.WrapDialer(opts.Dialer)
+	rdb, err := redisutil.NewClientWithOpts(opts, testhealthcheck.NewTestingHealthChecker(), "remote_execution_redis")
+	require.NoError(t, err)
+	t.Cleanup(func() { rdb.Close() })
+
+	rbe := rbetest.NewRBETestEnvWithOptions(t, &rbetest.EnvOptions{RedisClient: rdb})
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutors(t, 2)
+
+	// Run one command so that the claim script is cached in Redis and claims
+	// are a single EVALSHA.
+	rbe.ExecuteCustomCommand("sh", "-c", "echo warmup").Wait()
+
+	// The claim script is the only scheduler script run on a task key with
+	// one key and four arguments (8 RESP elements).
+	fi.Arm(1, redisfault.Reset, []byte("*8\r\n$7\r\nevalsha\r\n"), []byte("task/"))
+	start := time.Now()
+	cmd := rbe.ExecuteCustomCommand("sh", "-c", "echo hello")
+
+	var dupCh <-chan *rbeclient.CommandResult
+	dupSent := time.After(10 * time.Second)
+	timeout := time.After(60 * time.Second)
+	firstStage := repb.ExecutionStage_UNKNOWN
+	dupStage := repb.ExecutionStage_UNKNOWN
+	for {
+		select {
+		case <-dupSent:
+			// An identical request (e.g. the user re-runs the build) is
+			// merged into the first execution, and hedged.
+			dupCh = rbe.ExecuteCustomCommand("sh", "-c", "echo hello").StatusChannel()
+		case r, ok := <-dupCh:
+			if !ok {
+				dupCh = nil
+				continue
+			}
+			if r.Stage != dupStage {
+				t.Logf("%s: identical request stage %s (err=%v)", time.Since(start).Round(time.Millisecond), r.Stage, r.Err)
+				dupStage = r.Stage
+			}
+		case r, ok := <-cmd.StatusChannel():
+			require.True(t, ok, "status channel closed without a result")
+			if r.Stage != firstStage {
+				t.Logf("%s: first request stage %s (err=%v)", time.Since(start).Round(time.Millisecond), r.Stage, r.Err)
+				firstStage = r.Stage
+			}
+			require.NoError(t, r.Err, "first request failed after %s", time.Since(start))
+			if r.Stage != repb.ExecutionStage_COMPLETED {
+				continue
+			}
+			require.Equal(t, 1, fi.Lost(), "expected one claim reply to be lost")
+			require.Equal(t, 0, r.ExitCode)
+			return
+		case <-timeout:
+			ctx := context.Background()
+			keys, _ := rdb.Keys(ctx, "task/*").Result()
+			state := ""
+			for _, k := range keys {
+				f, _ := rdb.HMGet(ctx, k, "claimed", "leaseId", "attemptCount").Result()
+				ttl, _ := rdb.PTTL(ctx, k).Result()
+				state += fmt.Sprintf(" %s: claimed=%v leaseId=%v attemptCount=%v ttl=%s;", k, f[0], f[1], f[2], ttl)
+			}
+			require.FailNowf(t, "client still waiting",
+				"no result 60s after one lost claim reply: first request stage %s, identical request stage %s, claim sends %d, replies lost %d. Scheduler tasks:%s",
+				firstStage, dupStage, fi.Sent(), fi.Lost(), state)
+		}
+	}
 }

@@ -53,12 +53,12 @@ func (timeoutError) Temporary() bool { return true }
 // Injector wraps a dialer and injects faults into the connections it makes.
 type Injector struct {
 	mu        sync.Mutex
-	pattern   []byte
+	patterns  [][]byte
 	remaining int
 	mode      Mode
 
-	// Sent counts requests containing the pattern written while armed or
-	// after arming, i.e. how many times the client sent the command.
+	// Sent counts matching requests written since arming, i.e. how many
+	// times the client sent the command.
 	sent atomic.Int32
 	// Lost counts replies that were discarded.
 	lost atomic.Int32
@@ -69,20 +69,21 @@ func New() *Injector {
 	return &Injector{}
 }
 
-// Arm makes the next n requests containing pattern lose their replies, and
-// resets the counters.
-func (in *Injector) Arm(pattern []byte, n int, mode Mode) {
+// Arm makes the next n requests containing all of the given byte patterns
+// lose their replies, and resets the counters. Calling it with no patterns
+// disarms the injector.
+func (in *Injector) Arm(n int, mode Mode, patterns ...[]byte) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	in.pattern = append([]byte(nil), pattern...)
+	in.patterns = patterns
 	in.remaining = n
 	in.mode = mode
 	in.sent.Store(0)
 	in.lost.Store(0)
 }
 
-// Sent returns the number of requests containing the armed pattern that
-// the client wrote since the last Arm call.
+// Sent returns the number of requests matching the armed patterns that the
+// client wrote since the last Arm call.
 func (in *Injector) Sent() int { return int(in.sent.Load()) }
 
 // Lost returns the number of replies discarded since the last Arm call.
@@ -91,8 +92,13 @@ func (in *Injector) Lost() int { return int(in.lost.Load()) }
 func (in *Injector) onWrite(b []byte) (poison bool, mode Mode) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	if len(in.pattern) == 0 || !bytes.Contains(b, in.pattern) {
+	if len(in.patterns) == 0 {
 		return false, 0
+	}
+	for _, p := range in.patterns {
+		if !bytes.Contains(b, p) {
+			return false, 0
+		}
 	}
 	in.sent.Add(1)
 	if in.remaining <= 0 {
