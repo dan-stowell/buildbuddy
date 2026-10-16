@@ -21,6 +21,10 @@
 // their condition runs in an extra goroutine, adding one to runtime.NumGoroutine.
 // CheckGrowth samples synchronously and avoids that counting pitfall.
 //
+// These are process-local snapshots, not ownership tracking: they cannot see
+// child-process resources or work that starts after a passing snapshot. Shut
+// down the owner (including scheduled callbacks) before cleanup checks run.
+//
 // Ordering matters: t.Cleanup functions run in reverse order of registration,
 // so call Check and CheckFDs before setting up anything that registers a
 // cleanup (servers, test environments, temp dirs), so that the leak check runs
