@@ -118,6 +118,7 @@ go_test(
         "//server/testutil/testauth",
         "//server/testutil/testenv",
         "//server/testutil/testfs",
+        "//server/testutil/testleak",
         "//server/testutil/testnetworking",
         "//server/testutil/testshell",
         "//server/testutil/testtar",
