@@ -1111,3 +1111,24 @@ func TestPresenceInvalidation_DelayedLookupCannotResurrect(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []*repb.Digest{d}, rsp.GetMissingBlobDigests(), "older presence response resurrected an entry after a backend NotFound")
 }
+
+func TestPresenceLifetime_DefaultRefreshBoundsConfiguredTTL(t *testing.T) {
+	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+	ctx := testContext()
+	env := testenv.GetTestEnv(t)
+	clock := clockwork.NewFakeClockAt(time.Unix(1700000000, 0))
+	env.SetClock(clock)
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+	remote := &delayedPresenceClient{beforePresenceResponse: func() {}}
+	env.SetContentAddressableStorageClient(remote)
+	proxy, err := New(env)
+	require.NoError(t, err)
+	d := digestProto(fooDigest, 3)
+	_, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+	require.NoError(t, err)
+	clock.Advance(time.Minute)
+	rsp, err := proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+	require.NoError(t, err)
+	require.Equal(t, []*repb.Digest{d}, rsp.GetMissingBlobDigests(), "default refresh must discover backend loss before the configured hour TTL")
+}
