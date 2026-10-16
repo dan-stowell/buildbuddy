@@ -39,7 +39,6 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_client"
-	"github.com/buildbuddy-io/buildbuddy/server/util/healthcheck"
 	"github.com/buildbuddy-io/buildbuddy/server/util/lockingbuffer"
 	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
 	"github.com/buildbuddy-io/buildbuddy/server/util/redact"
@@ -1531,8 +1530,7 @@ func collectRunfiles(runfilesDir string) ([]*runfile, map[string]string, error) 
 }
 
 func uploadRunfiles(ctx context.Context, workspaceRoot, runfilesDir, executablePath string) ([]*bespb.File, []*bespb.Tree, []*bespb.Runfile, error) {
-	healthChecker := healthcheck.NewHealthChecker("ci-runner")
-	env := real_environment.NewRealEnv(healthChecker)
+	env := real_environment.NewBatchEnv()
 
 	runfileMetadata, dirs, err := collectRunfiles(runfilesDir)
 	if err != nil {
@@ -1542,6 +1540,7 @@ func uploadRunfiles(ctx context.Context, workspaceRoot, runfilesDir, executableP
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	defer conn.Close()
 	env.SetByteStreamClient(bspb.NewByteStreamClient(conn))
 	env.SetContentAddressableStorageClient(repb.NewContentAddressableStorageClient(conn))
 	env.SetCapabilitiesClient(repb.NewCapabilitiesClient(conn))

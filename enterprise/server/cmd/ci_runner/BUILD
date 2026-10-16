@@ -34,7 +34,6 @@ go_library(
         "//server/util/flag",
         "//server/util/git",
         "//server/util/grpc_client",
-        "//server/util/healthcheck",
         "//server/util/lockingbuffer",
         "//server/util/log",
         "//server/util/platform",
