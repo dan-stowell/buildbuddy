@@ -183,3 +183,57 @@ alias(
         "@platforms//cpu:aarch64": "@net_busybox_busybox-linux-arm64//file:busybox",
     }),
 )
+
+go_test(
+    name = "lifecycle_test",
+    srcs = ["lifecycle_test.go"],
+    data = [
+        ":crun",
+        "@busybox",
+    ],
+    exec_properties = {
+        "test.workload-isolation-type": "firecracker",
+        "test.container-image": "docker://" + NET_TOOLS_IMAGE,
+        "test.EstimatedComputeUnits": "2",
+        "test.EstimatedFreeDiskBytes": "10GB",
+        "test.no-sandbox": "",
+    },
+    # NOTE: if testing locally, use --test_sharding_strategy=disabled to work
+    # around the networking package not supporting cross-process locks.
+    shard_count = 1,
+    tags = [
+        "docker",
+    ],
+    target_compatible_with = [
+        "@platforms//os:linux",
+        # TODO: GitHub Actions arm runners are running into cgroup-related issues;
+        # fix and re-enable on arm64.
+        "@platforms//cpu:x86_64",
+    ],
+    x_defs = {
+        "busyboxImageRlocationpath": "$(rlocationpath @busybox)",
+        "crunRlocationpath": "$(rlocationpath :crun)",
+    },
+    deps = [
+        ":ociruntime",
+        "//enterprise/server/remote_execution/cgroup",
+        "//enterprise/server/remote_execution/container",
+        "//enterprise/server/remote_execution/filecache",
+        "//enterprise/server/testutil/testregistry",
+        "//enterprise/server/util/cpuset",
+        "//enterprise/server/util/oci",
+        "//proto:remote_execution_go_proto",
+        "//server/interfaces",
+        "//server/testutil/testenv",
+        "//server/testutil/testfs",
+        "//server/testutil/testleak",
+        "//server/testutil/testnetworking",
+        "//server/util/disk",
+        "//server/util/networking",
+        "//server/util/platform",
+        "//server/util/status",
+        "//server/util/testing/flags",
+        "@com_github_stretchr_testify//require",
+        "@io_bazel_rules_go//go/runfiles",
+    ],
+)
