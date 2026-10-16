@@ -232,6 +232,12 @@ type batchOperator struct {
 	ticker <-chan time.Time
 	quit   chan struct{}
 
+	workerCtx     context.Context
+	cancelWorkers context.CancelFunc
+	stopTicker    func()
+	stopOnce      sync.Once
+	workers       sync.WaitGroup
+
 	batchesByGroupID sync.Map // (string -> *groupDigestBatches)
 
 	name               string
@@ -252,13 +258,14 @@ func (u *batchOperator) ForceFlushBatchesForTesting(ctx context.Context) {
 }
 
 func (u *batchOperator) ForceShutdownForTesting() {
-	u.quit <- struct{}{}
+	u.stopWorkers()
+	u.workers.Wait()
 }
 
 // Start implements BatchDigestOperator.
 func (u *batchOperator) Start(hc interfaces.HealthChecker) {
-	go u.batcher()
-	go u.sender()
+	u.workers.Go(u.batcher)
+	u.workers.Go(u.sender)
 	hc.RegisterShutdownFunction(u.shutdown)
 }
 
@@ -291,11 +298,16 @@ func New(env environment.Env, name string, f OperatorFunc, c BatchDigestOperator
 	if authenticator == nil {
 		return nil, fmt.Errorf("An Authenticator is required to create a BatchDigestOperator.")
 	}
+	workerCtx, cancelWorkers := context.WithCancel(context.Background())
+	ticker := env.GetClock().NewTicker(config.BatchInterval)
 	operator := batchOperator{
+		workerCtx:          workerCtx,
+		cancelWorkers:      cancelWorkers,
+		stopTicker:         ticker.Stop,
 		name:               name,
 		authenticator:      authenticator,
 		enqueueChan:        make(chan *enqueuedDigests, config.QueueSize),
-		ticker:             env.GetClock().NewTicker(config.BatchInterval).Chan(),
+		ticker:             ticker.Chan(),
 		quit:               make(chan struct{}, 1),
 		maxDigestsPerGroup: config.MaxDigestsPerGroup,
 		maxDigestsPerBatch: config.MaxDigestsPerBatch,
@@ -480,7 +492,7 @@ func (u *batchOperator) sender() {
 		case <-u.quit:
 			return
 		case <-u.ticker:
-			u.flushBatches(context.Background())
+			u.flushBatches(u.workerCtx)
 		}
 	}
 }
@@ -584,8 +596,35 @@ func (u *batchOperator) dispatch(ctx context.Context, groupID string, authHeader
 	}
 }
 
+// Signals the workers to stop and cancels any in-flight operator callback.
+// Closing quit alone cannot interrupt a sender blocked inside the callback.
+func (u *batchOperator) stopWorkers() {
+	u.stopOnce.Do(func() {
+		close(u.quit)
+		u.cancelWorkers()
+		u.stopTicker()
+	})
+}
+
 func (u *batchOperator) shutdown(ctx context.Context) error {
-	close(u.quit)
+	u.stopWorkers()
+
+	// Wait for the workers to exit, but not past the shutdown deadline: an
+	// operator callback that ignores context cancellation must not hang
+	// server shutdown.
+	workersDone := make(chan struct{})
+	go func() {
+		u.workers.Wait()
+		close(workersDone)
+	}()
+	select {
+	case <-workersDone:
+	case <-ctx.Done():
+		// The final flush would only dispatch batches with an expired
+		// context, so skip it.
+		log.Warningf("[%s] Shutdown deadline exceeded while waiting for an in-flight batch operation to finish; skipping final flush", u.name)
+		return nil
+	}
 
 	// Make a best-effort attempt to flush pending batches.
 	// TODO(iain): we could do something fancier here if necessary, like
