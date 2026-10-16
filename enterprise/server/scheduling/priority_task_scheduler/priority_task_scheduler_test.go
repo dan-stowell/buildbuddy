@@ -10,6 +10,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/resources"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/expflag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
@@ -1340,4 +1341,80 @@ func TestStopCancelsDelayedEnqueue(t *testing.T) {
 	// delayed enqueue's goroutine is still running.
 	require.NoError(t, scheduler.Stop())
 	require.Empty(t, scheduler.GetQueuedTaskReservations())
+}
+
+// cancelAwareExecutor runs each task until its context is cancelled, like a
+// long-running action that only stops when the scheduler hard-stops it.
+type cancelAwareExecutor struct {
+	started chan string
+}
+
+func (e *cancelAwareExecutor) ID() string     { return "cancel-aware-executor" }
+func (e *cancelAwareExecutor) HostID() string { return "cancel-aware-host" }
+func (e *cancelAwareExecutor) ExecuteTaskAndStreamResults(ctx context.Context, st *repb.ScheduledTask, _ interfaces.Publisher) (bool, error) {
+	e.started <- st.GetExecutionTask().GetExecutionId()
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+func startShutdownTestScheduler(t *testing.T, clock clockwork.Clock, exec IExecutor, numTasks int) *PriorityTaskScheduler {
+	env := testenv.GetTestEnv(t)
+	env.SetClock(clock)
+	env.SetRemoteExecutionClient(&FakeExecutionClient{})
+	q, err := NewPriorityTaskScheduler(env, exec, &FakeRunnerPool{}, NewFakeTaskLeaser(), &Options{})
+	require.NoError(t, err)
+	require.NoError(t, q.Start())
+	size := &scpb.TaskSize{EstimatedMilliCpu: 1, EstimatedMemoryBytes: 1}
+	for i := range numTasks {
+		_, err := q.EnqueueTaskReservation(context.Background(), &scpb.EnqueueTaskReservationRequest{
+			TaskId:             fakeTaskID(fmt.Sprintf("task-%d", i)),
+			TaskSize:           size,
+			SchedulingMetadata: &scpb.SchedulingMetadata{TaskSize: size},
+		})
+		require.NoError(t, err)
+	}
+	return q
+}
+
+func TestShutdown_CancelsActiveTasksWhenCleanupWindowStarts(t *testing.T) {
+	testleak.Check(t)
+	flags.Set(t, "executor.shutdown_cleanup_duration", 50*time.Millisecond)
+	exec := &cancelAwareExecutor{started: make(chan string, 3)}
+	// Freeze the scheduler clock so that the shutdown context's own timer is
+	// always the first to fire when the cleanup window starts. With a real
+	// clock, Shutdown used to miss the hard stop whenever that timer won.
+	q := startShutdownTestScheduler(t, clockwork.NewFakeClockAt(time.Now()), exec, 3)
+	for range 3 {
+		<-exec.started
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- q.Shutdown(ctx) }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		// Cancel the tasks ourselves so Shutdown returns before failing.
+		q.rootCancel()
+		<-done
+		require.FailNow(t, "Shutdown did not cancel active tasks when the cleanup window started")
+	}
+	require.ErrorIs(t, q.rootContext.Err(), context.Canceled)
+}
+
+func TestShutdown_DoesNotCancelTasksThatFinishBeforeCleanupWindow(t *testing.T) {
+	testleak.Check(t)
+	exec := NewFakeExecutor()
+	q := startShutdownTestScheduler(t, clockwork.NewRealClock(), exec, 1)
+	execution := <-exec.StartedExecutions
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- q.Shutdown(ctx) }()
+	execution.Complete()
+	require.NoError(t, <-done)
+	require.NoError(t, q.rootContext.Err(), "graceful shutdown should not hard-stop the executor")
 }
