@@ -287,3 +287,40 @@ func TestConnCache_ExpiresUnusedConnections(t *testing.T) {
 	require.NoError(t, err)
 	assert.Same(t, used, stillUsed)
 }
+
+func TestPoolRepeatedLifecycleResources(t *testing.T) {
+	testleak.Check(t)
+	testleak.CheckFDs(t)
+	env := testenv.GetTestEnv(t)
+	port := testport.FindFree(t)
+	server, err := grpc_server.New(env, port, false, grpc_server.GRPCServerConfig{})
+	require.NoError(t, err)
+	pspb.RegisterApiServer(server.GetServer(), &TestService{})
+	require.NoError(t, server.Start())
+	for range 10 {
+		pool, err := grpc_client.DialSimpleWithPoolSize(fmt.Sprintf("grpc://localhost:%d", port), 10)
+		require.NoError(t, err)
+		client := pspb.NewApiClient(pool)
+		for range 20 {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, err := client.Ping(ctx, &pspb.PingRequest{})
+			cancel()
+			require.NoError(t, err)
+		}
+		require.NoError(t, pool.Close())
+	}
+
+	// Keep a fully warmed pool alive while checking per-RPC accumulation.
+	pool, err := grpc_client.DialSimpleWithPoolSize(fmt.Sprintf("grpc://localhost:%d", port), 10)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, pool.Close()) })
+	client := pspb.NewApiClient(pool)
+	testleak.CheckGrowth(t, testleak.Growth{Iterations: 10}, func(int) {
+		for range 20 {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, err := client.Ping(ctx, &pspb.PingRequest{})
+			cancel()
+			require.NoError(t, err)
+		}
+	})
+}
