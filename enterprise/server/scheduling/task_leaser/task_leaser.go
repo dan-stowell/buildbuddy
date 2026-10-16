@@ -27,6 +27,10 @@ var (
 const (
 	// Timeout for reconnecting a lease after disconnecting from the server.
 	reconnectTimeout = 1 * time.Second
+
+	// Timeout for sending the final lease message on a new stream, if the
+	// stream broke before the lease could be closed.
+	closeReconnectTimeout = 10 * time.Second
 )
 
 // Verify that TaskLeaser implements interfaces.TaskLeaser.
@@ -102,9 +106,23 @@ func (t *TaskLease) Task() *repb.ExecutionTask {
 
 func (t *TaskLease) sendRequest(req *scpb.LeaseTaskRequest) (*scpb.LeaseTaskResponse, error) {
 	if err := t.stream.Send(req); err != nil {
+		if err == io.EOF {
+			// Send returns io.EOF if the stream was terminated (e.g. the
+			// server was hard-stopped). The actual status can only be
+			// obtained from Recv.
+			if _, recvErr := t.stream.Recv(); recvErr != nil && recvErr != io.EOF {
+				return nil, recvErr
+			}
+		}
 		return nil, err
 	}
 	return t.stream.Recv()
+}
+
+// isReconnectable returns whether a lease stream error indicates that the
+// lease should be re-established on a new stream using the reconnect token.
+func isReconnectable(err error) bool {
+	return *enableReconnect && (status.IsUnavailableError(err) || status.IsInternalError(err))
 }
 
 func (t *TaskLease) pingServer(ctx context.Context) (b []byte, err error) {
@@ -132,7 +150,7 @@ func (t *TaskLease) pingServer(ctx context.Context) (b []byte, err error) {
 		if err == nil {
 			break
 		}
-		if !*enableReconnect || !(status.IsUnavailableError(err) || status.IsInternalError(err)) {
+		if !isReconnectable(err) {
 			return nil, err
 		}
 		originalErr := err
@@ -229,8 +247,14 @@ func (t *TaskLease) Close(ctx context.Context, taskErr error, retry bool) {
 	close(t.quit) // This cancels our lease-keep-alive background goroutine.
 
 	req := &scpb.LeaseTaskRequest{
-		ExecutorId: t.executorID,
-		TaskId:     t.taskID,
+		ExecutorId:       t.executorID,
+		ExecutorHostname: t.executorHostname,
+		TaskId:           t.taskID,
+		// The reconnect fields are only used if the final message has to be
+		// sent on a new stream (see below).
+		SupportsReconnect:       *enableReconnect,
+		ReconnectToken:          t.reconnectToken,
+		SupportsExperimentFlags: t.supportsExperimentFlags,
 	}
 
 	// We can finalize the task if the execution was successful, or if it failed
@@ -244,20 +268,24 @@ func (t *TaskLease) Close(ctx context.Context, taskErr error, retry bool) {
 		s, _ := gstatus.FromError(taskErr)
 		req.ReEnqueueReason = s.Proto()
 	}
-	if err := t.stream.Send(req); err != nil {
-		log.CtxWarningf(ctx, "Failed to send final message on task lease stream: %s", err)
+
+	// The lease context may already be canceled at this point, so use a
+	// background context (preserving auth) for any new RPCs.
+	bgCtx := context.Background()
+	if jwt := t.ctx.Value(authutil.ContextTokenStringKey); jwt != nil {
+		bgCtx = context.WithValue(bgCtx, authutil.ContextTokenStringKey, jwt)
 	}
-	closedCleanly := false
-	for {
-		rsp, err := t.stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			log.CtxWarningf(ctx, "Lease stream recv failed: %s", err)
-			break
-		}
-		closedCleanly = rsp.GetClosedCleanly()
+
+	closedCleanly, err := t.sendFinalRequest(req)
+	if !closedCleanly && isReconnectable(err) && t.reconnectToken != "" {
+		// The lease stream broke (e.g. the server was shut down) before the
+		// final message was processed, but the scheduler holds the task for
+		// us to reconnect: send the final message on a new stream.
+		log.CtxInfof(ctx, "Lease stream failed while closing (%s); reconnecting to send final message", err)
+		closedCleanly, err = t.reconnectAndSendFinalRequest(bgCtx, req, err)
+	}
+	if err != nil {
+		log.CtxWarningf(ctx, "Failed to close task lease stream: %s", err)
 	}
 
 	if !closedCleanly {
@@ -266,11 +294,7 @@ func (t *TaskLease) Close(ctx context.Context, taskErr error, retry bool) {
 		if taskErr != nil {
 			reason = taskErr.Error()
 		}
-		ctx := context.Background()
-		if jwt := t.ctx.Value(authutil.ContextTokenStringKey); jwt != nil {
-			ctx = context.WithValue(ctx, authutil.ContextTokenStringKey, jwt)
-		}
-		if err := t.reEnqueueTask(ctx, reason); err != nil {
+		if err := t.reEnqueueTask(bgCtx, reason); err != nil {
 			log.CtxWarningf(ctx, "Error re-enqueueing task: %s", err)
 		} else {
 			log.CtxInfof(ctx, "Successfully re-enqueued task")
@@ -278,4 +302,43 @@ func (t *TaskLease) Close(ctx context.Context, taskErr error, retry bool) {
 	} else {
 		log.CtxDebugf(ctx, "Task lease closed cleanly")
 	}
+}
+
+// sendFinalRequest sends the final message on the lease stream and waits for
+// the server to end the stream. It returns whether the server reported that
+// the lease was closed cleanly, and the stream error, if any.
+func (t *TaskLease) sendFinalRequest(req *scpb.LeaseTaskRequest) (closedCleanly bool, err error) {
+	// If Send fails, the stream is done and Recv returns its actual status.
+	_ = t.stream.Send(req)
+	for {
+		rsp, err := t.stream.Recv()
+		if err == io.EOF {
+			return closedCleanly, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		closedCleanly = rsp.GetClosedCleanly()
+	}
+}
+
+// reconnectAndSendFinalRequest re-establishes the lease on a new stream using
+// the reconnect token, and sends the final message on it. err is the error
+// from the previous attempt.
+func (t *TaskLease) reconnectAndSendFinalRequest(ctx context.Context, req *scpb.LeaseTaskRequest, err error) (closedCleanly bool, _ error) {
+	ctx, cancel := context.WithTimeout(ctx, closeReconnectTimeout)
+	defer cancel()
+	retryCtx, cancelRetry := context.WithTimeout(ctx, reconnectTimeout)
+	defer cancelRetry()
+	r := retry.DefaultWithContext(retryCtx)
+	for !closedCleanly && isReconnectable(err) && r.Next() {
+		var stream scpb.Scheduler_LeaseTaskClient
+		stream, err = t.env.GetSchedulerClient().LeaseTask(ctx)
+		if err != nil {
+			continue
+		}
+		t.stream = stream
+		closedCleanly, err = t.sendFinalRequest(req)
+	}
+	return closedCleanly, err
 }
