@@ -30,16 +30,18 @@ func TestV4ReviewSharedLargeSlowSuccess(t *testing.T) {
 }
 
 type reviewSlowWriter struct {
-	bytes.Buffer
+	buf     bytes.Buffer
 	delayed bool
 }
+
+func (w *reviewSlowWriter) String() string { return w.buf.String() }
 
 func (w *reviewSlowWriter) Write(p []byte) (int, error) {
 	if !w.delayed {
 		w.delayed = true
 		time.Sleep(1500 * time.Millisecond)
 	}
-	return w.Buffer.Write(p)
+	return w.buf.Write(p)
 }
 
 // A finite inherited pipe holder bounds this test even on the unmodified baseline.
