@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"slices"
 	"sort"
 	"sync"
@@ -45,6 +46,7 @@ import (
 	"github.com/open-feature/go-sdk/openfeature"
 	"github.com/open-feature/go-sdk/openfeature/memprovider"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/goleak"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -110,14 +112,22 @@ type schedulerOpts struct {
 	userOwnedEnabled   bool
 	groupOwnedEnabled  bool
 	preferredExecutors []string
+	// If set, returns the Redis client used by the scheduler instead of a
+	// client for a fresh test Redis. It is called after leak checking starts.
+	redisClientFactory func(t *testing.T) redis.UniversalClient
+	// Known goroutine leaks to ignore.
+	leakOptions []goleak.Option
 }
 
 func getEnv(t *testing.T, opts *schedulerOpts, user string) (*testenv.TestEnv, context.Context) {
-	testleak.Check(t)
-	redisTarget := testredis.Start(t).Target
-	env := enterprise_testenv.GetCustomTestEnv(t, &enterprise_testenv.Options{
-		RedisTarget: redisTarget,
-	})
+	testleak.Check(t, opts.leakOptions...)
+	envOpts := &enterprise_testenv.Options{}
+	if opts.redisClientFactory != nil {
+		envOpts.RedisClient = opts.redisClientFactory(t)
+	} else {
+		envOpts.RedisTarget = testredis.Start(t).Target
+	}
+	env := enterprise_testenv.GetCustomTestEnv(t, envOpts)
 	if opts.options.Clock != nil {
 		env.SetClock(opts.options.Clock)
 	}
@@ -2756,4 +2766,188 @@ func TestWatchTaskLiveness_StopsWhenWatchersAreDone(t *testing.T) {
 	s.livenessMu.Lock()
 	defer s.livenessMu.Unlock()
 	require.Empty(t, s.livenessWatches)
+}
+
+// lostRedisReplyConn consumes a successful integer reply before returning EOF.
+// Redis has applied the command, but go-redis must reconnect and retry it.
+type lostRedisReplyConn struct {
+	net.Conn
+	armed *atomic.Bool
+}
+
+func (c *lostRedisReplyConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 && c.armed.CompareAndSwap(true, false) {
+		_ = c.Conn.Close()
+		return 0, io.EOF
+	}
+	return n, err
+}
+
+func redisWithLostReply(t *testing.T) (*redis.Client, *atomic.Bool) {
+	t.Helper()
+	base := testredis.Start(t).Client().(*redis.Client)
+	opts := *base.Options()
+	dial := opts.Dialer
+	armed := &atomic.Bool{}
+	opts.Dialer = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &lostRedisReplyConn{Conn: conn, armed: armed}, nil
+	}
+	rdb := redis.NewClient(&opts)
+	t.Cleanup(func() { _ = rdb.Close() })
+	require.NoError(t, rdb.Ping(t.Context()).Err())
+	return rdb, armed
+}
+
+func TestRedisRetryIdempotency_InsertTask(t *testing.T) {
+	ctx := t.Context()
+	rdb, drop := redisWithLostReply(t)
+	s := &SchedulerServer{rdb: rdb}
+	require.NoError(t, redisInsertTask.Load(ctx, rdb).Err())
+	drop.Store(true)
+	err := s.insertTask(ctx, "retry-insert", &scpb.SchedulingMetadata{}, []byte("task"), "")
+	require.False(t, drop.Load(), "must lose the successful insert script reply")
+	require.True(t, rdb.Exists(ctx, s.redisKeyForTask("retry-insert")).Val() == 1)
+	ttl, ttlErr := rdb.TTL(ctx, s.redisKeyForTask("retry-insert")).Result()
+	require.NoError(t, ttlErr)
+	t.Logf("insertTask returned %v; stored task TTL=%s", err, ttl)
+	require.NoError(t, err, "successful insert replay must preserve the task and TTL")
+	require.Positive(t, ttl)
+}
+
+func TestRedisRetryIdempotency_DeleteClaimedTask(t *testing.T) {
+	ctx := t.Context()
+	rdb, drop := redisWithLostReply(t)
+	s := &SchedulerServer{rdb: rdb}
+	key := s.redisKeyForTask("retry-delete")
+	require.NoError(t, rdb.HSet(ctx, key, "claimed", "1").Err())
+	// Preload the script so the lost reply is EVALSHA's successful deletion,
+	// rather than the initial NOSCRIPT error.
+	require.NoError(t, redisDeleteClaimedTask.Load(ctx, rdb).Err())
+	drop.Store(true)
+	err := s.deleteClaimedTask(ctx, "retry-delete", "")
+	require.False(t, drop.Load(), "must lose the successful EVALSHA reply")
+	require.Zero(t, rdb.Exists(ctx, key).Val(), "first execution deleted the task")
+	require.NoError(t, err, "successful deletion replay must reach action-merging and reservation cleanup")
+}
+
+// Both legacy and new tasks must survive a conflicting insert unchanged.
+func TestRedisRetryIdempotency_InsertConflict(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy=%t", legacy), func(t *testing.T) {
+			ctx := t.Context()
+			rdb := testredis.Start(t).Client()
+			s := &SchedulerServer{rdb: rdb}
+			key := s.redisKeyForTask("conflict")
+			require.NoError(t, s.insertTask(ctx, "conflict", &scpb.SchedulingMetadata{}, []byte("original"), "jwt"))
+			if legacy {
+				require.NoError(t, rdb.HDel(ctx, key, "insertToken").Err())
+			}
+			require.NoError(t, rdb.HSet(ctx, key, "claimed", "1", "leaseId", "owner", "attemptCount", 3).Err())
+			require.NoError(t, rdb.Expire(ctx, key, time.Minute).Err())
+			before, err := rdb.HGetAll(ctx, key).Result()
+			require.NoError(t, err)
+			err = s.insertTask(ctx, "conflict", &scpb.SchedulingMetadata{}, []byte("replacement"), "different jwt")
+			require.True(t, status.IsAlreadyExistsError(err), "%v", err)
+			after, err := rdb.HGetAll(ctx, key).Result()
+			require.NoError(t, err)
+			require.Equal(t, before, after)
+			require.InDelta(t, time.Minute, rdb.TTL(ctx, key).Val(), float64(2*time.Second))
+		})
+	}
+}
+
+func TestRedisRetryIdempotency_InsertReplayPreservesState(t *testing.T) {
+	ctx := t.Context()
+	rdb := testredis.Start(t).Client()
+	s := &SchedulerServer{rdb: rdb}
+	key := s.redisKeyForTask("replay")
+	require.NoError(t, s.insertTask(ctx, "replay", &scpb.SchedulingMetadata{}, []byte("task"), "jwt"))
+	token, err := rdb.HGet(ctx, key, "insertToken").Result()
+	require.NoError(t, err)
+	// A worker can claim the task between the first execution and its retry.
+	require.NoError(t, rdb.HSet(ctx, key, "claimed", "1", "leaseId", "owner", "attemptCount", 2).Err())
+	require.NoError(t, rdb.Expire(ctx, key, time.Minute).Err())
+	before, err := rdb.HGetAll(ctx, key).Result()
+	require.NoError(t, err)
+	r, err := redisInsertTask.Run(ctx, rdb, []string{key}, token, int64(taskTTL/time.Second), "attemptCount", 0).Int64()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), r)
+	after, err := rdb.HGetAll(ctx, key).Result()
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+	require.InDelta(t, time.Minute, rdb.TTL(ctx, key).Val(), float64(2*time.Second))
+}
+
+func TestRedisRetryIdempotency_FinalizeLease(t *testing.T) {
+	ctx := t.Context()
+	rdb := testredis.Start(t).Client()
+	s := &SchedulerServer{rdb: rdb}
+	key := s.redisKeyForTask("finalize")
+	require.NoError(t, rdb.HSet(ctx, key, "claimed", "1", "leaseId", "new-owner").Err())
+	require.True(t, status.IsPermissionDeniedError(s.deleteClaimedTask(ctx, "finalize", "old-owner")))
+	require.True(t, status.IsPermissionDeniedError(s.deleteClaimedTask(ctx, "finalize", "")))
+	require.Equal(t, "new-owner", rdb.HGet(ctx, key, "leaseId").Val())
+	require.NoError(t, s.deleteClaimedTask(ctx, "finalize", "new-owner"))
+	require.NoError(t, s.deleteClaimedTask(ctx, "finalize", "new-owner"))
+	require.Zero(t, rdb.Exists(ctx, key).Val())
+	// A recreated task must not be deleted by the old lease's retry.
+	require.NoError(t, rdb.HSet(ctx, key, "claimed", "1", "leaseId", "next-owner").Err())
+	require.True(t, status.IsPermissionDeniedError(s.deleteClaimedTask(ctx, "finalize", "new-owner")))
+	require.NoError(t, rdb.HDel(ctx, key, "claimed").Err())
+	require.True(t, status.IsNotFoundError(s.deleteClaimedTask(ctx, "finalize", "next-owner")))
+	// Legacy claimed hashes without lease IDs remain finalizable.
+	require.NoError(t, rdb.HSet(ctx, key, "claimed", "1").Err())
+	require.NoError(t, rdb.HDel(ctx, key, "leaseId").Err())
+	require.NoError(t, s.deleteClaimedTask(ctx, "finalize", "legacy-owner"))
+}
+
+// A partial legacy hash is still an existing task. HSET's count of newly
+// added fields must not authorize overwriting an existing owner's state.
+func TestVerifyRedisRetry_InsertPartialLegacyHash(t *testing.T) {
+	ctx := t.Context()
+	rdb := testredis.Start(t).Client()
+	s := &SchedulerServer{rdb: rdb}
+	key := s.redisKeyForTask("partial-legacy")
+	require.NoError(t, rdb.HSet(ctx, key, "claimed", "1", "leaseId", "owner", "attemptCount", 7).Err())
+	require.NoError(t, rdb.Expire(ctx, key, time.Minute).Err())
+	before, err := rdb.HGetAll(ctx, key).Result()
+	require.NoError(t, err)
+	err = s.insertTask(ctx, "partial-legacy", &scpb.SchedulingMetadata{}, []byte("replacement"), "jwt")
+	after, readErr := rdb.HGetAll(ctx, key).Result()
+	require.NoError(t, readErr)
+	require.Equal(t, before, after, "conflicting insertion must preserve partial legacy state")
+	require.True(t, status.IsAlreadyExistsError(err), "got %v", err)
+	require.InDelta(t, time.Minute, rdb.TTL(ctx, key).Val(), float64(2*time.Second))
+}
+
+// A finalize from a superseded stream must not delete the reconnected lease,
+// including through the stream handler's deferred re-enqueue path.
+func TestVerifyRedisRetry_StaleFinalizeAfterReconnect(t *testing.T) {
+	flags.Set(t, "remote_execution.lease_reconnect_grace_period", time.Hour)
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+	fe := newFakeExecutor(ctx, t, env.GetSchedulerClient())
+	fe.Register()
+	taskID := scheduleTask(ctx, t, env, map[string]string{platform.RetryPropertyName: "false"})
+	fe.WaitForTask(taskID)
+	old := fe.Claim(taskID)
+	s := env.GetSchedulerService().(*SchedulerServer)
+	require.NoError(t, s.reEnqueueTask(ctx, taskID, old.leaseID, old.leaseID, 1, "reconnect"))
+	current, err := fe.Reconnect(taskID, old.leaseID)
+	require.NoError(t, err)
+	require.NotEqual(t, old.leaseID, current.leaseID)
+	require.NoError(t, old.stream.Send(&scpb.LeaseTaskRequest{TaskId: taskID, Finalize: true}))
+	rsp, err := old.stream.Recv()
+	require.NoError(t, err)
+	t.Logf("stale finalize ClosedCleanly=%t", rsp.GetClosedCleanly())
+	// Receiving the terminal EOF waits for the handler, including defers.
+	_, err = old.stream.Recv()
+	require.Error(t, err)
+	key := s.redisKeyForTask(taskID)
+	require.Equal(t, current.leaseID, s.rdb.HGet(ctx, key, "leaseId").Val(), "stale finalize must preserve the current lease")
+	require.NoError(t, current.Finalize())
 }

@@ -53,18 +53,23 @@ go_library(
         "@org_golang_google_protobuf//encoding/prototext",
         "@org_golang_google_protobuf//types/known/durationpb",
         "@org_golang_google_protobuf//types/known/timestamppb",
+        "@org_uber_go_goleak//:goleak",
     ],
 )
 
 go_test(
     name = "scheduler_server_test",
     size = "medium",
-    srcs = ["scheduler_server_test.go"],
+    srcs = [
+        "redis_lost_reply_test.go",
+        "scheduler_server_test.go",
+    ],
     embed = [":scheduler_server"],
     deps = [
         "//enterprise/server/backends/redis_execution_collector",
         "//enterprise/server/experiments",
         "//enterprise/server/githubapp",
+        "//enterprise/server/remote_execution/action_merger",
         "//enterprise/server/remote_execution/execution_server",
         "//enterprise/server/tasksize",
         "//enterprise/server/testutil/enterprise_testauth",
@@ -88,6 +93,7 @@ go_test(
         "//server/util/expflag",
         "//server/util/log",
         "//server/util/platform",
+        "//server/util/prefix",
         "//server/util/proto",
         "//server/util/status",
         "//server/util/testing/flags",
@@ -104,5 +110,6 @@ go_test(
         "@org_golang_google_protobuf//testing/protocmp",
         "@org_golang_google_protobuf//types/known/durationpb",
         "@org_golang_google_protobuf//types/known/timestamppb",
+        "@org_uber_go_goleak//:goleak",
     ],
 )
