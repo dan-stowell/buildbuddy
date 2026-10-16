@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"io"
 	"strconv"
-	"strings"
-	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_crypter"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/proxy_util"
@@ -29,14 +27,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"google.golang.org/grpc/codes"
-	gstatus "google.golang.org/grpc/status"
 
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 )
 
 var (
 	enableGetTreeCaching             = flag.Bool("cache_proxy.enable_get_tree_caching", false, "If true, the Cache Proxy attempts to serve GetTree requests out of the local cache. If false, GetTree requests are always proxied to the remote, authoritative cache.")
-	findMissingBlobsRefreshInterval  = flag.Duration("cache_proxy.find_missing_blobs_refresh_interval", time.Minute, "Maximum interval between backend presence checks for hot digests. Presence entries expire after the smaller of this interval and find_missing_blobs_cache_ttl, so checks also refresh backend access times.")
 	findMissingBlobsCacheTTL         = flag.Duration("cache_proxy.find_missing_blobs_cache_ttl", 0, "If greater than 0, the proxy caches digests reported by the backing cache as 'present' locally for FindMissingBlobs requests for this long.")
 	findMissingBlobsCacheSizeEntries = flag.Int64("cache_proxy.find_missing_blobs_cache_size_entries", 500*1000, "The number of digests to hold in each in-memory FindMissingBlobs digest cache. Only used if cache_proxy.find_missing_blobs_cache_ttl is greater than 0.")
 )
@@ -107,19 +103,12 @@ func New(env environment.Env) (*CASServerProxy, error) {
 		localCache:         env.GetCache(),
 	}
 	if *findMissingBlobsCacheTTL > 0 {
-		if *findMissingBlobsRefreshInterval <= 0 {
-			return nil, status.InvalidArgumentError("find_missing_blobs_refresh_interval must be positive")
-		}
-		// Expiration is based on insertion, not hits. Revalidate hot entries in
-		// batches on the request path to refresh backend access times without
-		// a backend call on every hit or an unbounded background work queue.
-		ttl := min(*findMissingBlobsCacheTTL, *findMissingBlobsRefreshInterval)
 		newCache := func() (lru.LRU[struct{}], error) {
 			return lru.New[struct{}](&lru.Config[struct{}]{
 				MaxSize:    *findMissingBlobsCacheSizeEntries,
 				SizeFn:     func(struct{}) int64 { return 1 },
 				ThreadSafe: true,
-				TTL:        ttl,
+				TTL:        *findMissingBlobsCacheTTL,
 				Clock:      env.GetClock(),
 			})
 		}
@@ -340,37 +329,6 @@ func (s *CASServerProxy) findMissingBlobsCacheKey(groupID string, req *repb.Find
 	return groupID + "/" + digest.NewCASResourceName(d, req.GetInstanceName(), req.GetDigestFunction()).DownloadString()
 }
 
-// InvalidatePresence removes cached presence after a backend read fails. Both
-// representations must be removed: neither a raw blob nor a chunked lookup
-// should keep reporting a blob that could not be read.
-func (s *CASServerProxy) InvalidatePresence(ctx context.Context, rn *digest.CASResourceName) {
-	if s.findMissingBlobsCache == nil {
-		return
-	}
-	user, err := s.authenticator.AuthenticatedUser(ctx)
-	groupID := interfaces.AuthAnonymousUser
-	if err == nil {
-		groupID = user.GetGroupID()
-	} else if !authutil.IsAnonymousUserError(err) {
-		return
-	}
-	if rn != nil {
-		key := groupID + "/" + digest.NewCASResourceName(rn.GetDigest(), rn.GetInstanceName(), rn.GetDigestFunction()).DownloadString()
-		s.findMissingBlobsCache.Remove(key)
-		s.findMissingChunksCache.Remove(key)
-		return
-	}
-	// GetTree can report a missing descendant without identifying its digest.
-	// Conservatively invalidate this group's entries, including descendants.
-	for _, cache := range []lru.LRU[struct{}]{s.findMissingBlobsCache, s.findMissingChunksCache} {
-		for _, key := range cache.Keys() {
-			if strings.HasPrefix(key, groupID+"/") {
-				cache.Remove(key)
-			}
-		}
-	}
-}
-
 func (s *CASServerProxy) BatchUpdateBlobs(ctx context.Context, req *repb.BatchUpdateBlobsRequest) (*repb.BatchUpdateBlobsResponse, error) {
 	if remote_cache_config.BlackholeAnonymousRequests() && authutil.IsAnonymousRequest(ctx, s.authenticator) {
 		return s.local.BatchUpdateBlobs(ctx, req)
@@ -515,11 +473,6 @@ func (s *CASServerProxy) batchReadBlobsRemote(ctx context.Context, readReq *repb
 	defer spn.End()
 	tracing.AddStringAttributeToCurrentSpan(ctx, "requested-blobs", strconv.Itoa(len(readReq.Digests)))
 	readResp, err := s.remote.BatchReadBlobs(ctx, readReq)
-	if status.IsNotFoundError(err) {
-		for _, d := range readReq.GetDigests() {
-			s.InvalidatePresence(ctx, digest.NewCASResourceName(d, readReq.GetInstanceName(), readReq.GetDigestFunction()))
-		}
-	}
 	if err != nil {
 		return nil, err
 	}
@@ -528,9 +481,6 @@ func (s *CASServerProxy) batchReadBlobsRemote(ctx context.Context, readReq *repb
 		DigestFunction: readReq.DigestFunction,
 	}
 	for _, response := range readResp.Responses {
-		if response.GetStatus().GetCode() == int32(codes.NotFound) {
-			s.InvalidatePresence(ctx, digest.NewCASResourceName(response.GetDigest(), readReq.GetInstanceName(), readReq.GetDigestFunction()))
-		}
 		if response.Status.Code != int32(codes.OK) {
 			continue
 		}
@@ -562,12 +512,7 @@ func (s *CASServerProxy) GetTree(req *repb.GetTreeRequest, stream repb.ContentAd
 	return s.getTreeWithoutCaching(req, stream)
 }
 
-func (s *CASServerProxy) getTreeWithoutCaching(req *repb.GetTreeRequest, stream repb.ContentAddressableStorage_GetTreeServer) (err error) {
-	defer func() {
-		if status.IsNotFoundError(err) {
-			s.InvalidatePresence(stream.Context(), nil)
-		}
-	}()
+func (s *CASServerProxy) getTreeWithoutCaching(req *repb.GetTreeRequest, stream repb.ContentAddressableStorage_GetTreeServer) error {
 	digests := 0
 	bytes := 0
 	defer func() {
@@ -617,9 +562,6 @@ func (s *CASServerProxy) getTree(req *repb.GetTreeRequest, stream repb.ContentAd
 
 		dirsToGet = []*repb.Digest{}
 		for _, brbresp := range brbresps.Responses {
-			if brbresp.GetStatus().GetCode() != int32(codes.OK) {
-				return gstatus.ErrorProto(brbresp.GetStatus())
-			}
 			dir := &repb.Directory{}
 			if err := proto.Unmarshal(brbresp.Data, dir); err != nil {
 				return err

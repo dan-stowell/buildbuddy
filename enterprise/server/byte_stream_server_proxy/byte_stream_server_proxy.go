@@ -82,7 +82,6 @@ func (s *ByteStreamServerProxy) shouldBypassLocalCacheForEncryption(ctx context.
 }
 
 type ByteStreamServerProxy struct {
-	env                environment.Env
 	supportsEncryption bool
 	authenticator      interfaces.Authenticator
 	local              interfaces.ByteStreamServer
@@ -116,7 +115,6 @@ func New(env environment.Env) (*ByteStreamServerProxy, error) {
 		return nil, fmt.Errorf("A local ByteStreamServer is required to enable ByteStreamServerProxy")
 	}
 	return &ByteStreamServerProxy{
-		env:                env,
 		supportsEncryption: remote_crypter.SupportsEncryption(env),
 		authenticator:      authenticator,
 		local:              local,
@@ -153,16 +151,6 @@ func (s *ByteStreamServerProxy) Read(req *bspb.ReadRequest, stream bspb.ByteStre
 	meteredStream := &meteredReadServerStream{ByteStream_ReadServer: stream}
 	stream = meteredStream
 	readMetrics, err := s.read(ctx, req, meteredStream)
-	if status.IsNotFoundError(err) && !proxy_util.SkipRemote(ctx) {
-		// Resolve lazily since ByteStream is registered before CAS.
-		if invalidator, ok := s.env.GetCASServer().(interface {
-			InvalidatePresence(context.Context, *digest.CASResourceName)
-		}); ok {
-			if rn, parseErr := digest.ParseDownloadResourceName(req.GetResourceName()); parseErr == nil {
-				invalidator.InvalidatePresence(ctx, rn)
-			}
-		}
-	}
 	bsm := byteStreamMetrics{
 		requestType:  requestTypeLabel,
 		compressor:   readMetrics.compressor,
