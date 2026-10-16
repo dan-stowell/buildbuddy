@@ -599,27 +599,21 @@ func (q *PriorityTaskScheduler) EnqueueTaskReservation(ctx context.Context, req 
 	return &scpb.EnqueueTaskReservationResponse{}, nil
 }
 
-func (q *PriorityTaskScheduler) remove(taskID string) bool {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if p := q.q.FindTask(taskID); p != nil {
-		q.q.DequeueAt(p)
-		return true
-	}
-	return false
-
-}
-
 func (q *PriorityTaskScheduler) CancelTaskReservation(ctx context.Context, taskID string) {
 	ctx = q.enrichContext(ctx)
 	ctx = log.EnrichContext(ctx, log.ExecutionIDKey, taskID)
 	q.mu.Lock()
 	cancel := q.activeTaskCancels[taskID]
+	removed := false
+	if p := q.q.FindTask(taskID); p != nil {
+		q.q.DequeueAt(p)
+		removed = true
+	}
 	q.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
-	if removed := q.remove(taskID); removed {
+	if removed {
 		log.CtxInfof(ctx, "Removed completed task from queue")
 		// If the task we removed was at the head of the queue, the task behind
 		// it in the queue might now be schedulable. Wake up the scheduler to
