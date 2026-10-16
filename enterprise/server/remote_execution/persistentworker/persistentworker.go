@@ -170,6 +170,29 @@ func (w *Worker) Exec(ctx context.Context, command *repb.Command) (result *inter
 		}()
 	}
 
+	// Cancellation invalidates the protocol stream: a partial response cannot
+	// safely be used by the next request. Stop also closes the pipes, unblocking
+	// both request writes and response reads.
+	stopped := make(chan struct{})
+	stopCancellation := context.AfterFunc(ctx, func() {
+		defer close(stopped)
+		if err := w.Stop(); err != nil {
+			log.CtxWarningf(ctx, "Failed to stop canceled persistent worker: %s", err)
+		}
+	})
+	defer func() {
+		if !stopCancellation() {
+			<-stopped
+			result = commandutil.ErrorResult(status.FromContextError(ctx))
+		} else if ctx.Err() != nil {
+			// Cancellation raced with completion before the callback started.
+			if err := w.Stop(); err != nil {
+				log.CtxWarningf(ctx, "Failed to stop canceled persistent worker: %s", err)
+			}
+			result = commandutil.ErrorResult(status.FromContextError(ctx))
+		}
+	}()
+
 	// Clear any stderr that might be associated with a previous request.
 	stderr := w.stderr.String()
 	w.stderr.Reset()

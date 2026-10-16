@@ -975,6 +975,47 @@ func TestRunnerPool_PersistentWorker(t *testing.T) {
 	}
 }
 
+// Run must return once its context is done (e.g. the action timeout expired)
+// even if the persistent worker stalls mid-response, and the runner must not
+// be reused: the next task with the same key gets a fresh worker.
+func TestRunnerPool_PersistentWorker_StalledResponseHonorsContext(t *testing.T) {
+	env := newTestEnv(t)
+	pool := newRunnerPool(t, env, noLimitsCfg())
+	ctx := withAuthenticatedUser(t, context.Background(), env, "US1")
+
+	// The worker announces a 100-byte response, writes 10 bytes, then stalls.
+	stalled := newPersistentRunnerTask(t, "abc", "", "proto", &wkpb.WorkResponse{})
+	partial := append([]byte{100}, "0123456789"...)
+	stalled.ExecutionTask.Command.Arguments[2] = "--response_base64=" + base64.StdEncoding.EncodeToString(partial)
+	r, err := get(ctx, pool, stalled)
+	require.NoError(t, err)
+
+	runCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+	done := make(chan *interfaces.CommandResult, 1)
+	go func() { done <- r.Run(runCtx, &repb.IOStats{}) }()
+	select {
+	case res := <-done:
+		require.ErrorContains(t, res.Error, "deadline exceeded")
+	case <-time.After(10 * time.Second):
+		require.NoError(t, r.RemoveWithTimeout(ctx)) // unblock Run
+		<-done
+		require.FailNow(t, "Run still blocked 9s after its context deadline")
+	}
+	// Even if the caller reports a clean finish, the runner is not recycled.
+	pool.TryRecycle(ctx, r, true)
+	require.Equal(t, 0, pool.PausedRunnerCount())
+
+	resp := &wkpb.WorkResponse{Output: "ok"}
+	r2, err := get(ctx, pool, newPersistentRunnerTask(t, "abc", "", "proto", resp))
+	require.NoError(t, err)
+	require.NotSame(t, r, r2)
+	res := r2.Run(ctx, &repb.IOStats{})
+	require.NoError(t, res.Error)
+	require.Equal(t, []byte("ok"), res.Stderr)
+	pool.TryRecycle(ctx, r2, true)
+}
+
 func TestRunnerPool_PersistentWorkerUnknownProtocol(t *testing.T) {
 	resp := &wkpb.WorkResponse{
 		ExitCode: 0,
