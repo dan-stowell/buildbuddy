@@ -3,6 +3,9 @@ package build_event_handler_test
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,6 +20,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testolapdb"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testusage"
 	"github.com/buildbuddy-io/buildbuddy/server/usage/sku"
@@ -2357,4 +2361,97 @@ func TestTruncateStringSlice(t *testing.T) {
 			assert.Equal(t, test.Truncated, truncated, "truncated should be %t", test.Truncated)
 		})
 	}
+}
+
+// TestBESLifecycleResources exercises channel owners the same way the RPC does:
+// finalize before Close, and cancel the transport context when the RPC ends.
+// Counts are diagnostic; testleak checks all goroutines after environment shutdown.
+func TestBESLifecycleResources(t *testing.T) {
+	for _, outcome := range []string{"finished", "unfinished", "disconnect", "replay", "finalized_replay", "db_error", "blob_error"} {
+		for _, n := range []int{1, 10, 50} {
+			t.Run(fmt.Sprintf("%s/N=%d", outcome, n), func(t *testing.T) {
+				testleak.Check(t)
+				flags.Set(t, "cache_stats_finalization_delay", time.Duration(0))
+				te := testenv.GetTestEnv(t)
+				bs := &failingBlobstore{Blobstore: te.GetBlobstore()}
+				te.SetBlobstore(bs)
+				h := build_event_handler.NewBuildEventHandler(te)
+				// The environment owns h.Stop via its health checker.
+				before := besFDTargets(t)
+				beforeG := runtime.NumGoroutine()
+				for range n {
+					iid := uuid.NewString()
+					attempts := 1
+					if outcome == "replay" || outcome == "finalized_replay" {
+						attempts = 2
+					}
+					for attempt := 0; attempt < attempts; attempt++ {
+						func() {
+							ctx, cancel := context.WithCancel(context.Background())
+							defer cancel()
+							c, err := h.OpenChannel(ctx, iid)
+							require.NoError(t, err)
+							defer c.Close()
+							if outcome == "db_error" {
+								te.SetInvocationDB(&failingInvocationDB{InvocationDB: te.GetInvocationDB()})
+							}
+							err = c.HandleEvent(streamRequest(startedEvent("--remote_upload_local_results"), iid, 1))
+							if outcome == "db_error" {
+								require.Error(t, err)
+							} else {
+								require.NoError(t, err)
+								require.NoError(t, c.HandleEvent(streamRequest(progressEventWithOutput("hello\n", "stderr\n"), iid, 2)))
+								if outcome == "finished" || outcome == "blob_error" || outcome == "finalized_replay" || (outcome == "replay" && attempt == 1) {
+									require.NoError(t, c.HandleEvent(streamRequest(finishedEvent(), iid, 3)))
+								}
+							}
+							if outcome == "disconnect" || (outcome == "replay" && attempt == 0) {
+								cancel()
+							}
+							if outcome == "blob_error" {
+								bs.failWrites.Store(true)
+								require.Error(t, c.FinalizeInvocation(iid))
+								bs.failWrites.Store(false)
+							} else if outcome == "db_error" {
+								require.Error(t, c.FinalizeInvocation(iid))
+							} else {
+								require.NoError(t, c.FinalizeInvocation(iid))
+							}
+						}()
+					}
+				}
+				// No per-invocation writeLoop should remain once its transport is gone.
+				require.Eventually(t, func() bool {
+					b := make([]byte, 2<<20)
+					b = b[:runtime.Stack(b, true)]
+					return !strings.Contains(string(b), "chunkstore.(*writeLoop).run")
+				}, 15*time.Second, 10*time.Millisecond)
+				after := besFDTargets(t)
+				var added []string
+				for fd, target := range after {
+					if before[fd] != target {
+						added = append(added, fd+"="+target)
+					}
+				}
+				t.Logf("N=%d goroutines=%d->%d FDs=%d->%d added=%v (shared handler workers still owned)", n, beforeG, runtime.NumGoroutine(), len(before), len(after), added)
+			})
+		}
+	}
+}
+
+// Local FD diagnostics until the shared detector's FD API is available here.
+func besFDTargets(t *testing.T) map[string]string {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	require.NoError(t, err)
+	targets := make(map[string]string)
+	for _, entry := range entries {
+		target, err := os.Readlink(filepath.Join("/proc/self/fd", entry.Name()))
+		if os.IsNotExist(err) {
+			continue
+		} // ReadDir's own descriptor has closed.
+		require.NoError(t, err)
+		targets[entry.Name()] = target
+	}
+	return targets
 }

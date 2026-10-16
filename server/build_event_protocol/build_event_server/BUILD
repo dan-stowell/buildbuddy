@@ -30,6 +30,7 @@ go_test(
         "//server/interfaces",
         "//server/testutil/testbes",
         "//server/testutil/testenv",
+        "//server/testutil/testleak",
         "//server/util/status",
         "//server/util/uuid",
         "@com_github_stretchr_testify//assert",
