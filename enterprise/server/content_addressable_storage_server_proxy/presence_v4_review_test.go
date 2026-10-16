@@ -52,7 +52,7 @@ func TestReviewPresence_OverlapSurvivesTombstonePressure(t *testing.T) {
 		// The target is invalidated first, making its tombstone oldest. Every
 		// shard receives more than 1,000 subsequent invalidations.
 		ds := []*repb.Digest{d}
-		for i := 0; i < 200000; i++ {
+		for i := range 200000 {
 			ds = append(ds, &repb.Digest{Hash: fmt.Sprintf("%064x", i), SizeBytes: 1})
 		}
 		_, err := proxy.batchReadBlobsRemote(ctx, readBlobsRequest(ds))
