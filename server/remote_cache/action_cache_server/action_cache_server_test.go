@@ -1072,3 +1072,34 @@ func TestRecordOriginScorecard(t *testing.T) {
 	assert.Equal(t, actionDigest.GetHash(), result.GetActionId())
 	assert.Equal(t, originInvocationID, result.GetOriginInvocationId())
 }
+
+// All CAS blobs referenced by an AC hit must exist, including log blobs.
+func TestPresenceLifetime_ACRejectsMissingReferences(t *testing.T) {
+	for _, kind := range []string{"output", "stdout", "stderr"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx := context.Background()
+			te := testenv.GetTestEnv(t)
+			client := repb.NewActionCacheClient(runACServer(ctx, t, te))
+			action := &repb.Digest{Hash: strings.Repeat("a", 64), SizeBytes: 100}
+			missing := &repb.Digest{Hash: strings.Repeat("b", 64), SizeBytes: 10}
+			ar := &repb.ActionResult{}
+			switch kind {
+			case "output":
+				ar.OutputFiles = []*repb.OutputFile{{Path: "out", Digest: missing}}
+			case "stdout":
+				ar.StdoutDigest = missing
+			case "stderr":
+				ar.StderrDigest = missing
+			}
+			_, err := client.UpdateActionResult(ctx, &repb.UpdateActionResultRequest{
+				ActionDigest: action, DigestFunction: repb.DigestFunction_SHA256, ActionResult: ar,
+			})
+			require.NoError(t, err)
+			// No inlining: the client must download referenced blobs after the AC hit.
+			got, err := client.GetActionResult(ctx, &repb.GetActionResultRequest{
+				ActionDigest: action, DigestFunction: repb.DigestFunction_SHA256,
+			})
+			require.True(t, status.IsNotFoundError(err), "AC hit references missing %s blob: result=%v err=%v", kind, got, err)
+		})
+	}
+}
