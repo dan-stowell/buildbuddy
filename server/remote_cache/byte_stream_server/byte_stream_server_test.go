@@ -1512,3 +1512,65 @@ func TestShutdown_ByteStreamWrite(t *testing.T) {
 		})
 	}
 }
+
+func TestShutdown_ByteStreamRead(t *testing.T) {
+	for _, finish := range []bool{true, false} {
+		name := "deadline"
+		if finish {
+			name = "complete"
+		}
+		t.Run(name, func(t *testing.T) {
+			te := testenv.GetTestEnv(t)
+			flags.Set(t, "max_shutdown_duration", 2*time.Second)
+			flags.Set(t, "shutdown_lameduck_duration", time.Duration(0))
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			payload := []byte("deterministic shutdown download payload")
+			d, err := digest.Compute(bytes.NewReader(payload), repb.DigestFunction_SHA256)
+			require.NoError(t, err)
+			rn := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256)
+			cacheCtx, err := prefix.AttachUserPrefixToContext(ctx, te.GetAuthenticator())
+			require.NoError(t, err)
+			require.NoError(t, te.GetCache().Set(cacheCtx, rn.ToProto(), payload))
+			cache := &gatedReadCache{Cache: te.GetCache(), release: make(chan struct{}), started: make(chan struct{}, 1), gateSize: int64(len(payload))}
+			te.SetCache(cache)
+			actual, err := NewByteStreamServer(te)
+			require.NoError(t, err)
+			srv, run, lis := testenv.RegisterLocalGRPCServer(t, te)
+			bspb.RegisterByteStreamServer(srv, actual)
+			hc := te.GetHealthChecker()
+			hc.RegisterShutdownFunction(grpc_server.GRPCShutdownFunc(srv))
+			go run()
+			conn, err := testenv.LocalGRPCConn(t, ctx, lis)
+			require.NoError(t, err)
+			stream, err := bspb.NewByteStreamClient(conn).Read(ctx, &bspb.ReadRequest{ResourceName: rn.DownloadString()})
+			require.NoError(t, err)
+			select {
+			case <-cache.started:
+			case <-ctx.Done():
+				t.Fatal("read handler did not reach cache")
+			}
+			hc.Shutdown()
+			if finish {
+				close(cache.release)
+			}
+			var data []byte
+			for {
+				resp, err := stream.Recv()
+				if err != nil {
+					if finish {
+						require.Equal(t, io.EOF, err)
+					} else {
+						require.Equal(t, codes.Unavailable, gstatus.Code(err), "deadline-cut read must be retryable: %v", err)
+					}
+					break
+				}
+				data = append(data, resp.GetData()...)
+			}
+			if finish {
+				require.Equal(t, payload, data)
+			}
+			hc.WaitForGracefulShutdown()
+		})
+	}
+}
