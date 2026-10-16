@@ -742,7 +742,10 @@ func TestRetriedHitsRespectMaxPendingHitsPerKey(t *testing.T) {
 	h.trackDownloads(ctx, 8)
 	require.Eventually(t, pendingHitsExpectation(h.factory, anonKey, 8), 10*time.Second, 10*time.Millisecond)
 	h.service.failNextTracks(status.UnavailableError("injected"))
-	h.tick(t)
+	// Send from the test instead of ticking the sender, so that this flush
+	// is over before the hits below arrive. A flush that is still running
+	// would send them right away.
+	h.factory.sendTrackRequest(ctx)
 	require.True(t, status.IsUnavailableError(h.nextTrackResult(t)))
 
 	h.trackDownloads(ctx, 5)
