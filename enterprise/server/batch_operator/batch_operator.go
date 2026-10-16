@@ -393,10 +393,12 @@ func (u *batchOperator) batch(eqd *enqueuedDigests) {
 	batchesForGroup.authHeaders = eqd.authHeaders
 
 	// First, find the batch that the new digests can be merged into, or create
-	// a new one if one doesn't exist.
+	// a new one if one doesn't exist. Keep holding the group lock while
+	// merging so a concurrent flush can't finalize and remove pendingBatch
+	// while digests are still being added to it.
 	pendingBatch := batchesForGroup.findOrCreatePendingBatch(eqd.instanceName, eqd.digestFunction)
-	batchesForGroup.mu.Unlock()
 	if pendingBatch == nil {
+		batchesForGroup.mu.Unlock()
 		metrics.BatchOperatorEnqueuedDigests.WithLabelValues(
 			u.name,
 			groupID,
@@ -422,19 +424,17 @@ func (u *batchOperator) batch(eqd *enqueuedDigests) {
 			duplicate += count
 			continue
 		}
-		batchesForGroup.mu.Lock()
 		if batchesForGroup.numDigests+1 > u.maxDigestsPerGroup {
-			batchesForGroup.mu.Unlock()
 			dropped = len(eqd.digests) - enqueued - duplicate
 			log.Debugf("[%s] maxDigestsPerGroup exceeded for group %s, dropping %d digests", u.name, groupID, dropped)
 			break
 		}
 		batchesForGroup.numDigests++
-		batchesForGroup.mu.Unlock()
 		pendingBatch.set(key)
 		enqueued++
 		duplicate += count - 1
 	}
+	batchesForGroup.mu.Unlock()
 
 	if enqueued+duplicate+dropped != len(eqd.digests) {
 		log.Debugf("[%s] Metrics don't add up. incoming digests: %d, added: %d, duplicates: %d, dropped: %d", u.name, len(eqd.digests), enqueued, duplicate, dropped)
