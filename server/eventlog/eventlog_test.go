@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/buildbuddy-io/buildbuddy/server/backends/chunkstore"
 	"github.com/buildbuddy-io/buildbuddy/server/backends/memory_kvstore"
@@ -539,13 +540,18 @@ func renderBuildLogEvents(t *testing.T, events []string) string {
 }
 
 func TestBuildLogsEventPartitionInvariant(t *testing.T) {
-	for _, stream := range []string{"plain\n\nend", "\x1b[31mred\x1b[0m\n", "old\rnew\n", "hello\n\x1b[A\x1b[K\n\n\n", strings.Repeat("x", 70000) + "\nend"} {
+	for _, stream := range []string{"plain\n\nend", "hello 世界🙂\n", "\x1b[31mred\x1b[0m\n", "old\rnew\n", "hello\n\x1b[A\x1b[K\n\n\n", strings.Repeat("x", 70000) + "\nend"} {
 		t.Run(fmt.Sprintf("prefix=%q/bytes=%d", stream[:min(12, len(stream))], len(stream)), func(t *testing.T) {
 			want := renderBuildLogEvents(t, []string{stream})
 			// Exhaust every byte boundary for small examples, including boundaries
 			// inside UTF-8 and ANSI sequences. Sample long lines deterministically.
 			step := max(1, len(stream)/20)
 			for split := 0; split <= len(stream); split += step {
+				// Protobuf Progress strings require valid UTF-8. Exercise every
+				// valid event boundary here; the raw writer case has its own reproducer.
+				if !utf8.ValidString(stream[:split]) || !utf8.ValidString(stream[split:]) {
+					continue
+				}
 				got := renderBuildLogEvents(t, []string{stream[:split], "", stream[split:]})
 				assert.Equal(t, ansiDebugString(want), ansiDebugString(got), "split=%d", split)
 			}
