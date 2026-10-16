@@ -35,6 +35,7 @@ go_test(
         "commandutil_internal_unix_test.go",
         "commandutil_internal_windows_test.go",
         "commandutil_test.go",
+        "commandutil_verify_unix_test.go",
         "commandutil_unix_test.go",
         "commandutil_windows_test.go",
     ],
