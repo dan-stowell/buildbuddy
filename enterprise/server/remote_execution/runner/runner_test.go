@@ -1053,6 +1053,68 @@ func TestRunnerPool_PersistentWorker_Crash_ShowsWorkerStderrInOutput(t *testing.
 	assert.Equal(t, 0, pool.PausedRunnerCount())
 }
 
+// When a persistent worker has accepted a work request but has not responded
+// yet (e.g. the worker process is hung), Run should still return promptly once
+// the task context is done (action timeout or cancellation), and the runner
+// should not be recycled with an outstanding request.
+func TestRunnerPool_PersistentWorker_UnresponsiveWorkerRespectsTaskContext(t *testing.T) {
+	const (
+		// How long the fake worker waits before answering the first request.
+		// Bounded so that the worker process always terminates.
+		workerDelay = 6 * time.Second
+		// When the task context is done (deadline or cancellation).
+		taskCtxDone = 1 * time.Second
+		// Run should return reasonably soon after the task context is done.
+		maxRunDuration = 4 * time.Second
+	)
+	for _, tc := range []struct {
+		name     string
+		protocol string
+		cancel   bool
+	}{
+		{name: "proto_deadline", protocol: "proto"},
+		{name: "json_deadline", protocol: "json"},
+		{name: "proto_cancel", protocol: "proto", cancel: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &wkpb.WorkResponse{ExitCode: 0, Output: "late response"}
+			env := newTestEnv(t)
+			pool := newRunnerPool(t, env, noLimitsCfg())
+			ctx := withAuthenticatedUser(t, context.Background(), env, "US1")
+
+			task := newPersistentRunnerTask(t, "abc", "--first_response_delay="+workerDelay.String(), tc.protocol, resp)
+			r, err := pool.Get(ctx, task)
+			require.NoError(t, err)
+
+			var taskCtx context.Context
+			var cancel context.CancelFunc
+			if tc.cancel {
+				taskCtx, cancel = context.WithCancel(ctx)
+				time.AfterFunc(taskCtxDone, cancel)
+			} else {
+				taskCtx, cancel = context.WithTimeout(ctx, taskCtxDone)
+			}
+			defer cancel()
+
+			start := time.Now()
+			res := r.Run(taskCtx, &repb.IOStats{})
+			elapsed := time.Since(start)
+			t.Logf("Run returned after %s: taskCtx.Err()=%v res.Error=%v res.ExitCode=%d res.Stderr=%q",
+				elapsed, taskCtx.Err(), res.Error, res.ExitCode, string(res.Stderr))
+
+			// Mirror the executor, which only reuses the runner if the command
+			// result has no error.
+			pool.TryRecycle(ctx, r, res.Error == nil)
+			paused := pool.PausedRunnerCount()
+			t.Logf("Paused runners after TryRecycle: %d", paused)
+
+			assert.Less(t, elapsed, maxRunDuration, "Run should return soon after the task context is done, not when the worker eventually responds")
+			assert.Error(t, res.Error, "a request whose task context expired before the worker responded should not be reported as a success")
+			assert.Equal(t, 0, paused, "a runner whose worker did not respond before the task context was done should not be recycled")
+		})
+	}
+}
+
 func TestRunnerPool_RecycleAfterCreateFailed_CallsRemove(t *testing.T) {
 	env := newTestEnv(t)
 	cfg := noLimitsCfg()

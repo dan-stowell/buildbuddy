@@ -17,6 +17,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/oom"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/scheduling/scheduler_server"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/tasksize"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/test/integration/remote_execution/rbeclient"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/test/integration/remote_execution/rbetest"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/buildbuddy_enterprise"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testexecutor"
@@ -2802,4 +2803,207 @@ func getExecutionAuxiliaryMetadata(t testing.TB, execRes *repb.ExecuteResponse) 
 	require.NoError(t, err)
 	require.True(t, ok)
 	return auxMeta
+}
+
+// unresponsiveWorkerScript is a JSON-protocol persistent worker. For each
+// request it answers with its PID and request number. If the action's input
+// root contains a file named "hang", it first sleeps for the number of seconds
+// in that file (bounded, so the process always terminates), simulating a
+// worker that accepted a request but is not responding (e.g. a hung compiler).
+const unresponsiveWorkerScript = `
+n=0
+while IFS= read -r line; do
+  n=$((n+1))
+  if [ -e hang ]; then
+    echo "worker $$ hanging on request $n" >&2
+    sleep "$(cat hang)"
+  fi
+  printf '{"exitCode":0,"output":"pid=%s request=%s"}\n' "$$" "$n"
+done
+`
+
+func unresponsiveWorkerCommand() *repb.Command {
+	return &repb.Command{
+		Arguments: []string{"sh", "-c", unresponsiveWorkerScript},
+		Platform: &repb.Platform{
+			Properties: []*repb.Platform_Property{
+				{Name: "container-image", Value: "none"},
+				{Name: "OSFamily", Value: runtime.GOOS},
+				{Name: "Arch", Value: runtime.GOARCH},
+				{Name: "persistentWorkerKey", Value: "unresponsive-worker-test"},
+				{Name: "persistentWorkerProtocol", Value: "json"},
+			},
+		},
+	}
+}
+
+type runRecord struct {
+	start, end time.Time
+	ctxErr     error
+	res        *interfaces.CommandResult
+}
+
+// recordingRunInterceptor runs the real runner and reports when Run returned
+// (as seen by the executor).
+func recordingRunInterceptor(started chan<- time.Time, records chan<- *runRecord) rbetest.RunInterceptor {
+	return func(ctx context.Context, original rbetest.RunFunc) *interfaces.CommandResult {
+		start := time.Now()
+		started <- start
+		res := original(ctx, &repb.IOStats{})
+		records <- &runRecord{start: start, end: time.Now(), ctxErr: ctx.Err(), res: res}
+		return res
+	}
+}
+
+// waitForCommandResult waits for the final result of a command without
+// asserting anything about it, and returns how long the client waited.
+func waitForCommandResult(t *testing.T, cmd *rbetest.Command, start time.Time, timeout time.Duration) (*rbeclient.CommandResult, time.Duration) {
+	deadline := time.After(timeout)
+	for {
+		select {
+		case res, ok := <-cmd.StatusChannel():
+			require.True(t, ok, "status channel closed without a result")
+			if res.Stage != repb.ExecutionStage_COMPLETED {
+				continue
+			}
+			return res, time.Since(start)
+		case <-deadline:
+			require.FailNow(t, "no result within "+timeout.String())
+			return nil, 0
+		}
+	}
+}
+
+func workerStderr(t *testing.T, rbe *rbetest.Env, res *rbeclient.CommandResult) string {
+	if res.ActionResult == nil {
+		return "<no action result>"
+	}
+	_, stderr, err := rbe.GetStdoutAndStderr(rbe.WithAPIKey(context.Background(), rbe.APIKey1), res.ActionResult, res.InstanceName)
+	require.NoError(t, err)
+	return stderr
+}
+
+func hangInputRoot(t *testing.T, seconds int) string {
+	dir := testfs.MakeTempDir(t)
+	testfs.WriteAllFileContents(t, dir, map[string]string{"hang": fmt.Sprintf("%d", seconds)})
+	return dir
+}
+
+func receiveRunRecord(t *testing.T, records <-chan *runRecord, timeout time.Duration) *runRecord {
+	select {
+	case r := <-records:
+		return r
+	case <-time.After(timeout):
+		require.FailNow(t, "executor did not finish running the task within "+timeout.String())
+		return nil
+	}
+}
+
+func TestPersistentWorker_UnresponsiveWorker_ActionTimeout(t *testing.T) {
+	const (
+		actionTimeout = 2 * time.Second
+		workerHang    = 12 // seconds; bounded so the worker always exits
+	)
+	rbe := rbetest.NewRBETestEnv(t)
+	rbe.AddBuildBuddyServer()
+	started := make(chan time.Time, 10)
+	records := make(chan *runRecord, 10)
+	rbe.AddExecutorWithOptions(t, &rbetest.ExecutorOptions{
+		RunInterceptor: recordingRunInterceptor(started, records),
+	})
+
+	// Warm up the persistent worker.
+	start := time.Now()
+	warm, warmDur := waitForCommandResult(t, rbe.Execute(unresponsiveWorkerCommand(), &rbetest.ExecuteOpts{APIKey: rbe.APIKey1}), start, 60*time.Second)
+	t.Logf("warm-up action: err=%v exit=%d client_wait=%s worker_output=%q", warm.Err, warm.ExitCode, warmDur, workerStderr(t, rbe, warm))
+	receiveRunRecord(t, records, 60*time.Second)
+
+	// Run an action with a short timeout that the worker does not answer in
+	// time.
+	start = time.Now()
+	cmd := rbe.Execute(unresponsiveWorkerCommand(), &rbetest.ExecuteOpts{
+		APIKey:        rbe.APIKey1,
+		ActionTimeout: actionTimeout,
+		InputRootDir:  hangInputRoot(t, workerHang),
+	})
+	res, clientWait := waitForCommandResult(t, cmd, start, 90*time.Second)
+	rec := receiveRunRecord(t, records, 90*time.Second)
+	t.Logf("timed-out action: client_wait=%s err=%v exit=%d worker_output=%q", clientWait, res.Err, res.ExitCode, workerStderr(t, rbe, res))
+	t.Logf("executor Run: duration=%s ctx.Err()=%v res.Error=%v res.ExitCode=%d", rec.end.Sub(rec.start), rec.ctxErr, rec.res.Error, rec.res.ExitCode)
+
+	// Run a follow-up action with the same worker key.
+	start = time.Now()
+	next, nextDur := waitForCommandResult(t, rbe.Execute(unresponsiveWorkerCommand(), &rbetest.ExecuteOpts{APIKey: rbe.APIKey1}), start, 60*time.Second)
+	t.Logf("follow-up action: err=%v exit=%d client_wait=%s worker_output=%q", next.Err, next.ExitCode, nextDur, workerStderr(t, rbe, next))
+
+	assert.True(t, status.IsDeadlineExceededError(res.Err), "expected DeadlineExceeded for an action whose worker did not respond within the action timeout, got err=%v exit=%d", res.Err, res.ExitCode)
+	assert.Less(t, clientWait, actionTimeout+6*time.Second, "client should get a result soon after the action timeout")
+	assert.Less(t, rec.end.Sub(rec.start), actionTimeout+6*time.Second, "executor should stop running the task soon after the action timeout")
+}
+
+func TestPersistentWorker_UnresponsiveWorker_InvocationCancellation(t *testing.T) {
+	const workerHang = 12 // seconds; bounded so the worker always exits
+	rbe := rbetest.NewRBETestEnv(t)
+	bbServer := rbe.AddBuildBuddyServer()
+	started := make(chan time.Time, 10)
+	records := make(chan *runRecord, 10)
+	rbe.AddExecutorWithOptions(t, &rbetest.ExecutorOptions{
+		RunInterceptor: recordingRunInterceptor(started, records),
+	})
+
+	// Warm up the persistent worker.
+	start := time.Now()
+	warm, _ := waitForCommandResult(t, rbe.Execute(unresponsiveWorkerCommand(), &rbetest.ExecuteOpts{APIKey: rbe.APIKey1}), start, 60*time.Second)
+	t.Logf("warm-up action: err=%v worker_output=%q", warm.Err, workerStderr(t, rbe, warm))
+	<-started
+	receiveRunRecord(t, records, 60*time.Second)
+
+	iid := uuid.NewString()
+	bep, err := build_event_publisher.New(bbServer.PublishBuildEventClient(), "", iid)
+	require.NoError(t, err)
+	ctx := context.Background()
+	bep.Start(ctx)
+	err = bep.Publish(&bespb.BuildEvent{
+		Payload: &bespb.BuildEvent_Started{Started: &bespb.BuildStarted{StartTime: timestamppb.Now()}},
+	})
+	require.NoError(t, err)
+
+	start = time.Now()
+	cmd := rbe.Execute(unresponsiveWorkerCommand(), &rbetest.ExecuteOpts{
+		APIKey:       rbe.APIKey1,
+		InvocationID: iid,
+		InputRootDir: hangInputRoot(t, workerHang),
+	})
+	select {
+	case <-started:
+	case <-time.After(60 * time.Second):
+		require.FailNow(t, "task did not start")
+	}
+	// Give the worker time to receive the request.
+	time.Sleep(1 * time.Second)
+
+	cancelTime := time.Now()
+	err = bep.Publish(&bespb.BuildEvent{
+		Payload: &bespb.BuildEvent_Finished{Finished: &bespb.BuildFinished{
+			ExitCode:   &bespb.BuildFinished_ExitCode{Name: "INTERRUPTED", Code: build_event_handler.InterruptedExitCode},
+			FinishTime: timestamppb.Now(),
+		}},
+	})
+	require.NoError(t, err)
+
+	res, _ := waitForCommandResult(t, cmd, start, 90*time.Second)
+	clientAfterCancel := time.Since(cancelTime)
+	t.Logf("cancelled action: client got err=%v exit=%d %s after cancellation", res.Err, res.ExitCode, clientAfterCancel)
+	rec := receiveRunRecord(t, records, 90*time.Second)
+	runAfterCancel := rec.end.Sub(cancelTime)
+	t.Logf("executor Run returned %s after cancellation: ctx.Err()=%v res.Error=%v res.ExitCode=%d res.Stderr=%q", runAfterCancel, rec.ctxErr, rec.res.Error, rec.res.ExitCode, string(rec.res.Stderr))
+
+	// Run a follow-up action with the same worker key.
+	time.Sleep(1 * time.Second)
+	start = time.Now()
+	next, nextDur := waitForCommandResult(t, rbe.Execute(unresponsiveWorkerCommand(), &rbetest.ExecuteOpts{APIKey: rbe.APIKey1}), start, 60*time.Second)
+	t.Logf("follow-up action: err=%v client_wait=%s worker_output=%q", next.Err, nextDur, workerStderr(t, rbe, next))
+
+	assert.True(t, status.IsCanceledError(res.Err), "expected Canceled, got %v", res.Err)
+	assert.Less(t, runAfterCancel, 6*time.Second, "executor should stop running a cancelled task promptly")
 }
