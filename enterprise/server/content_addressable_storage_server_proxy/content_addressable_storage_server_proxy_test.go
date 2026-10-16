@@ -1306,3 +1306,28 @@ func TestPresenceLookupTracking_BoundedAndReleased(t *testing.T) {
 	s.endPresenceLookups(snapshot)
 	require.NotContains(t, s.presenceLookups, "overflow")
 }
+
+// A lagging replica (or an upstream presence cache) can answer from a snapshot
+// older than a completed read miss, even when the presence RPC starts later.
+func TestPresenceInvalidation_LaterLookupWithStaleBackendSnapshot(t *testing.T) {
+	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+	ctx := testContext()
+	env := testenv.GetTestEnv(t)
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+	remote := &delayedPresenceClient{beforePresenceResponse: func() {}}
+	env.SetContentAddressableStorageClient(remote)
+	proxy, err := New(env)
+	require.NoError(t, err)
+	d := digestProto(fooDigest, 3)
+	// No FindMissing RPC is active when this authoritative read fails.
+	_, err = proxy.batchReadBlobsRemote(ctx, readBlobsRequest([]*repb.Digest{d}))
+	require.Equal(t, codes.NotFound, status.Code(err))
+	// The first presence response is stale. The backend has converged by the
+	// second request; the proxy should not extend the stale answer for an hour.
+	_, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+	require.NoError(t, err)
+	rsp, err := proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+	require.NoError(t, err)
+	require.Equal(t, []*repb.Digest{d}, rsp.GetMissingBlobDigests(), "post-invalidation stale snapshot was cached for the configured TTL")
+}
