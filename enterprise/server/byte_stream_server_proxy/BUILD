@@ -70,6 +70,7 @@ go_test(
         "//server/testutil/testdigest",
         "//server/testutil/testenv",
         "//server/testutil/testfs",
+        "//server/testutil/testleak",
         "//server/util/authutil",
         "//server/util/bazel_request",
         "//server/util/bytebufferpool",

@@ -32,6 +32,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testdigest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/bazel_request"
 	"github.com/buildbuddy-io/buildbuddy/server/util/bytebufferpool"
@@ -3650,4 +3651,47 @@ func BenchmarkReadChunkedMixedLocalRemote(b *testing.B) {
 			})
 		}
 	}
+}
+
+// The remote owns the handler until the proxy propagates client cancellation.
+type cancelledReadRemote struct {
+	bspb.UnimplementedByteStreamServer
+}
+
+func (*cancelledReadRemote) Read(_ *bspb.ReadRequest, stream bspb.ByteStream_ReadServer) error {
+	if err := stream.Send(&bspb.ReadResponse{Data: []byte("partial")}); err != nil {
+		return err
+	}
+	<-stream.Context().Done()
+	return stream.Context().Err()
+}
+
+// A client that cancels a Read after a partial response must not leave proxy
+// or remote stream goroutines behind while the proxy and remote stay up, and
+// nothing may remain once they shut down.
+func TestCancelledReadLifecycleResources(t *testing.T) {
+	testleak.Check(t)
+	testleak.CheckFDs(t)
+	// Run server handlers on their own goroutines, so stuck handlers are
+	// visible to the checks (see testleak package docs).
+	flags.Set(t, "grpc_server_worker_multiplier", 0)
+	remoteEnv, proxyEnv := testenv.GetTestEnv(t), testenv.GetTestEnv(t)
+	server, run, lis := testenv.RegisterLocalGRPCServer(t, remoteEnv)
+	bspb.RegisterByteStreamServer(server, &cancelledReadRemote{})
+	go run()
+	conn, err := testenv.LocalGRPCConn(t, context.Background(), lis)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	proxy := runBSProxy(context.Background(), bspb.NewByteStreamClient(conn), proxyEnv, t)
+	testleak.CheckGrowth(t, testleak.Growth{Iterations: 10}, func(i int) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		stream, err := proxy.Read(ctx, &bspb.ReadRequest{ResourceName: fmt.Sprintf("request-%d/blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/100", i)})
+		require.NoError(t, err)
+		_, err = stream.Recv()
+		require.NoError(t, err)
+		cancel()
+		_, err = stream.Recv()
+		require.Error(t, err)
+	})
 }
