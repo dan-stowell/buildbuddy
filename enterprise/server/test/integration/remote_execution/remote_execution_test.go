@@ -3030,6 +3030,8 @@ func TestActionMerging_HedgeWinnerRemovesQueuedOriginalReservation(t *testing.T)
 		return err == nil
 	}, 10*time.Second, 10*time.Millisecond, "hedge must finish successfully")
 	require.Eventually(t, func() bool { return busy.QueueLength() == 0 }, 5*time.Second, 10*time.Millisecond, "hedge completion must remove original's queued reservation")
+}
+
 // hedgeWatcher drains a command's status channel in the background and records
 // every update so that tests can inspect what a client observed and when.
 type hedgeWatcher struct {
@@ -3233,4 +3235,3 @@ func TestActionMerging_HedgeResultReachesWaitingClients(t *testing.T) {
 	assert.True(t, got["client2"], "client2 (the request that triggered the hedge) did not receive the hedge's successful result within 10s")
 	assert.Equal(t, hb1, hb2, "canonical execution kept running after the hedge succeeded")
 }
-
