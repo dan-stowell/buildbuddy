@@ -28,7 +28,10 @@ go_library(
 go_test(
     name = "byte_stream_client_test",
     size = "small",
-    srcs = ["byte_stream_client_test.go"],
+    srcs = [
+        "byte_stream_client_test.go",
+        "http_churn_test.go",
+    ],
     data = [
         "no_files.zip",
         "some_files.zip",
@@ -42,9 +45,17 @@ go_test(
     },
     deps = [
         "//proto:zip_go_proto",
+        "//server/buildbuddy_server",
+        "//server/interfaces",
+        "//server/real_environment",
+        "//server/testutil/testleak",
+        "//server/util/grpc_server",
         "//server/util/proto",
+        "//server/util/testing/flags",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
         "@io_bazel_rules_go//go/runfiles",
+        "@org_golang_google_genproto_googleapis_bytestream//:bytestream",
+        "@org_golang_google_grpc//:grpc",
     ],
 )

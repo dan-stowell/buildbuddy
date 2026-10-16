@@ -94,3 +94,29 @@ go_test(
         "//conditions:default": [],
     }),
 )
+
+go_test(
+    name = "lifecycle_test",
+    size = "medium",
+    srcs = ["lifecycle_test.go"],
+    embed = [":dirtools"],
+    deps = [
+        "//enterprise/server/remote_execution/filecache",
+        "//proto:remote_execution_go_proto",
+        "//proto:resource_go_proto",
+        "//server/interfaces",
+        "//server/remote_cache/byte_stream_server",
+        "//server/remote_cache/cachetools",
+        "//server/remote_cache/content_addressable_storage_server",
+        "//server/remote_cache/digest",
+        "//server/testutil/testdigest",
+        "//server/testutil/testenv",
+        "//server/testutil/testfs",
+        "//server/testutil/testleak",
+        "//server/util/prefix",
+        "//server/util/status",
+        "//server/util/testing/flags",
+        "@com_github_stretchr_testify//require",
+        "@org_golang_google_genproto_googleapis_bytestream//:bytestream",
+    ],
+)
