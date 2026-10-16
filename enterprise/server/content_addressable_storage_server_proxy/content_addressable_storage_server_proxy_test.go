@@ -1136,28 +1136,36 @@ func (c *delayedPresenceClient) BatchReadBlobs(ctx context.Context, req *repb.Ba
 }
 
 func TestPresenceInvalidation_DelayedLookupCannotResurrect(t *testing.T) {
-	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
-	ctx := testContext()
-	env := testenv.GetTestEnv(t)
-	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
-	env.SetLocalCASServer(runLocalCASS(ctx, env, t))
-	remote := &delayedPresenceClient{}
-	env.SetContentAddressableStorageClient(remote)
-	proxy, err := New(env)
-	require.NoError(t, err)
-	d := digestProto(fooDigest, 3)
-	remote.beforePresenceResponse = func() {
-		_, err := proxy.batchReadBlobsRemote(ctx, readBlobsRequest([]*repb.Digest{d}))
-		require.Equal(t, codes.NotFound, status.Code(err))
+	for _, chunked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("chunked=%t", chunked), func(t *testing.T) {
+			flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+			ctx := testContext()
+			if chunked {
+				ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(cdc.ChunkedHeaderName, cdc.ChunkedHeaderValue))
+				require.True(t, cdc.IsChunked(ctx))
+			}
+			env := testenv.GetTestEnv(t)
+			env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+			env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+			remote := &delayedPresenceClient{}
+			env.SetContentAddressableStorageClient(remote)
+			proxy, err := New(env)
+			require.NoError(t, err)
+			d := digestProto(fooDigest, 3)
+			remote.beforePresenceResponse = func() {
+				_, err := proxy.batchReadBlobsRemote(ctx, readBlobsRequest([]*repb.Digest{d}))
+				require.Equal(t, codes.NotFound, status.Code(err))
+			}
+			_, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+			require.NoError(t, err)
+			rsp, err := proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+			require.NoError(t, err)
+			require.Equal(t, []*repb.Digest{d}, rsp.GetMissingBlobDigests(), "older presence response resurrected an entry after a backend NotFound")
+		})
 	}
-	_, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
-	require.NoError(t, err)
-	rsp, err := proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
-	require.NoError(t, err)
-	require.Equal(t, []*repb.Digest{d}, rsp.GetMissingBlobDigests(), "older presence response resurrected an entry after a backend NotFound")
 }
 
-func TestPresenceLifetime_DefaultRefreshBoundsConfiguredTTL(t *testing.T) {
+func TestPresenceLifetime_DefaultPreservesConfiguredTTL(t *testing.T) {
 	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
 	ctx := testContext()
 	env := testenv.GetTestEnv(t)
@@ -1175,5 +1183,42 @@ func TestPresenceLifetime_DefaultRefreshBoundsConfiguredTTL(t *testing.T) {
 	clock.Advance(time.Minute)
 	rsp, err := proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
 	require.NoError(t, err)
-	require.Equal(t, []*repb.Digest{d}, rsp.GetMissingBlobDigests(), "default refresh must discover backend loss before the configured hour TTL")
+	require.Empty(t, rsp.GetMissingBlobDigests(), "default must preserve the configured hour TTL")
+	clock.Advance(time.Hour)
+	rsp, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{d}))
+	require.NoError(t, err)
+	require.Equal(t, []*repb.Digest{d}, rsp.GetMissingBlobDigests())
 }
+
+// Unidentified descendants must not cause a scan or clear unrelated entries.
+func (c *delayedPresenceClient) GetTree(ctx context.Context, req *repb.GetTreeRequest, opts ...grpc.CallOption) (repb.ContentAddressableStorage_GetTreeClient, error) {
+	return nil, status.Error(codes.NotFound, "directory missing")
+}
+
+func TestGetTree_NotFoundInvalidatesOnlyRoot(t *testing.T) {
+	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+	ctx := testContext()
+	env := testenv.GetTestEnv(t)
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+	remote := &delayedPresenceClient{beforePresenceResponse: func() {}}
+	env.SetContentAddressableStorageClient(remote)
+	proxy, err := New(env)
+	require.NoError(t, err)
+	root := digestProto(fooDigest, 3)
+	other := digestProto(barDigest, 3)
+	_, err = proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{root, other}))
+	require.NoError(t, err)
+	err = proxy.getTreeWithoutCaching(&repb.GetTreeRequest{RootDigest: root, DigestFunction: repb.DigestFunction_SHA256}, &presenceTreeStream{ctx: ctx})
+	require.Equal(t, codes.NotFound, status.Code(err))
+	rsp, err := proxy.FindMissingBlobs(ctx, findMissingBlobsRequest([]*repb.Digest{root, other}))
+	require.NoError(t, err)
+	require.Equal(t, []*repb.Digest{root}, rsp.GetMissingBlobDigests())
+}
+
+type presenceTreeStream struct {
+	repb.ContentAddressableStorage_GetTreeServer
+	ctx context.Context
+}
+
+func (s *presenceTreeStream) Context() context.Context { return s.ctx }
