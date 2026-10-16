@@ -64,6 +64,7 @@ go_test(
 go_test(
     name = "cancel_merge_repro_test",
     size = "large",
+    timeout = "eternal",
     srcs = ["cancel_merge_repro_test.go"],
     exec_properties = {
         "test.EstimatedComputeUnits": "8",
@@ -75,6 +76,7 @@ go_test(
         "//proto:remote_execution_go_proto",
         "//server/build_event_protocol/build_event_handler",
         "//server/build_event_publisher",
+        "//server/util/status",
         "@com_github_google_uuid//:uuid",
         "@com_github_stretchr_testify//require",
         "@org_golang_google_protobuf//types/known/timestamppb",

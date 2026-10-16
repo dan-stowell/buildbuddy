@@ -2,6 +2,7 @@ package remote_execution_test
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"sort"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/test/integration/remote_execution/rbetest"
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/build_event_handler"
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_publisher"
+	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -181,4 +183,88 @@ func TestCancelMergeRepro_RunningTask(t *testing.T) {
 
 	require.Empty(t, keysAfter, "action-merging keys survived the cancellation")
 	require.Less(t, d2, 2*time.Second, "rerun of a cancelled (running) action was delayed by %s", d2)
+}
+
+// Bug B stress: with only real components, race a user cancel of invocation A
+// (BEP Finished/INTERRUPTED) against an identical Execute from invocation B.
+// B must never receive A's cancellation. Offsets between the two are swept.
+func TestCancelMergeRepro_RaceStress(t *testing.T) {
+	rbe := rbetest.NewRBETestEnv(t)
+	bbServer := rbe.AddBuildBuddyServer()
+	rbe.AddSingleTaskExecutor(t)
+
+	blocker := rbe.ExecuteControlledCommand("blocker", &rbetest.ExecuteControlledOpts{InvocationID: uuid.NewString()})
+	blocker.WaitStarted()
+
+	const trials = 60
+	type outcome struct {
+		opA, opB    string
+		bAcceptWait time.Duration
+		bCancelled  bool
+		aCancelled  bool
+	}
+	results := make([]outcome, trials)
+	var bCmds []*rbetest.Command
+	var aCmds []*rbetest.Command
+	for i := range trials {
+		cmd := &repb.Command{
+			Arguments: []string{"sh", "-c", fmt.Sprintf("echo race-%d", i)},
+			Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+				{Name: "OSFamily", Value: runtime.GOOS},
+				{Name: "Arch", Value: runtime.GOARCH},
+			}},
+		}
+		iidA, interruptA := startInvocation(t, bbServer)
+		iidB, _ := startInvocation(t, bbServer)
+		a := rbe.Execute(cmd, &rbetest.ExecuteOpts{InvocationID: iidA})
+		results[i].opA = a.WaitAccepted()
+		aCmds = append(aCmds, a)
+
+		offset := time.Duration(i%30) * time.Millisecond
+		go interruptA()
+		time.Sleep(offset)
+		start := time.Now()
+		b := rbe.Execute(cmd, &rbetest.ExecuteOpts{InvocationID: iidB})
+		bCmds = append(bCmds, b)
+		results[i].opB = b.WaitAccepted()
+		results[i].bAcceptWait = time.Since(start)
+	}
+	// Give cancellations time to land, then classify without consuming the
+	// final results of uncancelled commands.
+	time.Sleep(3 * time.Second)
+	peekCancelled := func(c *rbetest.Command) bool {
+		for {
+			select {
+			case r, ok := <-c.StatusChannel():
+				if !ok {
+					return false
+				}
+				if r.Stage == repb.ExecutionStage_COMPLETED {
+					return status.IsCanceledError(r.Err)
+				}
+			default:
+				return false
+			}
+		}
+	}
+	nMerged, nBCancelled, nSlow := 0, 0, 0
+	for i := range trials {
+		results[i].aCancelled = peekCancelled(aCmds[i])
+		results[i].bCancelled = peekCancelled(bCmds[i])
+		merged := results[i].opA == results[i].opB
+		if merged {
+			nMerged++
+		}
+		if results[i].bCancelled {
+			nBCancelled++
+		}
+		if results[i].bAcceptWait > 2*time.Second {
+			nSlow++
+		}
+		t.Logf("trial %2d offset=%2dms merged=%v aCancelled=%v bCancelled=%v bAcceptWait=%s",
+			i, i%30, merged, results[i].aCancelled, results[i].bCancelled, results[i].bAcceptWait)
+	}
+	t.Logf("SUMMARY trials=%d merged=%d bCancelled=%d bSlow(>2s)=%d", trials, nMerged, nBCancelled, nSlow)
+	blocker.Exit(0)
+	require.Zero(t, nBCancelled, "invocation B received invocation A's cancellation in %d/%d trials", nBCancelled, trials)
 }
