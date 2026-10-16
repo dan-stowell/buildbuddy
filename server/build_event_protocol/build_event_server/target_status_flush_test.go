@@ -10,11 +10,13 @@ import (
 
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/build_event_handler"
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/build_event_server"
+	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testclickhouse"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/db"
+	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/buildbuddy-io/buildbuddy/server/util/uuid"
 	"github.com/stretchr/testify/require"
@@ -277,6 +279,96 @@ func TestTargetStatusFlushOnStreamEnd(t *testing.T) {
 		for _, ending := range []streamEnding{endWithLastMessage, endWithEOFAfterFinished, endWithCancelAfterFinished} {
 			t.Run(fmt.Sprintf("%s/olap=%t", ending, olap), func(t *testing.T) {
 				runTargetStatusFlush(t, ending, olap)
+			})
+		}
+	}
+}
+
+// Fail only the final blob flush, after all target events were observed.
+type tfFailingBlobstore struct {
+	interfaces.Blobstore
+	fail bool
+}
+
+func (b *tfFailingBlobstore) WriteBlob(ctx context.Context, name string, data []byte) (int, error) {
+	if b.fail {
+		return 0, status.UnavailableError("test blob flush failure")
+	}
+	return b.Blobstore.WriteBlob(ctx, name, data)
+}
+
+func TestTargetStatusFlushRetry(t *testing.T) {
+	for _, olap := range []bool{false, true} {
+		for _, scenario := range []string{"blob_failure", "disconnect", "superseded", "complete_replay"} {
+			t.Run(fmt.Sprintf("%s/olap=%t", scenario, olap), func(t *testing.T) {
+				te := testenv.GetTestEnv(t)
+				flags.Set(t, "app.enable_target_tracking", true)
+				flags.Set(t, "app.enable_write_test_target_statuses_to_olap_db", olap)
+				if olap {
+					testclickhouse.Configure(t, te)
+				}
+				ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
+				te.SetAuthenticator(ta)
+				bs := &tfFailingBlobstore{Blobstore: te.GetBlobstore()}
+				te.SetBlobstore(bs)
+				handler := build_event_handler.NewBuildEventHandler(te)
+				iid := uuid.New()
+				ctx := ta.AuthContextFromAPIKey(context.Background(), "USER1")
+				send := func(finished bool) interfaces.BuildEventChannel {
+					ch, err := handler.OpenChannel(ctx, iid)
+					require.NoError(t, err)
+					t.Cleanup(ch.Close)
+					events := tfEventsThroughFinished()
+					if !finished {
+						events = events[:len(events)-1]
+					}
+					for i, ev := range events {
+						require.NoError(t, ch.HandleEvent(tfRequest(t, iid, int64(i+1), ev)))
+					}
+					return ch
+				}
+				count := func(want int64) {
+					var row struct{ Count int64 }
+					if olap {
+						require.NoError(t, te.GetOLAPDBHandle().NewQuery(ctx, "tf_count").Raw(`SELECT count(*) AS count FROM "TestTargetStatuses" WHERE invocation_uuid = ?`, strings.ReplaceAll(iid, "-", "")).Take(&row))
+					} else {
+						id, err := uuid.StringToBytes(iid)
+						require.NoError(t, err)
+						require.NoError(t, te.GetDBHandle().NewQuery(ctx, "tf_count").Raw(`SELECT count(*) AS count FROM "TargetStatuses" WHERE invocation_uuid = ?`, id).Take(&row))
+					}
+					require.Equal(t, want, row.Count)
+				}
+				first := send(scenario != "disconnect")
+				switch scenario {
+				case "blob_failure":
+					bs.fail = true
+					require.Error(t, first.FinalizeInvocation(iid))
+					bs.fail = false
+				case "disconnect":
+					require.NoError(t, first.FinalizeInvocation(iid))
+				case "complete_replay":
+					require.NoError(t, first.FinalizeInvocation(iid))
+					require.NoError(t, first.FinalizeInvocation(iid))
+					count(2)
+				}
+				if scenario != "complete_replay" {
+					count(0)
+				}
+				second := send(true)
+				if scenario == "superseded" {
+					require.Error(t, first.FinalizeInvocation(iid))
+					count(0)
+				}
+				require.NoError(t, second.FinalizeInvocation(iid))
+				require.NoError(t, second.FinalizeInvocation(iid))
+				count(2)
+				inv, err := te.GetInvocationDB().LookupInvocation(ctx, iid)
+				require.NoError(t, err)
+				wantAttempt := uint64(2)
+				if scenario == "complete_replay" {
+					wantAttempt = 1
+				}
+				require.Equal(t, wantAttempt, inv.Attempt)
 			})
 		}
 	}

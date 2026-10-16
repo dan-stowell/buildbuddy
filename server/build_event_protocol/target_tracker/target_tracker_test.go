@@ -420,6 +420,10 @@ func runTrackTargetsForEventsTransformed(t *testing.T, useClickHouse bool, trans
 		tracker.TrackTargetsForEvent(ctx, e)
 	}
 
+	// Invocation finalization may follow last_message, and may be repeated.
+	tracker.Finalize(ctx)
+	tracker.Finalize(ctx)
+
 	expected := []Row{
 		{
 			Role:       "CI",

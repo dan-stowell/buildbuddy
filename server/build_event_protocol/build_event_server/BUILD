@@ -51,6 +51,8 @@ go_test(
         "//server/testutil/testauth",
         "//server/testutil/testclickhouse",
         "//server/testutil/testenv",
+        "//server/interfaces",
+        "//server/util/status",
         "//server/util/authutil",
         "//server/util/db",
         "//server/util/testing/flags",
