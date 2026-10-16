@@ -50,6 +50,7 @@ go_test(
         "//server/testutil/testcache",
         "//server/testutil/testenv",
         "//server/testutil/testhttp",
+        "//server/testutil/testleak",
         "//server/util/claims",
         "//server/util/status",
         "//server/util/testing/flags",

@@ -25,6 +25,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testcache"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testhttp"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/claims"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
@@ -739,6 +740,31 @@ func TestServerRetryOnHTTPErrors(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, expectedLayerData, stream.collectData())
 	require.GreaterOrEqual(t, blobAttempts.Load(), int32(2), "expected at least 2 blob attempts")
+}
+
+// A request that fails on a cached puller (e.g. because its token expired)
+// evicts the puller and retries with a new one. The evicted puller's idle
+// registry connections must not outlive it.
+func TestEvictedPullerReleasesIdleConnections(t *testing.T) {
+	var failNextHead atomic.Bool
+	reg, _ := setupRegistry(t, nil, func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == http.MethodHead && strings.Contains(r.URL.Path, "/manifests/") && failNextHead.CompareAndSwap(true, false) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return false
+		}
+		return true
+	})
+	imageName, _ := reg.PushNamedImage(t, "test-image", nil)
+	// FetchManifestMetadata doesn't use the cache. Avoid starting a cache
+	// server whose connections are set up in the background.
+	server := newTestServerWithCache(t, failingByteStreamClient{}, notFoundActionCacheClient{})
+
+	testleak.CheckGrowth(t, testleak.Growth{Iterations: 20}, func(i int) {
+		failNextHead.Store(true)
+		_, err := server.FetchManifestMetadata(context.Background(), &ofpb.FetchManifestMetadataRequest{Ref: imageName})
+		require.NoError(t, err)
+		require.False(t, failNextHead.Load(), "the request on the cached puller should have failed, evicting it")
+	})
 }
 
 // TestFetchBlobRetryOnCompressedError verifies that when the initial
