@@ -221,6 +221,7 @@ func TestGeneratedDailyTrends(t *testing.T) {
 	te := testenv.GetTestEnv(t)
 	testclickhouse.Configure(t, te)
 	flags.Set(t, "app.finer_time_buckets", true)
+	flags.Set(t, "app.trends_heatmap_enabled", true)
 	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1"))
 	te.SetAuthenticator(ta)
 	ctx, err := ta.WithAuthenticatedUser(context.Background(), "US1")
@@ -264,11 +265,6 @@ func TestGeneratedDailyTrends(t *testing.T) {
 							want[key] = &statspb.TrendStat{}
 						}
 						w := want[key]
-						e := executionByBucket[key]
-						require.NotNil(t, e)
-						require.Equal(t, g.TotalBuildTimeUsec, e.GetTotalBuildTimeUsec())
-						require.Equal(t, []float64{g.BuildTimeUsecP50, g.BuildTimeUsecP75, g.BuildTimeUsecP90, g.BuildTimeUsecP95, g.BuildTimeUsecP99}, []float64{e.GetQueueDurationUsecP50(), e.GetQueueDurationUsecP75(), e.GetQueueDurationUsecP90(), e.GetQueueDurationUsecP95(), e.GetQueueDurationUsecP99()})
-
 						w.TotalNumBuilds++
 						w.TotalBuildTimeUsec += r.DurationUsec
 						w.ActionCacheHits += r.ActionCacheHits
@@ -282,6 +278,31 @@ func TestGeneratedDailyTrends(t *testing.T) {
 						durations[key] = append(durations[key], r.DurationUsec)
 					}
 					require.Len(t, got, len(want))
+					metric := sfpb.InvocationMetricType_DURATION_USEC_INVOCATION_METRIC
+					heatmap, err := iss.GetStatHeatmap(ctx, &statspb.GetStatHeatmapRequest{RequestContext: rc, Query: q, Metric: &sfpb.Metric{Invocation: &metric}})
+					require.NoError(t, err)
+					seen := map[int64]bool{}
+					for _, col := range heatmap.GetColumn() {
+						local := time.UnixMicro(col.GetTimestampUsec()).In(loc)
+						key := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, loc).UnixMicro()
+						var count, total int64
+						for _, v := range col.GetValue() {
+							count += v
+						}
+						for _, v := range col.GetTotal() {
+							total += v
+						}
+						if w := want[key]; w != nil {
+							require.Equal(t, w.TotalNumBuilds, count)
+							require.Equal(t, w.TotalBuildTimeUsec, total)
+							seen[key] = true
+						} else {
+							require.Zero(t, count)
+							require.Zero(t, total)
+						}
+					}
+					require.Len(t, seen, len(want))
+
 					executionGot, err := iss.getExecutionTrend(ctx, &statspb.GetTrendRequest{RequestContext: rc, Query: q}, iss.getTrendTimeSettings(q, zone))
 					require.NoError(t, err)
 					require.Len(t, executionGot, len(got))
