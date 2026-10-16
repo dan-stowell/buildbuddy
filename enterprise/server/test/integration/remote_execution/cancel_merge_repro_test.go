@@ -189,6 +189,17 @@ func TestCancelMergeRepro_RunningTask(t *testing.T) {
 // (BEP Finished/INTERRUPTED) against an identical Execute from invocation B.
 // B must never receive A's cancellation. Offsets between the two are swept.
 func TestCancelMergeRepro_RaceStress(t *testing.T) {
+	testCancelMergeRace(t, false /*=bFirst*/, 60, time.Millisecond)
+}
+
+// Same, but B's Execute is started first and the interrupt for A follows after
+// a short offset (0-19.5ms in 0.5ms steps), so B's merge can land inside
+// Cancel's CheckMerged..CancelTask window.
+func TestCancelMergeRepro_RaceStressBFirst(t *testing.T) {
+	testCancelMergeRace(t, true /*=bFirst*/, 40, 500*time.Microsecond)
+}
+
+func testCancelMergeRace(t *testing.T, bFirst bool, trials int, step time.Duration) {
 	rbe := rbetest.NewRBETestEnv(t)
 	bbServer := rbe.AddBuildBuddyServer()
 	rbe.AddSingleTaskExecutor(t)
@@ -196,7 +207,6 @@ func TestCancelMergeRepro_RaceStress(t *testing.T) {
 	blocker := rbe.ExecuteControlledCommand("blocker", &rbetest.ExecuteControlledOpts{InvocationID: uuid.NewString()})
 	blocker.WaitStarted()
 
-	const trials = 60
 	type outcome struct {
 		opA, opB    string
 		bAcceptWait time.Duration
@@ -220,11 +230,19 @@ func TestCancelMergeRepro_RaceStress(t *testing.T) {
 		results[i].opA = a.WaitAccepted()
 		aCmds = append(aCmds, a)
 
-		offset := time.Duration(i%30) * time.Millisecond
-		go interruptA()
-		time.Sleep(offset)
+		offset := time.Duration(i%40) * step
+		var b *rbetest.Command
 		start := time.Now()
-		b := rbe.Execute(cmd, &rbetest.ExecuteOpts{InvocationID: iidB})
+		if bFirst {
+			b = rbe.Execute(cmd, &rbetest.ExecuteOpts{InvocationID: iidB})
+			time.Sleep(offset)
+			go interruptA()
+		} else {
+			go interruptA()
+			time.Sleep(offset)
+			start = time.Now()
+			b = rbe.Execute(cmd, &rbetest.ExecuteOpts{InvocationID: iidB})
+		}
 		bCmds = append(bCmds, b)
 		results[i].opB = b.WaitAccepted()
 		results[i].bAcceptWait = time.Since(start)
@@ -261,8 +279,8 @@ func TestCancelMergeRepro_RaceStress(t *testing.T) {
 		if results[i].bAcceptWait > 2*time.Second {
 			nSlow++
 		}
-		t.Logf("trial %2d offset=%2dms merged=%v aCancelled=%v bCancelled=%v bAcceptWait=%s",
-			i, i%30, merged, results[i].aCancelled, results[i].bCancelled, results[i].bAcceptWait)
+		t.Logf("trial %2d bFirst=%v offset=%s merged=%v aCancelled=%v bCancelled=%v bAcceptWait=%s",
+			i, bFirst, time.Duration(i%40)*step, merged, results[i].aCancelled, results[i].bCancelled, results[i].bAcceptWait)
 	}
 	t.Logf("SUMMARY trials=%d merged=%d bCancelled=%d bSlow(>2s)=%d", trials, nMerged, nBCancelled, nSlow)
 	blocker.Exit(0)
