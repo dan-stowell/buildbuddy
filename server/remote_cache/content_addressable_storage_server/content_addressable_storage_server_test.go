@@ -1647,15 +1647,15 @@ func makeRandomDirGraph(t *testing.T, ctx context.Context, bsClient bspb.ByteStr
 	emptyDigest, err := digest.Compute(strings.NewReader(""), repb.DigestFunction_SHA256)
 	require.NoError(t, err)
 	var prevStart int
-	for level := 0; level < levels; level++ {
+	for level := range levels {
 		start := len(g.dirs)
-		for i := 0; i < perLevel; i++ {
+		for i := range perLevel {
 			dir := &repb.Directory{}
 			nFiles := rng.Intn(4)
 			if level == 0 && nFiles == 0 {
 				nFiles = 1
 			}
-			for f := 0; f < nFiles; f++ {
+			for f := range nFiles {
 				content := fmt.Sprintf("l%d-d%d-f%d-%d", level, i, f, rng.Intn(3))
 				d, err := digest.Compute(strings.NewReader(content), repb.DigestFunction_SHA256)
 				require.NoError(t, err)
@@ -1667,7 +1667,7 @@ func makeRandomDirGraph(t *testing.T, ctx context.Context, bsClient bspb.ByteStr
 			if level > 0 {
 				nSub := 1 + rng.Intn(4)
 				used := map[string]bool{}
-				for s := 0; s < nSub; s++ {
+				for s := range nSub {
 					name := names[rng.Intn(len(names))]
 					if used[name] {
 						name = fmt.Sprintf("%s%d", name, s)
@@ -1747,7 +1747,7 @@ func TestGetTreeRandomizedMatchesReachableDirs(t *testing.T) {
 	if s := os.Getenv("GETTREE_SEED"); s != "" {
 		fmt.Sscan(s, &baseSeed)
 	}
-	for iter := 0; iter < 12; iter++ {
+	for iter := range 12 {
 		seed := baseSeed + int64(iter)
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			rng := rand.New(rand.NewSource(seed))
@@ -1771,7 +1771,7 @@ func TestGetTreeRandomizedMatchesReachableDirs(t *testing.T) {
 			// Roots: everything in the top two levels, plus a few random dirs.
 			roots := g.digests[len(g.digests)/2:]
 
-			for round := 0; round < 4; round++ {
+			for round := range 4 {
 				order := rng.Perm(len(roots))
 				for _, idx := range order {
 					root := roots[idx]
