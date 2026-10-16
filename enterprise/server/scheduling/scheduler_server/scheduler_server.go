@@ -1948,7 +1948,7 @@ func (s *SchedulerServer) redisKeyForTaskReservations(taskID string) string {
 func (s *SchedulerServer) recordProbeForProactiveCancellation(ctx context.Context, taskID, executorID string) error {
 	key := s.redisKeyForTaskReservations(taskID)
 	pipe := s.rdb.TxPipeline()
-	pipe.SAdd(ctx, key, executorID)
+	pipe.SAdd(ctx, key, s.ownHostPort+"\n"+executorID)
 	pipe.Expire(ctx, key, taskTTL)
 	_, err := pipe.Exec(ctx)
 	return err
@@ -1975,12 +1975,28 @@ func (s *SchedulerServer) sendCancellationRequests(ctx context.Context, taskID s
 	}
 	s.mu.RUnlock()
 
-	// Send cancellation requests to matching executors.
-	for _, executorID := range executorIDs {
+	// Tracking the owning scheduler lets completion on any app instance
+	// cancel reservations on every executor, including remote connections.
+	for _, member := range executorIDs {
+		host, executorID, routed := strings.Cut(member, "\n")
+		if !routed {
+			executorID = member
+			host = s.ownHostPort
+		}
+		if host != "" && host != s.ownHostPort {
+			client, err := s.schedulerClientCache.get(host)
+			if err != nil {
+				return err
+			}
+			if _, err := client.rpcClient.CancelTaskReservations(ctx, &scpb.CancelTaskReservationsRequest{TaskId: taskID, ExecutorId: executorID}); err != nil {
+				return err
+			}
+			continue
+		}
 		for _, pool := range pools {
 			if node := pool.FindConnectedExecutorByID(executorID); node != nil && node.handle != nil {
 				node.handle.sendProactiveCancellation(ctx, taskID)
-				break // Found the executor, no need to check other pools.
+				break
 			}
 		}
 	}
@@ -3526,4 +3542,25 @@ func errIsolationTypeUnsupported(pool, os, arch, isolationType string) error {
 	return status.UnavailableErrorf(
 		"no registered executors in pool %q with os %q with arch %q support workload isolation type %q",
 		pool, os, arch, isolationType)
+}
+
+// CancelTaskReservations forwards a cancellation only after the task has been
+// removed, so this RPC cannot be used to terminate an existing scheduled task.
+func (s *SchedulerServer) CancelTaskReservations(ctx context.Context, req *scpb.CancelTaskReservationsRequest) (*scpb.CancelTaskReservationsResponse, error) {
+	exists, err := s.ExistsTask(ctx, req.GetTaskId())
+	if err != nil {
+		return nil, err
+	}
+	if exists {
+		return nil, status.FailedPreconditionError("task is still scheduled")
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, pool := range s.pools {
+		if node := pool.FindConnectedExecutorByID(req.GetExecutorId()); node != nil && node.handle != nil {
+			node.handle.sendProactiveCancellation(ctx, req.GetTaskId())
+			break
+		}
+	}
+	return &scpb.CancelTaskReservationsResponse{}, nil
 }

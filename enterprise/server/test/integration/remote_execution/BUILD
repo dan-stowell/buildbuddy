@@ -43,6 +43,7 @@ go_test(
         "//server/testutil/testbazel",
         "//server/testutil/testenv",
         "//server/testutil/testfs",
+ "//server/testutil/testgrpc",
         "//server/testutil/testmetrics",
         "//server/util/bazel",
         "//server/util/grpc_client",

@@ -541,7 +541,18 @@ message RegisterAndStreamWorkResponse {
   CancelTaskReservationRequest cancel_task_reservation_request = 5;
 }
 
+// Forward a cancellation to the scheduler owning an executor connection.
+// Only reservations for tasks already removed from the scheduler may be cancelled.
+message CancelTaskReservationsRequest {
+  string task_id = 1;
+  string executor_id = 2;
+}
+message CancelTaskReservationsResponse {}
+
 service Scheduler {
+  rpc CancelTaskReservations(CancelTaskReservationsRequest)
+      returns (CancelTaskReservationsResponse) {}
+
   rpc RegisterAndStreamWork(stream RegisterAndStreamWorkRequest)
       returns (stream RegisterAndStreamWorkResponse) {}
 
