@@ -107,7 +107,7 @@ func TestCacheStatsAfterBESRetryOnDisconnect(t *testing.T) {
 				require.NoError(t, ch2.FinalizeInvocation(iid))
 				ch2.Close()
 				inv, _ = lookupACHits(t, te, userCtx, iid)
-				require.Equal(t, int64(2), inv.GetAttempt())
+				require.Equal(t, uint64(2), inv.GetAttempt())
 			}
 
 			// Wait for the stats recorder (500ms finalization delay) to
