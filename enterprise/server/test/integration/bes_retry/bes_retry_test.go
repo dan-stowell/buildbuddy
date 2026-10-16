@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -244,9 +245,7 @@ func TestRealBazelBESDisconnectRetry_FastRetry_CacheStats(t *testing.T) {
 	contents := map[string]string{
 		".bazelrc": "startup --host_jvm_args=-DBAZEL_BES_MIN_RETRY_SLEEP_MILLIS=50\n",
 	}
-	for k, v := range workspaceContents {
-		contents[k] = v
-	}
+	maps.Copy(contents, workspaceContents)
 	testScenario(t, testbazel.MakeTempModule(t, contents))
 }
 
