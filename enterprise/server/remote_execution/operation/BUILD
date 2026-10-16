@@ -38,6 +38,7 @@ go_test(
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//credentials/insecure",
+        "@org_golang_google_grpc//stats",
         "@org_golang_google_grpc//status",
     ],
 )
