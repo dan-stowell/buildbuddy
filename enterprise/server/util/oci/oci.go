@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"net/http"
 	"runtime"
 	"slices"
 	"sync"
@@ -197,7 +198,9 @@ func (c Credentials) Equals(o Credentials) bool {
 type Resolver struct {
 	env environment.Env
 
-	allowedPrivateIPs   []*net.IPNet
+	// Reuse connections across registry operations. Creating a transport per
+	// operation leaves its idle connections and goroutines without an owner.
+	transport           http.RoundTripper
 	imageTagToDigestLRU lru.LRU[string]
 }
 
@@ -219,7 +222,7 @@ func NewResolver(env environment.Env) (*Resolver, error) {
 	return &Resolver{
 		env:                 env,
 		imageTagToDigestLRU: imageTagToDigestLRU,
-		allowedPrivateIPs:   allowedPrivateIPNets,
+		transport:           httpclient.New(allowedPrivateIPNets, "oci").Transport,
 	}, nil
 }
 
@@ -552,7 +555,7 @@ func (r *Resolver) getRemoteOpts(ctx context.Context, platform *rgpb.Platform, c
 		}))
 	}
 
-	tr := httpclient.New(r.allowedPrivateIPs, "oci").Transport
+	tr := r.transport
 	mirrors := ocifetcher.Mirrors()
 	if len(mirrors) > 0 {
 		remoteOpts = append(remoteOpts, remote.WithTransport(ocifetcher.NewMirrorTransport(tr, mirrors)))
