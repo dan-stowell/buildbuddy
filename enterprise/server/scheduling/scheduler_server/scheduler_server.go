@@ -279,35 +279,13 @@ var (
 		else 
 			return 0 
 		end`)
-	// The token belongs to one insertTask call and survives go-redis retries.
-	// Existing hashes without a token are conflicts, including legacy tasks.
-	redisInsertTask = redis.NewScript(`
-		if redis.call("exists", KEYS[1]) == 1 then
-			if redis.call("hget", KEYS[1], "insertToken") == ARGV[1] then
-				return 1
-			end
-			return 0
-		end
-		redis.call("hset", KEYS[1], "insertToken", ARGV[1], unpack(ARGV, 3))
-		redis.call("expire", KEYS[1], ARGV[2])
-		return 1
-	`)
-	// An absent task is success so a lost deletion reply still reaches cleanup.
-	// Return 2 for a different lease and 0 for an existing, unclaimed task.
+	// Task deleted if claim field is present.
 	redisDeleteClaimedTask = redis.NewScript(`
-		if redis.call("exists", KEYS[1]) == 0 then
-			return 1
-		end
-		if redis.call("hget", KEYS[1], "claimed") == "1" then
-			local leaseId = redis.call("hget", KEYS[1], "leaseId")
-			-- Legacy hashes may not have a lease ID.
-			if leaseId and leaseId ~= ARGV[1] then
-				return 2
-			end
-			return redis.call("del", KEYS[1])
-		end
-		return 0
-	`)
+		if redis.call("hget", KEYS[1], "claimed") == "1" then 
+			return redis.call("del", KEYS[1]) 
+		else 
+			return 0 
+		end`)
 )
 
 func init() {
@@ -2031,23 +2009,26 @@ func (s *SchedulerServer) insertTask(ctx context.Context, taskID string, metadat
 		return status.InternalErrorf("unable to serialize scheduling metadata: %v", err)
 	}
 
-	token, err := random.RandomString(20)
-	if err != nil {
-		return status.InternalErrorf("could not generate insert token: %s", err)
+	props := map[string]any{
+		redisTaskProtoField:       serializedTask,
+		redisTaskMetadataField:    serializedMetadata,
+		redisTaskQueuedAtUsec:     time.Now().UnixMicro(),
+		redisTaskAttempCountField: 0,
+		redisTaskJWTField:         jwt,
 	}
-	c, err := redisInsertTask.Run(ctx, s.rdb, []string{s.redisKeyForTask(taskID)},
-		token, int64(taskTTL/time.Second),
-		redisTaskProtoField, serializedTask,
-		redisTaskMetadataField, serializedMetadata,
-		redisTaskQueuedAtUsec, time.Now().UnixMicro(),
-		redisTaskAttempCountField, 0,
-		redisTaskJWTField, jwt,
-	).Int64()
+	c, err := s.rdb.HSet(ctx, s.redisKeyForTask(taskID), props).Result()
 	if err != nil {
 		return err
 	}
-	if c != 1 {
+	if c == 0 {
 		return status.AlreadyExistsErrorf("task %s already exists", taskID)
+	}
+	ok, err := s.rdb.Expire(ctx, s.redisKeyForTask(taskID), taskTTL).Result()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return status.DataLossErrorf("task %s disappeared before we could set TTL", taskID)
 	}
 	return nil
 }
@@ -2058,16 +2039,13 @@ func (s *SchedulerServer) deleteTask(ctx context.Context, taskID string) (bool, 
 	return n == 1, err
 }
 
-func (s *SchedulerServer) deleteClaimedTask(ctx context.Context, taskID, leaseID string) error {
-	// The script returns 1 if the task was deleted or was already absent.
-	r, err := redisDeleteClaimedTask.Run(ctx, s.rdb, []string{s.redisKeyForTask(taskID)}, leaseID).Result()
+func (s *SchedulerServer) deleteClaimedTask(ctx context.Context, taskID string) error {
+	// The script will return 1 if the task is claimed & has been deleted.
+	r, err := redisDeleteClaimedTask.Run(ctx, s.rdb, []string{s.redisKeyForTask(taskID)}).Result()
 	if err != nil {
 		return err
 	}
 	if c, ok := r.(int64); !ok || c != 1 {
-		if c == 2 {
-			return status.PermissionDeniedErrorf("task %q already been re-claimed", taskID)
-		}
 		return status.NotFoundErrorf("unable to delete claimed task %s", taskID)
 	}
 
@@ -2532,7 +2510,7 @@ func (s *SchedulerServer) LeaseTask(stream scpb.Scheduler_LeaseTaskServer) error
 			// Finalize deletes the task (and implicitly releases the lease).
 			// It implies that no further work will/can be attempted for this task.
 
-			err := s.deleteClaimedTask(ctx, taskID, leaseID)
+			err := s.deleteClaimedTask(ctx, taskID)
 			if err == nil {
 				claimed = false
 				log.CtxDebugf(ctx, "LeaseTask task %q successfully finalized by %q", taskID, executorID)
