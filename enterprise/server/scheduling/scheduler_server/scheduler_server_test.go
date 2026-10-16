@@ -2799,3 +2799,37 @@ func TestExecutorRegistration_OldStreamCleanupPreservesReplacement(t *testing.T)
 		})
 	}
 }
+
+func TestExecutorRegistration_ExpiredNodesAreNotListed(t *testing.T) {
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+	enterprise_testauth.Configure(t, env)
+	u := enterprise_testauth.CreateRandomUser(t, env, "registration.invalid")
+	ctx, err := env.GetAuthenticator().(*testauth.TestAuthenticator).WithAuthenticatedUser(ctx, u.UserID)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(ctx)
+	t.Cleanup(cancel)
+	s := env.GetSchedulerService().(*SchedulerServer)
+	node := &scpb.ExecutionNode{ExecutorId: "crashed-executor", Host: "crashed", OsFamily: defaultOS, Arch: defaultArch}
+	handle := newExecutorHandle(env, s, false, &fakeExecutorStream{ctx: ctx})
+	key := handle.nodePoolKey(node)
+	require.NoError(t, s.insertOrUpdateNode(ctx, handle, node, key))
+	data, err := s.rdb.HGet(ctx, key.redisPoolKey(), node.GetExecutorId()).Result()
+	require.NoError(t, err)
+	registered := &scpb.RegisteredExecutionNode{}
+	require.NoError(t, proto.Unmarshal([]byte(data), registered))
+	// Model an app crash: no stream cleanup and no further heartbeats.
+	// Backdate by an hour beyond the expiry threshold to avoid timing races.
+	registered.LastPingTime = timestamppb.New(time.Now().Add(-executorMaxRegistrationStaleness - time.Hour))
+	encoded, err := proto.Marshal(registered)
+	require.NoError(t, err)
+	require.NoError(t, s.rdb.HSet(ctx, key.redisPoolKey(), node.GetExecutorId(), encoded).Err())
+
+	rsp, err := s.GetExecutionNodes(ctx, &scpb.GetExecutionNodesRequest{RequestContext: &ctxpb.RequestContext{GroupId: u.Groups[0].Group.GroupID}})
+	require.NoError(t, err)
+	// Routing rejects this exact Redis record. Listing should agree, even
+	// before any scheduling request triggers lazy expiry cleanup.
+	nodes, err := s.getOrCreatePool(key).fetchExecutionNodes(ctx)
+	require.NoError(t, err)
+	require.Empty(t, nodes)
+	require.Empty(t, rsp.GetExecutor(), "GetExecutionNodes lists an expired executor that routing rejects")
+}
