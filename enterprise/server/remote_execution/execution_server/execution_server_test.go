@@ -3098,3 +3098,7 @@ func (h *failOnceExecutionOLAP) FlushExecutionStats(ctx context.Context, inv *si
 	}
 	return h.OLAPDBHandle.FlushExecutionStats(ctx, inv, executions)
 }
+
+func TestExecutionOLAP_CompletedMergedInvocationsInsertFailure(t *testing.T) {
+	testExecutionOLAPCompletedInvocations(t, true)
+}
