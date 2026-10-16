@@ -1,14 +1,17 @@
 package remote_execution_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -2802,4 +2805,178 @@ func getExecutionAuxiliaryMetadata(t testing.TB, execRes *repb.ExecuteResponse) 
 	require.NoError(t, err)
 	require.True(t, ok)
 	return auxMeta
+}
+
+// lossyRedisProxy forwards TCP connections to a Redis server. When armed, the
+// next request matching a predicate is forwarded to Redis (so Redis executes
+// it), but the reply is discarded and the client connection is closed, as if
+// the connection had been reset after the command ran.
+type lossyRedisProxy struct {
+	upstream string
+	lis      net.Listener
+	dropped  atomic.Int32
+
+	mu     sync.Mutex
+	match  func([]byte) bool
+	conns  []net.Conn
+	closed bool
+	wg     sync.WaitGroup
+}
+
+func startLossyRedisProxy(t *testing.T, upstream string) *lossyRedisProxy {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	p := &lossyRedisProxy{upstream: upstream, lis: lis}
+	p.wg.Go(func() {
+		for {
+			c, err := lis.Accept()
+			if err != nil {
+				return
+			}
+			p.handle(c)
+		}
+	})
+	t.Cleanup(func() {
+		lis.Close()
+		p.mu.Lock()
+		p.closed = true
+		for _, c := range p.conns {
+			c.Close()
+		}
+		p.mu.Unlock()
+		p.wg.Wait()
+	})
+	return p
+}
+
+func (p *lossyRedisProxy) dropNextReply(match func([]byte) bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.match = match
+}
+
+func (p *lossyRedisProxy) take(b []byte) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.match != nil && p.match(b) {
+		p.match = nil
+		return true
+	}
+	return false
+}
+
+func (p *lossyRedisProxy) track(c net.Conn) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		c.Close()
+		return false
+	}
+	p.conns = append(p.conns, c)
+	return true
+}
+
+func (p *lossyRedisProxy) handle(client net.Conn) {
+	if !p.track(client) {
+		return
+	}
+	server, err := net.Dial("tcp", p.upstream)
+	if err != nil {
+		client.Close()
+		return
+	}
+	if !p.track(server) {
+		client.Close()
+		return
+	}
+	var dropReplies atomic.Bool
+	p.wg.Go(func() {
+		defer client.Close()
+		defer server.Close()
+		buf := make([]byte, 64<<10)
+		for {
+			n, err := server.Read(buf)
+			if n > 0 {
+				if dropReplies.Load() {
+					p.dropped.Add(1)
+					return
+				}
+				if _, err := client.Write(buf[:n]); err != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	})
+	p.wg.Go(func() {
+		defer client.Close()
+		defer server.Close()
+		buf := make([]byte, 64<<10)
+		for {
+			n, err := client.Read(buf)
+			if n > 0 {
+				if p.take(buf[:n]) {
+					dropReplies.Store(true)
+				}
+				if _, err := server.Write(buf[:n]); err != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	})
+}
+
+// The reply to an executor's task claim is lost (the Redis connection is
+// reset after Redis ran the claim). The client must still get a result.
+func TestLostRedisReplyDuringClaim_CommandStillCompletes(t *testing.T) {
+	redisServer := testredis.StartTCP(t)
+	proxy := startLossyRedisProxy(t, redisServer.Target)
+	rdb := redis.NewClient(&redis.Options{Addr: proxy.lis.Addr().String()})
+	t.Cleanup(func() { rdb.Close() })
+	rbe := rbetest.NewRBETestEnvWithOptions(t, &rbetest.EnvOptions{RedisClient: rdb})
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutors(t, 2)
+
+	// Run one command so that the scheduler's Redis scripts are loaded and
+	// claims are a single EVALSHA.
+	rbe.ExecuteCustomCommand("sh", "-c", "echo warmup").Wait()
+
+	// Lose the reply to the next task claim: the first EVALSHA on a task key.
+	proxy.dropNextReply(func(b []byte) bool {
+		return bytes.Contains(b, []byte("evalsha")) && bytes.Contains(b, []byte("task/"))
+	})
+	cmd := rbe.ExecuteCustomCommand("sh", "-c", "echo hello")
+
+	timeout := time.After(60 * time.Second)
+	lastStage := repb.ExecutionStage_UNKNOWN
+	for {
+		select {
+		case result, ok := <-cmd.StatusChannel():
+			require.True(t, ok, "status channel closed without a result")
+			lastStage = result.Stage
+			if result.Stage != repb.ExecutionStage_COMPLETED {
+				continue
+			}
+			require.NoError(t, result.Err)
+			require.Equal(t, 0, result.ExitCode)
+			return
+		case <-timeout:
+			ctx := context.Background()
+			keys, _ := redisServer.Client().Keys(ctx, "task/*").Result()
+			state := ""
+			for _, k := range keys {
+				f, _ := redisServer.Client().HMGet(ctx, k, "claimed", "leaseId", "attemptCount").Result()
+				ttl, _ := redisServer.Client().PTTL(ctx, k).Result()
+				state += fmt.Sprintf(" %s: claimed=%v leaseId=%v attemptCount=%v ttl=%s;", k, f[0], f[1], f[2], ttl)
+			}
+			require.FailNowf(t, "client still waiting",
+				"command did not complete within 60s (last stage %s, claim replies dropped: %d). Scheduler tasks:%s",
+				lastStage, proxy.dropped.Load(), state)
+		}
+	}
 }
