@@ -24,6 +24,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/bazel_request"
 	"github.com/buildbuddy-io/buildbuddy/server/util/bytebufferpool"
 	"github.com/buildbuddy-io/buildbuddy/server/util/compression"
+	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_server"
 	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
 	"github.com/buildbuddy-io/buildbuddy/server/util/random"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
@@ -1409,6 +1410,105 @@ func TestReadChunked_UsesParallelReads(t *testing.T) {
 			require.Equal(t, tc.want, cache.maxConcurrentReads())
 			close(cache.release)
 			require.NoError(t, <-errCh)
+		})
+	}
+}
+
+// Observe the second Recv: the real handler has consumed the first chunk and
+// is now waiting for more client data. No sleeps or random payloads are needed.
+type shutdownObservedWriteStream struct {
+	bspb.ByteStream_WriteServer
+	receiving chan struct{}
+	calls     int
+}
+
+func (s *shutdownObservedWriteStream) Recv() (*bspb.WriteRequest, error) {
+	s.calls++
+	if s.calls == 2 {
+		close(s.receiving)
+	}
+	return s.ByteStream_WriteServer.Recv()
+}
+
+type shutdownObservedByteStream struct {
+	bspb.ByteStreamServer
+	receiving chan struct{}
+	finished  chan struct{}
+}
+
+func (s *shutdownObservedByteStream) Write(stream bspb.ByteStream_WriteServer) error {
+	defer close(s.finished)
+	return s.ByteStreamServer.Write(&shutdownObservedWriteStream{ByteStream_WriteServer: stream, receiving: s.receiving})
+}
+
+func TestShutdown_ByteStreamWrite(t *testing.T) {
+	for _, finish := range []bool{true, false} {
+		name := "deadline"
+		if finish {
+			name = "complete"
+		}
+		t.Run(name, func(t *testing.T) {
+			te := testenv.GetTestEnv(t)
+			flags.Set(t, "max_shutdown_duration", 2*time.Second)
+			flags.Set(t, "shutdown_lameduck_duration", time.Duration(0))
+			flags.Set(t, "cache.max_direct_write_size_bytes", 0)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			actual, err := NewByteStreamServer(te)
+			require.NoError(t, err)
+			observed := &shutdownObservedByteStream{ByteStreamServer: actual, receiving: make(chan struct{}), finished: make(chan struct{})}
+			srv, run, lis := testenv.RegisterLocalGRPCServer(t, te)
+			bspb.RegisterByteStreamServer(srv, observed)
+			// Use the same callback registered by the app's gRPC server builder.
+			hc := te.GetHealthChecker()
+			hc.RegisterShutdownFunction(grpc_server.GRPCShutdownFunc(srv))
+			go run()
+			conn, err := testenv.LocalGRPCConn(t, ctx, lis)
+			require.NoError(t, err)
+			client := bspb.NewByteStreamClient(conn)
+			payload := []byte("deterministic shutdown upload payload")
+			d, err := digest.Compute(bytes.NewReader(payload), repb.DigestFunction_SHA256)
+			require.NoError(t, err)
+			rn := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256)
+			stream, err := client.Write(ctx)
+			require.NoError(t, err)
+			require.NoError(t, stream.Send(&bspb.WriteRequest{ResourceName: rn.UploadString("c75e42d8-cbf4-4ad0-bcf2-f2d0b5ad4b13"), Data: payload[:8]}))
+			select {
+			case <-observed.receiving:
+			case <-ctx.Done():
+				t.Fatal("handler did not consume first chunk")
+			}
+			hc.Shutdown()
+			if finish {
+				require.NoError(t, stream.Send(&bspb.WriteRequest{WriteOffset: 8, Data: payload[8:], FinishWrite: true}))
+			}
+			if !finish {
+				hc.WaitForGracefulShutdown()
+			}
+			resp, err := stream.CloseAndRecv()
+			if finish {
+				require.NoError(t, err)
+				require.Equal(t, int64(len(payload)), resp.GetCommittedSize())
+			} else {
+				require.Equal(t, codes.Unavailable, gstatus.Code(err), "deadline-cut stream must be retryable: %v", err)
+			}
+			hc.WaitForGracefulShutdown()
+			select {
+			case <-observed.finished:
+			case <-ctx.Done():
+				t.Fatal("write handler did not exit")
+			}
+			cacheCtx, err := prefix.AttachUserPrefixToContext(ctx, te.GetAuthenticator())
+			require.NoError(t, err)
+			if finish {
+				data, err := te.GetCache().Get(cacheCtx, rn.ToProto())
+				require.NoError(t, err)
+				require.Equal(t, payload, data, "successful write must persist the full blob")
+			} else {
+				found, err := te.GetCache().Contains(cacheCtx, rn.ToProto())
+				require.NoError(t, err)
+				require.False(t, found, "cut write must not commit a partial blob")
+			}
 		})
 	}
 }

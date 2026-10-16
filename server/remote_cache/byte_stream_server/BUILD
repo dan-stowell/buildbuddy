@@ -63,6 +63,7 @@ go_test(
         "//server/util/bazel_request",
         "//server/util/bytebufferpool",
         "//server/util/compression",
+        "//server/util/grpc_server",
         "//server/util/prefix",
         "//server/util/random",
         "//server/util/status",
