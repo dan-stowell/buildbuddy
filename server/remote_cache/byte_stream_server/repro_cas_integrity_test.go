@@ -226,7 +226,7 @@ func TestReproCAS_TruncatedStoredZstdRealDecoder(t *testing.T) {
 			total := 0
 			var lastErr error
 			zeroErrReads := 0
-			for i := 0; i < 1000; i++ {
+			for range 1000 {
 				n, err := dr.Read(p)
 				total += n
 				lastErr = err
