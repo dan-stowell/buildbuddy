@@ -2,6 +2,8 @@ package invocation_stat_service
 
 import (
 	"context"
+	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -209,4 +211,90 @@ func TestGetStatHeatmap_LogScale(t *testing.T) {
 	}
 	require.Equal(t, int64(len(durations)), valueCount)
 	require.Equal(t, int64(5555), totalCount)
+}
+
+// TestGeneratedDailyTrends compares the production SQL aggregation with an
+// independent local-calendar oracle. The fixture is deterministic (no RNG).
+func TestGeneratedDailyTrends(t *testing.T) {
+	t.Log("deterministic fixture; seed=none")
+	te := testenv.GetTestEnv(t)
+	testclickhouse.Configure(t, te)
+	flags.Set(t, "app.finer_time_buckets", true)
+	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1"))
+	te.SetAuthenticator(ta)
+	ctx, err := ta.WithAuthenticatedUser(context.Background(), "US1")
+	require.NoError(t, err)
+	iss := NewInvocationStatService(te, te.GetDBHandle(), te.GetOLAPDBHandle())
+	for _, window := range []string{"2024-03-01T03:17:00Z", "2024-10-27T03:17:00Z", "2024-12-23T03:17:00Z"} {
+		start, err := time.Parse(time.RFC3339, window)
+		require.NoError(t, err)
+		end := start.Add(20*24*time.Hour + 37*time.Minute)
+		rows := make([]olaptables.Invocation, 0)
+		// Include both boundaries and rows outside the requested half-open range.
+		for n := -1; n <= 481; n++ {
+			rows = append(rows, olaptables.Invocation{GroupID: "GR1", InvocationUUID: fmt.Sprintf("%032x", n+2), UpdatedAtUsec: start.Add(time.Duration(n) * time.Hour).UnixMicro(), DurationUsec: int64(n+2) * 100, ActionCacheHits: int64(n + 2), ActionCacheMisses: 2, ActionCacheUploads: 3, CasCacheHits: 4, CasCacheMisses: 5, CasCacheUploads: 6, TotalDownloadSizeBytes: int64(n+2) * 17, TotalUploadSizeBytes: int64(n+2) * 19, User: fmt.Sprintf("user%d", (n+2)%2), Host: fmt.Sprintf("host%d", (n+2)%3), Success: true, InvocationStatus: 1})
+		}
+		require.NoError(t, te.GetOLAPDBHandle().GORM(ctx, "generated_rows").Create(rows).Error)
+		for _, zone := range []string{"UTC", "America/New_York", "Australia/Lord_Howe", "Asia/Kathmandu"} {
+			for _, filters := range []struct{ user, host string }{{"", ""}, {"user0", ""}, {"", "host1"}, {"user0", "host1"}, {"absent", ""}} {
+				t.Run(window+"/"+zone+"/"+filters.user+"/"+filters.host, func(t *testing.T) {
+					loc, err := time.LoadLocation(zone)
+					require.NoError(t, err)
+					q := &statspb.TrendQuery{UpdatedAfter: timestamppb.New(start), UpdatedBefore: timestamppb.New(end), User: filters.user, Host: filters.host}
+					rc := testauth.RequestContext("US1", "GR1")
+					rc.Timezone = zone
+					got, err := iss.getInvocationTrend(ctx, &statspb.GetTrendRequest{RequestContext: rc, Query: q}, iss.getTrendTimeSettings(q, zone))
+					require.NoError(t, err)
+					want := map[int64]*statspb.TrendStat{}
+					durations := map[int64][]int64{}
+					for _, r := range rows {
+						if r.UpdatedAtUsec < start.UnixMicro() || r.UpdatedAtUsec >= end.UnixMicro() || (filters.user != "" && r.User != filters.user) || (filters.host != "" && r.Host != filters.host) {
+							continue
+						}
+						local := time.UnixMicro(r.UpdatedAtUsec).In(loc)
+						key := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, loc).UnixMicro()
+						if want[key] == nil {
+							want[key] = &statspb.TrendStat{}
+						}
+						w := want[key]
+						w.TotalNumBuilds++
+						w.TotalBuildTimeUsec += r.DurationUsec
+						w.ActionCacheHits += r.ActionCacheHits
+						w.ActionCacheMisses += r.ActionCacheMisses
+						w.ActionCacheUploads += r.ActionCacheUploads
+						w.CasCacheHits += r.CasCacheHits
+						w.CasCacheMisses += r.CasCacheMisses
+						w.CasCacheUploads += r.CasCacheUploads
+						w.TotalDownloadSizeBytes += r.TotalDownloadSizeBytes
+						w.TotalUploadSizeBytes += r.TotalUploadSizeBytes
+						durations[key] = append(durations[key], r.DurationUsec)
+					}
+					require.Len(t, got, len(want))
+					for _, g := range got {
+						key := g.GetBucketStartTimeMicros()
+						w := want[key]
+						require.NotNil(t, w, "unexpected bucket %v", time.UnixMicro(key))
+						require.Equal(t, []int64{w.TotalNumBuilds, w.TotalBuildTimeUsec, w.ActionCacheHits, w.ActionCacheMisses, w.ActionCacheUploads, w.CasCacheHits, w.CasCacheMisses, w.CasCacheUploads, w.TotalDownloadSizeBytes, w.TotalUploadSizeBytes}, []int64{g.TotalNumBuilds, g.TotalBuildTimeUsec, g.ActionCacheHits, g.ActionCacheMisses, g.ActionCacheUploads, g.CasCacheHits, g.CasCacheMisses, g.CasCacheUploads, g.TotalDownloadSizeBytes, g.TotalUploadSizeBytes})
+						ds := durations[key]
+						slices.Sort(ds)
+						for n, p := range []float64{.5, .75, .9, .95, .99} {
+							// Exclusive quantiles use rank p*(N+1), clamped to endpoints.
+							rank := p*float64(len(ds)+1) - 1
+							var expected float64
+							if rank <= 0 {
+								expected = float64(ds[0])
+							} else if rank >= float64(len(ds)-1) {
+								expected = float64(ds[len(ds)-1])
+							} else {
+								lo := int(rank)
+								expected = float64(ds[lo]) + (rank-float64(lo))*float64(ds[lo+1]-ds[lo])
+							}
+							actual := []float64{g.BuildTimeUsecP50, g.BuildTimeUsecP75, g.BuildTimeUsecP90, g.BuildTimeUsecP95, g.BuildTimeUsecP99}[n]
+							require.InDelta(t, expected, actual, 1e-6, "p=%v", p)
+						}
+					}
+				})
+			}
+		}
+	}
 }
