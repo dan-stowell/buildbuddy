@@ -1072,3 +1072,126 @@ func TestRecordOriginScorecard(t *testing.T) {
 	assert.Equal(t, actionDigest.GetHash(), result.GetActionId())
 	assert.Equal(t, originInvocationID, result.GetOriginInvocationId())
 }
+
+// Inlining output file contents must never push the ActionResult past the
+// size limit that the server budgets for (4MiB, the default max inbound
+// message size for gRPC clients).
+func TestInlineOutputFileExactlyFillingBudget(t *testing.T) {
+	const maxResultSize = 4 * 1024 * 1024
+	ctx := context.Background()
+	te := testenv.GetTestEnv(t)
+
+	clientConn := runACServer(ctx, t, te)
+	acClient := repb.NewActionCacheClient(clientConn)
+	bsClient := bspb.NewByteStreamClient(clientConn)
+
+	// First store a result with a placeholder file whose size has the same
+	// varint encoding length as the final file, to learn the size of the
+	// (un-inlined) ActionResult as the server sees it.
+	placeholder, err := cachetools.UploadBlobToCAS(ctx, bsClient, "", repb.DigestFunction_SHA256, bytes.Repeat([]byte("b"), 3*1024*1024))
+	require.NoError(t, err)
+	update(t, ctx, acClient, []*repb.OutputFile{{Path: "my/pkg/file", Digest: placeholder}})
+	baseResult := getWithInlining(t, ctx, acClient, nil, nil)
+	baseSize := proto.Size(baseResult)
+
+	// Pick a file size that exactly consumes the server's computed budget:
+	// 1 tag byte + 4 length-varint bytes + contents.
+	n := maxResultSize - baseSize - 1 - 4
+	require.Greater(t, n, 1<<21)
+	fileDigest, err := cachetools.UploadBlobToCAS(ctx, bsClient, "", repb.DigestFunction_SHA256, bytes.Repeat([]byte("a"), n))
+	require.NoError(t, err)
+	update(t, ctx, acClient, []*repb.OutputFile{{Path: "my/pkg/file", Digest: fileDigest}})
+
+	// Sanity check: the un-inlined result has the same size as before.
+	require.Equal(t, baseSize, proto.Size(getWithInlining(t, ctx, acClient, nil, nil)))
+
+	rsp := getWithInlining(t, ctx, acClient, []string{"my/pkg/file"}, nil)
+	t.Logf("un-inlined size=%d, file size=%d, inlined result size=%d, limit=%d", baseSize, n, proto.Size(rsp), maxResultSize)
+	if len(rsp.GetOutputFiles()[0].GetContents()) > 0 {
+		assert.LessOrEqual(t, proto.Size(rsp), maxResultSize, "inlined ActionResult exceeds the size budget")
+	}
+
+	// A client using the default 4MiB receive limit must be able to read it.
+	req := &repb.GetActionResultRequest{
+		ActionDigest:      &repb.Digest{Hash: strings.Repeat("a", 64), SizeBytes: 1024},
+		DigestFunction:    repb.DigestFunction_SHA256,
+		InlineOutputFiles: []string{"my/pkg/file"},
+	}
+	_, err = acClient.GetActionResult(ctx, req, grpc.MaxCallRecvMsgSize(maxResultSize))
+	assert.NoError(t, err)
+}
+
+// GetActionResult should only return results whose CAS-referenced blobs
+// (including stdout/stderr) are present.
+func TestGetActionResultWithMissingStdoutOrStderr(t *testing.T) {
+	for _, tc := range []string{"stdout", "stderr"} {
+		t.Run(tc, func(t *testing.T) {
+			ctx := context.Background()
+			te := testenv.GetTestEnv(t)
+			clientConn := runACServer(ctx, t, te)
+			acClient := repb.NewActionCacheClient(clientConn)
+			bsClient := bspb.NewByteStreamClient(clientConn)
+
+			present, err := cachetools.UploadBlobToCAS(ctx, bsClient, "", repb.DigestFunction_SHA256, []byte("present output"))
+			require.NoError(t, err)
+			missingRN, _ := testdigest.RandomCASResourceBuf(t, 100)
+			ar := &repb.ActionResult{
+				OutputFiles: []*repb.OutputFile{{Path: "out", Digest: present}},
+			}
+			if tc == "stdout" {
+				ar.StdoutDigest = missingRN.GetDigest()
+			} else {
+				ar.StderrDigest = missingRN.GetDigest()
+			}
+			actionDigest := &repb.Digest{Hash: strings.Repeat("c", 64), SizeBytes: 10}
+			_, err = acClient.UpdateActionResult(ctx, &repb.UpdateActionResultRequest{
+				ActionDigest:   actionDigest,
+				DigestFunction: repb.DigestFunction_SHA256,
+				ActionResult:   ar,
+			})
+			require.NoError(t, err)
+			_, err = acClient.GetActionResult(ctx, &repb.GetActionResultRequest{
+				ActionDigest:   actionDigest,
+				DigestFunction: repb.DigestFunction_SHA256,
+			})
+			assert.True(t, status.IsNotFoundError(err), "expected NotFound when %s blob is missing from CAS, got err=%v", tc, err)
+		})
+	}
+}
+
+// Control: a missing file reachable only through an output directory Tree is
+// detected.
+func TestGetActionResultWithMissingFileInOutputTree(t *testing.T) {
+	ctx := context.Background()
+	te := testenv.GetTestEnv(t)
+	clientConn := runACServer(ctx, t, te)
+	acClient := repb.NewActionCacheClient(clientConn)
+	bsClient := bspb.NewByteStreamClient(clientConn)
+
+	missingRN, _ := testdigest.RandomCASResourceBuf(t, 100)
+	presentDigest, err := cachetools.UploadBlobToCAS(ctx, bsClient, "", repb.DigestFunction_SHA256, []byte("present"))
+	require.NoError(t, err)
+	tree := &repb.Tree{
+		Root: &repb.Directory{
+			Files:       []*repb.FileNode{{Name: "a", Digest: presentDigest}},
+			Directories: []*repb.DirectoryNode{{Name: "sub", Digest: &repb.Digest{Hash: strings.Repeat("d", 64), SizeBytes: 5}}},
+		},
+		Children: []*repb.Directory{{Files: []*repb.FileNode{{Name: "b", Digest: missingRN.GetDigest()}}}},
+	}
+	treeDigest, err := cachetools.UploadProto(ctx, bsClient, "", repb.DigestFunction_SHA256, tree)
+	require.NoError(t, err)
+	actionDigest := &repb.Digest{Hash: strings.Repeat("e", 64), SizeBytes: 10}
+	_, err = acClient.UpdateActionResult(ctx, &repb.UpdateActionResultRequest{
+		ActionDigest:   actionDigest,
+		DigestFunction: repb.DigestFunction_SHA256,
+		ActionResult: &repb.ActionResult{
+			OutputDirectories: []*repb.OutputDirectory{{Path: "dir", TreeDigest: treeDigest}},
+		},
+	})
+	require.NoError(t, err)
+	_, err = acClient.GetActionResult(ctx, &repb.GetActionResultRequest{
+		ActionDigest:   actionDigest,
+		DigestFunction: repb.DigestFunction_SHA256,
+	})
+	assert.True(t, status.IsNotFoundError(err), "got err=%v", err)
+}

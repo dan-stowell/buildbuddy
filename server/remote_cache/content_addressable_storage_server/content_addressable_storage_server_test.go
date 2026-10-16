@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"strings"
 	"testing"
@@ -1631,4 +1632,197 @@ func TestStreamingChunkMappingRPCsUnimplemented(t *testing.T) {
 	require.NoError(t, err)
 	_, err = registerStream.CloseAndRecv()
 	require.Equal(t, gcodes.Unimplemented, gstatus.Code(err))
+}
+
+type randomDirGraph struct {
+	dirs    []*repb.Directory
+	digests []*repb.Digest
+}
+
+// Builds a random DAG of directories bottom-up (subdirectories may be shared
+// between parents) and uploads them all. Returns the graph.
+func makeRandomDirGraph(t *testing.T, ctx context.Context, bsClient bspb.ByteStreamClient, rng *rand.Rand, levels, perLevel int) *randomDirGraph {
+	g := &randomDirGraph{}
+	names := []string{"node_modules", "node_modules", "a", "b", "c", "lib", "src"}
+	emptyDigest, err := digest.Compute(strings.NewReader(""), repb.DigestFunction_SHA256)
+	require.NoError(t, err)
+	var prevStart int
+	for level := 0; level < levels; level++ {
+		start := len(g.dirs)
+		for i := 0; i < perLevel; i++ {
+			dir := &repb.Directory{}
+			nFiles := rng.Intn(4)
+			if level == 0 && nFiles == 0 {
+				nFiles = 1
+			}
+			for f := 0; f < nFiles; f++ {
+				content := fmt.Sprintf("l%d-d%d-f%d-%d", level, i, f, rng.Intn(3))
+				d, err := digest.Compute(strings.NewReader(content), repb.DigestFunction_SHA256)
+				require.NoError(t, err)
+				dir.Files = append(dir.Files, &repb.FileNode{Name: fmt.Sprintf("f%d", f), Digest: d})
+			}
+			if rng.Intn(5) == 0 {
+				dir.Symlinks = append(dir.Symlinks, &repb.SymlinkNode{Name: "link", Target: "f0"})
+			}
+			if level > 0 {
+				nSub := 1 + rng.Intn(4)
+				used := map[string]bool{}
+				for s := 0; s < nSub; s++ {
+					name := names[rng.Intn(len(names))]
+					if used[name] {
+						name = fmt.Sprintf("%s%d", name, s)
+					}
+					used[name] = true
+					var child *repb.Digest
+					if rng.Intn(10) == 0 {
+						child = emptyDigest
+					} else {
+						// Mostly pick from the previous level, sometimes from any lower level.
+						lo := prevStart
+						if rng.Intn(3) == 0 {
+							lo = 0
+						}
+						child = g.digests[lo+rng.Intn(start-lo)]
+					}
+					dir.Directories = append(dir.Directories, &repb.DirectoryNode{Name: name, Digest: child})
+				}
+			}
+			if len(dir.Files) == 0 && len(dir.Directories) == 0 && len(dir.Symlinks) == 0 {
+				dir.Files = append(dir.Files, &repb.FileNode{Name: "x", Digest: emptyDigest})
+			}
+			d, err := cachetools.UploadProto(ctx, bsClient, "", repb.DigestFunction_SHA256, dir)
+			require.NoError(t, err)
+			g.dirs = append(g.dirs, dir)
+			g.digests = append(g.digests, d)
+		}
+		prevStart = start
+	}
+	return g
+}
+
+// Returns the set of non-empty directory hashes reachable from root.
+func reachableDirs(g *randomDirGraph, root *repb.Digest) map[string]bool {
+	byHash := map[string]*repb.Directory{}
+	for i, d := range g.digests {
+		byHash[d.GetHash()] = g.dirs[i]
+	}
+	out := map[string]bool{}
+	var walk func(h string)
+	walk = func(h string) {
+		if out[h] {
+			return
+		}
+		out[h] = true
+		for _, sub := range byHash[h].GetDirectories() {
+			if sub.GetDigest().GetSizeBytes() == 0 {
+				continue
+			}
+			walk(sub.GetDigest().GetHash())
+		}
+	}
+	walk(root.GetHash())
+	return out
+}
+
+func resolveTreeCacheBlob(t *testing.T, ctx context.Context, bsClient bspb.ByteStreamClient, rn *digest.CASResourceName) []*repb.Directory {
+	tc := &capb.TreeCache{}
+	require.NoError(t, cachetools.GetBlobAsProto(ctx, bsClient, rn, tc))
+	var out []*repb.Directory
+	for _, c := range tc.GetChildren() {
+		out = append(out, c.GetDirectory())
+	}
+	for _, child := range tc.GetTreeCacheChildren() {
+		crn, err := digest.CASResourceNameFromProto(child)
+		require.NoError(t, err)
+		out = append(out, resolveTreeCacheBlob(t, ctx, bsClient, crn)...)
+	}
+	return out
+}
+
+// Differential test: GetTree results (with tree caching, splitting and
+// subtrees in play) must contain exactly the directories reachable from the
+// requested root.
+func TestGetTreeRandomizedMatchesReachableDirs(t *testing.T) {
+	baseSeed := time.Now().UnixNano()
+	if s := os.Getenv("GETTREE_SEED"); s != "" {
+		fmt.Sscan(s, &baseSeed)
+	}
+	for iter := 0; iter < 12; iter++ {
+		seed := baseSeed + int64(iter)
+		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
+			rng := rand.New(rand.NewSource(seed))
+			flags.Set(t, "cache.tree_cache_write_probability", 1.0)
+			flags.Set(t, "cache.tree_cache_splitting", true)
+			flags.Set(t, "cache.tree_cache_splitting_min_size", 1+rng.Intn(6))
+			flags.Set(t, "cache.get_tree_subtree_support", true)
+			flags.Set(t, "cache.get_tree_subtree_min_dir_count", 1+rng.Intn(4))
+			flags.Set(t, "cache.tree_cache_min_descendents", 1+rng.Intn(3))
+			flags.Set(t, "cache.tree_cache_min_level", rng.Intn(2)+1)
+
+			ctx := context.Background()
+			te := testenv.GetTestEnv(t)
+			ctx, err := prefix.AttachUserPrefixToContext(ctx, te.GetAuthenticator())
+			require.NoError(t, err)
+			clientConn := runCASServer(ctx, t, te)
+			bsClient := bspb.NewByteStreamClient(clientConn)
+			casClient := repb.NewContentAddressableStorageClient(clientConn)
+
+			g := makeRandomDirGraph(t, ctx, bsClient, rng, 3+rng.Intn(4), 3+rng.Intn(5))
+			// Roots: everything in the top two levels, plus a few random dirs.
+			roots := g.digests[len(g.digests)/2:]
+
+			for round := 0; round < 4; round++ {
+				order := rng.Perm(len(roots))
+				for _, idx := range order {
+					root := roots[idx]
+					sendSubtrees := rng.Intn(2) == 0
+					stream, err := casClient.GetTree(ctx, &repb.GetTreeRequest{
+						RootDigest:               root,
+						DigestFunction:           repb.DigestFunction_SHA256,
+						SendCachedSubtreeDigests: sendSubtrees,
+					})
+					require.NoError(t, err)
+					var dirs []*repb.Directory
+					for {
+						rsp, err := stream.Recv()
+						if err == io.EOF {
+							break
+						}
+						require.NoError(t, err, "round %d root %s", round, root.GetHash())
+						dirs = append(dirs, rsp.GetDirectories()...)
+						for _, st := range rsp.GetSubtrees() {
+							if !sendSubtrees {
+								t.Fatalf("received subtrees without requesting them")
+							}
+							rn := digest.NewCASResourceName(st.GetDigest(), st.GetInstanceName(), st.GetDigestFunction())
+							rn.SetCompressor(st.GetCompressor())
+							dirs = append(dirs, resolveTreeCacheBlob(t, ctx, bsClient, rn)...)
+						}
+					}
+					got := map[string]bool{}
+					for _, d := range dirs {
+						dd, err := digest.ComputeForMessage(d, repb.DigestFunction_SHA256)
+						require.NoError(t, err)
+						got[dd.GetHash()] = true
+					}
+					want := reachableDirs(g, root)
+					var missing, extra []string
+					for h := range want {
+						if !got[h] {
+							missing = append(missing, h)
+						}
+					}
+					for h := range got {
+						if !want[h] {
+							extra = append(extra, h)
+						}
+					}
+					require.Empty(t, missing, "round %d root %s subtrees=%v: missing dirs", round, root.GetHash(), sendSubtrees)
+					require.Empty(t, extra, "round %d root %s subtrees=%v: unexpected dirs", round, root.GetHash(), sendSubtrees)
+				}
+				// Let async tree cache writes land.
+				time.Sleep(100 * time.Millisecond)
+			}
+		})
+	}
 }
