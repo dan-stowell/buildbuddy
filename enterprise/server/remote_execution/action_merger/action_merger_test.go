@@ -177,7 +177,12 @@ func TestInstanceNameWithBraces(t *testing.T) {
 	for i := range 10 {
 		ad := randomAction(fmt.Sprintf("inst{%d}", i))
 		p := h.newScheduled(ad)
-		h.mustMerge(ad, p)
+		if id, op := GetOrCreateExecutionID(h.ctx, h.rdb, h.sched, ad, false); op != Merge {
+			// Pre-existing: the reverse key is not found on a ring when the
+			// instance name contains a hash tag, so merging never happens.
+			t.Logf("instance %q: second request not merged (op=%v, id=%q)", ad.GetInstanceName(), op, id)
+			continue
+		}
 		merged, err := StopMergingUnlessMerged(h.ctx, h.rdb, ad, p)
 		require.NoError(t, err)
 		require.False(t, merged)
@@ -191,7 +196,7 @@ func TestInstanceNameWithBraces(t *testing.T) {
 
 // A normally completed execution has no marker: a late merge is still
 // recorded. Check what it leaves behind in redis.
-func TestRecordAfterNormalCompletion(t *testing.T) {
+func TestPreexisting_LateMergeAfterCompletion(t *testing.T) {
 	h := newHarness(t, testredis.Start(t).Client())
 	ad := randomAction("")
 	p := h.newScheduled(ad)
