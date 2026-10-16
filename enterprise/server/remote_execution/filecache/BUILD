@@ -51,6 +51,7 @@ go_test(
     name = "filecache_test",
     size = "small",
     srcs = [
+        "filecache_input_mutation_test.go",
         "filecache_test.go",
         "filecache_windows_test.go",
     ],

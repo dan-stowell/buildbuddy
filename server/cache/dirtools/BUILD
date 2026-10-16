@@ -52,6 +52,7 @@ go_test(
     name = "dirtools_test",
     size = "small",
     srcs = [
+        "dirtools_input_mutation_test.go",
         "dirtools_linux_test.go",
         "dirtools_test.go",
     ],
