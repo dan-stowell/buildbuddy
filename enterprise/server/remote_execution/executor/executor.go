@@ -488,12 +488,6 @@ func (s *Executor) ExecuteTaskAndStreamResults(ctx context.Context, st *repb.Sch
 	if cmdResult.ExitCode < 0 {
 		cmdResult.Error = incompleteExecutionError(ctx, cmdResult.ExitCode, cmdResult.Error)
 	}
-	// A runner may return a normal exit code after its context deadline.
-	// Do not publish that late result as success or recycle the runner.
-	if ctx.Err() == context.DeadlineExceeded && !oom.IsError(cmdResult.Error) {
-		cmdResult.ExitCode = commandutil.NoExitCode
-		cmdResult.Error = status.DeadlineExceededError("deadline exceeded")
-	}
 	// If the command was terminated gracefully, make sure we return a
 	// DeadlineExceeded error.
 	select {
