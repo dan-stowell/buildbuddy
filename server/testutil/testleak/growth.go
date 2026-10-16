@@ -53,6 +53,10 @@ type Growth struct {
 // accumulate in long-lived objects that are only closed at the end of the
 // test, e.g. a connection pool that never evicts dead connections.
 //
+// Retiring baseline resources offsets newly created resources of the same kind.
+// This accepts bounded replacement, but can mask a leak if unrelated baseline
+// resources happen to exit during the measurement. Use a stable live owner.
+//
 // The failure message reports the growth per iteration (measured right after
 // each op, without settling) and the remaining goroutines and FDs. Linear
 // growth over the iterations points to a leak per operation; a step at the
