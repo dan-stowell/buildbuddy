@@ -67,6 +67,7 @@ go_test(
         "//server/util/authutil",
         "//server/util/claims",
         "//server/util/disk",
+        "//server/util/fastcopy",
         "//server/util/hash",
         "//server/util/log",
         "//server/util/status",

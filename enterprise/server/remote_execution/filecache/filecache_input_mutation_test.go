@@ -11,6 +11,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
 	"github.com/buildbuddy-io/buildbuddy/server/util/claims"
+	"github.com/buildbuddy-io/buildbuddy/server/util/fastcopy"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/stretchr/testify/require"
 
@@ -128,6 +129,14 @@ func TestFileCacheInputMutation_VisibleToLaterAction(t *testing.T) {
 					for k, v := range cfg.flags {
 						flags.Set(t, k, v)
 					}
+					if cfg.flags["executor.enable_fastcopy_reflinking"] == true {
+						probeDir := testfs.MakeTempDir(t)
+						src := filepath.Join(probeDir, "src")
+						require.NoError(t, os.WriteFile(src, []byte("x"), 0o644))
+						if err := fastcopy.Clone(src, filepath.Join(probeDir, "dst")); err != nil {
+							t.Skipf("reflink not supported by this filesystem: %s", err)
+						}
+					}
 					ctx := context.Background()
 					if group != "ANON" {
 						ctx = claims.AuthContextWithJWT(ctx, &claims.Claims{GroupID: group}, nil)
@@ -135,9 +144,6 @@ func TestFileCacheInputMutation_VisibleToLaterAction(t *testing.T) {
 					fc := newMutationFileCache(t)
 					node, ws2Path := linkAndMutate(t, ctx, fc, tc)
 					linked := fc.FastLinkFile(ctx, node, ws2Path)
-					if !linked && cfg.flags["executor.enable_fastcopy_reflinking"] == true {
-						t.Skip("reflink not supported by this filesystem")
-					}
 					require.True(t, linked, "expected filecache hit")
 					requireDigestMatches(t, ws2Path, node)
 				})
