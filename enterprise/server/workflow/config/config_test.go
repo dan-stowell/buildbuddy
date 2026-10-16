@@ -474,3 +474,79 @@ func TestGetMergeWithBaseInterval(t *testing.T) {
 		})
 	}
 }
+
+// TestBughuntTriggerMatrix checks action sets, including the documented push-based
+// merge queue integration. The branch argument for PR events is the base branch.
+func TestBughuntTriggerMatrix(t *testing.T) {
+	cfg, err := config.NewConfig(strings.NewReader(`
+actions:
+  - name: push
+    triggers: {push: {branches: ['*', '!release/*', 'release/stable']}}
+  - name: pr
+    triggers: {pull_request: {branches: [main], skip_drafts: true}}
+  - name: queue
+    triggers: {push: {branches: ['gh-readonly-queue/main/*']}}
+  - name: release
+    triggers: {push: {tags: ['v*']}}
+  - name: manual
+`))
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name, event, branch, tag, action string
+		draft                            bool
+		want                             []string
+	}{
+		{name: "unicode push", event: "push", branch: "feature/日本語", want: []string{"push"}},
+		{name: "excluded push", event: "push", branch: "release/next"},
+		{name: "reincluded push", event: "push", branch: "release/stable", want: []string{"push"}},
+		{name: "queue push", event: "push", branch: "gh-readonly-queue/main/pr-42", want: []string{"push", "queue"}},
+		{name: "tag", event: "push", tag: "v1.2", want: []string{"release"}},
+		{name: "PR base", event: "pull_request", branch: "main", action: "synchronize", want: []string{"pr"}},
+		{name: "PR wrong base", event: "pull_request", branch: "feature/main", action: "opened"},
+		{name: "draft", event: "pull_request", branch: "main", action: "opened", draft: true},
+		{name: "ready", event: "pull_request", branch: "main", action: "ready_for_review", want: []string{"pr"}},
+		{name: "labels only", event: "pull_request", branch: "main", action: "labeled"},
+		{name: "unrelated", event: "issues", branch: "main"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []string
+			for _, a := range cfg.Actions {
+				if config.MatchesAnyTrigger(a, tc.event, tc.branch, tc.tag, tc.action, tc.draft) {
+					got = append(got, a.Name)
+				}
+			}
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestBughuntConfigValues(t *testing.T) {
+	cfg, err := config.NewConfig(strings.NewReader(`
+actions:
+ - name: defaults
+ - name: explicit
+   git_fetch_depth: 17
+   git_fetch_filters: []
+   timeout: 30m
+   platform_properties: {OSFamily: Linux, custom: value}
+   triggers: {pull_request: {merge_with_base: false}}
+`))
+	require.NoError(t, err)
+	require.Len(t, cfg.Actions, 2)
+	a, b := cfg.Actions[0], cfg.Actions[1]
+	assert.Nil(t, a.GitFetchDepth)
+	assert.Nil(t, a.Timeout)
+	assert.Equal(t, []string{"blob:none"}, a.GetGitFetchFilters())
+	assert.True(t, a.GetTriggers().GetPullRequestTrigger().GetMergeWithBase())
+	require.NotNil(t, b.GitFetchDepth)
+	assert.Equal(t, 17, *b.GitFetchDepth)
+	require.NotNil(t, b.Timeout)
+	assert.Equal(t, 30*time.Minute, *b.Timeout)
+	assert.Empty(t, b.GetGitFetchFilters())
+	assert.Equal(t, map[string]string{"OSFamily": "Linux", "custom": "value"}, b.PlatformProperties)
+	assert.False(t, b.GetTriggers().GetPullRequestTrigger().GetMergeWithBase())
+	for _, input := range []string{"actions: [", "actions: [{timeout: someday}]", "actions: [{git_fetch_depth: nope}]"} {
+		_, err := config.NewConfig(strings.NewReader(input))
+		assert.Error(t, err, "input: %s", input)
+	}
+}

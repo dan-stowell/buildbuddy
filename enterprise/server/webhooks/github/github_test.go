@@ -320,3 +320,25 @@ func TestParseWebhookData_CommentEvent(t *testing.T) {
 		})
 	}
 }
+
+func TestBughuntSyntheticEvents(t *testing.T) {
+	provider := github.NewProvider(nil)
+	for _, tc := range []struct {
+		name, event, payload string
+		want                 *interfaces.WebhookData
+	}{
+		{"forced unicode branch", "push", `{"ref":"refs/heads/feature/日本語","forced":true,"after":"abc123","head_commit":{"id":"abc123"},"repository":{"clone_url":"https://github.com/org/repo.git","default_branch":"main"}}`, &interfaces.WebhookData{EventName: "push", PushedRepoURL: "https://github.com/org/repo.git", TargetRepoURL: "https://github.com/org/repo.git", PushedBranch: "feature/日本語", TargetBranch: "feature/日本語", TargetRepoDefaultBranch: "main", SHA: "abc123", IsTargetRepoPublic: true}},
+		{"deleted branch", "push", `{"ref":"refs/heads/main","deleted":true}`, nil},
+		{"deleted tag", "push", `{"ref":"refs/tags/v1","deleted":true}`, nil},
+		{"labels only", "pull_request", `{"action":"labeled"}`, nil},
+		{"title edited", "pull_request", `{"action":"edited","changes":{"title":{"from":"old"}}}`, nil},
+		{"unrelated issue", "issues", `{"action":"opened"}`, nil},
+		{"fork PR", "pull_request", `{"action":"synchronize","pull_request":{"number":42,"draft":true,"head":{"sha":"forksha","ref":"topic/日本語","repo":{"clone_url":"https://github.com/fork/repo.git"}},"base":{"ref":"release/main","repo":{"clone_url":"https://github.com/org/repo.git","default_branch":"main"}},"user":{"login":"author"}}}`, &interfaces.WebhookData{EventName: "pull_request", PushedRepoURL: "https://github.com/fork/repo.git", PushedBranch: "topic/日本語", SHA: "forksha", TargetRepoURL: "https://github.com/org/repo.git", TargetRepoDefaultBranch: "main", TargetBranch: "release/main", IsTargetRepoPublic: true, PullRequestNumber: 42, PullRequestIsDraft: true, PullRequestAction: "synchronize", PullRequestAuthor: "author"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := provider.ParseWebhookData(webhookRequest(t, tc.event, []byte(tc.payload)))
+			assert.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
