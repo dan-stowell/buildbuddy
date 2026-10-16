@@ -205,29 +205,13 @@ func ReadAllLimited(r io.Reader, limit int64) ([]byte, error) {
 // ReadTryFillBuffer tries to fill the given buffer by repeatedly reading
 // from the reader until it runs out of data. If the underlying reader does
 // not have enough data left to fill the buffer, the returned buffer will only
-// be partially filled. It returns io.EOF only if no bytes were read before the
-// reader returned io.EOF. Any other error from the underlying reader
-// (including io.ErrUnexpectedEOF) is returned as-is.
+// be partially filled.
 func ReadTryFillBuffer(r io.Reader, buf []byte) (int, error) {
-	// Note: io.ReadFull is not used here because it returns
-	// io.ErrUnexpectedEOF both for a short read ending in io.EOF and for an
-	// underlying reader that itself failed with io.ErrUnexpectedEOF, so the
-	// two cases could not be told apart.
-	n := 0
-	for n < len(buf) {
-		m, err := r.Read(buf[n:])
-		n += m
-		if err == io.EOF {
-			if n > 0 {
-				return n, nil
-			}
-			return 0, io.EOF
-		}
-		if err != nil {
-			return n, err
-		}
+	n, err := io.ReadFull(r, buf)
+	if err == io.ErrUnexpectedEOF {
+		return n, nil
 	}
-	return n, nil
+	return n, err
 }
 
 type byteRepeater byte
