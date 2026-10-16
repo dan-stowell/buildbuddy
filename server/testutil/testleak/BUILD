@@ -5,6 +5,7 @@ go_library(
     testonly = 1,
     srcs = [
         "fd.go",
+        "gc.go",
         "growth.go",
         "testleak.go",
     ],
