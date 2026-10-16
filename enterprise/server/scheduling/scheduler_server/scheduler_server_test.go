@@ -3037,10 +3037,13 @@ func TestLeaseTask_SchedulerCrashThenExecutorReEnqueueRecovers(t *testing.T) {
 // reconnecting, the task must not be left waiting forever.
 func TestLeaseReconnectGrace_RetriesDisabled_ExecutorNeverReconnects(t *testing.T) {
 	flags.Set(t, "remote_execution.lease_reconnect_grace_period", 100*time.Millisecond)
-	env, ctx := getEnv(t, &schedulerOpts{options: Options{
-		LeaseDuration:    1 * time.Second,
-		LeaseGracePeriod: 1 * time.Second,
-	}}, "user1")
+	// The holder's lease stream belongs to the replica that shut down, whose
+	// LeaseTask handler has already exited after releasing the task with a
+	// reconnect grace period. Freeze the scheduler clock so that this test's
+	// still-open stream doesn't run a second lease-expiry release that the
+	// real (exited) handler would never run.
+	fakeClock := clockwork.NewFakeClock()
+	env, ctx := getEnv(t, &schedulerOpts{options: Options{Clock: fakeClock}}, "user1")
 
 	holder := newFakeExecutorWithId(ctx, t, "holder", env.GetSchedulerClient())
 	holder.Register()
@@ -3071,6 +3074,6 @@ func TestLeaseReconnectGrace_RetriesDisabled_ExecutorNeverReconnects(t *testing.
 		time.Sleep(250 * time.Millisecond)
 	}
 	require.FailNowf(t, "task stranded",
-		"retry=false task %q was neither re-offered nor failed 10s after its executor stopped reconnecting (grace 100ms, lease 1s). Task state: %s",
+		"retry=false task %q was neither re-offered nor failed 10s after its executor stopped reconnecting (grace 100ms). Task state: %s",
 		taskID, describeTaskState(t, env, taskID))
 }
