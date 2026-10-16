@@ -2,11 +2,17 @@ package uffd
 
 import (
 	"errors"
+	"net"
 	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/copy_on_write"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
@@ -416,4 +422,49 @@ func TestZero_RejectsInvalidProgress(t *testing.T) {
 	err := h.copyZeroes(0 /*=uffd*/, faultingAddress, mapping)
 	require.Error(t, err)
 	require.Contains(t, h.removedAddresses, int64(faultingAddress))
+}
+
+// waitForSetupRead waits until the handler has accepted a connection and is
+// blocked reading the setup message from it.
+func waitForSetupRead(t *testing.T) {
+	buf := make([]byte, 1<<20)
+	for start := time.Now(); time.Since(start) < 10*time.Second; time.Sleep(time.Millisecond) {
+		for g := range strings.SplitSeq(string(buf[:runtime.Stack(buf, true)]), "\n\n") {
+			if strings.Contains(g, "ReadMsgUnix") && strings.Contains(g, "(*Handler).receiveSetupMsg") {
+				return
+			}
+		}
+	}
+	require.FailNow(t, "handler did not start reading the setup message")
+}
+
+func TestStop_PeerConnectedWithoutSetupMessage(t *testing.T) {
+	testleak.Check(t)
+	testleak.CheckFDs(t)
+
+	sockPath := filepath.Join(t.TempDir(), "uffd.sock")
+	h, err := NewHandler()
+	require.NoError(t, err)
+	require.NoError(t, h.Start(t.Context(), sockPath, nil /*=memoryStore*/))
+
+	// Connect like Firecracker does, but never send the setup message.
+	conn, err := net.Dial("unix", sockPath)
+	require.NoError(t, err)
+	defer conn.Close()
+	waitForSetupRead(t)
+
+	stopped := make(chan struct{})
+	go func() {
+		h.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		// Unblock the handler so the failure doesn't leak into other tests.
+		conn.Close()
+		<-stopped
+		require.FailNow(t, "Stop blocked while the peer was connected")
+	}
+	require.Error(t, h.Wait())
 }
