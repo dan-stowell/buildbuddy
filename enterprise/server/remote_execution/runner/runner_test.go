@@ -1315,3 +1315,49 @@ func TestTransientErrorExitCodes(t *testing.T) {
 		})
 	}
 }
+
+// TestPersistentWorkerFraming exercises the real fake-worker process and checks
+// both exact output and whether failed workers can reenter the pool.
+func TestPersistentWorkerFraming(t *testing.T) {
+	for _, protocol := range []string{"proto", "json"} {
+		for _, mode := range []string{"large_split", "noise", "truncated", "crash"} {
+			t.Run(protocol+"/"+mode, func(t *testing.T) {
+				env := newTestEnv(t)
+				pool := newRunnerPool(t, env, noLimitsCfg())
+				ctx := withAuthenticatedUser(t, context.Background(), env, "US1")
+				output := strings.Repeat("abcdefgh", 16*1024)
+				task := newPersistentRunnerTask(t, "framing", "", protocol, &wkpb.WorkResponse{Output: output, ExitCode: 7})
+				extra := map[string]string{
+					"large_split": "--response_chunk_size=17",
+					"noise":       "--stdout_noise",
+					"truncated":   "--truncate_response",
+					"crash":       "--fail_with_stderr=expected-crash",
+				}[mode]
+				task.ExecutionTask.Command.Arguments = append(task.ExecutionTask.Command.Arguments, extra)
+				r, err := pool.Get(ctx, task)
+				require.NoError(t, err)
+				res := r.Run(ctx, &repb.IOStats{})
+				if mode == "large_split" {
+					require.NoError(t, res.Error)
+					require.Equal(t, 7, res.ExitCode)
+					require.Equal(t, output, string(res.Stderr))
+				} else {
+					require.Error(t, res.Error)
+				}
+				pool.TryRecycle(ctx, r, true)
+				if mode == "large_split" {
+					require.Equal(t, 1, pool.PausedRunnerCount())
+				} else {
+					require.Equal(t, 0, pool.PausedRunnerCount())
+					next, err := pool.Get(ctx, newPersistentRunnerTask(t, "framing", "", protocol, &wkpb.WorkResponse{Output: "fresh"}))
+					require.NoError(t, err)
+					require.NotSame(t, r, next)
+					got := next.Run(ctx, &repb.IOStats{})
+					require.NoError(t, got.Error)
+					require.Equal(t, "fresh", string(got.Stderr))
+					pool.TryRecycle(ctx, next, true)
+				}
+			})
+		}
+	}
+}

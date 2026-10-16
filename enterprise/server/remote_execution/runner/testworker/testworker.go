@@ -10,11 +10,16 @@ import (
 	"flag"
 	"io"
 	"os"
+	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 )
 
 var (
+	chunkSize        = flag.Int("response_chunk_size", 0, "Maximum response write size.")
+	noise            = flag.Bool("stdout_noise", false, "Emit invalid protocol data before the response.")
+	truncate         = flag.Bool("truncate_response", false, "Exit halfway through a response.")
+	gate             = flag.String("response_gate", "", "Wait for this file before responding; create .ready after reading the request.")
 	persistentWorker = flag.Bool("persistent_worker", false, "Persistent worker flag.")
 
 	protocol       = flag.String("protocol", "proto", "Serialization protocol: 'json' or 'proto'.")
@@ -64,7 +69,38 @@ func main() {
 
 		log.Info("[worker] Got request! Sending response...")
 
-		_, err = os.Stdout.Write(resBytes)
+		if *gate != "" {
+			if err := os.WriteFile(*gate+".ready", nil, 0600); err != nil {
+				panic(err)
+			}
+			for {
+				if _, err := os.Stat(*gate); err == nil {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}
+		if *noise {
+			_, _ = os.Stdout.Write([]byte("worker debug noise\n"))
+		}
+		out := resBytes
+		if *truncate {
+			out = out[:len(out)/2]
+		}
+		for len(out) > 0 {
+			n := len(out)
+			if *chunkSize > 0 && n > *chunkSize {
+				n = *chunkSize
+			}
+			if _, err := os.Stdout.Write(out[:n]); err != nil {
+				panic(err)
+			}
+			out = out[n:]
+		}
+		if *truncate {
+			os.Exit(0)
+		}
+		_, err = os.Stdout.Write(nil)
 		if err != nil {
 			panic(err)
 		}
