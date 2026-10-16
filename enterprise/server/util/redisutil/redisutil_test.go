@@ -862,7 +862,7 @@ func TestCommandBuffer_ShutdownCancelsBlockedPeriodicFlush(t *testing.T) {
 			if blocked > 0 && n == 1 {
 				dump := make([]byte, 1<<20)
 				dump = dump[:runtime.Stack(dump, true)]
-				for _, stack := range strings.Split(string(dump), "\n\n") {
+				for stack := range strings.SplitSeq(string(dump), "\n\n") {
 					if strings.Contains(stack, "blockedPipeline).Exec") || strings.Contains(stack, "CommandBuffer).StopPeriodicFlush") {
 						t.Log(stack)
 					}
