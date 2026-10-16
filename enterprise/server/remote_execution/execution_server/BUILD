@@ -70,7 +70,7 @@ go_library(
 go_test(
     name = "execution_server_test",
     size = "small",
-    srcs = ["execution_server_test.go", "hedge_third_client_test.go"],
+    srcs = ["execution_server_test.go", "hedge_third_client_test.go", "review_hedge_test.go"],
     deps = [
         "@com_google_cloud_go_longrunning//autogen/longrunningpb",
         ":execution_server",
