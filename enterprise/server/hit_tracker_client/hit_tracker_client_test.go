@@ -494,8 +494,8 @@ func TestShutdownSendsHitsStillInEnqueueChannel(t *testing.T) {
 	hitTrackerFactory.mu.Unlock()
 	te.GetHealthChecker().WaitForGracefulShutdown()
 
-	require.Eventually(t, hitTrackerService.casDownloadExpectation(anonKey, hits), 5*time.Second, 50*time.Millisecond,
-		"hits accepted before shutdown were not reported")
+	waitForCASDownloads(hitTrackerService, anonKey, hits, 5*time.Second)
+	require.Equal(t, int64(hits), hitTrackerService.casDownloads[anonKey].Load(), "hits accepted before shutdown were not reported")
 }
 
 // A transient Track RPC failure should not silently discard the whole batch.
@@ -517,8 +517,17 @@ func TestTransientTrackFailureDoesNotLoseHits(t *testing.T) {
 		clock.BlockUntil(1)
 		clock.Advance(*remoteHitTrackerPollInterval)
 	}
-	require.Eventually(t, hitTrackerService.casDownloadExpectation(anonKey, hits), 5*time.Second, 50*time.Millisecond,
-		"hits from a batch whose Track RPC failed transiently were never reported")
+	waitForCASDownloads(hitTrackerService, anonKey, hits, 5*time.Second)
+	require.Equal(t, int64(hits), hitTrackerService.casDownloads[anonKey].Load(), "hits from a batch whose Track RPC failed transiently were never reported")
+}
+
+// waitForCASDownloads waits up to timeout for the service to have recorded
+// the expected number of CAS downloads for key.
+func waitForCASDownloads(ht *testHitTracker, key string, expected int64, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) && ht.casDownloads[key].Load() != expected {
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func BenchmarkEnqueue(b *testing.B) {
