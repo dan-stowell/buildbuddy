@@ -167,7 +167,7 @@ func TestCancel_RacingMergedClientIsNotCancelled(t *testing.T) {
 	var streamB repb.Execution_ExecuteClient
 	h.sched.onCancel = func(taskID string) {
 		h.sched.onCancel = nil
-		// B's request arrives between CheckMerged and CancelTask.
+		// B's request arrives while A's execution is being cancelled.
 		streamB = h.execute(iidB)
 		_, done, ok := recvWithTimeout(t, streamB, 10*time.Second)
 		require.True(t, ok)

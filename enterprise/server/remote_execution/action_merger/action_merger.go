@@ -147,42 +147,99 @@ func RecordHedgedExecution(ctx context.Context, rdb redis.UniversalClient, adRes
 	return err
 }
 
-// CheckMerged returns true if the specified action has been merged against.
-func CheckMerged(ctx context.Context, rdb redis.UniversalClient, adResource *digest.CASResourceName) (bool, error) {
-	key, err := redisKeyForPendingExecutionID(ctx, adResource)
+// redisKeyForCancelledExecution returns the key of a marker indicating that the
+// given execution is being cancelled and must not be merged into. It is stored
+// on the same shard as the action-merging keys for the execution's action.
+func redisKeyForCancelledExecution(executionID string) string {
+	s, err := executionIDWithDigestSharding(executionID)
 	if err != nil {
-		return false, err
+		alert.UnexpectedEvent("action_merger_unexpected_execution_id", "%s", err)
+		return fmt.Sprintf("cancelledExecution/%d/%s", keyVersion, executionID)
 	}
-	rawCount, err := rdb.HGet(ctx, key, actionCountKey).Result()
-	if err == redis.Nil || rawCount == "" {
-		return false, nil
-	}
-	count, err := strconv.Atoi(rawCount)
-	if err != nil {
-		return false, err
-	}
-	return count > 1, nil
+	return fmt.Sprintf("cancelledExecution/%d/%s", keyVersion, s)
 }
 
-// This function records a merged execution in Redis.
-func RecordMergedExecution(ctx context.Context, rdb redis.UniversalClient, adResource *digest.CASResourceName, groupIdForMetrics string) error {
+// KEYS[1]: forward key (action digest -> execution ID hash)
+// KEYS[2]: reverse key (execution ID -> forward key)
+// KEYS[3]: cancelled-execution marker for the execution
+// ARGV[1]: execution ID
+// ARGV[2]: marker TTL in milliseconds
+//
+// Returns 0 if the action has been merged against, otherwise stops merging into
+// the execution and returns 1.
+var stopMergingScript = redis.NewScript(`
+local count = tonumber(redis.call("HGET", KEYS[1], "` + actionCountKey + `") or "0") or 0
+if count > 1 then
+	return 0
+end
+if redis.call("HGET", KEYS[1], "` + executionIDKey + `") == ARGV[1] then
+	redis.call("DEL", KEYS[1])
+end
+redis.call("DEL", KEYS[2])
+redis.call("SET", KEYS[3], "1", "PX", ARGV[2])
+return 1
+`)
+
+// StopMergingUnlessMerged is called before cancelling the given execution. It
+// atomically checks whether the action has been merged against and, if not,
+// prevents any further requests from merging into the execution (see
+// RecordMergedExecution). It returns true if the action has been merged
+// against, in which case the execution should not be cancelled.
+func StopMergingUnlessMerged(ctx context.Context, rdb redis.UniversalClient, adResource *digest.CASResourceName, executionID string) (bool, error) {
+	forwardKey, err := redisKeyForPendingExecutionID(ctx, adResource)
+	if err != nil {
+		return false, err
+	}
+	keys := []string{
+		forwardKey,
+		redisKeyForPendingExecutionDigest(executionID),
+		redisKeyForCancelledExecution(executionID),
+	}
+	r, err := stopMergingScript.Run(ctx, rdb, keys, executionID, queuedExecutionTTL.Milliseconds()).Int64()
+	if err != nil {
+		return false, err
+	}
+	return r == 0, nil
+}
+
+// KEYS[1]: forward key (action digest -> execution ID hash)
+// KEYS[2]: cancelled-execution marker for the execution being merged into
+//
+// Returns 0 if the execution is being cancelled, otherwise increments the
+// action count and returns 1.
+var recordMergedScript = redis.NewScript(`
+if redis.call("EXISTS", KEYS[2]) == 1 then
+	return 0
+end
+redis.call("HINCRBY", KEYS[1], "` + actionCountKey + `", 1)
+return 1
+`)
+
+// RecordMergedExecution records that a request is being merged into the given
+// execution. It returns false, and records nothing, if the execution is being
+// cancelled; the caller must then not wait on that execution.
+func RecordMergedExecution(ctx context.Context, rdb redis.UniversalClient, adResource *digest.CASResourceName, executionID string, groupIdForMetrics string) (bool, error) {
 	key, err := redisKeyForPendingExecutionID(ctx, adResource)
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	if err := rdb.HIncrBy(ctx, key, actionCountKey, 1).Err(); err != nil {
-		return err
+	r, err := recordMergedScript.Run(ctx, rdb, []string{key, redisKeyForCancelledExecution(executionID)}).Int64()
+	if err != nil {
+		return false, err
+	}
+	if r == 0 {
+		return false, nil
 	}
 
 	hash, err := rdb.HGetAll(ctx, key).Result()
 	if err != nil {
 		log.Debugf("Error reading action-merging state from Redis: %s", err)
-		return nil
+		return true, nil
 	}
 	recordCountMetric(hash, groupIdForMetrics)
 	recordSubmitTimeOffsetMetric(hash, groupIdForMetrics)
-	return nil
+	return true, nil
 }
 
 func recordCountMetric(hash map[string]string, groupIdForMetrics string) {
