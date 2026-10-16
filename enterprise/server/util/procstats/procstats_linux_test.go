@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"os/exec"
 	"runtime"
-	"runtime/debug"
 	"syscall"
 	"testing"
 
@@ -32,7 +31,6 @@ func TestTreeStatsUpdateDoesNotRetainFDs(t *testing.T) {
 
 	// Disable GC so that anything only released by a GC cleanup shows up.
 	runtime.GC()
-	defer debug.SetGCPercent(debug.SetGCPercent(-1))
 
 	ts := procstats.NewTreeStats(cmd.Process.Pid)
 	testleak.CheckGrowth(t, testleak.Growth{Iterations: 20}, func(int) {
