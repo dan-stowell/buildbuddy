@@ -1,4 +1,4 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "hostid",
@@ -8,5 +8,15 @@ go_library(
     deps = [
         "//server/util/disk",
         "@com_github_google_uuid//:uuid",
+    ],
+)
+
+
+go_test(
+    name = "hostid_test",
+    srcs = ["hostid_test.go"],
+    embed = [":hostid"],
+    deps = [
+        "//server/testutil/testleak",
     ],
 )

@@ -29,6 +29,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testcache"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testusage"
 	"github.com/buildbuddy-io/buildbuddy/server/usage/sku"
 	"github.com/buildbuddy-io/buildbuddy/server/util/bazel_request"
@@ -147,13 +148,20 @@ func (s *secretServiceMock) GetSecretEnvVars(ctx context.Context, groupID string
 }
 
 func setupEnvWithClock(t *testing.T, clock clockwork.Clock) (*testenv.TestEnv, *grpc.ClientConn, *testredis.Handle) {
+	return setupEnvWithRedisPoolSize(t, clock, 0)
+}
+
+func setupEnvWithRedisPoolSize(t *testing.T, clock clockwork.Clock, poolSize int) (*testenv.TestEnv, *grpc.ClientConn, *testredis.Handle) {
 	env := testenv.GetTestEnv(t)
 	env.SetClock(clock)
 
 	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
 
 	r := testredis.Start(t)
-	rdb := redis.NewClient(redisutil.TargetToOptions(r.Target))
+	opts := redisutil.TargetToOptions(r.Target)
+	opts.PoolSize = poolSize
+	rdb := redis.NewClient(opts)
+	t.Cleanup(func() { require.NoError(t, rdb.Close()) })
 	env.SetDefaultRedisClient(r.Client())
 	err := redis_execution_collector.Register(env)
 	require.NoError(t, err)
@@ -2974,5 +2982,196 @@ func TestRedactCachedExecuteResponse(t *testing.T) {
 				))
 			}
 		})
+	}
+}
+
+// Keep the service and its Redis pool alive while repeatedly ending streams.
+// Redis Streams use blocking XREAD, not Redis PUBSUB subscriptions, so count
+// blocked clients rather than PUBSUB NUMSUB (which would always be zero).
+// Cancellation closes XREAD connections. Replacement idle connections have new
+// FD identities, so allow the explicitly bounded eight-connection shared pool
+// in CheckGrowth. CheckFDs still requires zero new FDs after server shutdown;
+// CheckGrowth permits no new goroutines, and every operation must release all
+// blocked Redis clients before the next operation begins.
+func TestExecutionStreamCancellationGrowth(t *testing.T) {
+	for _, monitored := range []bool{false, true} {
+		for _, n := range []int{1, 10, 50} {
+			t.Run(fmt.Sprintf("monitored=%t/N=%d", monitored, n), func(t *testing.T) {
+				flags.Set(t, "remote_execution.enable_redis_availability_monitoring", monitored)
+				testleak.Check(t)
+				testleak.CheckFDs(t)
+				env, conn, r := setupEnvWithRedisPoolSize(t, clockwork.NewRealClock(), 8)
+				ctx := t.Context()
+				arn := uploadAction(ctx, t, env, "", repb.DigestFunction_SHA256, &repb.Action{})
+				client := repb.NewExecutionClient(conn)
+				rdb := r.Client()
+				blocked := func() int {
+					clients, err := rdb.ClientList(ctx).Result()
+					require.NoError(t, err)
+					count := 0
+					for line := range strings.SplitSeq(clients, "\n") {
+						if strings.Contains(line, "cmd=xread") && strings.Contains(line, "flags=b") {
+							count++
+						}
+					}
+					return count
+				}
+				var name string
+				testleak.CheckGrowth(t, testleak.Growth{Iterations: n, MaxFDs: 8}, func(i int) {
+					streamCtx, cancel := context.WithCancel(ctx)
+					if i == 0 {
+						stream, err := client.Execute(streamCtx, &repb.ExecuteRequest{ActionDigest: arn.GetDigest(), DigestFunction: arn.GetDigestFunction()})
+						require.NoError(t, err)
+						op, err := stream.Recv()
+						require.NoError(t, err)
+						name = op.GetName()
+						require.Eventually(t, func() bool { return blocked() == 1 }, 5*time.Second, 10*time.Millisecond)
+						cancel()
+						_, err = stream.Recv()
+						require.Error(t, err)
+					} else {
+						stream, err := client.WaitExecution(streamCtx, &repb.WaitExecutionRequest{Name: name})
+						require.NoError(t, err)
+						require.Eventually(t, func() bool { return blocked() == 1 }, 5*time.Second, 10*time.Millisecond)
+						cancel()
+						_, err = stream.Recv()
+						require.Error(t, err)
+					}
+					require.Eventually(t, func() bool { return blocked() == 0 }, 5*time.Second, 10*time.Millisecond)
+				})
+				t.Logf("N=%d: blocked Redis XREAD clients after cancellation = %d; shared pool = %+v", n, blocked(), env.GetRemoteExecutionRedisClient().(*redis.Client).PoolStats())
+			})
+		}
+	}
+}
+
+type streamAuditScheduler struct{ *schedulerServerMock }
+
+func (s *streamAuditScheduler) ExistsTask(context.Context, string) (bool, error) { return true, nil }
+
+func TestExecutionStreamMergedCompletionGrowth(t *testing.T) {
+	for _, n := range []int{1, 10, 50} {
+		t.Run(fmt.Sprintf("N=%d", n), func(t *testing.T) {
+			testleak.Check(t)
+			testleak.CheckFDs(t)
+			env, conn, r := setupEnvWithRedisPoolSize(t, clockwork.NewRealClock(), 8)
+			scheduler := &streamAuditScheduler{env.GetSchedulerService().(*schedulerServerMock)}
+			env.SetSchedulerService(scheduler)
+			ctx := t.Context()
+			client := repb.NewExecutionClient(conn)
+			rdb := r.Client()
+			blocked := func() int {
+				clients, err := rdb.ClientList(ctx).Result()
+				require.NoError(t, err)
+				count := 0
+				for line := range strings.SplitSeq(clients, "\n") {
+					if strings.Contains(line, "cmd=xread") && strings.Contains(line, "flags=b") {
+						count++
+					}
+				}
+				return count
+			}
+			testleak.CheckGrowth(t, testleak.Growth{Iterations: n, MaxFDs: 8}, func(i int) {
+				// Each batch is a different action; the four Execute streams within it
+				// must merge onto a single scheduled task.
+				arn := uploadAction(ctx, t, env, "", repb.DigestFunction_SHA256, &repb.Action{Timeout: durationpb.New(time.Duration(i+1) * time.Second)})
+				before := len(scheduler.scheduleReqs)
+				var name string
+				streams := make([]repb.Execution_ExecuteClient, 0, 4)
+				cancels := make([]context.CancelFunc, 0, 4)
+				for j := range 4 {
+					streamCtx, cancel := context.WithCancel(ctx)
+					t.Cleanup(cancel)
+					stream, err := client.Execute(streamCtx, &repb.ExecuteRequest{ActionDigest: arn.GetDigest(), DigestFunction: arn.GetDigestFunction()})
+					require.NoError(t, err)
+					op, err := stream.Recv()
+					require.NoError(t, err)
+					if j == 0 {
+						name = op.GetName()
+					} else {
+						require.Equal(t, name, op.GetName())
+					}
+					streams = append(streams, stream)
+					cancels = append(cancels, cancel)
+				}
+				require.Equal(t, before+1, len(scheduler.scheduleReqs))
+				wait, err := client.WaitExecution(ctx, &repb.WaitExecutionRequest{Name: name})
+				require.NoError(t, err)
+				require.Eventually(t, func() bool { return blocked() == 5 }, 5*time.Second, 10*time.Millisecond)
+				for j := range 2 {
+					cancels[j]()
+					_, err := streams[j].Recv()
+					require.Error(t, err)
+				}
+				require.Eventually(t, func() bool { return blocked() == 3 }, 5*time.Second, 10*time.Millisecond)
+				require.NoError(t, env.GetRemoteExecutionService().MarkExecutionFailed(ctx, name, status.CanceledError("audit completion")))
+				for j := 2; j < 4; j++ {
+					op, err := streams[j].Recv()
+					require.NoError(t, err)
+					require.True(t, op.GetDone())
+					_, err = streams[j].Recv()
+					require.Equal(t, io.EOF, err)
+					cancels[j]()
+				}
+				op, err := wait.Recv()
+				require.NoError(t, err)
+				require.True(t, op.GetDone())
+				_, err = wait.Recv()
+				require.Equal(t, io.EOF, err)
+				require.Eventually(t, func() bool { return blocked() == 0 }, 5*time.Second, 10*time.Millisecond)
+			})
+			t.Logf("N=%d: merged batches (4 Execute + 1 WaitExecution), blocked Redis clients after cancellation/completion = %d; shared pool = %+v", n, blocked(), env.GetRemoteExecutionRedisClient().(*redis.Client).PoolStats())
+		})
+	}
+}
+
+func TestExecutionStreamErrorGrowth(t *testing.T) {
+	for _, outcome := range []string{"task_lost", "redis_state_lost"} {
+		for _, n := range []int{1, 10, 50} {
+			t.Run(fmt.Sprintf("%s/N=%d", outcome, n), func(t *testing.T) {
+				flags.Set(t, "remote_execution.enable_redis_availability_monitoring", true)
+				flags.Set(t, "remote_execution.pubsub_monitored_stream_check_interval", 10*time.Millisecond)
+				testleak.Check(t)
+				testleak.CheckFDs(t)
+				env, conn, r := setupEnvWithRedisPoolSize(t, clockwork.NewRealClock(), 8)
+				ctx := t.Context()
+				client := repb.NewExecutionClient(conn)
+				rdb := r.Client()
+				testleak.CheckGrowth(t, testleak.Growth{Iterations: n, MaxFDs: 8}, func(i int) {
+					scheduler := env.GetSchedulerService().(*schedulerServerMock)
+					scheduler.taskLost = make(chan struct{})
+					arn := uploadAction(ctx, t, env, "", repb.DigestFunction_SHA256, &repb.Action{DoNotCache: true, Timeout: durationpb.New(time.Duration(i+1) * time.Second)})
+					stream, err := client.Execute(ctx, &repb.ExecuteRequest{ActionDigest: arn.GetDigest(), DigestFunction: arn.GetDigestFunction()})
+					require.NoError(t, err)
+					op, err := stream.Recv()
+					require.NoError(t, err)
+					// Observe the reader before triggering the error, so this exercises
+					// cancellation of an already-blocked XREAD too.
+					require.Eventually(t, func() bool {
+						clients, err := rdb.ClientList(ctx).Result()
+						require.NoError(t, err)
+						return strings.Contains(clients, "flags=b")
+					}, 5*time.Second, 10*time.Millisecond)
+					if outcome == "task_lost" {
+						close(scheduler.taskLost)
+					} else {
+						// Simulate Redis losing this execution's monitored state.
+						require.NoError(t, rdb.Del(ctx, fmt.Sprintf("monitoredPubSub/taskStatusStream/{%s}", op.GetName())).Err())
+					}
+					op, err = stream.Recv()
+					require.NoError(t, err)
+					require.True(t, op.GetDone())
+					require.Equal(t, int32(codes.NotFound), operation.ExtractExecuteResponse(op).GetStatus().GetCode())
+					_, err = stream.Recv()
+					require.Equal(t, io.EOF, err)
+					require.Eventually(t, func() bool {
+						clients, err := rdb.ClientList(ctx).Result()
+						require.NoError(t, err)
+						return !strings.Contains(clients, "flags=b")
+					}, 5*time.Second, 10*time.Millisecond)
+				})
+				t.Logf("%s N=%d: blocked Redis clients after stream error = 0; shared pool = %+v", outcome, n, env.GetRemoteExecutionRedisClient().(*redis.Client).PoolStats())
+			})
+		}
 	}
 }
