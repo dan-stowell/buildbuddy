@@ -182,6 +182,37 @@ type tfStatusRow struct {
 	Status int32
 }
 
+// Signal only after the handler has processed BuildFinished, so cancellation
+// cannot race the delivery of the event being tested.
+type tfObservedHandler struct {
+	interfaces.BuildEventHandler
+	finished chan struct{}
+}
+
+func (h *tfObservedHandler) OpenChannel(ctx context.Context, iid string) (interfaces.BuildEventChannel, error) {
+	ch, err := h.BuildEventHandler.OpenChannel(ctx, iid)
+	return &tfObservedChannel{BuildEventChannel: ch, finished: h.finished}, err
+}
+
+type tfObservedChannel struct {
+	interfaces.BuildEventChannel
+	finished chan struct{}
+}
+
+func (c *tfObservedChannel) HandleEvent(req *pepb.PublishBuildToolEventStreamRequest) error {
+	if err := c.BuildEventChannel.HandleEvent(req); err != nil {
+		return err
+	}
+	ev := &bspb.BuildEvent{}
+	if err := req.GetOrderedBuildEvent().GetEvent().GetBazelEvent().UnmarshalTo(ev); err != nil {
+		return err
+	}
+	if ev.GetFinished() != nil {
+		close(c.finished)
+	}
+	return nil
+}
+
 func runTargetStatusFlush(t *testing.T, ending streamEnding, olap bool) {
 	te := testenv.GetTestEnv(t)
 	flags.Set(t, "app.enable_target_tracking", true)
@@ -191,7 +222,8 @@ func runTargetStatusFlush(t *testing.T, ending streamEnding, olap bool) {
 	}
 	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 	te.SetAuthenticator(ta)
-	te.SetBuildEventHandler(build_event_handler.NewBuildEventHandler(te))
+	finished := make(chan struct{})
+	te.SetBuildEventHandler(&tfObservedHandler{BuildEventHandler: build_event_handler.NewBuildEventHandler(te), finished: finished})
 
 	server, err := build_event_server.NewBuildEventProtocolServer(te, false /*=synchronous*/)
 	require.NoError(t, err)
@@ -228,9 +260,11 @@ func runTargetStatusFlush(t *testing.T, ending streamEnding, olap bool) {
 			require.NoError(t, err)
 		}
 	case endWithCancelAfterFinished:
-		// Give the server time to process everything that was sent, as a
-		// real client would have been streaming for a while; then cancel.
-		time.Sleep(1 * time.Second)
+		select {
+		case <-finished:
+		case <-time.After(10 * time.Second):
+			t.Fatal("BuildFinished was not processed")
+		}
 		cancelStream()
 	}
 
