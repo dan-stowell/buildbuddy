@@ -13,7 +13,6 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/accumulator"
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
-	"github.com/buildbuddy-io/buildbuddy/server/util/background"
 	"github.com/buildbuddy-io/buildbuddy/server/util/clickhouse/schema"
 	"github.com/buildbuddy-io/buildbuddy/server/util/db"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
@@ -320,9 +319,6 @@ func (t *TargetTracker) writeTestTargetStatusesToOLAPDB(ctx context.Context, per
 	if !t.WriteToOLAPDBEnabled() {
 		return nil
 	}
-	ctx, cancel := background.ExtendContextForFinalization(ctx, writeTestTargetStatusesTimeout)
-	defer cancel()
-
 	entries := make([]*schema.TestTargetStatus, 0)
 	invocation := t.buildEventAccumulator.Invocation()
 	if invocation == nil {
@@ -464,9 +460,16 @@ func (t *TargetTracker) handleWorkspaceStatusEvent(ctx context.Context) {
 		log.CtxDebugf(ctx, "Not tracking targets for %q because it's not authenticated: %s", t.invocationID(), err.Error())
 		return
 	}
+	// Finalization waits for this work, even if the client disconnects while
+	// it is pending. Preserve auth and other values, but bound its lifetime
+	// independently of the stream.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeTestTargetStatusesTimeout)
 	eg, gctx := errgroup.WithContext(ctx)
 	t.errGroup = eg
-	t.errGroup.Go(func() error { return t.writeTestTargets(gctx, permissions) })
+	t.errGroup.Go(func() error {
+		defer cancel()
+		return t.writeTestTargets(gctx, permissions)
+	})
 }
 
 // Finalize flushes the observed target statuses at most once. The caller must
@@ -477,6 +480,10 @@ func (t *TargetTracker) Finalize(ctx context.Context) {
 		return
 	}
 	t.finalized = true
+	// Both primary and OLAP status writes must survive stream cancellation,
+	// including when this is called directly by the last-message path.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeTestTargetStatusesTimeout)
+	defer cancel()
 	ctx = log.EnrichContext(ctx, log.InvocationIDKey, t.invocationID())
 	if !isTestCommand(t.buildEventAccumulator.Invocation().GetCommand()) {
 		log.Debugf("Not tracking targets statuses for %q because it's not a test", t.invocationID())
