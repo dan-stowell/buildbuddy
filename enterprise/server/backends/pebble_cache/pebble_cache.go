@@ -2828,21 +2828,49 @@ func (p *PebbleCache) newWrappedWriter(ctx context.Context, fileRecord *sgpb.Fil
 	if err != nil {
 		return nil, err
 	}
-	return p.wrapWriter(ctx, fileRecord, wcm, shouldCompress, encryptionMetadata, db.Close, func(md *sgpb.FileMetadata) error {
+	localFile := wcm.Metadata().GetFileMetadata() != nil
+	wc, err := p.wrapWriter(ctx, fileRecord, wcm, shouldCompress, encryptionMetadata, db.Close, func(md *sgpb.FileMetadata) error {
 		// Test-only barrier: lets a test deterministically run in the window
 		// after the blob's backing data has been published to storage but
-		// before its metadata is written under the per-key lock. nil (and
+		// before its metadata is written. For local files the per-key lock is
+		// already held. nil (and
 		// therefore a no-op) in production.
 		if beforeWriteMetadataHook != nil {
 			beforeWriteMetadataHook(key)
 		}
+		if localFile {
+			return p.writeMetadataLocked(ctx, db, key, md)
+		}
 		return p.writeMetadata(ctx, db, key, md)
 	})
+	if err != nil {
+		return nil, err
+	}
+	if localFile {
+		// Serialize only Commit: streaming writes still use independent temporary
+		// files. Publish the file and its metadata atomically with respect to
+		// eviction, Delete, and other writers of this key.
+		wc = &lockedCommitWriter{CommittedWriteCloser: wc, lock: func() func() { return p.locker.Lock(key.LockID()) }}
+	}
+	return wc, nil
+}
+
+// lockedCommitWriter releases the lock even if publishing data or metadata fails.
+// Close and Write do not need the lock: they only operate on the temporary file.
+type lockedCommitWriter struct {
+	interfaces.CommittedWriteCloser
+	lock func() func()
+}
+
+func (w *lockedCommitWriter) Commit() error {
+	unlock := w.lock()
+	defer unlock()
+	return w.CommittedWriteCloser.Commit()
 }
 
 // beforeWriteMetadataHook, if non-nil, is invoked inside the blob write commit
 // path after the backing data has been published to storage but before the
-// metadata record is written under the per-key lock. It exists only so tests
+// metadata record is written (with the lock already held for local files). Tests
 // can interleave eviction into that window; it is nil in production.
 var beforeWriteMetadataHook func(key filestore.PebbleKey)
 
@@ -2896,6 +2924,13 @@ func (p *PebbleCache) wrapWriter(ctx context.Context, fileRecord *sgpb.FileRecor
 }
 
 func (p *PebbleCache) writeMetadata(ctx context.Context, db pebble.IPebbleDB, key filestore.PebbleKey, md *sgpb.FileMetadata) error {
+	unlockFn := p.locker.Lock(key.LockID())
+	defer unlockFn()
+	return p.writeMetadataLocked(ctx, db, key, md)
+}
+
+// writeMetadataLocked requires the caller to hold the per-key lock.
+func (p *PebbleCache) writeMetadataLocked(ctx context.Context, db pebble.IPebbleDB, key filestore.PebbleKey, md *sgpb.FileMetadata) error {
 	ctx, spn := tracing.StartSpan(ctx)
 	defer spn.End()
 
@@ -2908,9 +2943,6 @@ func (p *PebbleCache) writeMetadata(ctx context.Context, db pebble.IPebbleDB, ke
 		p.metrics.compressedBlobSizeWrite.Add(float64(md.GetStoredSizeBytes()))
 		p.metrics.decompressedBlobSizeWrite.Add(float64(md.GetFileRecord().GetDigest().GetSizeBytes()))
 	}
-
-	unlockFn := p.locker.Lock(key.LockID())
-	defer unlockFn()
 
 	oldMD := sgpb.FileMetadataFromVTPool()
 	defer oldMD.ReturnToVTPool()
