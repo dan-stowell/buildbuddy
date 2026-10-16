@@ -234,10 +234,26 @@ func summarize(o *buildOutcome) string {
 // retries the BES upload on its own. The final invocation's cache stats must
 // match a control build that was not cut.
 func TestRealBazelBESDisconnectRetry_CacheStats(t *testing.T) {
+	testScenario(t, testbazel.MakeTempModule(t, workspaceContents))
+}
+
+// Same, but with Bazel's BES retry backoff lowered to 50ms (well below the
+// 500ms cache_stats_finalization_delay), to check whether retry timing
+// matters.
+func TestRealBazelBESDisconnectRetry_FastRetry_CacheStats(t *testing.T) {
+	contents := map[string]string{
+		".bazelrc": "startup --host_jvm_args=-DBAZEL_BES_MIN_RETRY_SLEEP_MILLIS=50\n",
+	}
+	for k, v := range workspaceContents {
+		contents[k] = v
+	}
+	testScenario(t, testbazel.MakeTempModule(t, contents))
+}
+
+func testScenario(t *testing.T, ws string) {
 	app := buildbuddy_enterprise.RunWithConfig(t, buildbuddy_enterprise.DefaultAppConfig(t), buildbuddy_enterprise.NoAuthConfig)
 	bb := app.BuildBuddyServiceClient(t)
 	ctx := context.Background()
-	ws := testbazel.MakeTempModule(t, workspaceContents)
 	grpcHostPort := strings.TrimPrefix(app.GRPCAddress(), "grpc://")
 	t.Logf("test bazel version: %s", testbazel.Version)
 
