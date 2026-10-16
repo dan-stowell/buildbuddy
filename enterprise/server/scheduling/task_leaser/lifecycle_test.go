@@ -96,6 +96,8 @@ func TestLeaseLifecycleResources(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				// Intentionally omit BuildBuddy CommonGRPCServerOptions: this server
+				// has no pre-spawned worker pool to hide stuck handlers from testleak.
 				srv := grpc.NewServer()
 				handler := &leaseServer{failPing: mode == "keepalive_failure"}
 				scpb.RegisterSchedulerServer(srv, handler)

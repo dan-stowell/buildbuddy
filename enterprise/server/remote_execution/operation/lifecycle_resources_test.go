@@ -78,6 +78,8 @@ func TestPublisherLifecycleResources(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				// Intentionally omit BuildBuddy CommonGRPCServerOptions: this server
+				// has no pre-spawned worker pool to hide stuck handlers from testleak.
 				srv := grpc.NewServer()
 				handler := &resourceExecutionServer{retry: mode == "retry"}
 				repb.RegisterExecutionServer(srv, handler)
