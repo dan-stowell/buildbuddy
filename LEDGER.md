@@ -12,7 +12,7 @@ Branch convention: `leak/det-*` detector work, `leak/repro-*` reproducers (no fi
 ## Investigations
 | ID | Subsystem / lifecycle | Hypothesis | Agent(s) | Detector | Repro | Prod rel. | Baseline meas. | Fixed meas. | Candidate fix | Regression test | Indep. verify | Human review |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| I27 | Executor host-side VFS server (metal enable_vfs): per-task handle map / FDs / lazy fetch; guest dies w/o Release | — | Codex lk-w2 | CheckGrowth | IN PROGRESS | High (metal) | — | — | — | — | — | — |
+| I27-neg | Executor host-side VFS server (metal enable_vfs): Release, guest disappears w/o Release, task cancel, lazy CAS read, missing blob, active CAS stream cancel; N=10/50 | per-task leak | Codex lk-w2 | CheckGrowth(0) + workspace FD count (8 → 0 after Stop) | **No leak** (1,116 task lifecycles, 3/3, --config=remote) | High (metal) | — | — | — | `vfs_server:vfs_server_lifecycle_test` on lk-w2 audit branch (enforcement candidate) | — | — |
 | I25 | procstats `getProcessStats` → gopsutil NewProcess → os.FindProcess opens a pidfd per process per poll, never Released → closed only by GC | GC-delayed FD accumulation | V16 noticed; Codex lk-w2 investigated; Claude V20 verifying | /proc/self/fd w/ GC disabled + CheckGrowth | 3/3: exactly (K+1)·N pidfds w/ GC off (2550 @ K=50,N=50); 0 w/ fix | **Low** (bare+stats only; Go forced GC ≤2min → ~8k typical/~56k pessimistic in flight vs soft=hard NOFILE ~0.5–1M; real cost = syscalls + noisy FD metrics) | (K+1)·N | 0 | `leak/pr-pidfd` (fix 92cf8c56 + test bb94eb69) | 20/20 fail (+80), 20/20 pass; race 5/5 | **Draft PR #85 (stacked on #65)** — CONFIRMED (Claude V20) | — |
 | I24-neg | App HTTP streaming: MCP (initialize w/o delete, tool ok/err/disconnect mid-call), protolet streaming HTTP bridge (complete/error/disconnect), /file/download 2MiB (complete/upstream err/disconnect after 128B); N=10/50 | per-request/session leak | Codex lk-w1 | CheckGrowth(0) live + Check/CheckFDs | **No leak**; MCP is stateless (POST/JSON, no session map) | High | +0 | — | — | `leak/repro-http-audit` (enforcement candidate) | — | — |
 | I26 | Long soaks (≈40 measured batches) for slow (<1/batch) drift; top-delta report; optional slow-leak rule | untargeted | Codex lk-w1 | testleak.Soak | IN PROGRESS | — | — | — | — | — | — | — |
@@ -99,6 +99,7 @@ Branch convention: `leak/det-*` detector work, `leak/repro-*` reproducers (no fi
 | priority_task_scheduler shutdown | DROPPED (2/30) | — | flake → real bug lead I10 |
 
 ## Process notes
+- 2026-10-16: lk-w2 VM deleted after I27 (idle; coverage broad, diminishing returns). Status page: https://claude.ai/artifact/QZy2hqsJY74mF3GvrqSJFd
 - 2026-10-16: user requirement — all bb remote builds/tests pass `--config=remote`. Open PR branches being re-verified with it (~/coord/reverify). Codex tasks E2/I18/I19 started before the rule; their outputs are re-verified with the flag before PRs.
 
 ## --config=remote re-verification of open PRs (2026-10-16)
