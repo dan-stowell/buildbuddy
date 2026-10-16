@@ -5,6 +5,7 @@ go_library(
     testonly = 1,
     srcs = [
         "fd.go",
+        "growth.go",
         "testleak.go",
     ],
     importpath = "github.com/buildbuddy-io/buildbuddy/server/testutil/testleak",
