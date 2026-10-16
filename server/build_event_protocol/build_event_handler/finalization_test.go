@@ -8,6 +8,7 @@ import (
 
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/build_event_handler"
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/build_event_server"
+	"github.com/buildbuddy-io/buildbuddy/server/buildbuddy_server"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
@@ -19,6 +20,7 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 
 	bspb "github.com/buildbuddy-io/buildbuddy/proto/build_event_stream"
+	inpb "github.com/buildbuddy-io/buildbuddy/proto/invocation"
 	inspb "github.com/buildbuddy-io/buildbuddy/proto/invocation_status"
 	pepb "github.com/buildbuddy-io/buildbuddy/proto/publish_build_event"
 )
@@ -128,6 +130,19 @@ func checkStreamFinalization(t *testing.T, order []int, terminal error, cancelCo
 	assert.Equal(t, row.Command, inv.Command)
 	assert.Equal(t, []string{row.Pattern}, inv.Pattern)
 	assert.Equal(t, row.BazelExitCode, inv.BazelExitCode)
+	api, err := buildbuddy_server.NewBuildBuddyServer(te, nil)
+	require.NoError(t, err)
+	response, err := api.GetInvocation(readCtx, &inpb.GetInvocationRequest{Lookup: &inpb.InvocationLookup{InvocationId: iid}})
+	require.NoError(t, err)
+	require.Len(t, response.Invocation, 1)
+	apiInv := response.Invocation[0]
+	assert.Equal(t, inv.InvocationStatus, apiInv.InvocationStatus)
+	assert.Equal(t, inv.Success, apiInv.Success)
+	assert.Equal(t, inv.DurationUsec, apiInv.DurationUsec)
+	assert.Equal(t, inv.Command, apiInv.Command)
+	assert.Equal(t, inv.Pattern, apiInv.Pattern)
+	assert.Equal(t, inv.BazelExitCode, apiInv.BazelExitCode)
+
 	// Disconnected invocations are intentionally excluded from OLAP.
 	if !finishedSeen {
 		assert.Nil(t, olap.GetFlushedInvocation(iid))

@@ -69,6 +69,7 @@ go_test(
     deps = [
         ":build_event_handler",
         "//server/build_event_protocol/build_event_server",
+        "//server/buildbuddy_server",
         "//proto:build_event_stream_go_proto",
         "//proto:build_events_go_proto",
         "//proto:command_line_go_proto",
