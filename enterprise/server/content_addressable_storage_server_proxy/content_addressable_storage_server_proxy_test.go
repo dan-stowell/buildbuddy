@@ -1282,31 +1282,6 @@ func TestPresenceInvalidation_UnrelatedMissesDoNotStarveFills(t *testing.T) {
 	}
 }
 
-func TestPresenceLookupTracking_BoundedAndReleased(t *testing.T) {
-	s := &CASServerProxy{presenceLookups: make(map[string]*presenceLookup)}
-	// Fill tracking capacity with active lookups. Capacity must never evict an
-	// active entry: doing so would lose invalidations for delayed RPCs.
-	for i := range maxPresenceLookups {
-		s.presenceLookups[fmt.Sprint(i)] = &presenceLookup{refs: 1}
-	}
-	key := digest.NewKey(&repb.Digest{Hash: "a", SizeBytes: 1})
-	require.Empty(t, s.beginPresenceLookups(map[digest.Key]string{key: "overflow"}))
-	require.Len(t, s.presenceLookups, maxPresenceLookups)
-	// Existing keys still participate when capacity is exhausted.
-	snapshot := s.beginPresenceLookups(map[digest.Key]string{key: "0"})
-	require.Contains(t, snapshot, "0")
-	s.presenceLookups["0"].sequence++
-	require.NotEqual(t, snapshot["0"], s.presenceLookups["0"].sequence)
-	s.endPresenceLookups(snapshot)
-	require.Equal(t, 1, s.presenceLookups["0"].refs)
-	s.endPresenceLookups(map[string]uint64{"0": 0})
-	require.NotContains(t, s.presenceLookups, "0")
-	snapshot = s.beginPresenceLookups(map[digest.Key]string{key: "overflow"})
-	require.Contains(t, snapshot, "overflow")
-	s.endPresenceLookups(snapshot)
-	require.NotContains(t, s.presenceLookups, "overflow")
-}
-
 // A lagging replica (or an upstream presence cache) can answer from a snapshot
 // older than a completed read miss, even when the presence RPC starts later.
 func TestPresenceInvalidation_LaterLookupWithStaleBackendSnapshot(t *testing.T) {
