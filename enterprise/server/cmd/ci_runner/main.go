@@ -2032,20 +2032,12 @@ func (ws *workspace) sync(ctx context.Context) error {
 		return status.WrapError(err, "fetch pushed ref")
 	}
 
-	// Return submodules to an uninitialized state before checkout. Workflows
-	// opt in to initializing submodules themselves; doing that here would add
-	// network access and potentially initialize dependencies they do not use.
-	// Force also discards changes made by a previous invocation.
-	if _, err := git(ctx, ws.log, "submodule", "deinit", "--all", "-f"); err != nil {
-		return err
-	}
-
 	// Clean up in case a previous workflow made a mess.
 	cleanArgs := []string{
 		"clean",
-		"-x",  /* include ignored files */
-		"-d",  /* recurse into directories */
-		"-ff", /* also remove untracked nested Git repositories */
+		"-x", /* include ignored files */
+		"-d", /* recurse into directories */
+		"--force",
 	}
 	for _, path := range *gitCleanExclude {
 		cleanArgs = append(cleanArgs, "-e", path)
@@ -2056,12 +2048,6 @@ func (ws *workspace) sync(ctx context.Context) error {
 
 	if err := ws.checkoutRef(ctx); err != nil {
 		return status.WrapError(err, "checkout ref")
-	}
-
-	// Checkout can turn tracked paths (including removed submodules) into
-	// untracked paths. Apply the same exclusions on both cleanup passes.
-	if _, err := git(ctx, ws.log, cleanArgs...); err != nil {
-		return err
 	}
 
 	// If commit sha is not set, pull the sha that is checked out so that it can be used in Github Status reporting
