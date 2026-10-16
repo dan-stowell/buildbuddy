@@ -3204,3 +3204,30 @@ func TestExecute_HedgingDisabledAvoidsCopyRegistry(t *testing.T) {
 	t.Logf("hedging disabled; copy registry commands before initial operation: %d", len(commands))
 	require.Empty(t, commands, "the common no-hedge Execute must preserve baseline Redis work")
 }
+
+func TestCancel_PreservesLegacyMergedExecution(t *testing.T) {
+	flags.Set(t, "remote_execution.enable_action_merging", true)
+	env, _, _ := setupEnv(t)
+	ctx, err := prefix.AttachUserPrefixToContext(context.Background(), env.GetAuthenticator())
+	require.NoError(t, err)
+	userPrefix, err := prefix.UserPrefixFromContext(ctx)
+	require.NoError(t, err)
+	invocationID := "11111111-1111-4111-8111-111111111111"
+	createInvocation(ctx, t, env.GetDBHandle(), &tables.Invocation{
+		InvocationID:     invocationID,
+		InvocationStatus: int64(invocation_status.InvocationStatus_PARTIAL_INVOCATION_STATUS),
+		Perms:            perms.OTHERS_READ,
+	})
+	action := digest.NewCASResourceName(&repb.Digest{Hash: strings.Repeat("a", 64), SizeBytes: 1}, "", repb.DigestFunction_SHA256)
+	id := action.NewUploadString()
+	createExecution(ctx, t, env.GetDBHandle(), &tables.Execution{
+		ExecutionID: id, InvocationID: invocationID, Stage: int64(repb.ExecutionStage_EXECUTING),
+	})
+	// Legacy writers record aggregate interest without a copy registry.
+	key := fmt.Sprintf("pendingExecution/4/%s/sha256/{%s}", userPrefix, action.GetDigest().GetHash())
+	require.NoError(t, env.GetRemoteExecutionRedisClient().HSet(ctx, key,
+		"execution-id", id, "action-count", 2).Err())
+	require.NoError(t, env.GetRemoteExecutionService().Cancel(ctx, invocationID))
+	require.Zero(t, env.GetSchedulerService().(*schedulerServerMock).canceledCount,
+		"another legacy merged invocation still needs this execution")
+}
