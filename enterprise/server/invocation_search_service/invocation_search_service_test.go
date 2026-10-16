@@ -4,6 +4,10 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
+
+	inspb "github.com/buildbuddy-io/buildbuddy/proto/invocation_status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/invocation_search_service"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
@@ -316,4 +320,95 @@ func TestUnblendedOLAPQuery(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, []string{getUUIDString(3)}, getInvocationIDSlice(rsp))
+}
+
+// paginationFixture creates exact timestamps after insertion because Model's
+// BeforeCreate hook replaces supplied timestamps. No wall clock or randomness
+// participates in the generated ordering.
+func paginationFixture(t *testing.T, n int, tied bool, olap bool) (context.Context, *real_environment.RealEnv, *invocation_search_service.InvocationSearchService) {
+	t.Helper()
+	env := testenv.GetTestEnv(t)
+	if olap {
+		testclickhouse.Configure(t, env)
+		flags.Set(t, "olap_database.invocation_batch_insert_interval", 0)
+		flags.Set(t, "olap_database.async_insert", true)
+	}
+	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1"))
+	env.SetAuthenticator(ta)
+	ctx, err := ta.WithAuthenticatedUser(context.Background(), "US1")
+	require.NoError(t, err)
+	for i := range n {
+		row := &tables.Invocation{InvocationID: getUUIDString(byte(i)), InvocationUUID: getUUIDBytes(byte(i)), GroupID: "GR1", Perms: perms.GROUP_READ, User: "pager", RepoURL: "https://github.com/example/repo", BranchName: "main", CommitSHA: "abc", InvocationStatus: 1, Success: true}
+		require.NoError(t, env.GetDBHandle().NewQuery(ctx, "pagination_insert").Create(row))
+		stamp := int64(1700000000000000 + i*1000000)
+		if tied {
+			stamp = 1700000000000000 + int64(i/3)*1000000
+		}
+		require.NoError(t, env.GetDBHandle().GORM(ctx, "pagination_timestamp").Exec("UPDATE Invocations SET created_at_usec = ?, updated_at_usec = ? WHERE invocation_id = ?", stamp, stamp, row.InvocationID).Error)
+		row.CreatedAtUsec, row.UpdatedAtUsec = stamp, stamp
+		if olap {
+			require.NoError(t, env.GetOLAPDBHandle().FlushInvocationStats(ctx, row))
+		}
+	}
+	return ctx, env, invocation_search_service.NewInvocationSearchService(env, env.GetDBHandle(), env.GetOLAPDBHandle())
+}
+
+func TestPaginationStatic(t *testing.T) {
+	for _, backend := range []string{"sqlite", "olap"} {
+		for _, tied := range []bool{false, true} {
+			for n := 0; n <= 7; n++ {
+				t.Run(fmt.Sprintf("%s/tied=%t/n=%d", backend, tied, n), func(t *testing.T) {
+					olap := backend == "olap"
+					flags.Set(t, "app.blended_invocation_search_enabled", false)
+					flags.Set(t, "app.olap_invocation_search_enabled", olap)
+					ctx, _, service := paginationFixture(t, n, tied, olap)
+					for size := 1; size <= 4; size++ {
+						for _, ascending := range []bool{false, true} {
+							for _, field := range []inpb.InvocationSort_SortField{inpb.InvocationSort_UPDATED_AT_USEC_SORT_FIELD, inpb.InvocationSort_CREATED_AT_USEC_SORT_FIELD} {
+								t.Run(fmt.Sprintf("size=%d/asc=%t/field=%d", size, ascending, field), func(t *testing.T) {
+									req := &inpb.SearchInvocationRequest{Count: int32(size), Sort: &inpb.InvocationSort{SortField: field, Ascending: ascending}, Query: &inpb.InvocationQuery{
+										User: "pager", RepoUrl: "https://github.com/example/repo", BranchName: "main", CommitSha: "abc", Status: []inspb.OverallStatus{inspb.OverallStatus_SUCCESS},
+										UpdatedAfter: timestamppb.New(time.UnixMicro(1700000000000000)), UpdatedBefore: timestamppb.New(time.UnixMicro(1700000007000000)),
+									}}
+									// A nonempty stat filter selects the unblended OLAP path.
+									if olap {
+										metric, min := sfpb.InvocationMetricType_UPDATED_AT_USEC_INVOCATION_METRIC, int64(0)
+										req.Query.Filter = []*sfpb.StatFilter{{Metric: &sfpb.Metric{Invocation: &metric}, Min: &min}}
+									}
+									var ids []string
+									var timestamps []int64
+									for page := 0; ; page++ {
+										require.LessOrEqual(t, page, n+1, "pagination must terminate")
+										rsp, err := service.QueryInvocations(ctx, req)
+										require.NoError(t, err)
+										for _, inv := range rsp.Invocation {
+											ids = append(ids, inv.InvocationId)
+											timestamps = append(timestamps, inv.UpdatedAtUsec)
+										}
+										if rsp.NextPageToken == "" {
+											break
+										}
+										require.NotEqual(t, req.PageToken, rsp.NextPageToken, "cursor must advance")
+										req.PageToken = rsp.NextPageToken
+									}
+									want := make([]string, n)
+									for i := range want {
+										want[i] = getUUIDString(byte(i))
+									}
+									require.ElementsMatch(t, want, ids, "all matching invocations exactly once")
+									for i := 1; i < len(timestamps); i++ {
+										if ascending {
+											require.LessOrEqual(t, timestamps[i-1], timestamps[i])
+										} else {
+											require.GreaterOrEqual(t, timestamps[i-1], timestamps[i])
+										}
+									}
+								})
+							}
+						}
+					}
+				})
+			}
+		}
+	}
 }

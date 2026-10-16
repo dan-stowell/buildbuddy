@@ -40,6 +40,8 @@ go_test(
         ":invocation_search_service",
         "//proto:context_go_proto",
         "//proto:invocation_go_proto",
+        "//proto:invocation_status_go_proto",
+        "@org_golang_google_protobuf//types/known/timestamppb",
         "//proto:stat_filter_go_proto",
         "//server/real_environment",
         "//server/tables",
