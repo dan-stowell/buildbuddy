@@ -2269,3 +2269,45 @@ func (s *trackedWriteStream) CloseAndRecv() (*bspb.WriteResponse, error) {
 	defer s.done()
 	return s.ByteStream_WriteClient.CloseAndRecv()
 }
+
+func TestCompressionDownloadFlagPreservesBytes(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("download_compression=%t", enabled), func(t *testing.T) {
+			env, ctx := testEnv(t)
+			flags.Set(t, "cache.zstd_transcoding_enabled", true)
+			flags.Set(t, "cache.client.enable_download_compression", enabled)
+			client := &countingByteStreamClient{ByteStreamClient: env.GetByteStreamClient(), reads: make(map[string]int)}
+			env.SetByteStreamClient(client)
+			tree := &repb.Tree{Root: &repb.Directory{}}
+			contents := make(map[string][]byte)
+			var large *digest.CASResourceName
+			for _, size := range []int{0, 1, 65535, 65536, 65537, 4*1024*1024 + 1} {
+				blob := make([]byte, size)
+				for i := range blob {
+					blob[i] = byte((i*31 + i/257) % 251)
+				}
+				d, err := digest.Compute(bytes.NewReader(blob), repb.DigestFunction_SHA256)
+				require.NoError(t, err)
+				rn := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256)
+				require.NoError(t, env.GetCache().Set(ctx, rn.ToProto(), blob))
+				name := fmt.Sprintf("blob-%d", size)
+				tree.Root.Files = append(tree.Root.Files, &repb.FileNode{Name: name, Digest: d})
+				contents[name] = blob
+				large = rn
+			}
+			root := testfs.MakeTempDir(t)
+			_, err := dirtools.DownloadTree(ctx, env, "", repb.DigestFunction_SHA256, tree, &dirtools.DownloadTreeOpts{RootDir: root})
+			require.NoError(t, err)
+			for name, want := range contents {
+				got, err := os.ReadFile(filepath.Join(root, name))
+				require.NoError(t, err)
+				require.True(t, bytes.Equal(want, got), "file=%s", name)
+			}
+			identityReads := client.readCount(large.DownloadString())
+			large.SetCompressor(repb.Compressor_ZSTD)
+			compressedReads := client.readCount(large.DownloadString())
+			t.Logf("download_compression=%t identity_reads=%d zstd_reads=%d", enabled, identityReads, compressedReads)
+			require.Greater(t, identityReads+compressedReads, 0, "large file must exercise ByteStream")
+		})
+	}
+}
