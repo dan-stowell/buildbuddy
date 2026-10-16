@@ -114,7 +114,10 @@ func RecordClaimedExecution(ctx context.Context, rdb redis.UniversalClient, exec
 		return nil
 	}
 	reverseKey := redisKeyForPendingExecutionDigest(executionID)
-	mapping, err := rdb.Get(ctx, reverseKey).Result()
+	mapping, err := rdb.Get(ctx, pairKey(executionID)).Result()
+	if err == redis.Nil {
+		mapping, err = rdb.Get(ctx, reverseKey).Result()
+	}
 	if err == redis.Nil {
 		return nil
 	}
@@ -127,8 +130,8 @@ func RecordClaimedExecution(ctx context.Context, rdb redis.UniversalClient, exec
 		pipe := rdb.TxPipeline()
 		pipe.Expire(ctx, copyKey(executionID), 24*time.Hour)
 		pipe.Expire(ctx, copyKey(canonical), 24*time.Hour)
-		pipe.Expire(ctx, reverseKey, 24*time.Hour)
-		pipe.Expire(ctx, redisKeyForPendingExecutionDigest(canonical), 24*time.Hour)
+		pipe.Expire(ctx, pairKey(executionID), 24*time.Hour)
+		pipe.Expire(ctx, pairKey(canonical), 24*time.Hour)
 		if _, err := pipe.Exec(ctx); err != nil {
 			return err
 		}
@@ -460,6 +463,14 @@ func copyKey(id string) string {
 	return "executionCopies/1/" + s
 }
 
+// Pair mappings are separate from the v4 reverse mappings consumed by older
+// replicas. Legacy cleanup can remove pending state, but cannot erase a winner's
+// fence. Old replicas still publish without fencing; full fencing requires all
+// completion handlers to be upgraded. Pair state expires after 24 hours.
+func pairKey(id string) string {
+	return "executionPair/1/" + redisKeyForPendingExecutionDigest(id)
+}
+
 // RegisterHedge creates copy state only when a hedge is about to be dispatched.
 // Registration and completion serialize on the canonical copy hash.
 func RegisterHedge(ctx context.Context, rdb redis.UniversalClient, canonical, id string) error {
@@ -485,7 +496,7 @@ func RegisterHedge(ctx context.Context, rdb redis.UniversalClient, canonical, id
  redis.call('EXPIRE', KEYS[2], 86400)
  redis.call('SET', KEYS[4], KEYS[3] .. '\n' .. ARGV[1], 'EX', 86400)
  redis.call('SET', KEYS[5], KEYS[3] .. '\n' .. ARGV[1], 'EX', 86400)
- return 1`, []string{copyKey(canonical), copyKey(id), forward, redisKeyForPendingExecutionDigest(canonical), redisKeyForPendingExecutionDigest(id)}, canonical, id, *hedgedActionCount, strconv.FormatInt(time.Now().UnixMicro(), 36)).Result()
+ return 1`, []string{copyKey(canonical), copyKey(id), forward, pairKey(canonical), pairKey(id)}, canonical, id, *hedgedActionCount, strconv.FormatInt(time.Now().UnixMicro(), 36)).Result()
 	return err
 }
 
@@ -497,12 +508,19 @@ func CompleteCopy(ctx context.Context, rdb redis.UniversalClient, id string, suc
 	if *hedgedActionCount == 0 {
 		return id, true, nil, nil
 	}
-	// This replaces the existing pending-execution cleanup lookup. Pair metadata
-	// is added to that mapping only by RegisterHedge, never by ordinary Execute.
+	// Failure callers may run on a different replica than hedge registration.
+	// One shared-state lookup is required even when no hedge was dispatched.
 	reverseKey := redisKeyForPendingExecutionDigest(id)
-	mapping, err := rdb.Get(ctx, reverseKey).Result()
+	mapping, err := rdb.Get(ctx, pairKey(id)).Result()
 	if err == redis.Nil {
-		return id, true, []string{}, nil
+		if !success {
+			return id, true, nil, nil
+		}
+		// Preserve atomic registration-versus-completion ordering on the success path.
+		mapping, err = rdb.Get(ctx, reverseKey).Result()
+		if err == redis.Nil {
+			return id, true, []string{}, nil
+		}
 	}
 	if err != nil {
 		return "", false, nil, err

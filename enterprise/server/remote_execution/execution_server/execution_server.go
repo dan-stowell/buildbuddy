@@ -1489,7 +1489,9 @@ func (s *ExecutionServer) MarkExecutionFailed(ctx context.Context, taskID string
 			s.env.GetSchedulerService().CancelTask(ctx, id)
 		}
 	}
-	action_merger.DeletePendingExecution(ctx, s.rdb, canonical)
+	if len(copies) > 0 {
+		action_merger.DeletePendingExecution(ctx, s.rdb, canonical)
+	}
 	return s.publishFailure(ctx, taskID, reason)
 }
 
