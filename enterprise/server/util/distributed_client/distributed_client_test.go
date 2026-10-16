@@ -9,7 +9,10 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"net"
+	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,6 +27,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testcompression"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testdigest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testmetrics"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testport"
 	"github.com/buildbuddy-io/buildbuddy/server/util/compression"
@@ -2678,4 +2682,79 @@ func TestCloseInactiveClients(t *testing.T) {
 	require.NoError(t, err)
 	_, err = local.RemoteContains(ctx, peer2, rn)
 	require.NoError(t, err)
+}
+
+// fileReaderCache models Pebble's external-blob reader without DB background FDs.
+type fileReaderCache struct {
+	interfaces.Cache
+	path string
+}
+
+func (c *fileReaderCache) Reader(ctx context.Context, rn *rspb.ResourceName, offset, limit int64) (io.ReadCloser, error) {
+	return os.Open(c.path)
+}
+func countOpenBlobFDs(t *testing.T, path string) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	require.NoError(t, err)
+	count := 0
+	for _, e := range entries {
+		target, err := os.Readlink(filepath.Join("/proc/self/fd", e.Name()))
+		if err == nil && target == path {
+			count++
+		}
+	}
+	return count
+}
+
+func TestRemoteReaderPartialCloseReleasesBlob(t *testing.T) {
+	testleak.Check(t)
+	// Keep cloud metadata HTTP connection pools out of this local RPC test.
+	flags.Set(t, "zone_override", "test-zone")
+	flags.Set(t, "cache.read_buf_size_bytes", 64*1024)
+	te := getTestEnv(t, emptyUserMap)
+	ctx, err := prefix.AttachUserPrefixToContext(context.Background(), te.GetAuthenticator())
+	require.NoError(t, err)
+	// Keep the parent alive during measurements: closing a reader must finish its
+	// own RPC even when the caller continues doing other work with this context.
+	ctx, cancel := context.WithCancel(ctx)
+	t.Cleanup(cancel)
+	path := filepath.Join(t.TempDir(), "external-blob")
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	require.NoError(t, f.Truncate(16*1024*1024))
+	require.NoError(t, f.Close())
+	cache := &fileReaderCache{Cache: te.GetCache(), path: path}
+	peer := fmt.Sprintf("localhost:%d", testport.FindFree(t))
+	proxy := newProxy(t, te, cache, peer)
+	require.NoError(t, proxy.StartListening())
+	// Cancel outstanding RPCs before the proxy's graceful shutdown on baseline.
+	t.Cleanup(cancel)
+	rn := &rspb.ResourceName{Digest: &repb.Digest{Hash: strings.Repeat("a", 64), SizeBytes: 16 * 1024 * 1024}, CacheType: rspb.CacheType_CAS}
+	opened := 0
+	for _, n := range []int{1, 10, 50} {
+		for ; opened < n; opened++ {
+			r, err := proxy.RemoteReader(ctx, peer, rn, 0, 0)
+			require.NoError(t, err)
+			_, err = io.ReadFull(r, make([]byte, 17))
+			require.NoError(t, err)
+			require.NoError(t, r.Close())
+		}
+		// Poll for async gRPC cancellation and server-side deferred Close.
+		deadline := time.Now().Add(3 * time.Second)
+		for countOpenBlobFDs(t, path) > 0 && time.Now().Before(deadline) {
+			runtime.Gosched()
+			time.Sleep(10 * time.Millisecond)
+		}
+		count := countOpenBlobFDs(t, path)
+		t.Logf("N=%d open_external_blob_FDs=%d target=%s", n, count, path)
+		if count != 0 && n == 1 {
+			buf := make([]byte, 2*1024*1024)
+			size := runtime.Stack(buf, true)
+			t.Logf("goroutines after reader Close: %s", buf[:size])
+		}
+		if count != 0 {
+			t.Errorf("reader Close left %d blob FDs open", count)
+		}
+	}
 }
