@@ -17,6 +17,7 @@ go_test(
     size = "small",
     srcs = ["paging_test.go"],
     deps = [
+        "//server/util/status",
         ":paging",
         "//proto:pagination_go_proto",
         "@com_github_stretchr_testify//assert",

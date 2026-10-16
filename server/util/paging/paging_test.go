@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/buildbuddy-io/buildbuddy/server/util/paging"
+	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -28,4 +29,13 @@ func TestDecodeEmptyStringToEmptyProto(t *testing.T) {
 
 	assert.Equal(t, int64(0), page.Offset)
 	assert.Equal(t, int64(0), page.Limit)
+}
+
+func TestPaginationMalformedEncoding(t *testing.T) {
+	for _, token := range []string{"!", "not_base64", "AA==", "/w=="} {
+		t.Run(token, func(t *testing.T) {
+			_, err := paging.DecodeOffsetLimit(token)
+			require.True(t, status.IsInvalidArgumentError(err), "token %q: got %v", token, err)
+		})
+	}
 }

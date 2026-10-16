@@ -2,6 +2,7 @@ package target_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -303,4 +304,57 @@ func makeInvocationID(char byte) (hex, ascii string) {
 	// Insert dashes for human-readable ASCII representation
 	ascii = hex[:8] + "-" + hex[8:12] + "-" + hex[12:16] + "-" + hex[16:20] + "-" + hex[20:]
 	return
+}
+
+func TestPaginationTargetHistoryTies(t *testing.T) {
+	flags.Set(t, "app.enable_read_target_statuses_from_olap_db", true)
+	env := testenv.GetTestEnv(t)
+	testclickhouse.Configure(t, env)
+	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1"))
+	env.SetAuthenticator(ta)
+	ctx, err := ta.WithAuthenticatedUser(context.Background(), "US1")
+	require.NoError(t, err)
+	// History has a fixed page size of 40 distinct commits. The tie groups of
+	// three straddle the 40-commit boundary; each commit has two test results.
+	for _, n := range []int{0, 1, 39, 40, 41, 81} {
+		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
+			repo := fmt.Sprintf("https://github.com/example/repo%d", n)
+			var rows []*olaptables.TestTargetStatus
+			var want []string
+			for i := range n {
+				for _, label := range []string{"//:a", "//:b"} {
+					iid := fmt.Sprintf("%032x", i+1)
+					rows = append(rows, &olaptables.TestTargetStatus{GroupID: "GR1", RepoURL: repo, BranchName: "main", CommitSHA: fmt.Sprintf("commit%03d", i), Label: label, Status: int32(bespb.TestStatus_PASSED), InvocationUUID: iid, InvocationStartTimeUsec: int64(1000000 + i/3), StartTimeUsec: int64(1000000 + i/3)})
+					want = append(want, fmt.Sprintf("%s/commit%03d", label, i))
+				}
+			}
+			if len(rows) > 0 {
+				require.NoError(t, env.GetOLAPDBHandle().GORM(ctx, "pagination_targets").Create(&rows).Error)
+			}
+			req := &trpb.GetTargetHistoryRequest{RequestContext: &ctxpb.RequestContext{GroupId: "GR1"}, ServerSidePagination: true, Query: &trpb.TargetQuery{RepoUrl: repo, BranchName: "main"}}
+			var got []string
+			last := map[string]int64{}
+			for page := 0; ; page++ {
+				require.Less(t, page, 5, "history must terminate")
+				rsp, err := target.GetTargetHistory(ctx, env, req)
+				require.NoError(t, err)
+				for _, history := range rsp.InvocationTargets {
+					label := history.Target.Label
+					for _, status := range history.TargetStatus {
+						if prev, ok := last[label]; ok {
+							require.GreaterOrEqual(t, prev, status.InvocationCreatedAtUsec)
+						}
+						last[label] = status.InvocationCreatedAtUsec
+						got = append(got, label+"/"+status.CommitSha)
+					}
+				}
+				if rsp.NextPageToken == "" {
+					break
+				}
+				require.NotEqual(t, req.PageToken, rsp.NextPageToken)
+				req.PageToken = rsp.NextPageToken
+			}
+			require.ElementsMatch(t, want, got, "every target/commit exactly once")
+		})
+	}
 }
