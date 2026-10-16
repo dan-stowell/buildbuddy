@@ -2824,3 +2824,34 @@ func TestRedisRetryIdempotency_DeleteClaimedTask(t *testing.T) {
 	require.Zero(t, rdb.Exists(ctx, key).Val(), "first execution deleted the task")
 	require.NoError(t, err, "successful deletion replay must reach action-merging and reservation cleanup")
 }
+
+func TestRedisRetryIdempotency_ReleaseState(t *testing.T) {
+	ctx := t.Context()
+	rdb, drop := redisWithLostReply(t)
+	s := &SchedulerServer{rdb: rdb}
+	key := s.redisKeyForTask("retry-release")
+	require.NoError(t, rdb.HSet(ctx, key, "claimed", "1", "leaseId", "lease", "attemptCount", 1).Err())
+	require.NoError(t, redisReleaseClaim.Load(ctx, rdb).Err())
+	drop.Store(true)
+	err := s.unclaimTask(ctx, "retry-release", "lease", "reconnect-token")
+	require.False(t, drop.Load())
+	// The wrapper reports NotFound on replay, but reEnqueueTask explicitly
+	// tolerates this error and continues. The state must be usable for reconnect.
+	require.True(t, status.IsNotFoundError(err), "got %v", err)
+	require.False(t, rdb.HExists(ctx, key, "claimed").Val())
+	require.Equal(t, "1", rdb.HGet(ctx, key, "attemptCount").Val())
+	require.Equal(t, "lease", rdb.HGet(ctx, key, "leaseId").Val())
+	require.Equal(t, "reconnect-token", rdb.HGet(ctx, key, "reconnectToken").Val())
+	require.NotEmpty(t, rdb.HGet(ctx, key, "reconnectPeriodEnd").Val())
+}
+
+func TestRedisRetryIdempotency_NoLostReply(t *testing.T) {
+	ctx := t.Context()
+	rdb, _ := redisWithLostReply(t)
+	s := &SchedulerServer{rdb: rdb}
+	require.NoError(t, s.insertTask(ctx, "control", &scpb.SchedulingMetadata{}, []byte("task"), ""))
+	require.Positive(t, rdb.TTL(ctx, s.redisKeyForTask("control")).Val())
+	require.NoError(t, rdb.HSet(ctx, s.redisKeyForTask("control"), "claimed", "1").Err())
+	require.NoError(t, s.deleteClaimedTask(ctx, "control"))
+	require.Zero(t, rdb.Exists(ctx, s.redisKeyForTask("control")).Val())
+}
