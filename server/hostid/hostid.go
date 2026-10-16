@@ -77,16 +77,13 @@ func getOrCreateHostId(dir string) (string, error) {
 			return "", err
 		}
 		// the file exists, read the file to get the host ID
-		hostIDFile, err := os.Open(hostIDFilepath)
-		if err != nil {
-			return "", err
-		}
-		id, err := io.ReadAll(hostIDFile)
+		id, err := os.ReadFile(hostIDFilepath)
 		if err != nil {
 			return "", err
 		}
 		return string(id), nil
 	}
+	defer hostIDFile.Close()
 	// we successfully opened the file, generate and record the host id
 	id, err := guuid.NewRandom()
 	if err != nil {
@@ -94,6 +91,9 @@ func getOrCreateHostId(dir string) (string, error) {
 		return "", err
 	}
 	if _, err = io.WriteString(hostIDFile, id.String()); err != nil {
+		return "", err
+	}
+	if err := hostIDFile.Close(); err != nil {
 		return "", err
 	}
 	return id.String(), nil
