@@ -2797,3 +2797,33 @@ func TestUnclaimedTaskStaleCacheLeaseSafety(t *testing.T) {
 		})
 	}
 }
+
+func TestCancelTaskRemovesUnclaimedTracking(t *testing.T) {
+	for _, shards := range []int{1, 3} {
+		t.Run(fmt.Sprintf("shards=%d", shards), func(t *testing.T) {
+			flags.Set(t, "remote_execution.unclaimed_tasks_shard_count", shards)
+			flags.Set(t, "remote_execution.unclaimed_tasks_cache_ttl", time.Duration(0))
+			env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+			s := env.GetSchedulerService().(*SchedulerServer)
+			ex := newFakeExecutor(ctx, t, env.GetSchedulerClient())
+			ex.Register()
+			id := scheduleTask(ctx, t, env, map[string]string{})
+			nextReservation(t, ex, id)
+			task, err := s.readTask(ctx, id)
+			require.NoError(t, err)
+			np := s.getOrCreatePool(nodePoolKey{os: task.metadata.GetOs(), arch: task.metadata.GetArch(), pool: task.metadata.GetPool(), groupID: task.metadata.GetExecutorGroupId()})
+			ids, err := np.SampleUnclaimedTasks(ctx, 100)
+			require.NoError(t, err)
+			require.Contains(t, ids, id)
+			deleted, err := s.CancelTask(ctx, id)
+			require.NoError(t, err)
+			require.True(t, deleted)
+			exists, err := s.TaskExists(ctx, &scpb.TaskExistsRequest{TaskId: id})
+			require.NoError(t, err)
+			require.False(t, exists.GetExists())
+			ids, err = np.SampleUnclaimedTasks(ctx, 100)
+			require.NoError(t, err)
+			require.NotContains(t, ids, id, "cancelled task remains in unclaimed tracking with caching disabled")
+		})
+	}
+}
