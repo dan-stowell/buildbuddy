@@ -387,6 +387,7 @@ func TestGeneratedTrendFilters(t *testing.T) {
 	te := testenv.GetTestEnv(t)
 	testclickhouse.Configure(t, te)
 	flags.Set(t, "app.finer_time_buckets", false)
+	flags.Set(t, "app.trends_heatmap_enabled", true)
 	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1"))
 	te.SetAuthenticator(ta)
 	ctx, err := ta.WithAuthenticatedUser(context.Background(), "US1")
@@ -451,7 +452,7 @@ func TestGeneratedTrendFilters(t *testing.T) {
 			if name == "status_or" {
 				q.Status = []inspb.OverallStatus{inspb.OverallStatus_SUCCESS, inspb.OverallStatus_FAILURE}
 			}
-			var wantCount, wantDuration int64
+			var wantCount, wantDuration, wantSelection int64
 			for _, r := range rows {
 				matches := true
 				for _, pair := range [][2]string{{q.User, r.User}, {q.Host, r.Host}, {q.RepoUrl, r.RepoURL}, {q.BranchName, r.BranchName}, {q.CommitSha, r.CommitSHA}, {q.Command, r.Command}, {q.Pattern, r.Pattern}} {
@@ -476,6 +477,9 @@ func TestGeneratedTrendFilters(t *testing.T) {
 				}
 				if matches {
 					wantCount++
+					if r.DurationUsec >= 513 {
+						wantSelection++
+					}
 					wantDuration += r.DurationUsec
 				}
 			}
@@ -489,6 +493,26 @@ func TestGeneratedTrendFilters(t *testing.T) {
 			}
 			require.Equal(t, wantCount, count, strings.Join([]string{name, "count"}, " "))
 			require.Equal(t, wantDuration, duration)
+			metricType := sfpb.InvocationMetricType_DURATION_USEC_INVOCATION_METRIC
+			metric := &sfpb.Metric{Invocation: &metricType}
+			min := int64(513)
+			drilldown, err := iss.GetStatDrilldown(ctx, &statspb.GetStatDrilldownRequest{RequestContext: rc, Query: q, DrilldownMetric: metric, Filter: []*sfpb.StatFilter{{Metric: metric, Min: &min}}})
+			require.NoError(t, err)
+			require.Equal(t, wantSelection, drilldown.GetTotalInSelection())
+			require.Equal(t, wantCount-wantSelection, drilldown.GetTotalInBase())
+			for _, chart := range drilldown.GetChart() {
+				if chart.GetDrilldownType() == statspb.DrilldownType_TAG_DRILLDOWN_TYPE {
+					continue
+				} // rows may have multiple tags
+				var base, selection int64
+				for _, entry := range chart.GetEntry() {
+					base += entry.GetBaseValue()
+					selection += entry.GetSelectionValue()
+				}
+				require.Equal(t, wantCount-wantSelection, base)
+				require.Equal(t, wantSelection, selection)
+			}
+
 			// The SQL fallback supports these dimensions except tags. It also has
 			// no percentile support, so compare the common count/duration fields.
 			if len(q.Tags) == 0 {
