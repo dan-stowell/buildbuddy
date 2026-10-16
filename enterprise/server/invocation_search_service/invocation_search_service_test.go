@@ -361,7 +361,36 @@ func TestPaginationStatic(t *testing.T) {
 					olap := backend == "olap"
 					flags.Set(t, "app.blended_invocation_search_enabled", false)
 					flags.Set(t, "app.olap_invocation_search_enabled", olap)
-					ctx, _, service := paginationFixture(t, n, tied, olap)
+					ctx, env, service := paginationFixture(t, n, tied, olap)
+					// Interleave one exclusion for each filter with matching timestamps.
+					for excluded := range 8 {
+						row := &tables.Invocation{InvocationID: getUUIDString(byte(100 + excluded)), InvocationUUID: getUUIDBytes(byte(100 + excluded)), GroupID: "GR1", Perms: perms.GROUP_READ, User: "pager", RepoURL: "https://github.com/example/repo", BranchName: "main", CommitSHA: "abc", InvocationStatus: 1, Success: true}
+						stamp := int64(1700000001000000)
+						switch excluded {
+						case 0:
+							row.User = "other"
+						case 1:
+							row.RepoURL = "https://github.com/example/other"
+						case 2:
+							row.BranchName = "other"
+						case 3:
+							row.CommitSHA = "other"
+						case 4:
+							row.Success = false
+						case 5:
+							stamp = 1699999999999999
+						case 6:
+							stamp = 1700000007000000
+						case 7:
+							row.GroupID = "GR2"
+						}
+						require.NoError(t, env.GetDBHandle().NewQuery(ctx, "pagination_excluded").Create(row))
+						require.NoError(t, env.GetDBHandle().GORM(ctx, "pagination_timestamp").Exec("UPDATE Invocations SET created_at_usec = ?, updated_at_usec = ? WHERE invocation_id = ?", stamp, stamp, row.InvocationID).Error)
+						row.CreatedAtUsec, row.UpdatedAtUsec = stamp, stamp
+						if olap {
+							require.NoError(t, env.GetOLAPDBHandle().FlushInvocationStats(ctx, row))
+						}
+					}
 					for size := 1; size <= 4; size++ {
 						for _, ascending := range []bool{false, true} {
 							for _, field := range []inpb.InvocationSort_SortField{inpb.InvocationSort_UPDATED_AT_USEC_SORT_FIELD, inpb.InvocationSort_CREATED_AT_USEC_SORT_FIELD} {
