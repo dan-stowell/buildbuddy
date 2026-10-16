@@ -36,7 +36,10 @@ go_library(
 
 go_test(
     name = "action_cache_server_test",
-    srcs = ["action_cache_server_test.go"],
+    srcs = [
+        "action_cache_server_test.go",
+        "authz_writepaths_splice_test.go",
+    ],
     deps = [
         ":action_cache_server",
         "//proto:cache_go_proto",
