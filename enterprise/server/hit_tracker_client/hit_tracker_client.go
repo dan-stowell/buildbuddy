@@ -35,6 +35,8 @@ var (
 	remoteHitTrackerPollInterval = flag.Duration("cache_proxy.remote_hit_tracker.update_interval", 250*time.Millisecond, "The time interval to wait between sending remote cache-hit-tracking RPCs.")
 	maxPendingHitsPerKey         = flag.Int("cache_proxy.remote_hit_tracker.max_pending_hits_per_key", 3_000_000, "The maximum number of pending cache-hit updates to store in memory for a given (group, usagelabels) tuple.")
 	maxHitsPerUpdate             = flag.Int("cache_proxy.remote_hit_tracker.max_hits_per_update", 100_000, "The maximum number of cache-hit updates to send in one request to the hit-tracking backend.")
+	maxTrackAttempts             = flag.Int("cache_proxy.remote_hit_tracker.max_track_attempts", 10, "The maximum number of times to send a batch of cache-hit updates whose Track RPC fails with Unavailable. Failed batches are retried once per update_interval.")
+	maxRetryHits                 = flag.Int("cache_proxy.remote_hit_tracker.max_retry_hits", 200_000, "The maximum number of cache-hit updates, across all keys, to hold in memory for retrying after a failed Track RPC. Updates over this limit are dropped.")
 	remoteHitTrackerWorkers      = flag.Int("cache_proxy.remote_hit_tracker.workers", 1, "The number of workers to use to send asynchronous remote cache-hit-tracking RPCs. Set to 0 to disable remote hit tracking.")
 )
 
@@ -80,6 +82,8 @@ func newHitTrackerClient(ctx context.Context, env *real_environment.RealEnv, con
 		enqueueChan:          make(chan *enqueuedCacheHit, *enqueueChanSize),
 		maxPendingHitsPerKey: *maxPendingHitsPerKey,
 		maxHitsPerUpdate:     *maxHitsPerUpdate,
+		maxTrackAttempts:     *maxTrackAttempts,
+		maxRetryHits:         *maxRetryHits,
 		hitsByCollection:     map[string]*cacheHits{},
 		client:               hitpb.NewHitTrackerServiceClient(conn),
 	}
@@ -101,6 +105,15 @@ type cacheHits struct {
 	encodedCollection string
 	authHeaders       map[string][]string
 	hits              []*hitpb.CacheHit
+	// The number of failed Track RPCs that the oldest hits in this batch
+	// were sent in.
+	attempts int
+}
+
+// A batch whose Track RPC failed and that will be sent again.
+type failedBatch struct {
+	hits    *cacheHits
+	groupID string
 }
 
 // An enqueued cache hit
@@ -120,11 +133,17 @@ type HitTrackerFactory struct {
 
 	maxPendingHitsPerKey int
 	maxHitsPerUpdate     int
+	maxTrackAttempts     int
+	maxRetryHits         int
 
 	// mu guards the fields below and every cacheHits reachable from them.
 	mu               sync.Mutex
 	hitsByCollection map[string]*cacheHits
 	hitsQueue        []*cacheHits // Used to round-robin send collection keys
+	// Batches waiting to be retried on the next tick, and their total number
+	// of hits, which is at most maxRetryHits.
+	failed     []failedBatch
+	failedHits int
 
 	client hitpb.HitTrackerServiceClient
 }
@@ -350,6 +369,7 @@ func (h *HitTrackerFactory) sender(ctx context.Context, ticker <-chan time.Time)
 			return
 		case <-ticker:
 		}
+		h.requeueFailed()
 		// Keep flushing until there is nothing to flush.
 		for h.sendTrackRequest(ctx) > 0 {
 		}
@@ -377,9 +397,10 @@ func (h *HitTrackerFactory) shouldFlushSynchronously() bool {
 }
 
 // Sends the oldest pending batch of hits from the queue. This function sends
-// one RPC and returns the number of updates sent. If the RPC fails in a way
-// that means the batch can be sent again (see canRetry), the batch is put back
-// for the next tick and 0 is returned, so that the caller stops flushing.
+// one RPC and returns the number of updates taken off the queue. If the RPC
+// fails in a way that means the batch can be sent again (see canRetry), the
+// batch is held and put back on the queue at the next tick, so that each
+// flush tries every batch at most once.
 func (h *HitTrackerFactory) sendTrackRequest(ctx context.Context) int {
 	return h.sendBatch(ctx, true /*=retryLater*/)
 }
@@ -433,23 +454,62 @@ func (h *HitTrackerFactory) sendBatch(ctx context.Context, retryLater bool) int 
 	).Observe(float64(hitCount))
 	if err != nil {
 		log.CtxWarningf(ctx, "Error sending Track request to record cache hit-tracking state group %s: %v", groupID, err)
-		if retryLater && canRetry(err) {
-			h.requeue(hitsToSend, groupID)
-			return 0
+		if canRetry(err) {
+			hitsToSend.attempts++
+			if !retryLater || !h.holdForRetry(hitsToSend, groupID) {
+				metrics.RemoteHitTrackerUpdates.WithLabelValues(
+					groupID,
+					"dropped_send_failed",
+				).Add(float64(hitCount))
+			}
 		}
 	}
 	return hitCount
 }
 
-// canRetry returns true if a batch whose Track RPC failed with err can be
-// sent again without double counting. HitTrackerService.Track records hits
-// one at a time, so after most errors (including DeadlineExceeded) the app
-// may already have recorded some or all of them. Unavailable is returned when
-// the proxy cannot reach the app at all, for example while an app replica is
-// restarting, so the batch has almost always not been recorded. The exception
-// is a connection that breaks while the app is handling the RPC.
+// canRetry returns true if a batch whose Track RPC failed with err should be
+// sent again. HitTrackerService.Track records hits one at a time, so after
+// most errors (including DeadlineExceeded) the app may already have recorded
+// some or all of them, and those batches are not retried. Unavailable is
+// usually returned when the RPC never reached the app, for example while an
+// app replica is restarting, so retrying it avoids losing the batch.
+//
+// This is a trade-off: if the connection breaks after the app has started
+// recording a batch, the proxy also sees Unavailable, and the retry records
+// those hits again. Each such break adds at most one extra copy of the batch,
+// and a batch is sent at most max_track_attempts times. Removing the double
+// count entirely would need the app to deduplicate retried batches.
 func canRetry(err error) bool {
 	return gstatus.Code(err) == codes.Unavailable
+}
+
+// holdForRetry keeps a batch that failed to send so that requeueFailed can put
+// it back on the queue at the next tick. It returns false, and keeps nothing,
+// if the batch has been tried maxTrackAttempts times or if holding it would
+// keep more than maxRetryHits hits for retry. This bounds the memory used
+// during a long app outage: like before retries existed, every batch is still
+// tried once per tick and then dropped, except for at most maxRetryHits hits.
+func (h *HitTrackerFactory) holdForRetry(failed *cacheHits, groupID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if failed.attempts >= h.maxTrackAttempts || h.failedHits+len(failed.hits) > h.maxRetryHits {
+		return false
+	}
+	h.failed = append(h.failed, failedBatch{hits: failed, groupID: groupID})
+	h.failedHits += len(failed.hits)
+	return true
+}
+
+// requeueFailed puts the batches held by holdForRetry back on the queue.
+func (h *HitTrackerFactory) requeueFailed() {
+	h.mu.Lock()
+	failed := h.failed
+	h.failed = nil
+	h.failedHits = 0
+	h.mu.Unlock()
+	for _, f := range failed {
+		h.requeue(f.hits, f.groupID)
+	}
 }
 
 // requeue puts back a batch that failed to send, merging it with any hits
@@ -466,6 +526,9 @@ func (h *HitTrackerFactory) requeue(failed *cacheHits, groupID string) {
 	hits := append(failed.hits, pending.hits...)
 	dropped := max(0, len(hits)-h.maxPendingHitsPerKey)
 	pending.hits = hits[:len(hits)-dropped]
+	// The failed hits come first. Newer hits sent with them count as tried
+	// as often, so they may be dropped a little early.
+	pending.attempts = failed.attempts
 	h.mu.Unlock()
 
 	if dropped > 0 {
@@ -491,6 +554,7 @@ drain:
 			break drain
 		}
 	}
+	h.requeueFailed()
 
 	// Make a best-effort attempt to flush pending updates. There is no later
 	// attempt, so don't put back batches that fail to send.

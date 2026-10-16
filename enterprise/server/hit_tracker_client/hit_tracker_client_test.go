@@ -11,6 +11,7 @@ import (
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/proxy_util"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
@@ -21,6 +22,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/buildbuddy-io/buildbuddy/server/util/usageutil"
 	"github.com/jonboulle/clockwork"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
@@ -877,4 +879,92 @@ func TestVerifyShutdownReturnsWhenTrackHangs(t *testing.T) {
 		<-done
 		require.FailNow(t, "shutdown still blocked 10s after it started (max_shutdown_duration 2s) while a Track RPC hung")
 	}
+}
+
+// retainedHits returns the number of hits that are batched and waiting to be
+// sent, and the number held for retry after a failed Track RPC.
+func retainedHits(f *HitTrackerFactory) (pending, held int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.hitsByCollection {
+		pending += len(c.hits)
+	}
+	return pending, f.failedHits
+}
+
+// During a long app outage, every batch is still tried once per tick and the
+// hits that are kept for retry stay within max_retry_hits, however long the
+// outage lasts. The rest are dropped and counted.
+func TestLongOutageKeepsRetainedHitsBounded(t *testing.T) {
+	const maxRetryHits, maxAttempts = 25, 3
+	flags.Set(t, "cache_proxy.remote_hit_tracker.max_hits_per_update", 10)
+	flags.Set(t, "cache_proxy.remote_hit_tracker.max_retry_hits", maxRetryHits)
+	flags.Set(t, "cache_proxy.remote_hit_tracker.max_track_attempts", maxAttempts)
+	h := newHarness(t)
+	ctxs := []context.Context{
+		context.Background(),
+		authenticatedContext(user1, h.authenticator),
+		authenticatedContextWithOrigin(user1, h.authenticator, "internal"),
+	}
+	keys := []string{anonKey, group1Key, group1InternalKey}
+	dropped := func() int {
+		n := 0.0
+		for _, g := range []string{interfaces.AuthAnonymousUser, group1} {
+			for _, s := range []string{"dropped_send_failed", "dropped_too_many_updates"} {
+				n += testutil.ToFloat64(metrics.RemoteHitTrackerUpdates.WithLabelValues(g, s))
+			}
+		}
+		return int(n)
+	}
+	droppedBefore := dropped()
+	delivered := func() int {
+		n := int64(0)
+		for _, k := range keys {
+			n += h.service.casDownloads[k].Load()
+		}
+		return int(n)
+	}
+	// accountedFor reports whether every tracked hit has been batched and is
+	// not in a Track RPC, i.e. is pending, held, delivered or dropped.
+	issued := 0
+	accountedFor := func() bool {
+		pending, held := retainedHits(h.factory)
+		return pending+held+delivered()+dropped()-droppedBefore == issued
+	}
+
+	h.srv.Stop()
+	const rounds, hitsPerKey = 40, 15
+	for i := range rounds {
+		for _, ctx := range ctxs {
+			h.trackDownloads(ctx, hitsPerKey)
+			issued += hitsPerKey
+		}
+		require.Eventually(t, accountedFor, 10*time.Second, time.Millisecond)
+		h.tick(t)
+		require.Eventually(t, func() bool {
+			pending, _ := retainedHits(h.factory)
+			return pending == 0 && accountedFor()
+		}, 10*time.Second, time.Millisecond, "round %d: flush did not try every batch", i)
+		_, held := retainedHits(h.factory)
+		require.LessOrEqual(t, held, maxRetryHits, "round %d", i)
+	}
+	require.Equal(t, 0, delivered())
+	t.Logf("%d hits tracked during the outage, %d dropped", issued, dropped()-droppedBefore)
+
+	// The app comes back. Only the hits still held for retry are delivered.
+	_, held := retainedHits(h.factory)
+	require.Greater(t, held, 0)
+	h.startServer(t)
+	readyCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	h.conn.Connect()
+	for state := h.conn.GetState(); state != connectivity.Ready; state = h.conn.GetState() {
+		require.True(t, h.conn.WaitForStateChange(readyCtx, state), "connection never became ready")
+	}
+	h.tick(t)
+	require.Eventually(t, func() bool {
+		pending, held := retainedHits(h.factory)
+		return pending == 0 && held == 0 && accountedFor()
+	}, 10*time.Second, time.Millisecond)
+	require.Equal(t, held, delivered())
 }
