@@ -40,6 +40,7 @@ type pooledByteStreamClient struct {
 	env         environment.Env
 	connMutex   sync.Mutex
 	connPoolMap map[string]*cachedConnPool
+	closed      bool
 }
 
 // cachedConnPool is a connection pool in the pool cache. Its fields are
@@ -56,10 +57,14 @@ func RegisterPooledBytestreamClient(env *real_environment.RealEnv) {
 }
 
 func NewPooledByteStreamClient(env environment.Env) *pooledByteStreamClient {
-	return &pooledByteStreamClient{
+	p := &pooledByteStreamClient{
 		env:         env,
 		connPoolMap: make(map[string]*cachedConnPool),
 	}
+	if hc := env.GetHealthChecker(); hc != nil {
+		hc.RegisterShutdownFunction(p.close)
+	}
+	return p
 }
 
 func (p *pooledByteStreamClient) FetchBytestreamZipManifest(ctx context.Context, url *url.URL) (*zipb.Manifest, error) {
@@ -329,6 +334,9 @@ func (p *pooledByteStreamClient) streamFromUrl(ctx context.Context, url *url.URL
 func (p *pooledByteStreamClient) getGrpcClientConnPoolForURL(target string) (conn grpc.ClientConnInterface, release func(), err error) {
 	p.connMutex.Lock()
 	defer p.connMutex.Unlock()
+	if p.closed {
+		return nil, nil, status.UnavailableError("bytestream pool cache is closed")
+	}
 	now := p.env.GetClock().Now()
 	defer p.closeIdlePoolsLocked(now)
 
@@ -341,7 +349,7 @@ func (p *pooledByteStreamClient) getGrpcClientConnPoolForURL(target string) (con
 		}
 		cp = &cachedConnPool{pool: pool}
 		p.connPoolMap[target] = cp
-		log.Infof("Cached connection pool for target: %s, %d targets cached so far", target, len(p.connPoolMap))
+		log.Infof("Cached connection pool for target: %s, %d targets cached so far", stripUserFromTarget(target), len(p.connPoolMap))
 	}
 	cp.lastUse = now
 	cp.inFlight++
@@ -377,4 +385,16 @@ func stripUserFromTarget(target string) string {
 		return "<unparsable target>"
 	}
 	return stripUser(u).String()
+}
+
+// close releases the pools when their owning server shuts down.
+func (p *pooledByteStreamClient) close(ctx context.Context) error {
+	p.connMutex.Lock()
+	defer p.connMutex.Unlock()
+	p.closed = true
+	for target, cp := range p.connPoolMap {
+		cp.pool.Close()
+		delete(p.connPoolMap, target)
+	}
+	return nil
 }
