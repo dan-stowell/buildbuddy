@@ -233,3 +233,22 @@ func TestRunnerReuseShallowMerge(t *testing.T) {
 	f.assertFresh(reuseGit(t, f.source, "rev-parse", "HEAD"))
 }
 
+// A workflow may clone a tool/dependency into its workspace. Without a clean
+// exclusion, it must not become an input of the next unrelated invocation.
+func TestRunnerReuseRemovesNestedRepository(t *testing.T) {
+	f := newReuseFixture(t)
+	checkout := filepath.Join(f.root, repoDirName)
+	nested := filepath.Join(checkout, "old-dependency")
+	require.NoError(t, os.Mkdir(nested, 0755))
+	reuseGit(t, nested, "init")
+	reuseGit(t, nested, "symbolic-ref", "HEAD", "refs/heads/main")
+	reuseWrite(t, nested, "stale-input", "from previous invocation\n")
+	reuseCommit(t, nested)
+	reuseGit(t, f.source, "checkout", "-b", "z")
+	reuseWrite(t, f.source, "tracked", "requested commit\n")
+	sha := reuseCommit(t, f.source)
+	require.NoError(t, f.setup("z", "", sha))
+	require.Equal(t, sha, reuseGit(t, checkout, "rev-parse", "HEAD"))
+	f.assertFresh(sha)
+}
+
