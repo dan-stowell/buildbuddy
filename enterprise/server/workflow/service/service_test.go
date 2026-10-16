@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -2570,4 +2571,34 @@ actions:
 			require.Equal(t, tc.expectedTimeout+workflow.TimeoutGracePeriod, exec.Action.GetTimeout().AsDuration())
 		})
 	}
+}
+
+// The same delivery ID denotes one event even if the provider retries the HTTP request.
+func TestBughuntRedeliveredWebhookRunsOnce(t *testing.T) {
+	flags.Set(t, "remote_execution.enable_remote_exec", true)
+	te := newTestEnv(t)
+	ctx, _, gid := authenticate(t, context.Background(), te)
+	runBBServer(ctx, t, te)
+	provider := setupFakeGitProvider(t, te)
+	repoURL := makeTempRepo(t)
+	wf := &tables.Workflow{WorkflowID: "WF-redelivery", WebhookID: "redelivery", GroupID: gid, UserID: gid, Perms: 48, RepoURL: repoURL}
+	require.NoError(t, te.GetDBHandle().NewQuery(ctx, "create_redelivery_workflow").Create(wf))
+	provider.FileContents = map[string]string{"buildbuddy.yaml": configWithLinuxWorkflow}
+	provider.WebhookData = &interfaces.WebhookData{EventName: "push", TargetRepoURL: repoURL, PushedRepoURL: repoURL, TargetBranch: "main", PushedBranch: "main", SHA: "c04d68571cb519e095772c865847007ed3e7fea9", IsTargetRepoPublic: true}
+	execClient := te.GetRemoteExecutionClient().(*fakeExecutionClient)
+	for range 2 {
+		req := httptest.NewRequest(http.MethodPost, "/webhooks/workflow/redelivery", nil)
+		req.Header.Set("X-GitHub-Delivery", "same-delivery-id")
+		recorder := httptest.NewRecorder()
+		te.GetWorkflowService().ServeHTTP(recorder, req)
+		require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	}
+	// Drain the worker queue before counting: no sleeps or timing-dependent negative assertion.
+	te.GetHealthChecker().Shutdown()
+	te.GetHealthChecker().WaitForGracefulShutdown()
+	count := len(execClient.executeRequests)
+	for range count {
+		<-execClient.executeRequests
+	}
+	assert.Equal(t, 1, count, "one action should execute for a redelivered webhook")
 }
