@@ -1072,3 +1072,17 @@ func TestRecordOriginScorecard(t *testing.T) {
 	assert.Equal(t, actionDigest.GetHash(), result.GetActionId())
 	assert.Equal(t, originInvocationID, result.GetOriginInvocationId())
 }
+
+func TestDigestFunctionACIsolation(t *testing.T) {
+	ctx := context.Background()
+	te := testenv.GetTestEnv(t)
+	client := repb.NewActionCacheClient(runACServer(ctx, t, te))
+	d := &repb.Digest{Hash: strings.Repeat("a", 64), SizeBytes: 1}
+	_, err := client.UpdateActionResult(ctx, &repb.UpdateActionResultRequest{ActionDigest: d, DigestFunction: repb.DigestFunction_SHA256, ActionResult: &repb.ActionResult{ExitCode: 1}})
+	require.NoError(t, err)
+	got, err := client.GetActionResult(ctx, &repb.GetActionResultRequest{ActionDigest: d, DigestFunction: repb.DigestFunction_SHA256})
+	require.NoError(t, err)
+	require.Equal(t, int32(1), got.GetExitCode())
+	_, err = client.GetActionResult(ctx, &repb.GetActionResultRequest{ActionDigest: d, DigestFunction: repb.DigestFunction_BLAKE3})
+	require.True(t, status.IsNotFoundError(err), "BLAKE3 must not return SHA256 action result; got %v", err)
+}
