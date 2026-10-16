@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"testing"
 	"time"
@@ -81,6 +82,17 @@ func TestReceiveSetupMessageStopAfterAccept(t *testing.T) {
 	case err := <-done:
 		require.Error(t, err)
 	case <-time.After(testleak.DefaultSettle):
+		stack := make([]byte, 64<<10)
+		stack = stack[:runtime.Stack(stack, true)]
+		t.Logf("goroutines after stop deadline:\n%s", stack)
+		fds, readErr := os.ReadDir("/proc/self/fd")
+		require.NoError(t, readErr)
+		for _, fd := range fds {
+			target, err := os.Readlink("/proc/self/fd/" + fd.Name())
+			if err == nil {
+				t.Logf("fd %s -> %s", fd.Name(), target)
+			}
+		}
 		conn.Close() // Unblock the baseline handler so failure doesn't poison siblings.
 		<-done
 		t.Fatal("stopped UFFD setup handler remains blocked reading accepted connection")
