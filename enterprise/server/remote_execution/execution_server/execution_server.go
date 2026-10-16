@@ -1363,6 +1363,18 @@ func (s *ExecutionServer) waitExecution(ctx context.Context, req *repb.WaitExecu
 	defer subscriber.Close()
 	streamPubSubChan := subscriber.Chan()
 
+	if data, err := action_merger.CompletedOperation(ctx, s.rdb, req.GetName()); err != nil {
+		return err
+	} else if len(data) > 0 {
+		op := new(longrunningpb.Operation)
+		if err := proto.Unmarshal(data, op); err != nil {
+			return err
+		}
+		op.Name = req.GetName()
+		_, err := e.processOpUpdate(ctx, op)
+		return err
+	}
+
 	if opts.isExecuteRequest {
 		// Send a best-effort initial "in progress" update to client.
 		// Once Bazel receives the initial update, it will use WaitExecution to handle retry on error instead of
@@ -1459,12 +1471,20 @@ func (s *ExecutionServer) waitExecution(ctx context.Context, req *repb.WaitExecu
 }
 
 func (s *ExecutionServer) MarkExecutionFailed(ctx context.Context, taskID string, reason error) error {
-	_, err := digest.ParseUploadResourceName(taskID)
+	r, err := digest.ParseUploadResourceName(taskID)
 	if err != nil {
 		log.CtxWarningf(ctx, "Could not parse taskID: %s", err)
 		return err
 	}
-	canonical, publish, copies, err := action_merger.CompleteCopy(ctx, s.rdb, taskID, false)
+	failureOp, err := operation.Assemble(taskID, operation.Metadata(repb.ExecutionStage_COMPLETED, r.GetDigest()), operation.ErrorResponse(reason))
+	if err != nil {
+		return err
+	}
+	data, err := proto.Marshal(failureOp)
+	if err != nil {
+		return err
+	}
+	canonical, publish, copies, err := action_merger.CompleteCopy(ctx, s.rdb, taskID, false, data)
 	if err != nil {
 		return err
 	}
@@ -1700,8 +1720,11 @@ func (s *ExecutionServer) PublishOperation(stream repb.Execution_PublishOperatio
 		publishResult := true
 		var otherCopies []string
 		if stage == repb.ExecutionStage_COMPLETED {
-			var err error
-			publishID, publishResult, otherCopies, err = action_merger.CompleteCopy(ctx, s.rdb, taskID, response != nil && response.GetStatus().GetCode() == 0 && response.GetResult() != nil && response.GetResult().GetExitCode() == 0)
+			data, err := proto.Marshal(op)
+			if err != nil {
+				return err
+			}
+			publishID, publishResult, otherCopies, err = action_merger.CompleteCopy(ctx, s.rdb, taskID, response != nil && response.GetStatus().GetCode() == 0 && response.GetResult() != nil && response.GetResult().GetExitCode() == 0, data)
 			if err != nil {
 				return err
 			}

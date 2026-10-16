@@ -467,13 +467,17 @@ func RegisterCopy(ctx context.Context, rdb redis.UniversalClient, canonical, id 
 
 // CompleteCopy atomically elects the first success. Failures are withheld until
 // every registered copy has failed. Replays by the winner are safe to publish.
-func CompleteCopy(ctx context.Context, rdb redis.UniversalClient, id string, success bool) (string, bool, []string, error) {
+func CompleteCopy(ctx context.Context, rdb redis.UniversalClient, id string, success bool, serializedOperation ...[]byte) (string, bool, []string, error) {
 	canonical, err := rdb.HGet(ctx, copyKey(id), "canonical").Result()
 	if err == redis.Nil {
 		return id, true, nil, nil
 	}
 	if err != nil {
 		return "", false, nil, err
+	}
+	var operation []byte
+	if len(serializedOperation) > 0 {
+		operation = serializedOperation[0]
 	}
 	result, err := rdb.Eval(ctx, `
  local winner = redis.call('HGET', KEYS[1], 'winner')
@@ -490,10 +494,11 @@ func CompleteCopy(ctx context.Context, rdb redis.UniversalClient, id string, suc
  end
  if not winner and ARGV[2] ~= '1' and pending then return {0} end
  redis.call('HSET', KEYS[1], 'winner', ARGV[1], 'success', ARGV[2])
+ if ARGV[3] ~= '' then redis.call('HSETNX', KEYS[1], 'operation', ARGV[3]) end
  redis.call('EXPIRE', KEYS[1], 86400)
  local result = {1}
  for _, id in ipairs(copies) do table.insert(result,id) end
- return result`, []string{copyKey(canonical)}, id, boolInt(success)).Slice()
+ return result`, []string{copyKey(canonical)}, id, boolInt(success), operation).Slice()
 	if err != nil {
 		return "", false, nil, err
 	}
@@ -582,4 +587,15 @@ func CopyShouldStop(ctx context.Context, rdb redis.UniversalClient, id string) (
 		return false, err
 	}
 	return winner != "" && winner != id, nil
+}
+
+// CompletedOperation is stored with the winner election, so reconnecting
+// waiters can recover the canonical terminal operation even if publication is
+// interrupted or a late progress update arrives from a losing copy.
+func CompletedOperation(ctx context.Context, rdb redis.UniversalClient, canonical string) ([]byte, error) {
+	data, err := rdb.HGet(ctx, copyKey(canonical), "operation").Bytes()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	return data, err
 }
