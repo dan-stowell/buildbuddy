@@ -60,6 +60,7 @@ go_test(
         "//server/testutil/testcompression",
         "//server/testutil/testdigest",
         "//server/testutil/testenv",
+        "//server/testutil/testleak",
         "//server/testutil/testmetrics",
         "//server/testutil/testport",
         "//server/util/compression",

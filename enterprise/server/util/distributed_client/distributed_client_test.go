@@ -24,6 +24,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testcompression"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testdigest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testmetrics"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testport"
 	"github.com/buildbuddy-io/buildbuddy/server/util/compression"
@@ -2678,4 +2679,45 @@ func TestCloseInactiveClients(t *testing.T) {
 	require.NoError(t, err)
 	_, err = local.RemoteContains(ctx, peer2, rn)
 	require.NoError(t, err)
+}
+
+// Closing a reader before EOF must end its Read RPC even while the caller's
+// context stays alive. Otherwise the peer's handler stays blocked on HTTP/2
+// flow control, holding its cache reader (an open file for Pebble blobs).
+func TestRemoteReaderCloseEndsPeerRead(t *testing.T) {
+	// The peer blocks once the blob's unread bytes exceed the stream window.
+	flags.Set(t, "cache.distributed_cache.stream_window_size", 64*1024)
+	flags.Set(t, "cache.distributed_cache.client_pool_size", 1)
+	// Run each peer handler on its own goroutine so testleak can see it.
+	flags.Set(t, "grpc_server_worker_multiplier", 0)
+	te := getTestEnv(t, emptyUserMap)
+	ctx, err := prefix.AttachUserPrefixToContext(context.Background(), te.GetAuthenticator())
+	require.NoError(t, err)
+
+	peer := fmt.Sprintf("localhost:%d", testport.FindFree(t))
+	c := newProxy(t, te, te.GetCache(), peer)
+	require.NoError(t, c.StartListening())
+	waitUntilServerIsAlive(peer)
+
+	rn, buf := testdigest.RandomCASResourceBuf(t, 4*1024*1024)
+	require.NoError(t, te.GetCache().Set(ctx, rn, buf))
+
+	// Connect to the peer before checking for leaks.
+	r, err := c.RemoteReader(ctx, peer, rn, 0, 0)
+	require.NoError(t, err)
+	got, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.Equal(t, buf, got)
+	require.NoError(t, r.Close())
+
+	t.Run("PartialReads", func(t *testing.T) {
+		testleak.Check(t)
+		for range 10 {
+			r, err := c.RemoteReader(ctx, peer, rn, 0, 0)
+			require.NoError(t, err)
+			_, err = io.ReadFull(r, make([]byte, 1))
+			require.NoError(t, err)
+			require.NoError(t, r.Close())
+		}
+	})
 }
