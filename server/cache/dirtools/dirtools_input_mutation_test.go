@@ -86,3 +86,18 @@ func TestUploadTree_OutputModifiedAfterUpload(t *testing.T) {
 	t.Logf("action 2: files downloaded=%d, bytes=%d", info.FileCount, info.BytesTransferred)
 	requireContentsMatchDigest(t, filepath.Join(ws2, "in.txt"), d)
 }
+
+func TestBytestreamDownloadWithoutFileCache(t *testing.T) {
+	env, ctx := testEnv(t)
+	env.SetFileCache(nil)
+	contents := strings.Repeat("uncached input\n", 400000)
+	d := setFile(t, env, ctx, "", contents)
+	for range 2 {
+		ws := testfs.MakeTempDir(t)
+		_, err := dirtools.DownloadTree(ctx, env, "", repb.DigestFunction_SHA256, singleFileTree("in", d), &dirtools.DownloadTreeOpts{RootDir: ws})
+		require.NoError(t, err)
+		got, err := os.ReadFile(filepath.Join(ws, "in"))
+		require.NoError(t, err)
+		require.Equal(t, contents, string(got))
+	}
+}

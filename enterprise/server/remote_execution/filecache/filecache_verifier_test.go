@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -127,6 +128,9 @@ func TestVerifierConcurrentAddAndLinkNeverPartial(t *testing.T) {
 
 // Immutable consumers share storage; workspace consumers must remain isolated.
 func TestExplicitTransferModes(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux inode transfer semantics")
+	}
 	flags.Set(t, "executor.enable_fastcopy_reflinking", false)
 	ctx := context.Background()
 	fc, err := filecache.NewFileCache(testfs.MakeTempDir(t), 1_000_000, false)
@@ -160,6 +164,9 @@ func TestExplicitTransferModes(t *testing.T) {
 }
 
 func TestWriterCommitRenamesPrivateTemp(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux inode transfer semantics")
+	}
 	fc, err := filecache.NewFileCache(testfs.MakeTempDir(t), 1_000_000, false)
 	require.NoError(t, err)
 	t.Cleanup(func() { fc.Close() })
@@ -186,6 +193,9 @@ func TestWriterCommitRenamesPrivateTemp(t *testing.T) {
 }
 
 func TestTrustedWorkloadHardlinkOptOut(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux inode transfer semantics")
+	}
 	flags.Set(t, "executor.local_cache_trusted_workspace_hardlinks", true)
 	flags.Set(t, "executor.enable_fastcopy_reflinking", false)
 	fc, err := filecache.NewFileCache(testfs.MakeTempDir(t), 1_000_000, false)
