@@ -110,14 +110,18 @@ type schedulerOpts struct {
 	userOwnedEnabled   bool
 	groupOwnedEnabled  bool
 	preferredExecutors []string
+	// If set, the scheduler uses this Redis client instead of a client for a
+	// new Redis server.
+	redisClient redis.UniversalClient
 }
 
 func getEnv(t *testing.T, opts *schedulerOpts, user string) (*testenv.TestEnv, context.Context) {
 	testleak.Check(t)
-	redisTarget := testredis.Start(t).Target
-	env := enterprise_testenv.GetCustomTestEnv(t, &enterprise_testenv.Options{
-		RedisTarget: redisTarget,
-	})
+	envOpts := &enterprise_testenv.Options{RedisClient: opts.redisClient}
+	if opts.redisClient == nil {
+		envOpts.RedisTarget = testredis.Start(t).Target
+	}
+	env := enterprise_testenv.GetCustomTestEnv(t, envOpts)
 	if opts.options.Clock != nil {
 		env.SetClock(opts.options.Clock)
 	}

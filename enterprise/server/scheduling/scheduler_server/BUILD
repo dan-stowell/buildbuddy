@@ -59,7 +59,10 @@ go_library(
 go_test(
     name = "scheduler_server_test",
     size = "medium",
-    srcs = ["scheduler_server_test.go"],
+    srcs = [
+        "claim_retry_test.go",
+        "scheduler_server_test.go",
+    ],
     embed = [":scheduler_server"],
     deps = [
         "//enterprise/server/backends/redis_execution_collector",
@@ -69,9 +72,11 @@ go_test(
         "//enterprise/server/tasksize",
         "//enterprise/server/testutil/enterprise_testauth",
         "//enterprise/server/testutil/enterprise_testenv",
+        "//enterprise/server/testutil/redisfault",
         "//enterprise/server/testutil/testredis",
         "//enterprise/server/util/ci_runner_env",
         "//enterprise/server/util/ci_runner_util",
+        "//enterprise/server/util/redisutil",
         "//proto:context_go_proto",
         "//proto:experiments_go_proto",
         "//proto:remote_execution_go_proto",
@@ -83,6 +88,7 @@ go_test(
         "//server/testutil/testauth",
         "//server/testutil/testcache",
         "//server/testutil/testenv",
+        "//server/testutil/testhealthcheck",
         "//server/testutil/testleak",
         "//server/util/claims",
         "//server/util/expflag",
