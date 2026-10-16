@@ -59,13 +59,17 @@ go_library(
 go_test(
     name = "scheduler_server_test",
     size = "medium",
-    srcs = ["scheduler_server_test.go"],
+    srcs = [
+        "lease_finalize_reconnect_test.go",
+        "scheduler_server_test.go",
+    ],
     embed = [":scheduler_server"],
     deps = [
         "//enterprise/server/backends/redis_execution_collector",
         "//enterprise/server/experiments",
         "//enterprise/server/githubapp",
         "//enterprise/server/remote_execution/execution_server",
+        "//enterprise/server/scheduling/task_leaser",
         "//enterprise/server/tasksize",
         "//enterprise/server/testutil/enterprise_testauth",
         "//enterprise/server/testutil/enterprise_testenv",
