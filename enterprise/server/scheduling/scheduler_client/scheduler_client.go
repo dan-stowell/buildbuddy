@@ -267,7 +267,7 @@ func (r *Registration) processWorkStream(ctx context.Context, stream scpb.Schedu
 			return false, nil
 		}
 		if cancellationRequest := msg.GetCancelTaskReservationRequest(); cancellationRequest != nil {
-			r.taskScheduler.CancelTaskReservation(ctx, cancellationRequest.GetTaskId())
+			r.taskScheduler.CancelTaskReservation(ctx, cancellationRequest.GetTaskId(), cancellationRequest.GetCancelRunning())
 			return false, nil
 		}
 		if msg.EnqueueTaskReservationRequest == nil {

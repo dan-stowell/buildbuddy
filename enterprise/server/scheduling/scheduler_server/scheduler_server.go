@@ -667,7 +667,7 @@ func (h *executorHandle) setMoreWorkDelay(d time.Duration) {
 
 // sendProactiveCancellation sends a cancellation request for the given task ID
 // to the executor. This is a best-effort operation - errors are not returned.
-func (h *executorHandle) sendProactiveCancellation(ctx context.Context, taskID string) {
+func (h *executorHandle) sendProactiveCancellation(ctx context.Context, taskID string, cancelRunning bool) {
 	if !h.getRegistration().GetSupportsProactiveCancellation() {
 		// This should never happen since we only add executors to the list of
 		// sent probes if they claimed to support proactive cancellation when
@@ -676,7 +676,8 @@ func (h *executorHandle) sendProactiveCancellation(ctx context.Context, taskID s
 	}
 	msg := &scpb.RegisterAndStreamWorkResponse{
 		CancelTaskReservationRequest: &scpb.CancelTaskReservationRequest{
-			TaskId: taskID,
+			TaskId:        taskID,
+			CancelRunning: cancelRunning,
 		},
 	}
 	select {
@@ -1948,7 +1949,7 @@ func (s *SchedulerServer) redisKeyForTaskReservations(taskID string) string {
 func (s *SchedulerServer) recordProbeForProactiveCancellation(ctx context.Context, taskID, executorID string) error {
 	key := s.redisKeyForTaskReservations(taskID)
 	pipe := s.rdb.TxPipeline()
-	pipe.SAdd(ctx, key, executorID)
+	pipe.SAdd(ctx, key, s.ownHostPort+"\n"+executorID)
 	pipe.Expire(ctx, key, taskTTL)
 	_, err := pipe.Exec(ctx)
 	return err
@@ -1957,7 +1958,7 @@ func (s *SchedulerServer) recordProbeForProactiveCancellation(ctx context.Contex
 // sendCancellationRequests sends CancelTaskReservationRequest to all
 // executors that have received a task reservation for the given task, then
 // deletes the Redis tracking set.
-func (s *SchedulerServer) sendCancellationRequests(ctx context.Context, taskID string) error {
+func (s *SchedulerServer) sendCancellationRequests(ctx context.Context, taskID string, cancelRunning bool) error {
 	key := s.redisKeyForTaskReservations(taskID)
 	executorIDs, err := s.rdb.SMembers(ctx, key).Result()
 	if err != nil && err != redis.Nil {
@@ -1975,12 +1976,28 @@ func (s *SchedulerServer) sendCancellationRequests(ctx context.Context, taskID s
 	}
 	s.mu.RUnlock()
 
-	// Send cancellation requests to matching executors.
-	for _, executorID := range executorIDs {
+	// Tracking the owning scheduler lets completion on any app instance
+	// cancel reservations on every executor, including remote connections.
+	for _, member := range executorIDs {
+		host, executorID, routed := strings.Cut(member, "\n")
+		if !routed {
+			executorID = member
+			host = s.ownHostPort
+		}
+		if host != "" && host != s.ownHostPort {
+			client, err := s.schedulerClientCache.get(host)
+			if err != nil {
+				return err
+			}
+			if _, err := client.rpcClient.CancelTaskReservations(ctx, &scpb.CancelTaskReservationsRequest{TaskId: taskID, ExecutorId: executorID, CancelRunning: cancelRunning}); err != nil {
+				return err
+			}
+			continue
+		}
 		for _, pool := range pools {
 			if node := pool.FindConnectedExecutorByID(executorID); node != nil && node.handle != nil {
-				node.handle.sendProactiveCancellation(ctx, taskID)
-				break // Found the executor, no need to check other pools.
+				node.handle.sendProactiveCancellation(ctx, taskID, cancelRunning)
+				break
 			}
 		}
 	}
@@ -2046,7 +2063,7 @@ func (s *SchedulerServer) deleteClaimedTask(ctx context.Context, taskID string) 
 
 	// Send cancellation requests to executors that have the task queued.
 	if *proactiveCancellationEnabled {
-		if err := s.sendCancellationRequests(ctx, taskID); err != nil {
+		if err := s.sendCancellationRequests(ctx, taskID, false); err != nil {
 			log.CtxWarningf(ctx, "Failed to cancel task reservations for task %q: %s", taskID, err)
 		}
 	}
@@ -3038,7 +3055,14 @@ func (s *SchedulerServer) ScheduleTask(ctx context.Context, req *scpb.ScheduleTa
 }
 
 func (s *SchedulerServer) CancelTask(ctx context.Context, taskID string) (bool, error) {
-	return s.deleteTask(ctx, taskID)
+	deleted, err := s.deleteTask(ctx, taskID)
+	if err != nil {
+		return deleted, err
+	}
+	if err := s.sendCancellationRequests(ctx, taskID, true); err != nil {
+		return deleted, err
+	}
+	return deleted, nil
 }
 
 func (s *SchedulerServer) ExistsTask(ctx context.Context, taskID string) (bool, error) {
@@ -3519,4 +3543,25 @@ func errIsolationTypeUnsupported(pool, os, arch, isolationType string) error {
 	return status.UnavailableErrorf(
 		"no registered executors in pool %q with os %q with arch %q support workload isolation type %q",
 		pool, os, arch, isolationType)
+}
+
+// CancelTaskReservations forwards a cancellation only after the task has been
+// removed, so this RPC cannot be used to terminate an existing scheduled task.
+func (s *SchedulerServer) CancelTaskReservations(ctx context.Context, req *scpb.CancelTaskReservationsRequest) (*scpb.CancelTaskReservationsResponse, error) {
+	exists, err := s.ExistsTask(ctx, req.GetTaskId())
+	if err != nil {
+		return nil, err
+	}
+	if exists {
+		return nil, status.FailedPreconditionError("task is still scheduled")
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, pool := range s.pools {
+		if node := pool.FindConnectedExecutorByID(req.GetExecutorId()); node != nil && node.handle != nil {
+			node.handle.sendProactiveCancellation(ctx, req.GetTaskId(), req.GetCancelRunning())
+			break
+		}
+	}
+	return &scpb.CancelTaskReservationsResponse{}, nil
 }
