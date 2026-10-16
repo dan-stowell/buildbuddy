@@ -273,3 +273,53 @@ func TestSpillBuffer_ZeroLimit(t *testing.T) {
 	assert.Equal(t, "hello", string(spilled))
 	require.NoError(t, b.Close())
 }
+
+// errAfterReader returns data (at most chunk bytes per Read), then err forever.
+type errAfterReader struct {
+	data  []byte
+	chunk int
+	err   error
+}
+
+func (r *errAfterReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+	n := copy(p[:min(len(p), r.chunk)], r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+func TestReadTryFillBuffer(t *testing.T) {
+	data := []byte("0123456789")
+
+	// Full buffer, then a short fill, then EOF.
+	r := &errAfterReader{data: data, chunk: 3, err: io.EOF}
+	buf := make([]byte, 8)
+	n, err := ioutil.ReadTryFillBuffer(r, buf)
+	require.NoError(t, err)
+	require.Equal(t, "01234567", string(buf[:n]))
+	n, err = ioutil.ReadTryFillBuffer(r, buf)
+	require.NoError(t, err)
+	require.Equal(t, "89", string(buf[:n]))
+	n, err = ioutil.ReadTryFillBuffer(r, buf)
+	require.Equal(t, io.EOF, err)
+	require.Equal(t, 0, n)
+
+	// An io.ErrUnexpectedEOF from the underlying reader is a failure, not a
+	// short read, with or without partial data.
+	r = &errAfterReader{data: data[:5], chunk: 3, err: io.ErrUnexpectedEOF}
+	n, err = ioutil.ReadTryFillBuffer(r, buf)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	require.Equal(t, 5, n)
+	n, err = ioutil.ReadTryFillBuffer(r, buf)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	require.Equal(t, 0, n)
+
+	// Other errors are passed through too.
+	otherErr := errors.New("boom")
+	r = &errAfterReader{data: data[:5], chunk: 3, err: otherErr}
+	n, err = ioutil.ReadTryFillBuffer(r, buf)
+	require.ErrorIs(t, err, otherErr)
+	require.Equal(t, 5, n)
+}
