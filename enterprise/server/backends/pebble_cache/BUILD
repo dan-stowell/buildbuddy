@@ -83,6 +83,7 @@ go_test(
         "//server/testutil/testdigest",
         "//server/testutil/testenv",
         "//server/testutil/testfs",
+        "//server/testutil/testleak",
         "//server/testutil/testmetrics",
         "//server/util/compression",
         "//server/util/disk",
