@@ -447,7 +447,10 @@ func DeletePendingExecution(ctx context.Context, rdb redis.UniversalClient, exec
 // Copy state outlives the digest-to-pending mapping so late completions cannot
 // replace a winner, including after a new execution of the same action starts.
 func copyKey(id string) string {
-	s, _ := executionIDWithDigestSharding(id)
+	s, err := executionIDWithDigestSharding(id)
+	if err != nil {
+		s = id
+	}
 	return "executionCopies/1/" + s
 }
 

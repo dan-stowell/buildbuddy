@@ -2233,7 +2233,7 @@ func (s *ExecutionServer) Cancel(ctx context.Context, invocationID string) error
 		// directly rather than entering copy completion arbitration again.
 		action_merger.DeletePendingExecution(ctx, s.rdb, canonical)
 		if err := s.publishCancellation(ctx, canonical); err != nil {
-			return err
+			log.CtxWarningf(ctx, "Could not mark execution %q as cancelled: %s", canonical, err)
 		}
 
 	}
