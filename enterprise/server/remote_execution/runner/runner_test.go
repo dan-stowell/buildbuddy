@@ -30,6 +30,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testcache"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testmetrics"
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
 	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
@@ -1313,5 +1314,34 @@ func TestTransientErrorExitCodes(t *testing.T) {
 				require.Nil(t, res.Error)
 			}
 		})
+	}
+}
+
+// Recycling runners through a bounded pool and shutting the pool down must
+// remove every workspace and leave no goroutines or FDs behind.
+func TestRunnerLifecycleResources(t *testing.T) {
+	testleak.Check(t)
+	testleak.CheckFDs(t)
+	env := newTestEnv(t)
+	p := newRunnerPool(t, env, &RunnerPoolOptions{MaxRunnerCount: 2, MaxRunnerDiskSizeBytes: unlimited, MaxRunnerMemoryUsageBytes: unlimited})
+	ctx := withAuthenticatedUser(t, context.Background(), env, "US1")
+	// Keep every runner workspace path so shutdown cleanup is checked directly.
+	var paths []string
+	for range 11 {
+		r, err := get(ctx, p, newTask())
+		require.NoError(t, err)
+		taskCtx, cancel := context.WithCancel(ctx)
+		res := r.Run(taskCtx, &repb.IOStats{})
+		cancel()
+		require.NoError(t, res.Error)
+		paths = append(paths, r.Workspace.Path())
+		p.TryRecycle(ctx, r, true)
+	}
+	require.LessOrEqual(t, p.RunnerCount(), 2, "runner cache must stay bounded")
+	require.NoError(t, p.Shutdown(ctx))
+	p.Wait()
+	for _, path := range paths {
+		_, err := os.Stat(path)
+		require.True(t, os.IsNotExist(err), "workspace remains: %s (%v)", path, err)
 	}
 }
