@@ -741,6 +741,10 @@ func TestExecuteTaskAndStreamResults_Timeout(t *testing.T) {
 		platformTimeout *durationpb.Duration
 		expectedTimeout time.Duration
 	}{
+		{name: "unset uses configured default", expectedTimeout: 8 * time.Hour},
+		{name: "zero uses configured default", actionTimeout: durationpb.New(0), expectedTimeout: 8 * time.Hour},
+		{name: "negative falls back to platform", actionTimeout: durationpb.New(-time.Second), platformTimeout: durationpb.New(time.Minute), expectedTimeout: time.Minute},
+		{name: "zero falls back to platform", actionTimeout: durationpb.New(0), platformTimeout: durationpb.New(time.Minute), expectedTimeout: time.Minute},
 		{name: "set action timeout", actionTimeout: durationpb.New(10 * time.Minute), platformTimeout: nil, expectedTimeout: 10 * time.Minute},
 		{name: "set timeout platform property", actionTimeout: nil, platformTimeout: durationpb.New(1 * time.Hour), expectedTimeout: 1 * time.Hour},
 		// The timeout on the action should take precedence over the platform property.

@@ -341,3 +341,39 @@ func TestRun_ExitedRootWithOpenPipe_Deadline(t *testing.T) {
 		}
 	}
 }
+
+func TestRun_TimeoutAndCancellation_IgnoreTERM(t *testing.T) {
+	for _, cancellation := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel=%t", cancellation), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if cancellation {
+				ctx, cancel = context.WithCancel(context.Background())
+				defer cancel()
+				timer := time.AfterFunc(time.Second, cancel)
+				defer timer.Stop()
+			}
+			start := time.Now()
+			res := runSh(ctx, "trap '' TERM; echo partial; echo diagnostic >&2; sleep 30 & wait")
+			assert.Less(t, time.Since(start), 3*time.Second)
+			assert.NotEqual(t, 0, res.ExitCode)
+			if cancellation {
+				assert.True(t, status.IsCanceledError(res.Error), "%v", res.Error)
+			} else {
+				assert.True(t, status.IsDeadlineExceededError(res.Error), "%v", res.Error)
+			}
+			assert.Equal(t, "partial\n", string(res.Stdout))
+			assert.Equal(t, "diagnostic\n", string(res.Stderr))
+		})
+	}
+}
+
+func TestRun_SignalExitNeverSuccessful(t *testing.T) {
+	for _, sig := range []string{"KILL", "SEGV"} {
+		t.Run(sig, func(t *testing.T) {
+			res := runSh(context.Background(), "ulimit -c 0; kill -"+sig+" $$")
+			assert.Equal(t, commandutil.KilledExitCode, res.ExitCode)
+			assert.True(t, status.IsResourceExhaustedError(res.Error), "%v", res.Error)
+		})
+	}
+}
