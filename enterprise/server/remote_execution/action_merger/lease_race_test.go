@@ -2,6 +2,7 @@ package action_merger
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -79,10 +80,12 @@ func TestReviewNoHedgeLeaseRoundTripBudget(t *testing.T) {
 	canonical, decision := GetOrCreateExecutionID(ctx, rdb, &leaseRaceScheduler{}, action, false)
 	require.Equal(t, New, decision)
 	for _, count := range []int{0, 1} {
-		flags.Set(t, "remote_execution.action_merging_hedge_count", count)
-		client := &leaseRaceClient{UniversalClient: rdb}
-		require.NoError(t, RecordClaimedExecution(ctx, client, canonical, time.Minute))
-		t.Logf("hedge_count=%d: ordinary lease used %d Redis round trips; baseline budget=2", count, client.rounds)
-		require.Equal(t, 2, client.rounds, "enabling hedging must preserve the ordinary lease budget")
+		t.Run(fmt.Sprintf("hedge_count=%d", count), func(t *testing.T) {
+			flags.Set(t, "remote_execution.action_merging_hedge_count", count)
+			client := &leaseRaceClient{UniversalClient: rdb}
+			require.NoError(t, RecordClaimedExecution(ctx, client, canonical, time.Minute))
+			t.Logf("hedge_count=%d: ordinary lease used %d Redis round trips; baseline budget=2", count, client.rounds)
+			require.Equal(t, 2, client.rounds, "enabling hedging must preserve the ordinary lease budget")
+		})
 	}
 }
