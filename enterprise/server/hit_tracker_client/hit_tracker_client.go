@@ -3,6 +3,7 @@ package hit_tracker_client
 import (
 	"context"
 	"flag"
+	"slices"
 	"sync"
 	"time"
 
@@ -452,7 +453,7 @@ func (h *HitTrackerFactory) requeue(failed *cacheHits) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if existing, ok := h.hitsByCollection[failed.encodedCollection]; ok {
-		existing.hits = append(failed.hits[:len(failed.hits):len(failed.hits)], existing.hits...)
+		existing.hits = append(slices.Clip(failed.hits), existing.hits...)
 		return
 	}
 	h.hitsByCollection[failed.encodedCollection] = failed
