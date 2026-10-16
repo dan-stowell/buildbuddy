@@ -334,15 +334,20 @@ func (p *pooledByteStreamClient) streamFromUrl(ctx context.Context, url *url.URL
 // getGrpcClientConnPoolForURL returns a cached connection pool for target,
 // dialing one if needed. The caller must call release once it is done using
 // the connection. Idle pools expire; at capacity the least recently used idle
-// pool is closed. If all pools are leased, return an uncached connection.
+// pool is closed. If all pools are leased, or the cache has been shut down,
+// return an uncached connection that release closes.
 func (p *pooledByteStreamClient) getGrpcClientConnPoolForURL(target string) (conn grpc.ClientConnInterface, release func(), err error) {
+	var toClose []*grpc_client.ClientConnPool
+	// Close evicted pools after unlocking: ClientConn.Close waits for its
+	// transports to shut down, which can take seconds if a peer is stuck.
+	defer func() { closePools(toClose) }()
 	p.connMutex.Lock()
 	defer p.connMutex.Unlock()
 	if p.closed {
-		return nil, nil, status.UnavailableError("bytestream pool cache is closed")
+		return dialUncached(p.env, target)
 	}
 	now := p.env.GetClock().Now()
-	p.closeIdlePoolsLocked(now)
+	toClose = p.removeIdlePoolsLocked(now)
 
 	cp, ok := p.connPoolMap[target]
 	if !ok {
@@ -355,14 +360,10 @@ func (p *pooledByteStreamClient) getGrpcClientConnPoolForURL(target string) (con
 				}
 			}
 			if oldest == nil {
-				conn, err := grpc_client.DialInternalWithoutPooling(p.env, target)
-				if err != nil {
-					return nil, nil, err
-				}
-				return conn, sync.OnceFunc(func() { conn.Close() }), nil
+				return dialUncached(p.env, target)
 			}
 			delete(p.connPoolMap, oldestTarget)
-			oldest.pool.Close()
+			toClose = append(toClose, oldest.pool)
 		}
 		// We didn't find a connection pool, so we'll make one.
 		pool, err := grpc_client.DialInternalWithPoolSize(p.env, target, 2)
@@ -377,25 +378,46 @@ func (p *pooledByteStreamClient) getGrpcClientConnPoolForURL(target string) (con
 	cp.inFlight++
 	release = sync.OnceFunc(func() {
 		p.connMutex.Lock()
-		defer p.connMutex.Unlock()
 		cp.inFlight--
 		cp.lastUse = p.env.GetClock().Now()
+		// After shutdown, the last user of a pool closes it.
+		closeNow := p.closed && cp.inFlight == 0
+		p.connMutex.Unlock()
+		if closeNow {
+			cp.pool.Close()
+		}
 	})
 	return cp.pool, release, nil
 }
 
-// closeIdlePoolsLocked removes and closes cached pools that have no RPCs in
-// flight and have not been used since before now - idle timeout.
-func (p *pooledByteStreamClient) closeIdlePoolsLocked(now time.Time) {
+func dialUncached(env environment.Env, target string) (grpc.ClientConnInterface, func(), error) {
+	conn, err := grpc_client.DialInternalWithoutPooling(env, target)
+	if err != nil {
+		return nil, nil, err
+	}
+	return conn, sync.OnceFunc(func() { conn.Close() }), nil
+}
+
+func closePools(pools []*grpc_client.ClientConnPool) {
+	for _, pool := range pools {
+		pool.Close()
+	}
+}
+
+// removeIdlePoolsLocked removes and returns cached pools that have no RPCs in
+// flight and have not been used since before now - idle timeout. The caller
+// must close them.
+func (p *pooledByteStreamClient) removeIdlePoolsLocked(now time.Time) []*grpc_client.ClientConnPool {
+	var removed []*grpc_client.ClientConnPool
 	for target, cp := range p.connPoolMap {
 		if cp.inFlight > 0 || now.Sub(cp.lastUse) <= poolCacheIdleTimeout {
 			continue
 		}
 		delete(p.connPoolMap, target)
-		// Closing is non-blocking.
-		cp.pool.Close()
-		log.Infof("Closed idle cached connection pool for target: %s", stripUserFromTarget(target))
+		removed = append(removed, cp.pool)
+		log.Infof("Closing idle cached connection pool for target: %s", stripUserFromTarget(target))
 	}
+	return removed
 }
 
 func stripUserFromTarget(target string) string {
@@ -406,14 +428,20 @@ func stripUserFromTarget(target string) string {
 	return stripUser(u).String()
 }
 
-// close releases the pools when their owning server shuts down.
+// close runs when the owning server shuts down. Requests that are still being
+// served while the server drains keep their pools, and the last of them
+// closes each one; later requests use uncached connections.
 func (p *pooledByteStreamClient) close(ctx context.Context) error {
+	var idle []*grpc_client.ClientConnPool
 	p.connMutex.Lock()
-	defer p.connMutex.Unlock()
 	p.closed = true
 	for target, cp := range p.connPoolMap {
-		cp.pool.Close()
 		delete(p.connPoolMap, target)
+		if cp.inFlight == 0 {
+			idle = append(idle, cp.pool)
+		}
 	}
+	p.connMutex.Unlock()
+	closePools(idle)
 	return nil
 }

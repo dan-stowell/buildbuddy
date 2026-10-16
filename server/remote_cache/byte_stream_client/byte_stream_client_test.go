@@ -179,8 +179,12 @@ func TestPoolCache_DistinctTargetsExpire(t *testing.T) {
 			release()
 			require.NoError(t, p.close(context.Background()))
 			require.Empty(t, p.connPoolMap)
-			_, _, err = p.getGrpcClientConnPoolForURL("grpcs://localhost:1")
-			require.Error(t, err)
+			// After shutdown, requests get uncached connections.
+			conn, release, err = p.getGrpcClientConnPoolForURL("grpcs://localhost:1")
+			require.NoError(t, err)
+			require.IsType(t, &grpc.ClientConn{}, conn)
+			require.Empty(t, p.connPoolMap)
+			release()
 
 		})
 	}
@@ -342,4 +346,80 @@ func TestPoolCache_AllLeasedUsesUncachedConn(t *testing.T) {
 	for _, cp := range p.connPoolMap {
 		require.Equal(t, 1, cp.inFlight)
 	}
+}
+
+// pausingByteStreamServer sends one chunk, then waits for resume before
+// sending a second one.
+type pausingByteStreamServer struct {
+	bspb.UnimplementedByteStreamServer
+	started chan struct{}
+	resume  chan struct{}
+}
+
+func (s *pausingByteStreamServer) Read(_ *bspb.ReadRequest, stream bspb.ByteStream_ReadServer) error {
+	if err := stream.Send(&bspb.ReadResponse{Data: []byte("first,")}); err != nil {
+		return err
+	}
+	s.started <- struct{}{}
+	<-s.resume
+	return stream.Send(&bspb.ReadResponse{Data: []byte("second")})
+}
+
+// The app's HTTP server keeps serving in-flight downloads while it shuts down,
+// concurrently with the pool cache's shutdown function. Shutting the cache
+// down must not cut off a download that is using a cached pool, nor fail
+// requests that arrive while the server drains. Every pool must still be
+// closed once its last user is done.
+func TestPoolCache_ShutdownWaitsForLeasedPools(t *testing.T) {
+	testleak.Check(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	service := &pausingByteStreamServer{started: make(chan struct{}, 2), resume: make(chan struct{})}
+	server := grpc.NewServer()
+	bspb.RegisterByteStreamServer(server, service)
+	go server.Serve(listener)
+	t.Cleanup(server.Stop)
+	var resumeOnce sync.Once
+	resume := func() { resumeOnce.Do(func() { close(service.resume) }) }
+	t.Cleanup(resume)
+
+	p := NewPooledByteStreamClient(real_environment.NewRealEnv(nil))
+	u, err := url.Parse(fmt.Sprintf("bytestream://%s/blobs/abc/1", listener.Addr()))
+	require.NoError(t, err)
+	type result struct {
+		data string
+		err  error
+	}
+	read := func() <-chan result {
+		ch := make(chan result, 1)
+		go func() {
+			var buf bytes.Buffer
+			err := p.streamFromUrl(context.Background(), u, false /*=grpcs*/, 0, 0, &buf)
+			ch <- result{buf.String(), err}
+		}()
+		select {
+		case <-service.started:
+			return ch
+		case r := <-ch:
+			// Failed before reaching the server.
+			ch <- r
+			return ch
+		case <-time.After(10 * time.Second):
+			require.FailNow(t, "Read never started")
+			return nil
+		}
+	}
+
+	inFlight := read()
+	require.NoError(t, p.close(context.Background()))
+	// A request that arrives after shutdown started.
+	late := read()
+	resume()
+	for _, ch := range []<-chan result{inFlight, late} {
+		r := <-ch
+		require.NoError(t, r.err)
+		require.Equal(t, "first,second", r.data)
+	}
+	require.Empty(t, p.connPoolMap)
+	// testleak checks that both connections were closed after their reads.
 }
