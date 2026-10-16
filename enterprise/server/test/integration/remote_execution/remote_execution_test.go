@@ -28,6 +28,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/resources"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testbazel"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
@@ -2214,6 +2215,113 @@ touch %s`, counter, fname)
 	op4 := cmd4.WaitAccepted()
 	require.NotEqual(t, op1, op4, "expected action to be hedged")
 	require.Equal(t, "FAST", strings.Trim(cmd4.Wait().Stdout, "\n"))
+}
+
+func TestActionMerging_HedgeWinnerReachesMergedWaiters(t *testing.T) {
+	flags.Set(t, "remote_execution.action_merging_hedge_count", 2)
+	flags.Set(t, "remote_execution.action_merging_hedge_delay", time.Microsecond)
+	rbe := rbetest.NewRBETestEnvWithOptions(t, &rbetest.EnvOptions{ShardedRedis: true})
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutor(t)
+
+	// This script runs quickly and outputs "FAST" if `fname` exists. Otherwise
+	// it writes a line to `counter`, runs slowly, and then outputs "SLOW".
+	fname := fmt.Sprintf("/tmp/%s", uuid.New().String())
+	counter := fmt.Sprintf("/tmp/%s", uuid.New().String())
+	flakyScript := fmt.Sprintf(`FILE="%s"
+COUNTER="%s"
+if [ -f $FILE ]; then
+	echo "FAST"
+else
+	echo "hello" >> $COUNTER
+	sleep 600
+	echo "SLOW"
+fi`, fname, counter)
+	platform := &repb.Platform{
+		Properties: []*repb.Platform_Property{
+			{Name: "OSFamily", Value: runtime.GOOS},
+			{Name: "Arch", Value: runtime.GOARCH},
+		},
+	}
+	flakyCmd := &repb.Command{
+		Arguments: []string{"sh", "-c", flakyScript},
+		Platform:  platform,
+	}
+
+	// Waits for two lines to be written to `counter`, to make sure the first 2
+	// flaky commands checked for the existance of `fname` and are sleeping.
+	// Then creates `fname`, making subsequent invocations of flakyCmd fast.
+	unlockScript := fmt.Sprintf(`COUNTER="%s"
+touch $COUNTER
+while [ $(wc -l <"$COUNTER") -lt 2 ]
+do
+	sleep 0.1
+done
+touch %s`, counter, fname)
+	unlockCmd := &repb.Command{
+		Arguments: []string{"sh", "-c", unlockScript},
+		Platform:  platform,
+	}
+
+	// Run flakyCmd the first time, this will be slow.
+	cmd1 := rbe.Execute(flakyCmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "invocation1"})
+	op1 := cmd1.WaitAccepted()
+	WaitForPendingExecution(rbe.GetRedisClient(), op1)
+
+	// The next invocation will merge against the slow op1 above and run a
+	// hedged action which will also be slow.
+	cmd2 := rbe.Execute(flakyCmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "invocation2"})
+	op2 := cmd2.WaitAccepted()
+	require.Equal(t, op1, op2, "expected actions to be merged")
+
+	// Run the unlock command, so the next execution of flakyCmd will be fast.
+	unlockRes := rbe.Execute(unlockCmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "unlock"}).Wait()
+	require.Empty(t, unlockRes.Stderr) // Helps with debugging the unlock command.
+
+	// The next execution should merge against the original execution, but run
+	// a second hedge, which will finish quickly.
+	cmd3 := rbe.Execute(flakyCmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "invocation3"})
+	op3 := cmd3.WaitAccepted()
+	require.Equal(t, op1, op3, "expected action to be merged")
+
+	// Wait for observable publication of the hedge result, rather than
+	// assuming that execution and upload finish within a fixed sleep.
+	actionRN, err := digest.ParseUploadResourceName(op1)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		_, err := rbe.GetActionResultStorageClient().GetActionResult(context.Background(), &repb.GetActionResultRequest{
+			ActionDigest: actionRN.GetDigest(), InstanceName: actionRN.GetInstanceName(), DigestFunction: actionRN.GetDigestFunction(),
+		})
+		return err == nil
+	}, 10*time.Second, 10*time.Millisecond, "successful hedge must populate the action cache")
+
+	// op3's hedged execution should populate the action cache, unblocking
+	// subsequent invocations.
+	cmd4 := rbe.Execute(flakyCmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "invocation4"})
+	op4 := cmd4.WaitAccepted()
+	require.NotEqual(t, op1, op4, "expected action to be hedged")
+	require.Equal(t, "FAST", strings.Trim(cmd4.Wait().Stdout, "\n"))
+	// The cache hit above confirms that the hedge's successful result has
+	// been uploaded. All clients already waiting on the canonical execution
+	// must receive that winner too, while the original remains blocked.
+	for i, cmd := range []*rbetest.Command{cmd1, cmd2, cmd3} {
+		deadline := time.NewTimer(5 * time.Second)
+		completed := false
+		for !completed {
+			select {
+			case result, ok := <-cmd.StatusChannel():
+				require.True(t, ok, "waiter %d closed without completion", i+1)
+				if result.Stage == repb.ExecutionStage_COMPLETED {
+					require.NoError(t, result.Err)
+					require.NotNil(t, result.ActionResult)
+					completed = true
+				}
+			case <-deadline.C:
+				t.Fatalf("waiter %d did not receive successful hedge completion within 5s", i+1)
+			}
+		}
+		deadline.Stop()
+	}
 }
 
 func TestActionMerging_DisabledWithDoNotCache(t *testing.T) {
