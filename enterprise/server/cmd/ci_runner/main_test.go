@@ -616,3 +616,66 @@ not json at all
 		})
 	}
 }
+
+// An event may arrive after its branch has advanced. Fetch/checkout must still
+// use its original commit, and merging the base must preserve its status SHA.
+func TestBughuntCheckoutEventCommit(t *testing.T) {
+	for _, merge := range []bool{false, true} {
+		t.Run(map[bool]string{false: "head only", true: "merge base"}[merge], func(t *testing.T) {
+			sourceDir, _ := testgit.MakeTempRepo(t, map[string]string{"base.txt": "base"})
+			testshell.Run(t, sourceDir, `
+    git checkout -q -b feature
+    echo event > event.txt
+    git add . && git commit -qm event
+   `)
+			eventSHA := strings.TrimSpace(testshell.Run(t, sourceDir, "git rev-parse HEAD"))
+			testshell.Run(t, sourceDir, `
+    echo later > later.txt
+    git add . && git commit -qm later
+    git checkout -q master
+    echo base-update > base.txt
+    git add . && git commit -qm base-update
+   `)
+			baseSHA := strings.TrimSpace(testshell.Run(t, sourceDir, "git rev-parse HEAD"))
+			flags.Set(t, "pushed_repo_url", sourceDir)
+			flags.Set(t, "target_repo_url", sourceDir)
+			flags.Set(t, "pushed_branch", "feature")
+			flags.Set(t, "target_branch", "master")
+			flags.Set(t, "pushed_tag", "")
+			flags.Set(t, "commit_sha", eventSHA)
+			flags.Set(t, "git_fetch_filters", []string{})
+			flags.Set(t, "git_fetch_depth", 0)
+			t.Setenv("USE_SYSTEM_GIT_CREDENTIALS", "1")
+			checkoutDir := t.TempDir()
+			originalDir, err := os.Getwd()
+			require.NoError(t, err)
+			require.NoError(t, os.Chdir(checkoutDir))
+			t.Cleanup(func() { require.NoError(t, os.Chdir(originalDir)) })
+			invocationLog := newInvocationLog(nil)
+			invocationLog.writer = io.Discard
+			ws := &workspace{rootDir: checkoutDir, log: &buildEventReporter{log: invocationLog}}
+			require.NoError(t, ws.init(t.Context()))
+			for _, kv := range [][2]string{{"user.email", "test@example.com"}, {"user.name", "Test"}} {
+				_, gitErr := git(t.Context(), io.Discard, "config", kv[0], kv[1])
+				require.Nil(t, gitErr)
+			}
+			require.NoError(t, ws.fetchPushedRef(t.Context()))
+			require.NoError(t, ws.checkoutRef(t.Context()))
+			got, gitErr := git(t.Context(), io.Discard, "rev-parse", "HEAD")
+			require.Nil(t, gitErr)
+			assert.Equal(t, eventSHA, strings.TrimSpace(got))
+			require.NoError(t, ws.mergeWithBaseIfRequested(t.Context(), &config.Triggers{PullRequest: &config.PullRequestTrigger{MergeWithBase: &merge}}))
+			require.Nil(t, ws.setupError)
+			assert.Equal(t, eventSHA, *commitSHA, "status SHA must stay at the event head")
+			_, err = os.Stat("later.txt")
+			assert.True(t, os.IsNotExist(err), "must not check out the advanced branch tip")
+			if merge {
+				for ref, want := range map[string]string{"HEAD^1": eventSHA, "HEAD^2": baseSHA} {
+					got, gitErr := git(t.Context(), io.Discard, "rev-parse", ref)
+					require.Nil(t, gitErr)
+					assert.Equal(t, want, strings.TrimSpace(got))
+				}
+			}
+		})
+	}
+}
