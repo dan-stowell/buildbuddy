@@ -3520,3 +3520,55 @@ func TestTaskCPUControllerDisabled(t *testing.T) {
 		})
 	}
 }
+
+// Inputs are hardlinked from the executor filecache into the workspace, which
+// is bind-mounted read-write into the container. Check whether a write to an
+// input from inside the container reaches the linked (cached) inode.
+func TestRunWriteToHardlinkedInput(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		user string
+	}{
+		{name: "image_default_user", user: ""},
+		{name: "nonroot_user", user: "1001:1001"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupNetworking(t)
+			image := busyboxImage(t)
+			ctx := context.Background()
+			env := testenv.GetTestEnv(t)
+			installLeaserInEnv(t, env)
+			installFileCacheInEnv(t, env)
+			flags.Set(t, "executor.oci.runtime_root", testfs.MakeTempDir(t))
+			buildRoot := testfs.MakeTempDir(t)
+			cacheRoot := testfs.MakeTempDir(t)
+			provider, err := ociruntime.NewProvider(env, buildRoot, cacheRoot)
+			require.NoError(t, err)
+
+			// Simulated filecache entry, hardlinked into the workspace.
+			fcEntryDir := testfs.MakeTempDir(t)
+			fcEntry := filepath.Join(fcEntryDir, "entry")
+			require.NoError(t, os.WriteFile(fcEntry, []byte("hello\n"), 0o644))
+			wd := testfs.MakeDirAll(t, buildRoot, "work")
+			require.NoError(t, os.Link(fcEntry, filepath.Join(wd, "input.txt")))
+
+			c, err := provider.New(ctx, &container.Init{Props: &platform.Properties{
+				ContainerImage: image,
+				DockerUser:     tc.user,
+			}})
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				require.NoError(t, c.Remove(ctx))
+			})
+			res := c.Run(ctx, &repb.Command{
+				Arguments: []string{"sh", "-c", `id; echo MUTATED >> input.txt; echo "append_exit=$?"`},
+			}, wd, oci.Credentials{})
+			require.NoError(t, res.Error)
+			t.Logf("stdout: %q stderr: %q", string(res.Stdout), string(res.Stderr))
+
+			b, err := os.ReadFile(fcEntry)
+			require.NoError(t, err)
+			require.Equal(t, "hello\n", string(b), "filecache entry linked into the workspace was modified by the container")
+		})
+	}
+}
