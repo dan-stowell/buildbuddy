@@ -2905,3 +2905,49 @@ func TestRedisRetryIdempotency_FinalizeLease(t *testing.T) {
 	require.NoError(t, rdb.HDel(ctx, key, "leaseId").Err())
 	require.NoError(t, s.deleteClaimedTask(ctx, "finalize", "legacy-owner"))
 }
+
+// A partial legacy hash is still an existing task. HSET's count of newly
+// added fields must not authorize overwriting an existing owner's state.
+func TestVerifyRedisRetry_InsertPartialLegacyHash(t *testing.T) {
+	ctx := t.Context()
+	rdb := testredis.Start(t).Client()
+	s := &SchedulerServer{rdb: rdb}
+	key := s.redisKeyForTask("partial-legacy")
+	require.NoError(t, rdb.HSet(ctx, key, "claimed", "1", "leaseId", "owner", "attemptCount", 7).Err())
+	require.NoError(t, rdb.Expire(ctx, key, time.Minute).Err())
+	before, err := rdb.HGetAll(ctx, key).Result()
+	require.NoError(t, err)
+	err = s.insertTask(ctx, "partial-legacy", &scpb.SchedulingMetadata{}, []byte("replacement"), "jwt")
+	after, readErr := rdb.HGetAll(ctx, key).Result()
+	require.NoError(t, readErr)
+	require.Equal(t, before, after, "conflicting insertion must preserve partial legacy state")
+	require.True(t, status.IsAlreadyExistsError(err), "got %v", err)
+	require.InDelta(t, time.Minute, rdb.TTL(ctx, key).Val(), float64(2*time.Second))
+}
+
+// A finalize from a superseded stream must not delete the reconnected lease,
+// including through the stream handler's deferred re-enqueue path.
+func TestVerifyRedisRetry_StaleFinalizeAfterReconnect(t *testing.T) {
+	flags.Set(t, "remote_execution.lease_reconnect_grace_period", time.Hour)
+	env, ctx := getEnv(t, &schedulerOpts{}, "user1")
+	fe := newFakeExecutor(ctx, t, env.GetSchedulerClient())
+	fe.Register()
+	taskID := scheduleTask(ctx, t, env, map[string]string{platform.RetryPropertyName: "false"})
+	fe.WaitForTask(taskID)
+	old := fe.Claim(taskID)
+	s := env.GetSchedulerService().(*SchedulerServer)
+	require.NoError(t, s.reEnqueueTask(ctx, taskID, old.leaseID, old.leaseID, 1, "reconnect"))
+	current, err := fe.Reconnect(taskID, old.leaseID)
+	require.NoError(t, err)
+	require.NotEqual(t, old.leaseID, current.leaseID)
+	require.NoError(t, old.stream.Send(&scpb.LeaseTaskRequest{TaskId: taskID, Finalize: true}))
+	rsp, err := old.stream.Recv()
+	require.NoError(t, err)
+	t.Logf("stale finalize ClosedCleanly=%t", rsp.GetClosedCleanly())
+	// Receiving the terminal EOF waits for the handler, including defers.
+	_, err = old.stream.Recv()
+	require.Error(t, err)
+	key := s.redisKeyForTask(taskID)
+	require.Equal(t, current.leaseID, s.rdb.HGet(ctx, key, "leaseId").Val(), "stale finalize must preserve the current lease")
+	require.NoError(t, current.Finalize())
+}
