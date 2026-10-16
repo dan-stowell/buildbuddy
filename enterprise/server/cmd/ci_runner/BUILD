@@ -79,9 +79,14 @@ go_image(
 
 go_test(
     name = "ci_runner_test",
-    srcs = ["main_test.go"],
+    srcs = [
+        "main_test.go",
+        "runfiles_probe_test.go",
+    ],
     embed = [":ci_runner_lib"],
     deps = [
+        "//proto:remote_execution_go_proto",
+        "@org_golang_google_grpc//:grpc",
         "//enterprise/server/workflow/config",
         "//server/testutil/testgit",
         "//server/testutil/testshell",
