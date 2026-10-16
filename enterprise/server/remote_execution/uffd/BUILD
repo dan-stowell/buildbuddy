@@ -31,6 +31,7 @@ go_test(
     ],
     deps = [
         "//enterprise/server/remote_execution/copy_on_write",
+        "//server/testutil/testleak",
         "@com_github_stretchr_testify//require",
         "@org_golang_x_sys//unix",
     ],
