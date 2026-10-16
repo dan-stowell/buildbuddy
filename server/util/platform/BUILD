@@ -35,6 +35,7 @@ go_test(
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
         "@org_golang_google_grpc//status",
+        "@org_golang_google_grpc//metadata",
         "@org_golang_google_protobuf//testing/protocmp",
     ],
 )

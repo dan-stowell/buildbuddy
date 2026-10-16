@@ -12,6 +12,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/testing/protocmp"
 
 	fcpb "github.com/buildbuddy-io/buildbuddy/proto/firecracker"
@@ -554,5 +555,32 @@ func TestPlatformRoutingRejectInvalidValues(t *testing.T) {
 			}}})
 			assert.True(t, status.IsInvalidArgumentError(err), "expected InvalidArgument for %s; got %v", name, err)
 		})
+	}
+}
+
+func TestPlatformRoutingHeaderPrecedence(t *testing.T) {
+	for _, actionPresent := range []bool{false, true} {
+		for _, headerValues := range [][]string{{"header"}, {"first", "last"}, {""}} {
+			t.Run(fmt.Sprintf("action=%t/headers=%q", actionPresent, headerValues), func(t *testing.T) {
+				task := &repb.ExecutionTask{
+					Command: &repb.Command{Platform: &repb.Platform{Properties: []*repb.Platform_Property{{Name: "Pool", Value: "command"}}}},
+				}
+				if actionPresent {
+					task.Action = &repb.Action{Platform: &repb.Platform{Properties: []*repb.Platform_Property{{Name: "Pool", Value: "action"}}}}
+				}
+				props, err := ParseProperties(task)
+				require.NoError(t, err)
+				if actionPresent {
+					require.Equal(t, "action", props.Pool)
+				} else {
+					require.Equal(t, "command", props.Pool)
+				}
+				ctx := metadata.NewIncomingContext(t.Context(), metadata.MD{OverrideHeaderPrefix + "pool": headerValues})
+				task.PlatformOverrides = &repb.Platform{Properties: RemoteHeaderOverrides(ctx)}
+				props, err = ParseProperties(task)
+				require.NoError(t, err)
+				require.Equal(t, headerValues[len(headerValues)-1], props.Pool)
+			})
+		}
 	}
 }
