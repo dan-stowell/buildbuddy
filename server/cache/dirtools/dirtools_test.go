@@ -2269,3 +2269,41 @@ func (s *trackedWriteStream) CloseAndRecv() (*bspb.WriteResponse, error) {
 	defer s.done()
 	return s.ByteStream_WriteClient.CloseAndRecv()
 }
+
+func TestExecutorInputCacheHardlinkedOutput(t *testing.T) {
+	for _, mutate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("mutate=%t", mutate), func(t *testing.T) {
+			env, ctx := testEnv(t)
+			root := testfs.MakeTempDir(t)
+			const original = "original input"
+			addToFileCache(t, ctx, env, testfs.MakeTempDir(t), original)
+			node := &repb.FileNode{Name: "input", Digest: &repb.Digest{Hash: hash.String(original), SizeBytes: int64(len(original))}}
+			tree := &repb.Tree{Root: &repb.Directory{Files: []*repb.FileNode{node}}}
+			_, err := dirtools.DownloadTree(ctx, env, "", repb.DigestFunction_SHA256, tree, &dirtools.DownloadTreeOpts{RootDir: root})
+			require.NoError(t, err)
+			require.NoError(t, os.Link(filepath.Join(root, "input"), filepath.Join(root, "output")))
+			expected := original
+			if mutate {
+				expected = "changed output"
+				require.NoError(t, os.WriteFile(filepath.Join(root, "output"), []byte(expected), 0644))
+			}
+			cmd := &repb.Command{OutputPaths: []string{"output"}}
+			result := &repb.ActionResult{}
+			_, err = dirtools.UploadTree(ctx, env, dirtools.NewDirHelper(root, cmd, 0755), "", repb.DigestFunction_SHA256, root, cmd, result, true, nil)
+			require.NoError(t, err)
+			require.Len(t, result.OutputFiles, 1)
+			assert.Equal(t, hash.String(expected), result.OutputFiles[0].Digest.Hash)
+			assert.Equal(t, int64(len(expected)), result.OutputFiles[0].Digest.SizeBytes)
+			r := &rspb.ResourceName{Digest: result.OutputFiles[0].Digest, CacheType: rspb.CacheType_CAS}
+			data, err := env.GetCache().Get(ctx, r)
+			require.NoError(t, err)
+			assert.Equal(t, expected, string(data))
+			later := filepath.Join(root, "later")
+			if env.GetFileCache().FastLinkFile(ctx, node, later) {
+				data, err := os.ReadFile(later)
+				require.NoError(t, err)
+				assert.Equal(t, original, string(data), "upload must not leave corrupt original digest cached")
+			}
+		})
+	}
+}
