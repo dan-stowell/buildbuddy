@@ -114,6 +114,10 @@ type schedulerOpts struct {
 
 func getEnv(t *testing.T, opts *schedulerOpts, user string) (*testenv.TestEnv, context.Context) {
 	testleak.Check(t)
+	testleak.CheckFDs(t)
+	// Run server handlers on their own goroutines, so stuck handlers are
+	// visible to the checks (see testleak package docs).
+	flags.Set(t, "grpc_server_worker_multiplier", 0)
 	redisTarget := testredis.Start(t).Target
 	env := enterprise_testenv.GetCustomTestEnv(t, &enterprise_testenv.Options{
 		RedisTarget: redisTarget,
