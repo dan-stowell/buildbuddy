@@ -535,3 +535,24 @@ func TestPlatformRoutingDuplicateLookupConsistency(t *testing.T) {
 		}
 	}
 }
+
+func TestPlatformRoutingRejectInvalidValues(t *testing.T) {
+	for _, name := range []string{"EstimatedCPU", "EstimatedMemory", "EstimatedFreeDiskBytes", "EstimatedComputeUnits", "resources:gpu"} {
+		for _, value := range []string{"-1", "NaN", "+Inf", "1e100", "garbage"} {
+			t.Run(name+"/"+value, func(t *testing.T) {
+				_, err := ParseProperties(&repb.ExecutionTask{Action: &repb.Action{Platform: &repb.Platform{
+					Properties: []*repb.Platform_Property{{Name: name, Value: value}},
+				}}})
+				assert.True(t, status.IsInvalidArgumentError(err), "expected InvalidArgument for %s=%q; got %v", name, value, err)
+			})
+		}
+	}
+	for _, name := range []string{"use-self-hosted-executors", "recycle-runner", "dockerInit", "init-dockerd"} {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseProperties(&repb.ExecutionTask{Action: &repb.Action{Platform: &repb.Platform{
+				Properties: []*repb.Platform_Property{{Name: name, Value: "not-a-bool"}},
+			}}})
+			assert.True(t, status.IsInvalidArgumentError(err), "expected InvalidArgument for %s; got %v", name, err)
+		})
+	}
+}
