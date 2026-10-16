@@ -1277,6 +1277,21 @@ func testExecuteAndPublishOperation(t *testing.T, test publishTest) {
 		Status:       gstatus.Convert(test.status).Proto(),
 	}
 	if test.checkExecutionResults {
+		// Attach an observer before completion, then disconnect it after a real
+		// progress update. Reconnect below and compare against the original stream.
+		observerCtx, disconnect := context.WithTimeout(clientCtx, 10*time.Second)
+		defer disconnect()
+		observer, err := client.WaitExecution(observerCtx, &repb.WaitExecutionRequest{Name: taskID})
+		require.NoError(t, err)
+		progress, err := operation.Assemble(taskID, operation.Metadata(repb.ExecutionStage_EXECUTING, arn.GetDigest()), operation.InProgressExecuteResponse())
+		require.NoError(t, err)
+		require.NoError(t, stream.Send(progress))
+		observed, err := observer.Recv()
+		require.NoError(t, err)
+		require.Equal(t, repb.ExecutionStage_EXECUTING, operation.ExtractStage(observed))
+		disconnect()
+	}
+	if test.checkExecutionResults {
 		expectedExecuteResponse.Message = "executor diagnostic message"
 		expectedExecuteResponse.ServerLogs = map[string]*repb.LogFile{
 			"diagnostic": {Digest: &repb.Digest{Hash: strings.Repeat("a", 64), SizeBytes: 123}, HumanReadable: true},
@@ -3083,7 +3098,7 @@ func TestExecutionResults_HedgedFailurePreservesSuccess(t *testing.T) {
 		_, err = stream.CloseAndRecv()
 		require.NoError(t, err)
 	}
-	success := &repb.ExecuteResponse{Result: &repb.ActionResult{StdoutRaw: []byte("winning output")}, Message: "success diagnostic", ServerLogs: map[string]*repb.LogFile{"log": {HumanReadable: true}}}
+	success := &repb.ExecuteResponse{Result: &repb.ActionResult{StdoutRaw: []byte("winning output"), ExecutionMetadata: &repb.ExecutedActionMetadata{Worker: "test-worker"}}, Message: "success diagnostic", ServerLogs: map[string]*repb.LogFile{"log": {HumanReadable: true}}}
 	publish(first.GetName(), success)
 	// The duplicate finishes later with different output and a failed exit.
 	publish(scheduled[1].GetTaskId(), &repb.ExecuteResponse{Result: &repb.ActionResult{ExitCode: 42, StdoutRaw: []byte("losing output")}})
