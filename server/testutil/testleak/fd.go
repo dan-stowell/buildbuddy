@@ -49,6 +49,11 @@ func FDSettle(d time.Duration) FDOption {
 // A file descriptor is "new" if its number wasn't open at the start, or was
 // open with a different target (e.g. it was closed and reused).
 //
+// Reopening the same target at the same descriptor number is indistinguishable
+// from retaining the original descriptor. This also applies to anonymous inode
+// targets with identical descriptions. Use CheckGrowth to detect accumulation,
+// and assert owner-specific closure when replacement matters.
+//
 // The Go runtime lazily opens an epoll instance and an eventfd the first time
 // anything uses the network poller, and never closes them. On Linux that
 // happens on the first socket, pipe, or even regular file opened with the os
