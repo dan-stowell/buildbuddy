@@ -508,3 +508,27 @@ func TestPaginationInvalidTokens(t *testing.T) {
 		require.True(t, status.IsInvalidArgumentError(err), "token from another query must be rejected; got %v", err)
 	})
 }
+
+func TestPaginationOLAPCreatedAtTies(t *testing.T) {
+	flags.Set(t, "app.blended_invocation_search_enabled", false)
+	flags.Set(t, "app.olap_invocation_search_enabled", true)
+	ctx, _, service := paginationFixture(t, 7, true, true)
+	metric, min := sfpb.InvocationMetricType_UPDATED_AT_USEC_INVOCATION_METRIC, int64(0)
+	req := &inpb.SearchInvocationRequest{Count: 1, Sort: &inpb.InvocationSort{SortField: inpb.InvocationSort_CREATED_AT_USEC_SORT_FIELD}, Query: &inpb.InvocationQuery{User: "pager", Filter: []*sfpb.StatFilter{{Metric: &sfpb.Metric{Invocation: &metric}, Min: &min}}}}
+	var got []string
+	for page := 0; ; page++ {
+		require.Less(t, page, 9)
+		rsp, err := service.QueryInvocations(ctx, req)
+		require.NoError(t, err)
+		got = append(got, getInvocationIDSlice(rsp)...)
+		if rsp.NextPageToken == "" {
+			break
+		}
+		req.PageToken = rsp.NextPageToken
+	}
+	var want []string
+	for i := range 7 {
+		want = append(want, getUUIDString(byte(i)))
+	}
+	require.ElementsMatch(t, want, got, "static tied timestamps must not repeat or omit invocations")
+}
