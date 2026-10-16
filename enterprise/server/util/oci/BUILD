@@ -71,3 +71,20 @@ go_test(
         "@org_golang_google_grpc//:grpc",
     ],
 )
+
+go_test(
+    name = "resolver_leak_repro_test",
+    size = "medium",
+    srcs = ["resolver_leak_repro_test.go"],
+    deps = [
+        ":oci",
+        "//enterprise/server/testutil/testregistry",
+        "//server/testutil/testenv",
+        "//server/util/testing/flags",
+        "@com_github_google_go_containerregistry//pkg/name",
+        "@com_github_google_go_containerregistry//pkg/registry",
+        "@com_github_google_go_containerregistry//pkg/v1/random",
+        "@com_github_google_go_containerregistry//pkg/v1/remote",
+        "@com_github_stretchr_testify//require",
+    ],
+)
