@@ -127,6 +127,11 @@ func checkStreamFinalization(t *testing.T, order []int, terminal error, cancelCo
 	assert.Equal(t, row.Command, inv.Command)
 	assert.Equal(t, []string{row.Pattern}, inv.Pattern)
 	assert.Equal(t, row.BazelExitCode, inv.BazelExitCode)
+	// Disconnected invocations are intentionally excluded from OLAP.
+	if !finishedSeen {
+		assert.Nil(t, olap.GetFlushedInvocation(iid))
+		return
+	}
 	var analytics *tables.Invocation
 	require.Eventually(t, func() bool { analytics = olap.GetFlushedInvocation(iid); return analytics != nil }, 30*time.Second, 10*time.Millisecond)
 	assert.Equal(t, row.InvocationStatus, analytics.InvocationStatus)
