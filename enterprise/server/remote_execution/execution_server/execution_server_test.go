@@ -2976,3 +2976,136 @@ func TestRedactCachedExecuteResponse(t *testing.T) {
 		})
 	}
 }
+
+// lostPublishAckClient lets the real server finish the first stream before
+// replacing its successful final response with Unavailable. No sleeps or
+// probabilistic network failures are involved.
+type lostPublishAckClient struct {
+	repb.ExecutionClient
+	streams int
+}
+
+func (c *lostPublishAckClient) PublishOperation(ctx context.Context, opts ...grpc.CallOption) (repb.Execution_PublishOperationClient, error) {
+	s, err := c.ExecutionClient.PublishOperation(ctx, opts...)
+	if err != nil {
+		return nil, err
+	}
+	c.streams++
+	if c.streams == 1 {
+		return &lostPublishAckStream{Execution_PublishOperationClient: s}, nil
+	}
+	return s, nil
+}
+
+type lostPublishAckStream struct {
+	repb.Execution_PublishOperationClient
+}
+
+func (s *lostPublishAckStream) CloseAndRecv() (*repb.PublishOperationResponse, error) {
+	rsp, err := s.Execution_PublishOperationClient.CloseAndRecv()
+	if err != nil {
+		return rsp, err
+	}
+	return nil, status.UnavailableError("injected loss of successful PublishOperation ACK")
+}
+
+func TestPublishOperation_LostCompletionAckDoesNotDoubleUsage(t *testing.T) {
+	for _, flushAfterCleanup := range []bool{false, true} {
+		t.Run(fmt.Sprintf("flushAfterCleanup=%v", flushAfterCleanup), func(t *testing.T) {
+			testPublishOperationLostCompletionAck(t, flushAfterCleanup)
+		})
+	}
+}
+
+func testPublishOperationLostCompletionAck(t *testing.T, flushAfterCleanup bool) {
+	ctx := context.Background()
+	flags.Set(t, "app.enable_write_executions_to_olap_db", true)
+	flags.Set(t, "remote_execution.write_execution_progress_state_to_redis", true)
+	env, conn, _ := setupEnv(t)
+	if flushAfterCleanup {
+		configureExperiments(t, env, map[string]bool{"remote_execution.flush_executions_after_cleanup": true})
+	}
+	client := repb.NewExecutionClient(conn)
+	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("user1", "group1"))
+	env.SetAuthenticator(ta)
+	ctx, err := ta.WithAuthenticatedUser(ctx, "user1")
+	require.NoError(t, err)
+
+	const instanceName = "test-instance"
+	const invocationID = "93383cc1-5d6c-4ad1-a321-8ee87c2f6816"
+
+	clientCtx, err := bazel_request.WithRequestMetadata(ctx, &repb.RequestMetadata{
+		ToolInvocationId: invocationID,
+		TargetId:         "//some:test",
+		ActionMnemonic:   "TestRunner",
+	})
+	require.NoError(t, err)
+
+	arn := uploadAction(clientCtx, t, env, instanceName, repb.DigestFunction_SHA256, &repb.Action{
+		Timeout: &durationpb.Duration{Seconds: 10},
+		Platform: &repb.Platform{
+			Properties: []*repb.Platform_Property{
+				{Name: "pool", Value: "test-pool"},
+				{Name: "workload-isolation-type", Value: "firecracker"},
+				{Name: "EstimatedComputeUnits", Value: "2.5"},
+			},
+		},
+	})
+	executionClient, err := client.Execute(clientCtx, &repb.ExecuteRequest{
+		InstanceName:   arn.GetInstanceName(),
+		ActionDigest:   arn.GetDigest(),
+		DigestFunction: arn.GetDigestFunction(),
+	})
+	require.NoError(t, err)
+	require.NoError(t, executionClient.CloseSend())
+	op, err := executionClient.Recv()
+	require.NoError(t, err)
+	taskID := op.GetName()
+
+	executorCtx := metadata.AppendToOutgoingContext(clientCtx, usageutil.ClientHeaderName, "executor")
+	executorCtx = metadata.AppendToOutgoingContext(executorCtx, "x-buildbuddy-executor-region", "test-region")
+
+	queuedTime := time.Unix(100, 0)
+	workerStartTime := queuedTime.Add(1 * time.Second)
+	workerEndTime := workerStartTime.Add(5 * time.Second)
+	aux := &espb.ExecutionAuxiliaryMetadata{
+		PlatformOverrides: &repb.Platform{},
+		IsolationType:     "firecracker",
+		SchedulingMetadata: &scpb.SchedulingMetadata{
+			ExecutorGroupId: sharedPoolGroupID,
+			Pool:            "test-pool",
+		},
+	}
+	auxAny, err := anypb.New(aux)
+	require.NoError(t, err)
+
+	// Use the production retrying publisher, losing the first final ACK only.
+	lossyClient := &lostPublishAckClient{ExecutionClient: client}
+	stream1, err := operation.Publish(executorCtx, lossyClient, taskID)
+	require.NoError(t, err)
+	firstOp, err := operation.Assemble(taskID, operation.Metadata(repb.ExecutionStage_COMPLETED, arn.GetDigest()), &repb.ExecuteResponse{
+		Result: &repb.ActionResult{
+			ExecutionMetadata: &repb.ExecutedActionMetadata{
+				QueuedTimestamp:          tspb.New(queuedTime),
+				WorkerStartTimestamp:     tspb.New(workerStartTime),
+				WorkerCompletedTimestamp: tspb.New(workerEndTime),
+				AuxiliaryMetadata:        []*anypb.Any{auxAny},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, stream1.Send(firstOp))
+	_, err = stream1.CloseAndRecv()
+	require.NoError(t, err)
+
+	require.Equal(t, 2, lossyClient.streams, "the lost ACK must cause one replay")
+	ut := env.GetUsageTracker().(*testusage.Tracker)
+	var duration int64
+	for _, u := range ut.Totals() {
+		if u.Labels.Client == "executor" {
+			duration += u.Counts.LinuxExecutionDurationUsec
+		}
+	}
+	require.Equal(t, (5 * time.Second).Microseconds(), duration,
+		"one execution must be billed once even when its completion ACK is lost")
+}
