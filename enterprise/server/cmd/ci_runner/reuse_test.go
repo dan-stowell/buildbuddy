@@ -200,6 +200,7 @@ func TestRunnerReuseCleanExclude(t *testing.T) {
 	flags.Set(t, "git_clean_exclude", []string{"keep/"})
 	checkout := filepath.Join(f.root, repoDirName)
 	reuseWrite(t, checkout, "keep/cache", "preserved")
+	reuseGit(t, filepath.Join(checkout, "keep"), "init")
 	reuseWrite(t, checkout, "discard", "removed")
 	sha := reuseGit(t, f.source, "rev-parse", "HEAD")
 	require.NoError(t, f.setup("x", "", sha))
@@ -253,7 +254,7 @@ func TestRunnerReuseRemovesNestedRepository(t *testing.T) {
 }
 
 func TestRunnerReuseSubmodule(t *testing.T) {
-	for _, scenario := range []string{"pointer-change", "removed"} {
+	for _, scenario := range []string{"pointer-change", "removed", "dirty", "never-initialized"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newReuseFixture(t)
 			sub := t.TempDir()
@@ -266,18 +267,34 @@ func TestRunnerReuseSubmodule(t *testing.T) {
 			require.NoError(t, f.setup("x", "", old))
 			checkout := filepath.Join(f.root, repoDirName)
 			// Model a workflow that initialized its dependencies on a prior run.
-			reuseGit(t, checkout, "submodule", "update", "--init", "--recursive")
+			if scenario != "never-initialized" {
+				reuseGit(t, checkout, "submodule", "update", "--init", "--recursive")
+			}
+			if scenario == "dirty" {
+				reuseWrite(t, checkout, "dependency/input", "modified by previous run\n")
+				reuseWrite(t, checkout, "dependency/untracked", "stale")
+				reuseWrite(t, checkout, "dependency/nested/stale", "stale nested repo")
+				reuseGit(t, filepath.Join(checkout, "dependency/nested"), "init")
+			}
 			if scenario == "pointer-change" {
 				reuseWrite(t, sub, "input", "new submodule\n")
 				next := reuseCommit(t, sub)
 				reuseGit(t, filepath.Join(f.source, "dependency"), "fetch", "origin")
 				reuseGit(t, filepath.Join(f.source, "dependency"), "checkout", next)
-			} else {
+			} else if scenario == "removed" {
 				reuseGit(t, f.source, "rm", "-f", "dependency")
 			}
-			sha := reuseCommit(t, f.source)
+			sha := old
+			if scenario == "pointer-change" || scenario == "removed" {
+				sha = reuseCommit(t, f.source)
+			}
 			require.NoError(t, f.setup("x", "", sha))
 			require.Equal(t, sha, reuseGit(t, checkout, "rev-parse", "HEAD"))
+			// Runner setup leaves submodules uninitialized, just like a fresh
+			// checkout. The workflow's own initialization must work even after
+			// a previous run dirtied a dependency or changed its pointer.
+			f.assertFresh(sha)
+			reuseGit(t, checkout, "submodule", "update", "--init", "--recursive")
 			fresh := t.TempDir()
 			reuseGit(t, fresh, "clone", "--quiet", "file://"+f.source, ".")
 			reuseGit(t, fresh, "checkout", "--quiet", sha)
