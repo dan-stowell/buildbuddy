@@ -82,11 +82,14 @@ go_test(
     embed = [":ci_runner_lib"],
     deps = [
         "//enterprise/server/workflow/config",
+        "//proto:remote_execution_go_proto",
         "//server/testutil/testgit",
+        "//server/testutil/testleak",
         "//server/testutil/testshell",
         "//server/util/platform",
         "//server/util/testing/flags",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
+        "@org_golang_google_grpc//:grpc",
     ],
 )
