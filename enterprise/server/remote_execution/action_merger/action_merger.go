@@ -485,3 +485,35 @@ func boolInt(b bool) int {
 	}
 	return 0
 }
+
+// AddInvocation records interest idempotently; multiple Execute calls from one
+// invocation count as one interested client. Empty IDs remain protected because
+// they cannot be cancelled by invocation ID.
+func AddInvocation(ctx context.Context, rdb redis.UniversalClient, canonical, invocation string) error {
+	return rdb.HSet(ctx, copyKey(canonical), "invocation:"+invocation, "1").Err()
+}
+
+// RemoveInvocation returns all copies only when no invocation still needs them.
+// The winner marker also fences concurrent hedge registration and completion.
+func RemoveInvocation(ctx context.Context, rdb redis.UniversalClient, id, invocation string) (string, []string, error) {
+	canonical, err := rdb.HGet(ctx, copyKey(id), "canonical").Result()
+	if err == redis.Nil {
+		canonical = id
+	} else if err != nil {
+		return "", nil, err
+	}
+	result, err := rdb.Eval(ctx, `
+ if redis.call('EXISTS', KEYS[1]) == 0 then return {ARGV[2]} end
+ redis.call('HDEL', KEYS[1], 'invocation:' .. ARGV[1])
+ local fields = redis.call('HKEYS', KEYS[1])
+ local copies = {}
+ for _, f in ipairs(fields) do
+   if string.sub(f,1,11) == 'invocation:' then return {} end
+   if string.sub(f,1,5) == 'copy:' then table.insert(copies,string.sub(f,6)) end
+ end
+ if redis.call('HEXISTS', KEYS[1], 'winner') == 1 then return {} end
+ redis.call('HSET', KEYS[1], 'winner', 'cancelled')
+ redis.call('EXPIRE', KEYS[1], 86400)
+ return copies`, []string{copyKey(canonical)}, invocation, canonical).StringSlice()
+	return canonical, result, err
+}

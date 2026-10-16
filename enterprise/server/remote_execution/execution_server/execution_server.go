@@ -1196,6 +1196,9 @@ func (s *ExecutionServer) execute(req *repb.ExecuteRequest, stream streamLike) e
 
 	// Check if there's already an identical action pending execution that this request can be merged into.
 	executionID, op := action_merger.GetOrCreateExecutionID(ctx, s.rdb, s.env.GetSchedulerService(), adInstanceDigest, action.DoNotCache)
+	if err := action_merger.AddInvocation(ctx, s.rdb, executionID, invocationID); err != nil {
+		return err
+	}
 	if op == action_merger.New {
 		log.CtxDebugf(ctx, "Scheduling new execution %s for %q for invocation %q", executionID, downloadString, invocationID)
 
@@ -1440,7 +1443,7 @@ func (s *ExecutionServer) waitExecution(ctx context.Context, req *repb.WaitExecu
 }
 
 func (s *ExecutionServer) MarkExecutionFailed(ctx context.Context, taskID string, reason error) error {
-	r, err := digest.ParseUploadResourceName(taskID)
+	_, err := digest.ParseUploadResourceName(taskID)
 	if err != nil {
 		log.CtxWarningf(ctx, "Could not parse taskID: %s", err)
 		return err
@@ -1459,6 +1462,18 @@ func (s *ExecutionServer) MarkExecutionFailed(ctx context.Context, taskID string
 		}
 	}
 	action_merger.DeletePendingExecution(ctx, s.rdb, canonical)
+	return s.publishFailure(ctx, taskID, reason)
+}
+
+func (s *ExecutionServer) publishCancellation(ctx context.Context, taskID string) error {
+	return s.publishFailure(ctx, taskID, status.CanceledError("invocation cancelled"))
+}
+
+func (s *ExecutionServer) publishFailure(ctx context.Context, taskID string, reason error) error {
+	r, err := digest.ParseUploadResourceName(taskID)
+	if err != nil {
+		return err
+	}
 	rsp := operation.ErrorResponse(reason)
 	op, err := operation.Assemble(taskID, operation.Metadata(repb.ExecutionStage_COMPLETED, r.GetDigest()), rsp)
 	if err != nil {
@@ -2189,35 +2204,29 @@ func (s *ExecutionServer) Cancel(ctx context.Context, invocationID string) error
 	for _, id := range ids {
 		ctx := log.EnrichContext(ctx, log.ExecutionIDKey, id)
 
-		rn, err := digest.ParseUploadResourceName(id)
-		if err == nil {
-			merged, err := action_merger.CheckMerged(ctx, s.rdb, rn)
+		canonical, copies, err := action_merger.RemoveInvocation(ctx, s.rdb, id, invocationID)
+		if err != nil {
+			return err
+		}
+		if len(copies) == 0 {
+			continue
+		}
+		for _, copyID := range copies {
+			cancelled, err := s.env.GetSchedulerService().CancelTask(ctx, copyID)
 			if err != nil {
-				log.CtxWarningf(ctx, "Error checking merge status of %q: %s", id, err)
+				return err
 			}
-			// Don't cancel execution if it has been merged against.
-			if merged {
-				log.CtxInfof(ctx, "Skip cancellation for %q as it has been merged against.", id)
-				continue
+			if cancelled {
+				numCancelled++
 			}
-		} else {
-			log.CtxWarningf(ctx, "could not parse execution ID %q: %s", id, err)
+		}
+		// Cancellation has fenced copies; publish the canonical cancellation
+		// directly rather than entering copy completion arbitration again.
+		action_merger.DeletePendingExecution(ctx, s.rdb, canonical)
+		if err := s.publishCancellation(ctx, canonical); err != nil {
+			return err
 		}
 
-		log.CtxInfof(ctx, "Cancelling execution %q due to user request for invocation %q", id, invocationID)
-		cancelled, err := s.env.GetSchedulerService().CancelTask(ctx, id)
-		if cancelled {
-			numCancelled++
-		}
-		if err != nil {
-			log.CtxWarningf(ctx, "Failed to cancel task %q: %s", id, err)
-		}
-		if err == nil && cancelled {
-			err = s.MarkExecutionFailed(ctx, id, status.CanceledError("invocation cancelled"))
-			if err != nil {
-				log.CtxWarningf(ctx, "Could not mark execution %q as cancelled: %s", id, err)
-			}
-		}
 	}
 	log.CtxInfof(ctx, "Cancelled %d executions for invocation %s", numCancelled, invocationID)
 
