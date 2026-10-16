@@ -298,3 +298,38 @@ func TestGeneratedDailyTrends(t *testing.T) {
 		}
 	}
 }
+
+// A heatmap must enclose its data in the timestamp brackets it returns, even
+// when the caller specifies a partial second at the edge of the window.
+func TestHeatmapPartialSecondBounds(t *testing.T) {
+	t.Log("deterministic fixture; seed=none")
+	flags.Set(t, "app.trends_heatmap_enabled", true)
+	te := testenv.GetTestEnv(t)
+	testclickhouse.Configure(t, te)
+	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1"))
+	te.SetAuthenticator(ta)
+	ctx, err := ta.WithAuthenticatedUser(context.Background(), "US1")
+	require.NoError(t, err)
+	start := time.Date(2024, 12, 31, 23, 59, 59, 100000000, time.UTC)
+	end := start.Add(800 * time.Millisecond)
+	updated := start.Add(400 * time.Millisecond)
+	require.NoError(t, te.GetOLAPDBHandle().GORM(ctx, "partial_second_row").Create(&olaptables.Invocation{
+		GroupID: "GR1", InvocationUUID: "00000000000000000000000000000001", UpdatedAtUsec: updated.UnixMicro(), DurationUsec: 100, Success: true, InvocationStatus: 1,
+	}).Error)
+	metric := sfpb.InvocationMetricType_DURATION_USEC_INVOCATION_METRIC
+	iss := NewInvocationStatService(te, te.GetDBHandle(), te.GetOLAPDBHandle())
+	rsp, err := iss.GetStatHeatmap(ctx, &statspb.GetStatHeatmapRequest{RequestContext: testauth.RequestContext("US1", "GR1"), Metric: &sfpb.Metric{Invocation: &metric}, Query: &statspb.TrendQuery{UpdatedAfter: timestamppb.New(start), UpdatedBefore: timestamppb.New(end)}})
+	require.NoError(t, err)
+	var count int64
+	for _, col := range rsp.GetColumn() {
+		for _, value := range col.GetValue() {
+			count += value
+		}
+	}
+	require.Equal(t, int64(1), count)
+	brackets := rsp.GetTimestampBracket()
+	require.GreaterOrEqual(t, len(brackets), 2)
+	require.Equal(t, start.UnixMicro(), brackets[0], "first bracket must preserve inclusive request start")
+	require.Equal(t, end.UnixMicro(), brackets[len(brackets)-1], "last bracket must preserve exclusive request end")
+	require.Less(t, updated.UnixMicro(), brackets[len(brackets)-1], "returned data must precede final bracket")
+}
