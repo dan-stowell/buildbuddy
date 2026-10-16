@@ -553,8 +553,10 @@ type valueExpiration struct {
 // not much new data should be written to the buffer during shutdown since we
 // don't accept new RPCs while shutting down.
 type CommandBuffer struct {
-	rdb       redis.UniversalClient
-	stopFlush chan struct{}
+	rdb         redis.UniversalClient
+	stopFlush   chan struct{}
+	flushDone   chan struct{}
+	cancelFlush context.CancelFunc
 
 	mu sync.Mutex // protects all fields below
 	// Buffer for SET commands.
@@ -809,7 +811,11 @@ func (c *CommandBuffer) StartPeriodicFlush(ctx context.Context) {
 	}
 
 	c.stopFlush = make(chan struct{})
+	c.flushDone = make(chan struct{})
+	ctx, c.cancelFlush = context.WithCancel(ctx)
 	go func() {
+		defer close(c.flushDone)
+		defer c.cancelFlush()
 		ticker := time.NewTicker(*commandBufferFlushPeriod)
 		defer ticker.Stop()
 		for {
@@ -832,7 +838,14 @@ func (c *CommandBuffer) StopPeriodicFlush(ctx context.Context) error {
 		return nil
 	}
 
-	c.stopFlush <- struct{}{}
+	// Allow an in-progress flush to finish during the shutdown grace period,
+	// but cancel its context once the shutdown deadline expires. Merely
+	// signalling the loop cannot interrupt a flush blocked in Redis.
+	stopCancel := context.AfterFunc(ctx, c.cancelFlush)
+	defer stopCancel()
+	defer c.cancelFlush()
+	close(c.stopFlush)
+	<-c.flushDone
 
 	c.mu.Lock()
 	// Set a flag to make any newly written commands to go directly to Redis.
