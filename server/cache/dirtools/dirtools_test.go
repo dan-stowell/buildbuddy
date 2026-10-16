@@ -2284,6 +2284,10 @@ func TestDigestFunctionInputOutputRoundTrip(t *testing.T) {
 			got, err := os.ReadFile(filepath.Join(root, "file"))
 			require.NoError(t, err)
 			require.Equal(t, data, got)
+			data = []byte("a distinct deterministic output")
+			require.NoError(t, os.WriteFile(filepath.Join(root, "file"), data, 0o644))
+			d, err = digest.Compute(bytes.NewReader(data), df)
+			require.NoError(t, err)
 			cmd := &repb.Command{OutputPaths: []string{"file"}}
 			result := &repb.ActionResult{}
 			helper := dirtools.NewDirHelper(root, cmd, fs.FileMode(0o755))

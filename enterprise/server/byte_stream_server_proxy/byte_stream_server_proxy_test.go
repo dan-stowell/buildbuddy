@@ -3651,3 +3651,35 @@ func BenchmarkReadChunkedMixedLocalRemote(b *testing.B) {
 		}
 	}
 }
+
+func TestDigestFunctionProxyRoundTrip(t *testing.T) {
+	for _, df := range digest.SupportedDigestFunctions() {
+		t.Run(df.String(), func(t *testing.T) {
+			ctx := testContext()
+			remoteEnv := testenv.GetTestEnv(t)
+			proxyEnv := testenv.GetTestEnv(t)
+			remote, _, _, _ := runRemoteServices(ctx, remoteEnv, t)
+			proxy := runBSProxy(ctx, remote, proxyEnv, t)
+			data := []byte("deterministic proxy digest function")
+			d, err := cachetools.UploadBlobToCAS(ctx, proxy, "instance", df, data)
+			require.NoError(t, err)
+			rn := digest.NewCASResourceName(d, "instance", df)
+			// Read directly from the remote service to check upload forwarding, then
+			// through the proxy to exercise its read path.
+			for _, client := range []bspb.ByteStreamClient{remote, proxy} {
+				stream, err := client.Read(ctx, &bspb.ReadRequest{ResourceName: rn.DownloadString()})
+				require.NoError(t, err)
+				var got []byte
+				for {
+					rsp, err := stream.Recv()
+					if err == io.EOF {
+						break
+					}
+					require.NoError(t, err)
+					got = append(got, rsp.GetData()...)
+				}
+				require.Equal(t, data, got)
+			}
+		})
+	}
+}

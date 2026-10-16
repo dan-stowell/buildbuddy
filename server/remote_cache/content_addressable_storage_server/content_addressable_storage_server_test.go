@@ -1676,3 +1676,44 @@ func TestDigestFunctionCASIsolation(t *testing.T) {
 		})
 	}
 }
+
+func TestDigestFunctionCASRoundTrip(t *testing.T) {
+	for _, df := range digest.SupportedDigestFunctions() {
+		t.Run(df.String(), func(t *testing.T) {
+			te := testenv.GetTestEnv(t)
+			ctx, err := prefix.AttachUserPrefixToContext(context.Background(), te.GetAuthenticator())
+			require.NoError(t, err)
+			conn := runCASServer(ctx, t, te)
+			bs := bspb.NewByteStreamClient(conn)
+			cas := repb.NewContentAddressableStorageClient(conn)
+			data := []byte("deterministic batch update")
+			d, err := digest.Compute(bytes.NewReader(data), df)
+			require.NoError(t, err)
+			update, err := cas.BatchUpdateBlobs(ctx, &repb.BatchUpdateBlobsRequest{DigestFunction: df, Requests: []*repb.BatchUpdateBlobsRequest_Request{{Digest: d, Data: data}}})
+			require.NoError(t, err)
+			require.Len(t, update.GetResponses(), 1)
+			require.Equal(t, int32(gcodes.OK), update.GetResponses()[0].GetStatus().GetCode())
+			missing, err := cas.FindMissingBlobs(ctx, &repb.FindMissingBlobsRequest{DigestFunction: df, BlobDigests: []*repb.Digest{d}})
+			require.NoError(t, err)
+			require.Empty(t, missing.GetMissingBlobDigests())
+			read, err := cas.BatchReadBlobs(ctx, &repb.BatchReadBlobsRequest{DigestFunction: df, Digests: []*repb.Digest{d}})
+			require.NoError(t, err)
+			require.Len(t, read.GetResponses(), 1)
+			require.Equal(t, data, read.GetResponses()[0].GetData())
+			stream, err := bs.Read(ctx, &bspb.ReadRequest{ResourceName: digest.NewCASResourceName(d, "", df).DownloadString()})
+			require.NoError(t, err)
+			rsp, err := stream.Recv()
+			require.NoError(t, err)
+			require.Equal(t, data, rsp.GetData())
+			root := &repb.Directory{Symlinks: []*repb.SymlinkNode{{Name: "link", Target: "target"}}}
+			rootDigest, err := cachetools.UploadProto(ctx, bs, "", df, root)
+			require.NoError(t, err)
+			tree, err := cas.GetTree(ctx, &repb.GetTreeRequest{RootDigest: rootDigest, DigestFunction: df})
+			require.NoError(t, err)
+			treeRsp, err := tree.Recv()
+			require.NoError(t, err)
+			require.Len(t, treeRsp.GetDirectories(), 1)
+			require.Equal(t, root.GetSymlinks()[0].GetTarget(), treeRsp.GetDirectories()[0].GetSymlinks()[0].GetTarget())
+		})
+	}
+}
