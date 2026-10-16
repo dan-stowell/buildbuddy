@@ -46,7 +46,7 @@ func TestRun_ReviewSharedOutputOrder(t *testing.T) {
 	_, err := commandutil.RunWithProcessTreeCleanup(ctx, cmd, nil)
 	assert.NoError(t, err)
 	var expected strings.Builder
-	for i := 0; i < 2000; i++ {
+	for i := range 2000 {
 		fmt.Fprintf(&expected, "out-%d\nerr-%d\n", i, i)
 	}
 	got := output.String()
