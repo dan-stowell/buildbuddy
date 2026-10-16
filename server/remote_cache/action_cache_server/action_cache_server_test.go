@@ -1072,3 +1072,77 @@ func TestRecordOriginScorecard(t *testing.T) {
 	assert.Equal(t, actionDigest.GetHash(), result.GetActionId())
 	assert.Equal(t, originInvocationID, result.GetOriginInvocationId())
 }
+
+// All CAS blobs referenced by an AC hit must exist, including log blobs.
+func TestPresenceLifetime_ACRejectsMissingReferences(t *testing.T) {
+	for _, kind := range []string{"output", "stdout", "stderr"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx := context.Background()
+			te := testenv.GetTestEnv(t)
+			client := repb.NewActionCacheClient(runACServer(ctx, t, te))
+			action := &repb.Digest{Hash: strings.Repeat("a", 64), SizeBytes: 100}
+			missing := &repb.Digest{Hash: strings.Repeat("b", 64), SizeBytes: 10}
+			ar := &repb.ActionResult{}
+			switch kind {
+			case "output":
+				ar.OutputFiles = []*repb.OutputFile{{Path: "out", Digest: missing}}
+			case "stdout":
+				ar.StdoutDigest = missing
+			case "stderr":
+				ar.StderrDigest = missing
+			}
+			_, err := client.UpdateActionResult(ctx, &repb.UpdateActionResultRequest{
+				ActionDigest: action, DigestFunction: repb.DigestFunction_SHA256, ActionResult: ar,
+			})
+			require.NoError(t, err)
+			// No inlining: the client must download referenced blobs after the AC hit.
+			got, err := client.GetActionResult(ctx, &repb.GetActionResultRequest{
+				ActionDigest: action, DigestFunction: repb.DigestFunction_SHA256,
+			})
+			require.True(t, status.IsNotFoundError(err), "AC hit references missing %s blob: result=%v err=%v", kind, got, err)
+		})
+	}
+}
+
+func TestValidateActionResult_LogDigests(t *testing.T) {
+	flags.Set(t, "cache.avg_chunk_size_bytes", 1024)
+	for _, field := range []string{"stdout", "stderr"} {
+		t.Run(field, func(t *testing.T) {
+			ctx := context.Background()
+			env := testenv.GetTestEnv(t)
+			ctx, err := prefix.AttachUserPrefixToContext(ctx, env.GetAuthenticator())
+			require.NoError(t, err)
+			cache := env.GetCache()
+			ar := &repb.ActionResult{}
+			setDigest := func(d *repb.Digest) {
+				if field == "stdout" {
+					ar.StdoutDigest = d
+				} else {
+					ar.StderrDigest = d
+				}
+			}
+			validate := func() error {
+				return action_cache_server.ValidateActionResult(ctx, cache, "", repb.DigestFunction_SHA256, ar)
+			}
+			require.NoError(t, validate(), "absent log digest")
+			empty, err := digest.Compute(strings.NewReader(""), repb.DigestFunction_SHA256)
+			require.NoError(t, err)
+			setDigest(empty)
+			require.NoError(t, validate(), "empty blob need not be stored")
+			data := []byte("stored log")
+			d, err := digest.Compute(bytes.NewReader(data), repb.DigestFunction_SHA256)
+			require.NoError(t, err)
+			rn := digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256).ToProto()
+			require.NoError(t, cache.Set(ctx, rn, data))
+			setDigest(d)
+			require.NoError(t, validate())
+			require.NoError(t, cache.Delete(ctx, rn))
+			require.True(t, status.IsNotFoundError(validate()))
+			chunked, chunks := storeChunkedBlob(t, ctx, cache, []byte(strings.Repeat("a", 8192)+strings.Repeat("b", 8192)), repb.DigestFunction_SHA256)
+			setDigest(chunked)
+			require.NoError(t, validate(), "manifest and chunks suffice without a full blob")
+			require.NoError(t, cache.Delete(ctx, chunks[1]))
+			require.True(t, status.IsNotFoundError(validate()), "missing log chunk invalidates result")
+		})
+	}
+}
