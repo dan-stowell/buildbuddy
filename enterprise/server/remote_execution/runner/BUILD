@@ -104,6 +104,7 @@ go_test(
         "//server/testutil/testcache",
         "//server/testutil/testenv",
         "//server/testutil/testfs",
+        "//server/testutil/testleak",
         "//server/testutil/testmetrics",
         "//server/util/disk",
         "//server/util/platform",
