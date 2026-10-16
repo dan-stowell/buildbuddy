@@ -2807,19 +2807,23 @@ func getExecutionAuxiliaryMetadata(t testing.TB, execRes *repb.ExecuteResponse) 
 // --- repro-sched: executor shutdown hand-back vs. tasks claimed elsewhere ---
 
 // handBackEnv sets up a single app with a controllable task router and
-// single-task executor "execB" kept busy by a real running blocker command,
-// so that later reservations sit in execB's queue.
-func handBackEnv(t *testing.T) (*rbetest.Env, *fixedNodeTaskRouter, *rbetest.Executor, *rbetest.ControlledCommand) {
+// single-task executors (all registered up front, so the scheduler's cached
+// node list contains all of them). "execB" is kept busy by a real running
+// blocker command so that later reservations sit in execB's queue.
+func handBackEnv(t *testing.T, otherExecutors ...string) (*rbetest.Env, *fixedNodeTaskRouter, map[string]*rbetest.Executor, *rbetest.ControlledCommand) {
 	rbe := rbetest.NewRBETestEnv(t)
 	router := newFixedNodeTaskRouter([]string{"execB"})
 	t.Cleanup(router.Unblock)
 	rbe.AddBuildBuddyServerWithOptions(&rbetest.BuildBuddyServerOptions{EnvModifier: func(env *testenv.TestEnv) {
 		env.SetTaskRouter(router)
 	}})
-	b := rbe.AddSingleTaskExecutorWithOptions(t, &rbetest.ExecutorOptions{Name: "execB"})
+	execs := map[string]*rbetest.Executor{}
+	for _, name := range append([]string{"execB"}, otherExecutors...) {
+		execs[name] = rbe.AddSingleTaskExecutorWithOptions(t, &rbetest.ExecutorOptions{Name: name})
+	}
 	blockerB := rbe.ExecuteControlledCommand("blockerB", &rbetest.ExecuteControlledOpts{})
 	blockerB.WaitStarted()
-	return rbe, router, b, blockerB
+	return rbe, router, execs, blockerB
 }
 
 func noRetryProps() []*repb.Platform_Property {
@@ -2836,8 +2840,8 @@ func asyncResult(cmd *rbetest.ControlledCommand) <-chan *rbetest.CommandResult {
 // execB's queue. execB then shuts down gracefully. The task must not be
 // started a second time.
 func TestReproSched_HandBackDoesNotDuplicateRunningTask(t *testing.T) {
-	rbe, router, b, blockerB := handBackEnv(t)
-	rbe.AddSingleTaskExecutorWithOptions(t, &rbetest.ExecutorOptions{Name: "execA"})
+	rbe, router, execs, blockerB := handBackEnv(t, "execA", "execC")
+	b := execs["execB"]
 	router.UpdateSubset([]string{"execA", "execB"})
 
 	target := rbe.ExecuteControlledCommand("target", &rbetest.ExecuteControlledOpts{})
@@ -2845,8 +2849,7 @@ func TestReproSched_HandBackDoesNotDuplicateRunningTask(t *testing.T) {
 	require.Eventually(t, func() bool { return b.QueueLength() == 1 }, 10*time.Second, 10*time.Millisecond,
 		"target's reservation should be queued on busy execB")
 
-	// A fresh, idle executor joins (e.g. autoscaling during a rollout).
-	rbe.AddSingleTaskExecutorWithOptions(t, &rbetest.ExecutorOptions{Name: "execC"})
+	// Route re-enqueued work to idle execC (or execA, which is busy).
 	router.UpdateSubset([]string{"execA", "execC"})
 
 	// execB gets SIGTERM: hands back its queued reservation for target.
@@ -2884,8 +2887,8 @@ func TestReproSched_HandBackDoesNotDuplicateRunningTask(t *testing.T) {
 // failed just because another executor holding a stale reservation for it
 // shut down.
 func TestReproSched_HandBackDoesNotFailRunningNoRetryTask(t *testing.T) {
-	rbe, router, b, blockerB := handBackEnv(t)
-	rbe.AddSingleTaskExecutorWithOptions(t, &rbetest.ExecutorOptions{Name: "execA"})
+	rbe, router, execs, blockerB := handBackEnv(t, "execA")
+	b := execs["execB"]
 	router.UpdateSubset([]string{"execA", "execB"})
 
 	target := rbe.ExecuteControlledCommand("target", &rbetest.ExecuteControlledOpts{Properties: noRetryProps()})
@@ -2924,8 +2927,8 @@ func TestReproSched_HandBackDoesNotFailRunningNoRetryTask(t *testing.T) {
 // execB (both busy). execB shuts down. The task should still run once execA
 // frees up, rather than fail.
 func TestReproSched_HandBackDoesNotFailQueuedNoRetryTask(t *testing.T) {
-	rbe, router, b, blockerB := handBackEnv(t)
-	a := rbe.AddSingleTaskExecutorWithOptions(t, &rbetest.ExecutorOptions{Name: "execA"})
+	rbe, router, execs, blockerB := handBackEnv(t, "execA")
+	a, b := execs["execA"], execs["execB"]
 	router.UpdateSubset([]string{"execA"})
 	blockerA := rbe.ExecuteControlledCommand("blockerA", &rbetest.ExecuteControlledOpts{})
 	blockerA.WaitStarted()
