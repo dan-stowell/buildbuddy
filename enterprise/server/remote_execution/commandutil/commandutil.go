@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -504,10 +503,9 @@ func prepareOutputDrain(ctx context.Context, cmd *exec.Cmd) (drain func() error,
 	if cmd.WaitDelay != 0 {
 		return func() error { return nil }, func() {}, func() {}, nil
 	}
-	if _, isFile := cmd.Stdout.(*os.File); !isFile && sameWriter(cmd.Stdout, cmd.Stderr) && cmd.Stdout != nil {
-		w := &serializedOutputWriter{w: cmd.Stdout}
-		cmd.Stdout, cmd.Stderr = w, w
-	}
+	// Like exec.Cmd, give equal destinations one pipe and one copier. Serializing
+	// writes from separate pipes would still lose stdout/stderr write ordering.
+	sharedOutput := sameWriter(cmd.Stdout, cmd.Stderr)
 	var readers, writers []*os.File
 	var results []chan error
 	closeWriters := func() {
@@ -521,7 +519,11 @@ func prepareOutputDrain(ctx context.Context, cmd *exec.Cmd) (drain func() error,
 		}
 	}
 	abort = func() { closeWriters(); closeReaders() }
-	for _, dst := range []*io.Writer{&cmd.Stdout, &cmd.Stderr} {
+	for i, dst := range []*io.Writer{&cmd.Stdout, &cmd.Stderr} {
+		if i == 1 && sharedOutput {
+			cmd.Stderr = cmd.Stdout
+			continue
+		}
 		if *dst == nil {
 			continue
 		}
@@ -606,15 +608,4 @@ func (p *process) waitCommand() error {
 func sameWriter(a, b io.Writer) (same bool) {
 	defer func() { _ = recover() }()
 	return a == b
-}
-
-type serializedOutputWriter struct {
-	mu sync.Mutex
-	w  io.Writer
-}
-
-func (w *serializedOutputWriter) Write(b []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.w.Write(b)
 }
