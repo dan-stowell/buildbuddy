@@ -114,6 +114,19 @@ func RecordClaimedExecution(ctx context.Context, rdb redis.UniversalClient, exec
 		return nil
 	}
 
+	canonical, err := rdb.HGet(ctx, copyKey(executionID), "canonical").Result()
+	if err != nil && err != redis.Nil {
+		return err
+	}
+	if canonical != "" {
+		pipe := rdb.TxPipeline()
+		pipe.Expire(ctx, copyKey(executionID), 24*time.Hour)
+		pipe.Expire(ctx, copyKey(canonical), 24*time.Hour)
+		if _, err := pipe.Exec(ctx); err != nil {
+			return err
+		}
+		executionID = canonical
+	}
 	// Use the execution ID to lookup the action digest and insert the forward
 	// entry (from action digest to execution ID).
 	reverseKey := redisKeyForPendingExecutionDigest(executionID)
@@ -127,9 +140,9 @@ func RecordClaimedExecution(ctx context.Context, rdb redis.UniversalClient, exec
 
 	_, err = rdb.Eval(ctx, `
     if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
-    redis.call('EXPIRE', KEYS[1], ARGV[3])
-    redis.call('EXPIRE', KEYS[2], ARGV[3])
-    return 1`, []string{forwardKey, reverseKey}, executionIDKey, executionID, int(ttl.Seconds())).Result()
+    redis.call('PEXPIRE', KEYS[1], ARGV[3])
+    redis.call('PEXPIRE', KEYS[2], ARGV[3])
+    return 1`, []string{forwardKey, reverseKey}, executionIDKey, executionID, ttl.Milliseconds()).Result()
 	return err
 }
 
@@ -355,6 +368,21 @@ func GetOrCreateExecutionID(ctx context.Context, rdb redis.UniversalClient, sche
 			return retry.NonRetryableError(err)
 		}
 		if !existsInScheduler {
+			fields, err := rdb.HGetAll(ctx, copyKey(executionID)).Result()
+			if err != nil {
+				return retry.NonRetryableError(err)
+			}
+			for key, value := range fields {
+				if strings.HasPrefix(key, "copy:") && value == "pending" {
+					exists, err := schedulerService.ExistsTask(ctx, strings.TrimPrefix(key, "copy:"))
+					if err != nil {
+						return retry.NonRetryableError(err)
+					}
+					if exists {
+						return nil
+					}
+				}
+			}
 			return fmt.Errorf("pending execution does not exist in the scheduler yet")
 		}
 		return nil
@@ -450,10 +478,8 @@ func CompleteCopy(ctx context.Context, rdb redis.UniversalClient, id string, suc
 	}
 	result, err := rdb.Eval(ctx, `
  local winner = redis.call('HGET', KEYS[1], 'winner')
- if winner then
-   if winner == ARGV[1] then return {1} else return {0} end
- end
- redis.call('HSET', KEYS[1], 'copy:' .. ARGV[1], 'failed')
+ if winner and (winner ~= ARGV[1] or redis.call('HGET', KEYS[1], 'success') ~= ARGV[2]) then return {0} end
+ if not winner then redis.call('HSET', KEYS[1], 'copy:' .. ARGV[1], 'failed') end
  local fields = redis.call('HKEYS', KEYS[1])
  local copies = {}
  local pending = false
@@ -463,8 +489,8 @@ func CompleteCopy(ctx context.Context, rdb redis.UniversalClient, id string, suc
      if redis.call('HGET', KEYS[1], f) == 'pending' then pending = true end
    end
  end
- if ARGV[2] ~= '1' and pending then return {0} end
- redis.call('HSET', KEYS[1], 'winner', ARGV[1])
+ if not winner and ARGV[2] ~= '1' and pending then return {0} end
+ redis.call('HSET', KEYS[1], 'winner', ARGV[1], 'success', ARGV[2])
  redis.call('EXPIRE', KEYS[1], 86400)
  local result = {1}
  for _, id in ipairs(copies) do table.insert(result,id) end
@@ -516,4 +542,21 @@ func RemoveInvocation(ctx context.Context, rdb redis.UniversalClient, id, invoca
  redis.call('EXPIRE', KEYS[1], 86400)
  return copies`, []string{copyKey(canonical)}, invocation, canonical).StringSlice()
 	return canonical, result, err
+}
+
+// HasPendingCopy distinguishes loss of the canonical task from loss of all work.
+func HasPendingCopy(ctx context.Context, rdb redis.UniversalClient, canonical string) (bool, error) {
+	fields, err := rdb.HGetAll(ctx, copyKey(canonical)).Result()
+	if err != nil {
+		return false, err
+	}
+	if fields["winner"] != "" {
+		return false, nil
+	}
+	for key, value := range fields {
+		if strings.HasPrefix(key, "copy:") && key != "copy:"+canonical && value == "pending" {
+			return true, nil
+		}
+	}
+	return false, nil
 }

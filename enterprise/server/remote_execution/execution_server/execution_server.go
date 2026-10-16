@@ -1243,15 +1243,14 @@ func (s *ExecutionServer) execute(req *repb.ExecuteRequest, stream streamLike) e
 			// in the background.
 			action_merger.RecordHedgedExecution(ctx, s.rdb, adInstanceDigest, s.getGroupIDForMetrics(ctx))
 			hedgedExecutionID := adInstanceDigest.NewUploadString()
-			if err := action_merger.RegisterCopy(ctx, s.rdb, executionID, hedgedExecutionID); err != nil {
-				return err
+			if err := action_merger.RegisterCopy(ctx, s.rdb, executionID, hedgedExecutionID); err == nil {
+				if err := s.dispatchHedge(ctx, req, action, hedgedExecutionID); err != nil {
+					s.MarkExecutionFailed(ctx, hedgedExecutionID, err)
+					log.CtxWarningf(ctx, "Failed to dispatch hedge: %s", err)
+				}
+				log.CtxInfof(ctx, "Dispatched new hedged execution %q for action %q and invocation %q", hedgedExecutionID, downloadString, invocationID)
+				metrics.RemoteExecutionHedgedActions.With(prometheus.Labels{metrics.GroupID: s.getGroupIDForMetrics(ctx)}).Inc()
 			}
-			if err := s.dispatchHedge(ctx, req, action, hedgedExecutionID); err != nil {
-				s.MarkExecutionFailed(ctx, hedgedExecutionID, err)
-				return status.WrapError(err, "dispatch hedged execution")
-			}
-			log.CtxInfof(ctx, "Dispatched new hedged execution %q for action %q and invocation %q", hedgedExecutionID, downloadString, invocationID)
-			metrics.RemoteExecutionHedgedActions.With(prometheus.Labels{metrics.GroupID: s.getGroupIDForMetrics(ctx)}).Inc()
 		}
 	}
 
@@ -1387,6 +1386,14 @@ func (s *ExecutionServer) waitExecution(ctx context.Context, req *repb.WaitExecu
 		select {
 		case msg, ok = <-streamPubSubChan:
 		case <-taskLost:
+			pending, err := action_merger.HasPendingCopy(ctx, s.rdb, req.GetName())
+			if err != nil {
+				return err
+			}
+			if pending {
+				taskLost = nil
+				continue
+			}
 			// select picks at random among ready cases, so before ending the
 			// wait, take any update that is already waiting, since it may be
 			// the final result.
