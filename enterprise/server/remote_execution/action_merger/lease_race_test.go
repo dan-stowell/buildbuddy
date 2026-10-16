@@ -37,7 +37,7 @@ func (r *leaseRaceClient) Get(ctx context.Context, key string) *redis.StringCmd 
 	}
 	return cmd
 }
-func (r *leaseRaceClient) Eval(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd {
+func (r *leaseRaceClient) Eval(ctx context.Context, script string, keys []string, args ...any) *redis.Cmd {
 	r.rounds++
 	return r.UniversalClient.Eval(ctx, script, keys, args...)
 }
