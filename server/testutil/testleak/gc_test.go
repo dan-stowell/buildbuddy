@@ -1,9 +1,11 @@
 package testleak
 
 import (
+	"math"
 	"net"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"runtime/metrics"
 	"strings"
 	"testing"
@@ -95,11 +97,13 @@ var gcTriggers = []gcTrigger{
 
 var allocSink []byte
 
-// allocateUntilGC allocates garbage until the GC has run twice, or 128MiB
-// have been allocated.
+// allocateUntilGC allocates garbage until the GC has run twice, or 32MiB
+// have been allocated. Keep the total well below gcHoldHeadroom: when the GC
+// is held, more than that makes the GC run anyway (and runtime.AddCleanup
+// cleanups with it).
 func allocateUntilGC() {
 	start := gcCycles()
-	for n := 0; n < 128<<20 && gcCycles() < start+2; n += 64 << 10 {
+	for n := 0; n < 32<<20 && gcCycles() < start+2; n += 64 << 10 {
 		allocSink = make([]byte, 64<<10)
 	}
 	allocSink = nil
@@ -170,4 +174,152 @@ func TestGC_GrowthOnlyClosedByGC_Caught(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestGC_ClosedResources_Accepted(t *testing.T) {
+	skipIfNoFDs(t)
+	for _, trig := range gcTriggers {
+		t.Run(trig.name, func(t *testing.T) {
+			dogfood(t)
+			f := newFakeTB(t)
+			CheckFDs(f)
+			var growthErrors *fakeTB
+			func() {
+				g := newFakeTB(t)
+				growthErrors = g
+				CheckGrowth(g, Growth{Iterations: 10}, func(int) {
+					file, err := os.Open(os.DevNull)
+					require.NoError(t, err)
+					require.NoError(t, file.Close())
+					conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+					require.NoError(t, err)
+					require.NoError(t, conn.Close())
+					p, err := os.FindProcess(os.Getpid())
+					require.NoError(t, err)
+					p.Release()
+					trig.gc()
+				})
+			}()
+			growthErrors.requireNoErrors(t)
+			trig.gc()
+			f.runCleanups()
+			f.requireNoErrors(t)
+		})
+	}
+}
+
+func TestGC_AllowGC_OptsOut(t *testing.T) {
+	skipIfNoFDs(t)
+	// Not dogfood: an outer CheckFDs would hold the GC.
+	Check(t)
+	f := newFakeTB(t)
+	CheckFDs(f, AllowGC(), FDSettle(failingSettle))
+	leakFile(t)
+	runtime.GC()
+	f.runCleanups()
+	// Documented: with AllowGC, a leak that the GC happened to clean up
+	// is not reported.
+	f.requireNoErrors(t)
+
+	g := newFakeTB(t)
+	CheckGrowth(g, Growth{Iterations: 10, AllowGC: true, Settle: failingSettle}, func(int) {
+		leakFile(t)
+		runtime.GC()
+	})
+	g.requireNoErrors(t)
+}
+
+// Documented limitation: *os.Process releases its pidfd with
+// runtime.AddCleanup, and cleanups run on their own goroutines, which testleak
+// can't hold. An explicit runtime.GC call during the check closes it before it
+// is counted. (A GC caused by allocation can't happen while the GC is held, so
+// that case is caught; see TestGC_FDOnlyClosedByGC_Caught.)
+func TestAudit_ExplicitGCRunsAddCleanups(t *testing.T) {
+	skipIfNoFDs(t)
+	skipIfNoPidfd(t, leakedResources[2])
+	dogfood(t)
+	f := newFakeTB(t)
+	CheckFDs(f, FDSettle(failingSettle))
+	leakProcess(t)
+	runtime.GC()
+	f.runCleanups()
+	f.requireNoErrors(t)
+}
+
+func currentGCPercent() int {
+	p := debug.SetGCPercent(-1)
+	debug.SetGCPercent(p)
+	return p
+}
+
+func TestGC_HeldDuringCheckAndRestored(t *testing.T) {
+	skipIfNoFDs(t)
+	dogfood(t)
+	// dogfood holds the GC too, so check the state with nested holds.
+	require.Equal(t, -1, currentGCPercent())
+	f := newFakeTB(t)
+	CheckFDs(f)
+	require.Equal(t, -1, currentGCPercent())
+	limit := debug.SetMemoryLimit(-1)
+	require.Less(t, limit, int64(math.MaxInt64), "a memory limit should be set as a safety net")
+
+	// No GC runs because of allocation.
+	start := gcCycles()
+	for range 256 {
+		allocSink = make([]byte, 64<<10)
+	}
+	allocSink = nil
+	require.Equal(t, start, gcCycles())
+
+	f.runCleanups()
+	f.requireNoErrors(t)
+	require.Equal(t, -1, currentGCPercent(), "the outer hold is still active")
+	require.Equal(t, limit, debug.SetMemoryLimit(-1))
+}
+
+func TestGC_RestoredAfterCheck(t *testing.T) {
+	skipIfNoFDs(t)
+	// No dogfood: check the settings without an outer hold.
+	gcBefore, limitBefore := currentGCPercent(), debug.SetMemoryLimit(-1)
+	f := newFakeTB(t)
+	CheckFDs(f)
+	require.Equal(t, -1, currentGCPercent())
+	f.runCleanups()
+	f.requireNoErrors(t)
+	require.Equal(t, gcBefore, currentGCPercent())
+	require.Equal(t, limitBefore, debug.SetMemoryLimit(-1))
+
+	g := newFakeTB(t)
+	CheckGrowth(g, Growth{Iterations: 2}, func(i int) {
+		if i >= 1 { // After the warmup.
+			require.Equal(t, -1, currentGCPercent())
+		}
+	})
+	g.requireNoErrors(t)
+	require.Equal(t, gcBefore, currentGCPercent())
+	require.Equal(t, limitBefore, debug.SetMemoryLimit(-1))
+
+	// Finalizers run again once the GC is released.
+	done := make(chan struct{})
+	runtime.SetFinalizer(&gcGateObject{}, func(*gcGateObject) { close(done) })
+	runtime.GC()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("finalizers are still held after the checks finished")
+	}
+}
+
+// The finalizer goroutine runs gcGateFinalizer while the GC is held; it must
+// not be reported as a leaked goroutine.
+func TestGC_HeldFinalizerGoroutine_NotReported(t *testing.T) {
+	skipIfNoFDs(t)
+	f := newFakeTB(t)
+	Check(f)
+	fds := newFakeTB(t)
+	CheckFDs(fds)
+	f.runCleanups() // While the finalizer goroutine is held.
+	fds.runCleanups()
+	f.requireNoErrors(t)
+	fds.requireNoErrors(t)
 }

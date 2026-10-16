@@ -39,6 +39,12 @@ type Growth struct {
 	// any of these functions anywhere in their stack are not counted.
 	IgnoreFunctions []string
 
+	// AllowGC lets the garbage collector run normally while counting file
+	// descriptors; see the AllowGC FDOption. By default, the GC is held from
+	// the baseline (after the warmup) until the end of the settle period,
+	// so FDs that are only closed by finalizers are counted.
+	AllowGC bool
+
 	// Settle is how long to wait for resources to be released after the last
 	// iteration before reporting growth. Defaults to DefaultSettle.
 	Settle time.Duration
@@ -89,6 +95,15 @@ func CheckGrowth(t testing.TB, g Growth, op func(i int)) {
 	}
 	for ; i < g.Warmup; i++ {
 		op(i)
+	}
+
+	if checkFDs && !g.AllowGC {
+		hold := holdGC()
+		defer func() {
+			if note := gcNote(hold.release()); note != "" {
+				t.Logf("%s", note)
+			}
+		}()
 	}
 
 	// Baseline goroutines and FDs, with the key used to match them to
@@ -201,8 +216,10 @@ func CheckGrowth(t testing.TB, g Growth, op func(i int)) {
 	}
 	if len(fds) > g.MaxFDs {
 		resolveFDs(fds)
+		closedByGC := fdsClosedByGC(fds)
 		b.WriteString("\nRemaining new ")
-		b.WriteString(describeFDs(fds))
+		b.WriteString(describeFDs(fds, closedByGC))
+		b.WriteString(gcClosedNote(closedByGC))
 	}
 	t.Errorf("%s: %s", t.Name(), b.String())
 }
