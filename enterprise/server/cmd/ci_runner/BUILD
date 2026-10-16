@@ -79,7 +79,7 @@ go_image(
 
 go_test(
     name = "ci_runner_test",
-    srcs = ["main_test.go"],
+    srcs = ["main_test.go", "reuse_test.go"],
     embed = [":ci_runner_lib"],
     deps = [
         "//enterprise/server/workflow/config",
