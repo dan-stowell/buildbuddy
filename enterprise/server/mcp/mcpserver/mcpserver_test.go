@@ -4,9 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/mcp/jsonrpc"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
@@ -270,4 +276,86 @@ func callJSONRPC[T any](t *testing.T, baseURL, apiKey, method string, params any
 func unmarshalJSON(t *testing.T, data []byte, out any) {
 	t.Helper()
 	require.NoError(t, json.Unmarshal(data, out))
+}
+
+// TestMCPClientChurn keeps the owner alive while clients initialize without
+// explicit session deletion, call tools, or disappear during a tool call.
+func TestMCPClientChurn(t *testing.T) {
+	for _, n := range []int{10, 50} {
+		for _, mode := range []string{"initialize", "complete", "error", "disconnect"} {
+			t.Run(fmt.Sprintf("%s/N=%d", mode, n), func(t *testing.T) {
+				testleak.Check(t)
+				testleak.CheckFDs(t)
+				var calls atomic.Int64
+				started := make(chan struct{}, 1)
+				finished := make(chan struct{}, 1)
+				server := newTestServer(t, testServerOptions{
+					users:       testUsers(testUser("developer-key", "GROUP1", []cappb.Capability{cappb.Capability_CACHE_WRITE})),
+					allowedRPCs: []string{apiServicePrefix + "GetInvocation"},
+					apiService: &fakeAPIService{getInvocation: func(ctx context.Context, _ *apipb.GetInvocationRequest) (*apipb.GetInvocationResponse, error) {
+						calls.Add(1)
+						if mode == "disconnect" {
+							started <- struct{}{}
+							<-ctx.Done()
+							finished <- struct{}{}
+							return nil, ctx.Err()
+						}
+						if mode == "error" {
+							return nil, status.UnavailableError("test upstream error")
+						}
+						return &apipb.GetInvocationResponse{}, nil
+					}},
+				})
+				transport := &http.Transport{DisableKeepAlives: true}
+				defer transport.CloseIdleConnections()
+				client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+				testleak.CheckGrowth(t, testleak.Growth{Iterations: n}, func(i int) {
+					body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_invocation","arguments":{}}}`)
+					if mode == "initialize" {
+						body = []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}`)
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+					req, err := http.NewRequestWithContext(ctx, "POST", server.URL+mcpPath, bytes.NewReader(body))
+					require.NoError(t, err)
+					req.Header.Set(authutil.APIKeyHeader, "developer-key")
+					req.Header.Set("Content-Type", "application/json")
+					if mode == "disconnect" {
+						done := make(chan error, 1)
+						go func() {
+							rsp, err := client.Do(req)
+							if rsp != nil {
+								rsp.Body.Close()
+							}
+							done <- err
+						}()
+						select {
+						case <-started:
+						case <-ctx.Done():
+							t.Fatal("tool did not start")
+						}
+						cancel()
+						select {
+						case <-finished:
+						case <-time.After(10 * time.Second):
+							t.Fatal("tool context not canceled")
+						}
+						require.Error(t, <-done)
+					} else {
+						rsp, err := client.Do(req)
+						require.NoError(t, err)
+						_, err = io.Copy(io.Discard, rsp.Body)
+						require.NoError(t, err)
+						require.NoError(t, rsp.Body.Close())
+						require.Equal(t, http.StatusOK, rsp.StatusCode)
+						require.Empty(t, rsp.Header.Get("Mcp-Session-Id"))
+					}
+				})
+				if mode != "initialize" {
+					require.EqualValues(t, n+1, calls.Load())
+				}
+				t.Logf("N=%d: settled goroutine and FD growth = 0; server still alive", n)
+			})
+		}
+	}
 }

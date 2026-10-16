@@ -1,4 +1,4 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "protolet",
@@ -13,5 +13,18 @@ go_library(
         "@org_golang_google_grpc//codes",
         "@org_golang_google_protobuf//encoding/protojson",
         "@org_golang_google_protobuf//encoding/prototext",
+    ],
+)
+
+go_test(
+    name = "protolet_test",
+    srcs = ["protolet_test.go"],
+    embed = [":protolet"],
+    deps = [
+        "//server/testutil/testleak",
+        "//server/util/status",
+        "@com_github_stretchr_testify//require",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_genproto_googleapis_bytestream//:bytestream",
     ],
 )

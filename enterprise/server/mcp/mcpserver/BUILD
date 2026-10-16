@@ -44,6 +44,7 @@ go_test(
         "//proto/api/v1:api_v1_go_proto",
         "//server/interfaces",
         "//server/testutil/testauth",
+        "//server/testutil/testleak",
         "//server/util/authutil",
         "//server/util/status",
         "@com_github_stretchr_testify//require",

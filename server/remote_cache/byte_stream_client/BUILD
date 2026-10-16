@@ -28,7 +28,7 @@ go_library(
 go_test(
     name = "byte_stream_client_test",
     size = "small",
-    srcs = ["byte_stream_client_test.go"],
+    srcs = ["byte_stream_client_test.go", "http_churn_test.go"],
     data = [
         "no_files.zip",
         "some_files.zip",
@@ -41,6 +41,15 @@ go_test(
         "tooManyFilesRunfilePath": "$(rlocationpath too_many_files.zip)",
     },
     deps = [
+        "//server/buildbuddy_server",
+        "//server/interfaces",
+        "//server/real_environment",
+        "//server/testutil/testleak",
+        "//server/util/status",
+        "//server/util/grpc_server",
+        "//server/util/testing/flags",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_genproto_googleapis_bytestream//:bytestream",
         "//proto:zip_go_proto",
         "//server/util/proto",
         "@com_github_stretchr_testify//assert",
