@@ -1361,3 +1361,22 @@ func TestPersistentWorkerFraming(t *testing.T) {
 		}
 	}
 }
+
+// Sequential workers send request ID zero. A nonzero response belongs to a
+// different multiplex request and must not be accepted as this action's result.
+func TestPersistentWorkerRejectsMismatchedRequestID(t *testing.T) {
+	for _, protocol := range []string{"proto", "json"} {
+		t.Run(protocol, func(t *testing.T) {
+			env := newTestEnv(t)
+			pool := newRunnerPool(t, env, noLimitsCfg())
+			ctx := withAuthenticatedUser(t, context.Background(), env, "US1")
+			task := newPersistentRunnerTask(t, "ids", "", protocol, &wkpb.WorkResponse{RequestId: 42, Output: "another request's output"})
+			r, err := pool.Get(ctx, task)
+			require.NoError(t, err)
+			res := r.Run(ctx, &repb.IOStats{})
+			pool.TryRecycle(ctx, r, true)
+			require.Error(t, res.Error, "accepted response for request 42 as response to request 0: %+v", res)
+			require.Equal(t, 0, pool.PausedRunnerCount())
+		})
+	}
+}
