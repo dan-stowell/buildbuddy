@@ -2819,7 +2819,12 @@ func handBackEnv(t *testing.T, otherExecutors ...string) (*rbetest.Env, *fixedNo
 	}})
 	execs := map[string]*rbetest.Executor{}
 	for _, name := range append([]string{"execB"}, otherExecutors...) {
-		execs[name] = rbe.AddSingleTaskExecutorWithOptions(t, &rbetest.ExecutorOptions{Name: name})
+		if strings.HasPrefix(name, "big") {
+			// Default-capacity executor that can run several tasks at once.
+			execs[name] = rbe.AddExecutorWithOptions(t, &rbetest.ExecutorOptions{Name: name})
+		} else {
+			execs[name] = rbe.AddSingleTaskExecutorWithOptions(t, &rbetest.ExecutorOptions{Name: name})
+		}
 	}
 	blockerB := rbe.ExecuteControlledCommand("blockerB", &rbetest.ExecuteControlledOpts{})
 	blockerB.WaitStarted()
@@ -2840,7 +2845,7 @@ func asyncResult(cmd *rbetest.ControlledCommand) <-chan *rbetest.CommandResult {
 // execB's queue. execB then shuts down gracefully. The task must not be
 // started a second time.
 func TestReproSched_HandBackDoesNotDuplicateRunningTask(t *testing.T) {
-	rbe, router, execs, blockerB := handBackEnv(t, "execA", "execC")
+	rbe, router, execs, blockerB := handBackEnv(t, "execA", "bigExecC")
 	b := execs["execB"]
 	router.UpdateSubset([]string{"execA", "execB"})
 
@@ -2850,8 +2855,8 @@ func TestReproSched_HandBackDoesNotDuplicateRunningTask(t *testing.T) {
 	require.Eventually(t, func() bool { return b.HasQueuedTask(taskID) }, 10*time.Second, 10*time.Millisecond,
 		"target's reservation should be queued on busy execB")
 
-	// Route re-enqueued work to idle execC (or execA, which is busy).
-	router.UpdateSubset([]string{"execA", "execC"})
+	// Route re-enqueued work to idle, multi-task bigExecC.
+	router.UpdateSubset([]string{"bigExecC"})
 
 	// execB gets SIGTERM: hands back its queued reservation for target.
 	b.BeginShutdown()
@@ -2859,6 +2864,9 @@ func TestReproSched_HandBackDoesNotDuplicateRunningTask(t *testing.T) {
 	dup := assert.Never(t, func() bool { return rbe.CommandStartCount("target") > 1 }, 8*time.Second, 50*time.Millisecond,
 		"target was started a second time while still running on execA")
 	t.Logf("target start count after execB shutdown: %d", rbe.CommandStartCount("target"))
+	// execB may also hold a stale reservation for its *own* running blocker
+	// (probes can hit the same executor more than once in a small pool).
+	assert.Equal(t, 1, rbe.CommandStartCount("blockerB"), "blockerB (running on execB) was started a second time elsewhere")
 
 	resCh := asyncResult(target)
 	if !dup {
@@ -2878,8 +2886,8 @@ func TestReproSched_HandBackDoesNotDuplicateRunningTask(t *testing.T) {
 		assert.Equal(t, "execA", res.ActionResult.GetExecutionMetadata().GetExecutorId())
 	}
 
-	blockerB.Exit(0)
-	blockerB.Wait()
+	blockerB.ExitAll(0)
+	blockerB.Result()
 	b.WaitForShutdown()
 	rbe.DisconnectExecutor(b)
 }
@@ -2919,8 +2927,8 @@ func TestReproSched_HandBackDoesNotFailRunningNoRetryTask(t *testing.T) {
 	}
 	t.Logf("target start count: %d", rbe.CommandStartCount("target"))
 
-	blockerB.Exit(0)
-	blockerB.Wait()
+	blockerB.ExitAll(0)
+	blockerB.Result()
 	b.WaitForShutdown()
 	rbe.DisconnectExecutor(b)
 }
@@ -2964,8 +2972,8 @@ func TestReproSched_HandBackDoesNotFailQueuedNoRetryTask(t *testing.T) {
 		blockerA.Exit(0)
 		blockerA.Wait()
 	}
-	blockerB.Exit(0)
-	blockerB.Wait()
+	blockerB.ExitAll(0)
+	blockerB.Result()
 	b.WaitForShutdown()
 	rbe.DisconnectExecutor(b)
 }
