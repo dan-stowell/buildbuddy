@@ -721,6 +721,10 @@ func (ff *BatchFileFetcher) writeToFileCache(fileNode *repb.FileNode, data []byt
 }
 
 func copyFile(src *FilePointer, dest *FilePointer, opts *DownloadTreeOpts) error {
+	// The dedupe leader may already have materialized this exact path.
+	if filepath.Clean(src.FullPath) == filepath.Clean(dest.FullPath) {
+		return nil
+	}
 	if err := removeExisting(dest, opts); err != nil {
 		return err
 	}

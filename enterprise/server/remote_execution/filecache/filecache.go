@@ -703,7 +703,7 @@ func (c *fileCache) FastLinkFile(ctx context.Context, node *repb.FileNode, outpu
 		return false
 	}
 	start := time.Now()
-	if err := fastcopy.CloneOrCopy(filecachePath(c.rootDir, key), outputPath); err != nil {
+	if err := fastcopy.CloneOrCopy(filecachePath(c.rootDir, key), outputPath); err != nil && !os.IsExist(err) {
 		log.Warningf("Failed to link file from cache: %s", err)
 		return false
 	}
