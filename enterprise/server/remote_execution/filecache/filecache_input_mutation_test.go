@@ -230,3 +230,47 @@ func TestInputFingerprintStatCost(t *testing.T) {
 		}
 	}
 }
+
+// Compare materialization costs without asserting a worker-dependent timing
+// threshold. Empty files isolate metadata cost; 1 MiB files include byte copies.
+func TestInputMaterializationCost(t *testing.T) {
+	flags.Set(t, "executor.enable_fastcopy_reflinking", false)
+	for _, tc := range []struct {
+		name        string
+		files, size int
+	}{
+		{"small_tree", 1000, 0},
+		{"large_tree", 10000, 0},
+		{"data_tree", 64, 1 << 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sources := testfs.MakeTempDir(t)
+			data := make([]byte, tc.size)
+			for i := range data {
+				data[i] = byte(i % 251)
+			}
+			paths := make([]string, tc.files)
+			for i := range paths {
+				paths[i] = filepath.Join(sources, fmt.Sprintf("input-%05d", i))
+				require.NoError(t, os.WriteFile(paths[i], data, 0644))
+			}
+			for _, method := range []struct {
+				name string
+				copy func(string, string) error
+			}{
+				{"hardlink", fastcopy.FastCopy},
+				{"independent", fastcopy.CloneOrCopy},
+			} {
+				dest := testfs.MakeTempDir(t)
+				start := time.Now()
+				for _, src := range paths {
+					if err := method.copy(src, filepath.Join(dest, filepath.Base(src))); err != nil {
+						t.Fatal(err)
+					}
+				}
+				elapsed := time.Since(start)
+				t.Logf("materialization: method=%s files=%d bytes/file=%d elapsed=%s ns/file=%d", method.name, tc.files, tc.size, elapsed, elapsed.Nanoseconds()/int64(tc.files))
+			}
+		})
+	}
+}
