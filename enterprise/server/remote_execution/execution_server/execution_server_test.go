@@ -1340,6 +1340,8 @@ func testExecuteAndPublishOperation(t *testing.T, test publishTest) {
 				}
 				hitResponse := operation.ExtractExecuteResponse(hitOp)
 				require.True(t, hitResponse.GetCachedResult())
+				// Cache hits add origin metadata identifying the producing invocation.
+				hitResponse.GetResult().GetExecutionMetadata().AuxiliaryMetadata = nil
 				assert.Empty(t, cmp.Diff(executeResponse.GetResult(), hitResponse.GetResult(), protocmp.Transform()))
 				break
 			}
@@ -3040,4 +3042,64 @@ func TestRedactCachedExecuteResponse(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The scheduler has accepted every task by the time Execute sends its first
+// operation. Let the action merger verify that the original task exists.
+type resultScheduler struct{ *schedulerServerMock }
+
+func (s *resultScheduler) ExistsTask(context.Context, string) (bool, error) { return true, nil }
+
+func TestExecutionResults_HedgedFailurePreservesSuccess(t *testing.T) {
+	flags.Set(t, "remote_execution.action_merging_hedge_count", 1)
+	env, conn, _ := setupEnv(t)
+	env.SetSchedulerService(&resultScheduler{env.GetSchedulerService().(*schedulerServerMock)})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("user1", "group1"))
+	env.SetAuthenticator(ta)
+	ctx, err := ta.WithAuthenticatedUser(ctx, "user1")
+	require.NoError(t, err)
+	arn := uploadActionWithCommand(ctx, t, env, "test", repb.DigestFunction_SHA256, &repb.Action{}, &repb.Command{Arguments: []string{"test"}})
+	client := repb.NewExecutionClient(conn)
+	request := &repb.ExecuteRequest{InstanceName: arn.GetInstanceName(), ActionDigest: arn.GetDigest(), DigestFunction: arn.GetDigestFunction()}
+	original, err := client.Execute(ctx, request)
+	require.NoError(t, err)
+	first, err := original.Recv()
+	require.NoError(t, err)
+	merged, err := client.Execute(ctx, request)
+	require.NoError(t, err)
+	second, err := merged.Recv()
+	require.NoError(t, err)
+	require.Equal(t, first.GetName(), second.GetName())
+	scheduled := env.GetSchedulerService().(*resultScheduler).scheduleReqs
+	require.Len(t, scheduled, 2, "one primary and one hedge must be dispatched")
+	publish := func(name string, response *repb.ExecuteResponse) {
+		stream, err := client.PublishOperation(ctx)
+		require.NoError(t, err)
+		op, err := operation.Assemble(name, operation.Metadata(repb.ExecutionStage_COMPLETED, arn.GetDigest()), response)
+		require.NoError(t, err)
+		require.NoError(t, stream.Send(op))
+		_, err = stream.CloseAndRecv()
+		require.NoError(t, err)
+	}
+	success := &repb.ExecuteResponse{Result: &repb.ActionResult{StdoutRaw: []byte("winning output")}, Message: "success diagnostic", ServerLogs: map[string]*repb.LogFile{"log": {HumanReadable: true}}}
+	publish(first.GetName(), success)
+	// The duplicate finishes later with different output and a failed exit.
+	publish(scheduled[1].GetTaskId(), &repb.ExecuteResponse{Result: &repb.ActionResult{ExitCode: 42, StdoutRaw: []byte("losing output")}})
+	for _, stream := range []repb.Execution_ExecuteClient{original, merged} {
+		for {
+			op, err := stream.Recv()
+			require.NoError(t, err)
+			if !op.GetDone() {
+				continue
+			}
+			assert.Empty(t, cmp.Diff(success, operation.ExtractExecuteResponse(op), protocmp.Transform()))
+			break
+		}
+	}
+	ac := digest.NewACResourceName(arn.GetDigest(), arn.GetInstanceName(), arn.GetDigestFunction())
+	cached, err := cachetools.GetActionResult(ctx, env.GetActionCacheClient(), ac)
+	require.NoError(t, err)
+	assert.Empty(t, cmp.Diff(success.GetResult(), cached, protocmp.Transform()))
 }
