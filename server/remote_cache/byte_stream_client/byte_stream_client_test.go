@@ -423,3 +423,18 @@ func TestPoolCache_ShutdownWaitsForLeasedPools(t *testing.T) {
 	require.Empty(t, p.connPoolMap)
 	// testleak checks that both connections were closed after their reads.
 }
+
+// Errors from streamFromUrl end up in StreamBytestreamFileChunk's warning
+// log, so they must not contain URL userinfo.
+func TestUnpermittedTargetErrorOmitsUserinfo(t *testing.T) {
+	flags.Set(t, "app.restrict_bytestream_dialing", true)
+	flags.Set(t, "app.cache_api_url", url.URL{Scheme: "grpcs", Host: "cache.example.com"})
+	p := NewPooledByteStreamClient(real_environment.NewRealEnv(nil))
+	u, err := url.Parse("bytestream://synthetic-user:synthetic-secret@other.example.org/blobs/abc/1")
+	require.NoError(t, err)
+	err = p.streamFromUrl(context.Background(), u, true /*=grpcs*/, 0, 0, io.Discard)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "other.example.org")
+	require.NotContains(t, err.Error(), "synthetic-user")
+	require.NotContains(t, err.Error(), "synthetic-secret")
+}

@@ -255,7 +255,7 @@ func isPermittedForDial(target string) bool {
 func (p *pooledByteStreamClient) streamFromUrl(ctx context.Context, url *url.URL, grpcs bool, offset int64, limit int64, writer io.Writer) (err error) {
 	target := getTargetForURL(url, grpcs)
 	if *restrictBytestreamDialing && !isPermittedForDial(target) {
-		return status.InvalidArgumentErrorf("Tried to connect to an unpermitted domain: %s", target)
+		return status.InvalidArgumentErrorf("Tried to connect to an unpermitted domain: %s", stripUserFromTarget(target))
 	}
 
 	var conn grpc.ClientConnInterface
