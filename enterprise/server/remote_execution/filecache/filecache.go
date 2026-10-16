@@ -764,6 +764,22 @@ func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, 
 		c.createParentDirLatency.Observe(float64(time.Since(start).Microseconds()))
 	}
 
+	// Copy outside the cache-wide lock. Byte copies can be much slower than
+	// links, and must not block unrelated cache lookups or admissions. Publish
+	// the completed file atomically so readers never see a partial copy.
+	var stagedPath string
+	if !existingFileIsInPlace {
+		stagedPath, err = c.tempPath(node.GetDigest().GetHash())
+		if err != nil {
+			return err
+		}
+		defer os.Remove(stagedPath)
+		start := time.Now()
+		if err := fastcopy.CloneOrCopy(existingFilePath, stagedPath); err != nil {
+			return err
+		}
+		c.linkIntoFileCacheLatency.Observe(float64(time.Since(start).Microseconds()))
+	}
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -778,14 +794,12 @@ func (c *fileCache) addFileWithKeyPrefix(keyPrefix string, node *repb.FileNode, 
 	} else {
 		// If the file being added is not already at the path where we expect it
 		// (i.e. it's being added from some action workspace), then remove and
-		// unlink any existing entry, then clone to the destination path.
+		// unlink any existing entry, then publish the completed clone.
 		c.l.Remove(k)
 
-		start := time.Now()
-		if err := fastcopy.CloneOrCopy(existingFilePath, fp); err != nil {
+		if err := os.Rename(stagedPath, fp); err != nil {
 			return err
 		}
-		c.linkIntoFileCacheLatency.Observe(float64(time.Since(start).Microseconds()))
 
 		// If the file being added is inside the filecache dir, and it
 		// is stored in an "old-style" location, then remove it.
