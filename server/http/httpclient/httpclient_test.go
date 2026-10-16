@@ -1,7 +1,14 @@
 package httpclient
 
 import (
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/stretchr/testify/require"
@@ -103,5 +110,38 @@ func TestBlockingDialerControl(t *testing.T) {
 				require.NoError(t, err)
 			}
 		})
+	}
+}
+
+// Each operation discards its client after fully consuming the response.
+// Keep the server alive so upstream shutdown cannot hide retained connections.
+func TestDiscardedClientIdleConnections(t *testing.T) {
+	for _, closeExplicitly := range []bool{false, true} {
+		for _, n := range []int{1, 10, 50} {
+			t.Run(fmt.Sprintf("close=%t/N=%d", closeExplicitly, n), func(t *testing.T) {
+				flags.Set(t, "http.client.allow_localhost", true)
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok")) }))
+				defer srv.Close()
+				testleak.CheckGrowth(t, testleak.Growth{Iterations: n}, func(i int) {
+					client := New(nil, "idle_cleanup_test")
+					inner := client.Transport.(*metricsTransport).inner.(*http.Transport)
+					t.Cleanup(inner.CloseIdleConnections)
+					if !closeExplicitly && inner.IdleConnTimeout > 0 {
+						// Scale the configured lifetime before first use. A zero (unbounded)
+						// production timeout stays zero so baseline reproduces the leak.
+						require.Equal(t, 90*time.Second, inner.IdleConnTimeout)
+						inner.IdleConnTimeout = 20 * time.Millisecond
+					}
+					resp, err := client.Get(srv.URL)
+					require.NoError(t, err)
+					_, err = io.Copy(io.Discard, resp.Body)
+					require.NoError(t, err)
+					require.NoError(t, resp.Body.Close())
+					if closeExplicitly {
+						client.CloseIdleConnections()
+					}
+				})
+			})
+		}
 	}
 }

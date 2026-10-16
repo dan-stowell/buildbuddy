@@ -19,6 +19,7 @@ go_test(
     embed = [":httpclient"],
     deps = [
         "//server/util/testing/flags",
+        "//server/testutil/testleak",
         "@com_github_stretchr_testify//require",
     ],
 )
