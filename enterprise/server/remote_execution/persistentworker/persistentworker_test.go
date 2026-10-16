@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/container"
@@ -100,4 +101,33 @@ func TestWorkerStop_UnreadOutputAfterInvalidResponse(t *testing.T) {
 	require.ErrorContains(t, res.Error, "invalid character")
 
 	require.NoError(t, w.Stop())
+}
+
+// Exec must return once its context is done, even if the worker stalls in the
+// middle of a response: the worker process runs under a longer-lived context.
+func TestWorkerExec_StalledResponseHonorsContext(t *testing.T) {
+	testleak.Check(t)
+	testleak.CheckFDs(t)
+
+	ctx := context.Background()
+	ctr := bare.NewBareCommandContainer(&bare.Opts{})
+	require.NoError(t, ctr.Create(ctx, t.TempDir()))
+	// Announce a 100-byte proto response, write one byte of it, then wait.
+	cmd := &repb.Command{Arguments: []string{"sh", "-c", `head -c 1 >/dev/null; printf '\144x'; read ignored`}}
+	w, err := persistentworker.Start(ctx, &workspace.Workspace{}, ctr, "proto", cmd)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, w.Stop()) })
+
+	execCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	done := make(chan *interfaces.CommandResult, 1)
+	go func() { done <- w.Exec(execCtx, cmd) }()
+	select {
+	case res := <-done:
+		require.ErrorContains(t, res.Error, "deadline exceeded")
+	case <-time.After(5 * time.Second):
+		require.NoError(t, w.Stop()) // unblock Exec so the test can exit
+		<-done
+		require.FailNow(t, "Exec still blocked 5s after its context deadline")
+	}
 }
