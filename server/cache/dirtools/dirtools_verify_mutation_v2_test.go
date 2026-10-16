@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -114,6 +115,18 @@ func TestVerifyV2_WarmMaterializationBench(t *testing.T) {
 	if os.Getenv("VERIFY_V2_BENCH") == "" {
 		t.Skip("set VERIFY_V2_BENCH=1 to run")
 	}
+	if m, err := os.ReadFile("/proc/self/mounts"); err == nil {
+		t.Logf("VBENCH mounts:\n%s", m)
+	}
+	// Optionally place the file cache and workspaces on another filesystem
+	// (e.g. tmpfs, where copy_file_range cannot share extents).
+	if dir := os.Getenv("VERIFY_V2_BENCH_DIR"); dir != "" {
+		base, err := os.MkdirTemp(dir, "vbench-*")
+		require.NoError(t, err)
+		t.Cleanup(func() { os.RemoveAll(base) })
+		t.Setenv("TMPDIR", base)
+		t.Setenv("TEST_TMPDIR", base)
+	}
 	for _, tc := range []struct {
 		name string
 		n    int
@@ -125,6 +138,9 @@ func TestVerifyV2_WarmMaterializationBench(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			env, ctx := testEnv(t)
 			fc := env.GetFileCache()
+			var sfs syscall.Statfs_t
+			_ = syscall.Statfs(fc.TempDir(), &sfs)
+			t.Logf("VBENCH filecache_tmp=%s fstype=0x%x", fc.TempDir(), sfs.Type)
 			rng := rand.New(rand.NewSource(42))
 			src := testfs.MakeTempDir(t)
 			dirs := map[string]*repb.Directory{}
