@@ -616,6 +616,58 @@ type testCommandController struct {
 	commandStartWaiters map[string]chan struct{}
 	// Current command state.
 	commandState map[string]*testCommandState
+	// Number of times each command has connected (i.e. started running).
+	startCounts map[string]int
+	// Every connection of each command, including earlier ones.
+	allCommandStates map[string][]*testCommandState
+}
+
+// CommandStartCount returns how many times a controlled command with the given
+// name has started running (connected to the controller).
+func (r *Env) CommandStartCount(name string) int {
+	c := r.testCommandController
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.startCounts[name]
+}
+
+// ExitAll instructs every running instance of the controlled command (there
+// can be several if the command was executed more than once) to exit.
+func (c *ControlledCommand) ExitAll(exitCode int32) {
+	ctrl := c.controller
+	ctrl.mu.Lock()
+	states := append([]*testCommandState(nil), ctrl.allCommandStates[c.Name]...)
+	ctrl.mu.Unlock()
+	for _, st := range states {
+		select {
+		case st.opChan <- &retpb.ControllerToCommandRequest{ExitOp: &retpb.ExitOp{ExitCode: exitCode}}:
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// WaitInstanceDisconnected waits for the i-th started instance of the
+// controlled command to disconnect (exit or be killed) and reports whether it
+// did so within the timeout.
+func (c *ControlledCommand) WaitInstanceDisconnected(i int, timeout time.Duration) bool {
+	ctrl := c.controller
+	ctrl.mu.Lock()
+	states := ctrl.allCommandStates[c.Name]
+	if i >= len(states) {
+		ctrl.mu.Unlock()
+		return false
+	}
+	st := states[i]
+	ctrl.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return st.WaitDisconnected(ctx) == nil
+}
+
+// Result blocks until the command completes and returns its result, without
+// asserting on success.
+func (c *Command) Result() *CommandResult {
+	return c.getResult()
 }
 
 func (c *testCommandController) RegisterCommand(stream retpb.CommandController_RegisterCommandServer) error {
@@ -632,6 +684,8 @@ func (c *testCommandController) RegisterCommand(stream retpb.CommandController_R
 
 	cmdState := &testCommandState{opChan: opChannel, state: testCommandStateStarted}
 	c.commandState[cmdName] = cmdState
+	c.startCounts[cmdName]++
+	c.allCommandStates[cmdName] = append(c.allCommandStates[cmdName], cmdState)
 	if ch, ok := c.commandStartWaiters[req.GetCommandName()]; ok {
 		close(ch)
 		delete(c.commandStartWaiters, req.GetCommandName())
@@ -722,6 +776,8 @@ func newTestCommandController(t *testing.T, env environment.Env) *testCommandCon
 		startedCommands:     make(map[string]bool),
 		commandStartWaiters: make(map[string]chan struct{}),
 		commandState:        make(map[string]*testCommandState),
+		startCounts:         make(map[string]int),
+		allCommandStates:    make(map[string][]*testCommandState),
 	}
 
 	server := grpc.NewServer(grpc_server.CommonGRPCServerOptions(env)...)
@@ -783,6 +839,17 @@ func (e *Executor) ShutdownTaskScheduler() {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultWaitTimeout)
 	defer cancel()
 	e.taskScheduler.Shutdown(ctx)
+}
+
+// HasQueuedTask reports whether the executor currently has a queued
+// reservation for the given task ID.
+func (e *Executor) HasQueuedTask(taskID string) bool {
+	for _, r := range e.taskScheduler.GetQueuedTaskReservations() {
+		if r.GetTaskId() == taskID {
+			return true
+		}
+	}
+	return false
 }
 
 // QueueLength returns the current number of tasks in the executor's queue.
