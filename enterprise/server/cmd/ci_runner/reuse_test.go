@@ -303,3 +303,30 @@ func TestRunnerReuseSubmodule(t *testing.T) {
 		})
 	}
 }
+
+// Deinitialization must keep the object store, so initializing again can work
+// without contacting the original submodule remote. Disable fallback so a fresh
+// clone cannot hide an unsuccessful recycled-workspace sync.
+func TestRunnerReuseSubmoduleObjectsSurviveOffline(t *testing.T) {
+	f := newReuseFixture(t)
+	flags.Set(t, "fallback_to_clean_checkout", false)
+	sub := t.TempDir()
+	reuseGit(t, sub, "init")
+	reuseWrite(t, sub, "input", "cached object\n")
+	object := reuseCommit(t, sub)
+	reuseGit(t, f.source, "submodule", "add", "file://"+sub, "dependency")
+	sha := reuseCommit(t, f.source)
+	require.NoError(t, f.setup("x", "", sha))
+	checkout := filepath.Join(f.root, repoDirName)
+	reuseGit(t, checkout, "submodule", "update", "--init")
+	require.NoError(t, os.RemoveAll(sub))
+	require.NoError(t, f.setup("x", "", sha))
+	_, err := os.Stat(filepath.Join(checkout, "dependency/input"))
+	require.True(t, os.IsNotExist(err), "recycled submodule must be uninitialized: %v", err)
+	modules := filepath.Join(checkout, ".git/modules/dependency")
+	require.Equal(t, "blob", reuseGit(t, modules, "cat-file", "-t", object+":input"))
+	reuseGit(t, checkout, "submodule", "update", "--init")
+	contents, err := os.ReadFile(filepath.Join(checkout, "dependency/input"))
+	require.NoError(t, err)
+	require.Equal(t, "cached object\n", string(contents))
+}
