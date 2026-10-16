@@ -31,6 +31,11 @@ const (
 	// never started, or its actual exit code could not be determined because of an
 	// error.
 	NoExitCode = -2
+
+	// OutputDrainTimeout bounds the final drain of inherited stdout/stderr
+	// pipes after the main process exits. Allow buffered output to be copied,
+	// without waiting indefinitely for background processes to close the pipes.
+	OutputDrainTimeout = 100 * time.Millisecond
 )
 
 var (
@@ -295,12 +300,13 @@ func RunWithProcessTreeCleanup(ctx context.Context, cmd *exec.Cmd, opts *RunOpts
 		opts = &RunOpts{}
 	}
 
-	// Leave WaitDelay unset by default: closing inherited output pipes after a
-	// fixed grace period can discard output even when only the main process
-	// wrote to them. Wait for EOF, keeping cancellation cleanup active through
-	// the drain so a deadline kills pipe-holding descendants. Successful
-	// daemons that outlive the action must redirect their inherited streams.
-	// If a caller explicitly sets WaitDelay, propagate its truncation error.
+	// As in the OCI runtime path, a bounded WaitDelay closes inherited pipes
+	// without changing the main process's exit status. Do not kill background
+	// processes on success: callers may intentionally retain daemons across
+	// actions or use a persistent worker with a longer-lived context.
+	if cmd.WaitDelay == 0 {
+		cmd.WaitDelay = OutputDrainTimeout
+	}
 	p, err := startNewProcess(ctx, cmd)
 	if err != nil {
 		return nil, err
@@ -313,6 +319,10 @@ func RunWithProcessTreeCleanup(ctx context.Context, cmd *exec.Cmd, opts *RunOpts
 
 	rusage, err := p.wait()
 	<-p.cleanupDone
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// Wait returns this only if the main process exited successfully.
+		err = nil
+	}
 	stats := <-statsCh
 	p.finalizeUsage(stats)
 	if cleanupErr := p.cleanup(); cleanupErr != nil {
