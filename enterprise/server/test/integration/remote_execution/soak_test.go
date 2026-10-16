@@ -37,6 +37,7 @@ func TestResourceSoak(t *testing.T) {
 	stop := make(chan struct{})
 	defer close(stop)
 	testleak.Soak(t, 2, 10, func(batch int) {
+		cacheHits := 0
 		for i := range 17 {
 			script := "cp blob out"
 			exit := 0
@@ -44,7 +45,17 @@ func TestResourceSoak(t *testing.T) {
 				script = "exit 7"
 				exit = 7
 			}
-			res := rbe.Execute(command(script), &rbetest.ExecuteOpts{InputRootDir: root, CheckCache: i%2 == 0}).Wait()
+			cmd := rbe.Execute(command(script), &rbetest.ExecuteOpts{InputRootDir: root, CheckCache: i%2 == 0})
+			res := cmd.Wait()
+			for _, op := range cmd.GetOperations() {
+				if op.GetDone() {
+					response := &repb.ExecuteResponse{}
+					require.NoError(t, op.GetResponse().UnmarshalTo(response))
+					if response.GetCachedResult() {
+						cacheHits++
+					}
+				}
+			}
 			require.Equal(t, exit, res.ExitCode)
 			if exit == 0 {
 				for _, out := range res.ActionResult.GetOutputFiles() {
@@ -60,6 +71,7 @@ func TestResourceSoak(t *testing.T) {
 				t.Cleanup(func() { f.Close() })
 			}
 		}
+		require.Positive(t, cacheHits, "each batch must exercise actual action-cache hits")
 		rbe.Execute(command("sleep 30"), &rbetest.ExecuteOpts{InputRootDir: root, ActionTimeout: 100 * time.Millisecond}).MustTerminateAbnormally()
 		c := rbe.ExecuteControlledCommand(fmt.Sprintf("disconnect-%d", batch), &rbetest.ExecuteControlledOpts{})
 		c.WaitStarted()
