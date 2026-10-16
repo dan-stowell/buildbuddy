@@ -712,3 +712,89 @@ func TestImmediateOperator(t *testing.T) {
 	require.Equal(t, []string{"fakeheader"}, update.clientIdentity)
 	require.Empty(t, updateChan)
 }
+
+// Reproducer (bug-hunt proxy-findmissing): a flush that runs concurrently
+// with batch() can finalize and remove a pendingDigestBatch while batch() is
+// still adding digests to it. Digests added after finalize() land in an
+// orphaned batch that is never sent, and the group's numDigests counter is
+// incremented for them but never decremented. Over time the counter drifts
+// up to MaxDigestsPerGroup and all further digests for the group are dropped.
+func TestEnqueue_ConcurrentFlushLosesDigestsAndLeaksGroupBudget(t *testing.T) {
+	const perRound = 2000
+	const rounds = 20
+	authenticator, updater, cas, _ := setup(t, batch_operator.BatchDigestOperatorConfig{
+		MaxDigestsPerGroup: perRound,
+		MaxDigestsPerBatch: 10_000,
+		MaxBatchesPerGroup: 50,
+	})
+	ctx := authenticatedContext(t.Context(), user1, authenticator)
+
+	randomDigests := func(n int) []*repb.Digest {
+		out := make([]*repb.Digest, 0, n)
+		for range n {
+			b := make([]byte, 32)
+			for i := range b {
+				b[i] = byte(rand.IntN(256))
+			}
+			out = append(out, digestProto(fmt.Sprintf("%x", b), 3))
+		}
+		return out
+	}
+	drain := func() {
+		for range 5 {
+			updater.ForceFlushBatchesForTesting(t.Context())
+		}
+	}
+
+	lost := 0
+	for r := range rounds {
+		cas.clearUpdates()
+		ds := randomDigests(perRound)
+		require.True(t, updater.Enqueue(ctx, "instance-1", ds, repb.DigestFunction_SHA256))
+
+		done := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					updater.ForceFlushBatchesForTesting(t.Context())
+				}
+			}
+		}()
+		updater.ForceBatchingForTesting()
+		close(done)
+		wg.Wait()
+		drain()
+
+		sent := map[digest.Key]struct{}{}
+		for _, u := range cas.getUpdates() {
+			sent[u.key] = struct{}{}
+		}
+		roundLost := 0
+		for _, d := range ds {
+			if _, ok := sent[digest.NewKey(d)]; !ok {
+				roundLost++
+			}
+		}
+		if roundLost > 0 {
+			t.Logf("round %d: %d of %d enqueued digests were never sent", r, roundLost, perRound)
+		}
+		lost += roundLost
+	}
+	t.Logf("total digests lost across %d rounds: %d", rounds, lost)
+
+	// With nothing pending, the group should again accept a full
+	// MaxDigestsPerGroup worth of digests.
+	cas.clearUpdates()
+	ds := randomDigests(perRound)
+	require.True(t, updater.Enqueue(ctx, "instance-1", ds, repb.DigestFunction_SHA256))
+	updater.ForceBatchingForTesting()
+	drain()
+	require.Equal(t, perRound, len(cas.getUpdates()), "group budget leaked: only %d of %d digests were sent after all batches drained", len(cas.getUpdates()), perRound)
+	require.Equal(t, 0, lost, "digests enqueued while a flush was running were never sent")
+}
