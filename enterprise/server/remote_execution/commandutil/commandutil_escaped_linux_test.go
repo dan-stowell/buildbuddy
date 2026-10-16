@@ -66,7 +66,7 @@ func TestRun_ReviewCancellationOrderings(t *testing.T) {
 		name, script string
 		truncated    bool
 	}{
-		{"cancel_before_root_exit", `/usr/bin/setsid sh -c 'echo ready > ready; exec sleep 4' & while [ ! -f ready ]; do sleep 0.01; done; echo out; echo err >&2; sleep 4`, true},
+		{"cancel_before_root_exit", `( /usr/bin/setsid sh -c 'echo ready > ready; exec sleep 4' & ) ; while [ ! -f ready ]; do sleep 0.01; done; echo out; echo err >&2; sleep 4`, true},
 		{"eof_before_cancel", `echo out; echo err >&2; exec 1>/dev/null 2>/dev/null; exec sleep 4`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
