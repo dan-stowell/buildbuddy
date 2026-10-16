@@ -23,16 +23,21 @@ go_library(
 
 go_test(
     name = "operation_test",
-    srcs = ["operation_test.go"],
+    srcs = [
+        "lifecycle_resources_test.go",
+        "operation_test.go",
+    ],
     embed = [":operation"],
     deps = [
         "//proto:remote_execution_go_proto",
         "//server/remote_cache/digest",
+        "//server/testutil/testleak",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
         "@com_google_cloud_go_longrunning//autogen/longrunningpb",
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//codes",
+        "@org_golang_google_grpc//credentials/insecure",
         "@org_golang_google_grpc//status",
     ],
 )
