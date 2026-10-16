@@ -3,11 +3,17 @@ package byte_stream_client
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
+	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"io"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bazelbuild/rules_go/go/runfiles"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
@@ -121,4 +127,30 @@ func TestReadZipFileContents(t *testing.T) {
 	validateZipContents(t, ctx, manifest.GetEntry()[0], "bazel", streamer)
 	validateZipContents(t, ctx, manifest.GetEntry()[1], "buildbuddy", streamer)
 	validateZipContents(t, ctx, manifest.GetEntry()[2], "san dimas high school football rules", streamer)
+}
+
+// TestV4DistinctPermittedTargets measures resources after every request has
+// returned. Synthetic userinfo is deliberately not a credential.
+func TestV4DistinctPermittedTargets(t *testing.T) {
+	for _, n := range []int{1, 10, 50} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			testleak.Check(t)
+			env := testenv.GetTestEnv(t)
+			flags.Set(t, "app.restrict_bytestream_dialing", true)
+			flags.Set(t, "app.cache_api_url", "grpcs://cache.example.com")
+			p := NewPooledByteStreamClient(env)
+			before := runtime.NumGoroutine()
+			for i := 0; i < n; i++ {
+				u, err := url.Parse(fmt.Sprintf("bytestream://synthetic-%d@localhost:1/blobs/abc/1", i))
+				require.NoError(t, err)
+				require.True(t, isPermittedForDial(getTargetForURL(u, true)))
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				require.Error(t, p.StreamBytestreamFile(ctx, u, io.Discard))
+			}
+			t.Logf("N=%d cached=%d goroutine_delta=%d", n, len(p.connPoolMap), runtime.NumGoroutine()-before)
+			// Polling cannot release these pools: there is no baseline cleanup path.
+			_ = time.Second
+		})
+	}
 }

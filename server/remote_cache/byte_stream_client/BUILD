@@ -41,6 +41,9 @@ go_test(
         "tooManyFilesRunfilePath": "$(rlocationpath too_many_files.zip)",
     },
     deps = [
+ "//server/testutil/testenv",
+ "//server/testutil/testleak",
+ "//server/util/testing/flags",
         "//proto:zip_go_proto",
         "//server/util/proto",
         "@com_github_stretchr_testify//assert",
