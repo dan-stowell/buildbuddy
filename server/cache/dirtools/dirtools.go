@@ -721,16 +721,10 @@ func (ff *BatchFileFetcher) writeToFileCache(fileNode *repb.FileNode, data []byt
 }
 
 func copyFile(src *FilePointer, dest *FilePointer, opts *DownloadTreeOpts) error {
-	// The dedupe leader may already have materialized this exact path.
-	if filepath.Clean(src.FullPath) == filepath.Clean(dest.FullPath) {
-		return nil
-	}
 	if err := removeExisting(dest, opts); err != nil {
 		return err
 	}
-	// A deduplicated download can be shared by concurrent actions. Keep each
-	// workspace independent even when reflinking is unavailable.
-	return fastcopy.CloneOrCopy(src.FullPath, dest.FullPath)
+	return fastcopy.FastCopy(src.FullPath, dest.FullPath)
 }
 
 // linkFileFromFileCache attempts to link the given file path from the local
@@ -739,7 +733,7 @@ func linkFileFromFileCache(ctx context.Context, fp *FilePointer, fc interfaces.F
 	if err := removeExisting(fp, opts); err != nil {
 		return false, err
 	}
-	return fc.MaterializeWritable(ctx, fp.FileNode, fp.FullPath), nil
+	return fc.FastLinkFile(ctx, fp.FileNode, fp.FullPath), nil
 }
 
 // fetchKey identifies an artifact to be fetched from a remote cache.
@@ -1265,34 +1259,7 @@ func (ff *BatchFileFetcher) publishDownloadedFile(ctx context.Context, fp *FileP
 // The blob is optionally added to the file cache, if the file cache
 // is enabled.
 func (ff *BatchFileFetcher) bytestreamReadToFilesystem(ctx context.Context, bsClient bspb.ByteStreamClient, dedupeKey downloadDedupeKey, fps []*FilePointer, opts *DownloadTreeOpts) error {
-	// Publish to cache before releasing the deduper. A follower must never
-	// depend on another action's workspace lifetime or mutable input bytes.
-	if fc := ff.env.GetFileCache(); fc != nil {
-		if err := ff.bytestreamReadToFilecache(ctx, bsClient, dedupeKey, fps); err != nil {
-			return err
-		}
-		for _, dest := range fps {
-			hit, err := linkFileFromFileCache(ctx, dest, fc, opts)
-			if err != nil {
-				return err
-			}
-			if !hit {
-				// Eviction is allowed between publication and materialization.
-				mode := os.FileMode(0644)
-				if dest.FileNode.GetIsExecutable() {
-					mode = 0755
-				}
-				if err := ff.downloadBlobToFile(ctx, bsClient, dest.FileNode, dest.FullPath, mode); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	}
-
-	// Without a cache there is no stable shared source. Download once per
-	// fetcher so concurrent actions never depend on each other's workspace.
-	fp, err := func(ctx context.Context) (*FilePointer, error) {
+	fp, _, err := DownloadDeduper.Do(ctx, dedupeKey, func(ctx context.Context) (*FilePointer, error) {
 		// Only the deduped call takes a slot, since waiting tasks do no I/O.
 		release, err := inputDownloadLimit.acquire(ctx, 1)
 		if err != nil {
@@ -1313,12 +1280,16 @@ func (ff *BatchFileFetcher) bytestreamReadToFilesystem(ctx context.Context, bsCl
 		}
 
 		return fp0, nil
-	}(ctx)
+	})
 	if err != nil {
 		return err
 	}
 
-	// Copy within this fetcher while its workspace is still owned by it.
+	// Depending on whether or not this bytestream request was deduped, fp
+	// will either be == fps[0], or a different fp from a concurrent request
+	// made by the same user.
+	// Check for that case, to avoid copying a file over itself, and copy fp
+	// to all of the destination fps.
 	for _, dest := range fps {
 		if fp == dest {
 			continue
@@ -1343,34 +1314,6 @@ func (ff *BatchFileFetcher) bytestreamReadToFilecache(ctx context.Context, bsCli
 		defer release()
 		fp0 := fps[0]
 
-		if ff.shouldDownloadChunked(fp0.FileNode) {
-			// Chunk assembly needs a seekable file. Stage privately in the cache
-			// filesystem and share only after all writes have completed.
-			fc := ff.env.GetFileCache()
-			f, err := os.CreateTemp(fc.TempDir(), "download-*")
-			if err != nil {
-				return nil, err
-			}
-			path := f.Name()
-			defer os.Remove(path)
-			if err := f.Close(); err != nil {
-				return nil, err
-			}
-			mode := os.FileMode(0644)
-			if fp0.FileNode.GetIsExecutable() {
-				mode = 0755
-			}
-			if err := os.Chmod(path, mode); err != nil {
-				return nil, err
-			}
-			if err := ff.downloadBlobToFile(ctx, bsClient, fp0.FileNode, path, mode); err != nil {
-				return nil, err
-			}
-			if err := fc.AddReadOnly(ctx, fp0.FileNode, path); err != nil {
-				return nil, err
-			}
-			return fp0, nil
-		}
 		w, err := ff.env.GetFileCache().Writer(ctx, fp0.FileNode, ff.digestFunction)
 		if err != nil {
 			return nil, status.WrapError(err, "could not create filecache writer")

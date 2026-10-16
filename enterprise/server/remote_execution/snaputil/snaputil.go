@@ -115,7 +115,7 @@ func GetArtifact(ctx context.Context, localCache interfaces.FileCache, bsClient 
 
 	if *EnableLocalSnapshotSharing {
 		node := &repb.FileNode{Digest: d}
-		fetchedLocally := localCache.LinkReadOnly(ctx, node, outputPath)
+		fetchedLocally := localCache.FastLinkFile(ctx, node, outputPath)
 		if fetchedLocally {
 			return ChunkSourceLocalFilecache, nil
 		}
@@ -265,7 +265,7 @@ func cacheLocally(ctx context.Context, localCache interfaces.FileCache, d *repb.
 	// If EnableLocalSnapshotSharing=true and we're computing real unloadedChunks,
 	// the files will be immutable. We won't need to re-save them to file cache
 	if !*EnableLocalSnapshotSharing || !localCache.ContainsFile(ctx, fileNode) {
-		return localCache.AddReadOnly(ctx, fileNode, path)
+		return localCache.AddFile(ctx, fileNode, path)
 	}
 	return nil
 }
