@@ -2,6 +2,7 @@ package remoteauth
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -488,4 +489,57 @@ func TestHS256ReauthResultIsCached(t *testing.T) {
 	ctx = authenticator.AuthenticatedGRPCContext(contextWithJwt(t, incomingHS256JWT))
 	require.Equal(t, remoteES256JWT, ctx.Value(authutil.ContextTokenStringKey))
 	require.Equal(t, 1, fakeAuth.getAuthenticateCalls())
+}
+
+// A JWT presented (and therefore cached by the claims parser) before its
+// signing key was removed from the auth service's public keys must stop
+// being accepted shortly after the key refresh and claims cache TTL, even if
+// the JWT keeps being presented.
+func TestJWTFromRemovedKeyRejectedAfterRefreshAndClaimsCacheTTL(t *testing.T) {
+	const claimsCacheTTL = 300 * time.Millisecond
+	flags.Set(t, "auth.jwt_claims_cache_ttl", claimsCacheTTL)
+	flags.Set(t, "auth.remote.use_es256_jwts", true)
+	flags.Set(t, "auth.remote.key_refresh_interval", 10*time.Millisecond)
+
+	retiredKey := testkeys.GenerateES256KeyPair(t)
+	currentKey := testkeys.GenerateES256KeyPair(t)
+	flags.Set(t, "auth.jwt_es256_private_key", retiredKey.PrivateKeyPEM)
+	require.NoError(t, claims.Init())
+	presented := validES256Jwt(t, "presented-before-rotation")
+
+	authenticator, fakeAuth := setup(t)
+	fakeAuth.setPublicKeys([]string{retiredKey.PublicKeyPEM})
+
+	ctx := authenticator.AuthenticatedGRPCContext(contextWithJwt(t, presented))
+	user, err := authenticator.AuthenticatedUser(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "presented-before-rotation", user.GetUserID())
+
+	// Remove the retired key and wait until the authenticator has picked up
+	// the new key set: a never-seen JWT signed by the retired key is
+	// rejected. (Each attempt uses a fresh JWT so that an attempt made before
+	// the refresh can't be served from the claims cache.)
+	fakeAuth.setPublicKeys([]string{currentKey.PublicKeyPEM})
+	rotatedAt := time.Now()
+	attempt := 0
+	require.Eventually(t, func() bool {
+		attempt++
+		neverPresented := validES256Jwt(t, fmt.Sprintf("never-presented-%d", attempt))
+		ctx := authenticator.AuthenticatedGRPCContext(contextWithJwt(t, neverPresented))
+		_, err := authenticator.AuthenticatedUser(ctx)
+		return err != nil
+	}, 5*time.Second, 10*time.Millisecond)
+
+	// Keep presenting the JWT seen before the rotation. It must be rejected
+	// within a small multiple of the claims cache TTL.
+	deadline := 10 * claimsCacheTTL
+	for time.Since(rotatedAt) < deadline {
+		ctx := authenticator.AuthenticatedGRPCContext(contextWithJwt(t, presented))
+		if _, err := authenticator.AuthenticatedUser(ctx); err != nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	require.FailNowf(t, "JWT signed by removed key still accepted",
+		"accepted for %s after rotation (claims cache TTL %s)", time.Since(rotatedAt), claimsCacheTTL)
 }

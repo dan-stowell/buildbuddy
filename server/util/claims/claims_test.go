@@ -2,7 +2,10 @@ package claims_test
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
@@ -548,4 +551,92 @@ func TestParseClaims_ES256_RejectsHS256(t *testing.T) {
 	// Parsing should fail because the parser is configured with ES256 public keys
 	_, err = parser.Parse(t.Context(), hs256Token)
 	require.Error(t, err)
+}
+
+// rotatingKeyProvider is a claims.KeyProvider whose ES256 public keys can be
+// swapped at runtime, like the remote authenticator's periodically refreshed
+// key set.
+type rotatingKeyProvider struct {
+	mu   sync.Mutex
+	keys []claims.VerificationKey
+}
+
+func (p *rotatingKeyProvider) set(publicKeyPEMs ...string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.keys = nil
+	for _, k := range publicKeyPEMs {
+		p.keys = append(p.keys, claims.VerificationKey{Key: k, SigningMethod: jwt.SigningMethodES256})
+	}
+}
+
+func (p *rotatingKeyProvider) provide(ctx context.Context) ([]claims.VerificationKey, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]claims.VerificationKey(nil), p.keys...), nil
+}
+
+func signES256(t *testing.T, privateKeyPEM, uid string) string {
+	flags.Set(t, "auth.jwt_es256_private_key", privateKeyPEM)
+	require.NoError(t, claims.Init())
+	token, err := claims.AssembleJWT(&claims.Claims{UserID: uid}, jwt.SigningMethodES256)
+	require.NoError(t, err)
+	return token
+}
+
+// A token that was parsed (and cached) before its signing key was removed
+// from the key provider must stop being accepted once the claims cache TTL
+// has elapsed, even if the token keeps being used and other tokens churn
+// through the cache.
+func TestClaimsParser_RemovedKeyRejectedAfterCacheTTL(t *testing.T) {
+	const cacheTTL = 200 * time.Millisecond
+	// One less than the parser's LRU capacity, so the frequently-used token
+	// is never evicted by size.
+	const otherTokens = 999
+	flags.Set(t, "auth.jwt_claims_cache_ttl", cacheTTL)
+	ctx := context.Background()
+
+	oldKey := testkeys.GenerateES256KeyPair(t)
+	newKey := testkeys.GenerateES256KeyPair(t)
+	hot := signES256(t, oldKey.PrivateKeyPEM, "US-hot")
+	unseen := signES256(t, oldKey.PrivateKeyPEM, "US-unseen")
+	others := make([]string, otherTokens)
+	for i := range others {
+		others[i] = signES256(t, newKey.PrivateKeyPEM, fmt.Sprintf("US-other-%d", i))
+	}
+
+	kp := &rotatingKeyProvider{}
+	kp.set(oldKey.PublicKeyPEM)
+	parser, err := claims.NewClaimsParser(kp.provide)
+	require.NoError(t, err)
+
+	c, err := parser.Parse(ctx, hot)
+	require.NoError(t, err)
+	require.Equal(t, "US-hot", c.UserID)
+
+	// Rotate: only the new key is trusted from now on.
+	kp.set(newKey.PublicKeyPEM)
+	rotatedAt := time.Now()
+
+	// Control: an old-key token that was never cached is rejected.
+	_, err = parser.Parse(ctx, unseen)
+	require.Error(t, err, "token signed by removed key should be rejected")
+
+	// Keep using the old-key token while other tokens churn through the
+	// cache. It must be rejected well within a few cache TTLs.
+	uses := 0
+	for time.Since(rotatedAt) < 5*cacheTTL {
+		for _, o := range others {
+			_, err := parser.Parse(ctx, o)
+			require.NoError(t, err)
+		}
+		uses++
+		if _, err := parser.Parse(ctx, hot); err != nil {
+			require.Less(t, time.Since(rotatedAt), 2*cacheTTL+time.Second)
+			return
+		}
+	}
+	require.FailNowf(t, "token signed by removed key still accepted",
+		"accepted %d times over %s after rotation (claims cache TTL %s, %d other tokens interleaved)",
+		uses, time.Since(rotatedAt), cacheTTL, otherTokens)
 }
