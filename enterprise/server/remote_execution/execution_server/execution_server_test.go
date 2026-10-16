@@ -1015,7 +1015,26 @@ func TestExecuteAndPublishOperation(t *testing.T) {
 	}
 }
 
+// TestExecutionResults checks cache eligibility and completed-operation replay using
+// the same executor publication harness as TestExecuteAndPublishOperation.
+func TestExecutionResults(t *testing.T) {
+	for _, tc := range []publishTest{
+		{name: "Success"},
+		{name: "NonzeroExit", exitCode: 42},
+		{name: "Timeout", status: status.DeadlineExceededError("action timed out")},
+		{name: "ExecutionError", status: status.InternalError("executor failed")},
+		{name: "DoNotCache", doNotCache: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.checkExecutionResults = true
+			tc.expectedExecutionUsage = tables.UsageCounts{LinuxExecutionDurationUsec: (5 * time.Second).Microseconds()}
+			testExecuteAndPublishOperation(t, tc)
+		})
+	}
+}
+
 type publishTest struct {
+	checkExecutionResults    bool
 	name                     string
 	instanceName             string
 	platformOverrides        map[string]string
@@ -1257,6 +1276,12 @@ func testExecuteAndPublishOperation(t *testing.T, test publishTest) {
 		Result:       actionResult,
 		Status:       gstatus.Convert(test.status).Proto(),
 	}
+	if test.checkExecutionResults {
+		expectedExecuteResponse.Message = "executor diagnostic message"
+		expectedExecuteResponse.ServerLogs = map[string]*repb.LogFile{
+			"diagnostic": {Digest: &repb.Digest{Hash: strings.Repeat("a", 64), SizeBytes: 123}, HumanReadable: true},
+		}
+	}
 	op, err = operation.Assemble(
 		taskID,
 		operation.Metadata(repb.ExecutionStage_COMPLETED, arn.GetDigest()),
@@ -1288,6 +1313,46 @@ func testExecuteAndPublishOperation(t *testing.T, test publishTest) {
 		executeResponse = operation.ExtractExecuteResponse(op)
 	}
 	assert.Empty(t, cmp.Diff(trimmedExecuteResponse, executeResponse, protocmp.Transform()))
+
+	if test.checkExecutionResults {
+		// Reconnect after completion. A deadline bounds regressions that hang.
+		replayCtx, cancel := context.WithTimeout(clientCtx, 10*time.Second)
+		defer cancel()
+		replay, err := client.WaitExecution(replayCtx, &repb.WaitExecutionRequest{Name: taskID})
+		require.NoError(t, err)
+		replayOp, err := replay.Recv()
+		require.NoError(t, err)
+		require.True(t, replayOp.GetDone())
+		assert.Empty(t, cmp.Diff(executeResponse, operation.ExtractExecuteResponse(replayOp), protocmp.Transform()))
+		_, err = replay.Recv()
+		require.Equal(t, io.EOF, err)
+
+		if test.status == nil && test.exitCode == 0 && !test.doNotCache {
+			hit, err := client.Execute(replayCtx, &repb.ExecuteRequest{
+				InstanceName: arn.GetInstanceName(), ActionDigest: arn.GetDigest(), DigestFunction: arn.GetDigestFunction(),
+			})
+			require.NoError(t, err)
+			for {
+				hitOp, err := hit.Recv()
+				require.NoError(t, err)
+				if !hitOp.GetDone() {
+					continue
+				}
+				hitResponse := operation.ExtractExecuteResponse(hitOp)
+				require.True(t, hitResponse.GetCachedResult())
+				assert.Empty(t, cmp.Diff(executeResponse.GetResult(), hitResponse.GetResult(), protocmp.Transform()))
+				break
+			}
+			forced, err := client.Execute(replayCtx, &repb.ExecuteRequest{
+				InstanceName: arn.GetInstanceName(), ActionDigest: arn.GetDigest(), DigestFunction: arn.GetDigestFunction(), SkipCacheLookup: true,
+			})
+			require.NoError(t, err)
+			forcedOp, err := forced.Recv()
+			require.NoError(t, err)
+			require.False(t, forcedOp.GetDone(), "skip_cache_lookup must dispatch despite a populated cache")
+			require.NotEqual(t, taskID, forcedOp.GetName())
+		}
+	}
 
 	// Check that the action cache contains the right entry, if any.
 	arn.ToProto().CacheType = rspb.CacheType_AC
