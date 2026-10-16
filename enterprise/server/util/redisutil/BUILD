@@ -25,7 +25,7 @@ go_library(
 go_test(
     name = "redisutil_test",
     size = "small",
-    srcs = ["redisutil_test.go"],
+    srcs = ["redisutil_test.go", "stopflush_probe_test.go"],
     deps = [
         ":redisutil",
         "//enterprise/server/experiments",
