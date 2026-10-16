@@ -57,6 +57,7 @@ go_test(
         "//server/remote_cache/digest",
         "//server/testutil/testauth",
         "//server/testutil/testenv",
+        "//server/testutil/testleak",
         "//server/testutil/testmetrics",
         "//server/util/bazel_request",
         "//server/util/prefix",

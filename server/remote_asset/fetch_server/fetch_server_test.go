@@ -32,6 +32,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testmetrics"
 	"github.com/buildbuddy-io/buildbuddy/server/util/bazel_request"
 	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
@@ -1870,5 +1871,63 @@ func TestFetchBlob_DigestConversionClosesScratchFile(t *testing.T) {
 		}
 		require.NoError(t, err)
 		assert.NotContains(t, target, scratchRoot, "digest conversion must close its temporary file, not just unlink it")
+	}
+}
+
+// Completed fetches must not leave idle upstream connections behind. The origin
+// stays alive with keep-alives enabled, so a connection pool that is created
+// per fetch and then abandoned keeps one socket and its reader/writer
+// goroutines until the origin closes it.
+func TestFetchBlob_DoesNotRetainUpstreamConnectionsPerFetch(t *testing.T) {
+	flags.Set(t, "storage.tempdir", t.TempDir())
+	require.NoError(t, scratchspace.Init())
+	ctx := context.Background()
+	te := testenv.GetTestEnv(t)
+	fetchClient := rapb.NewFetchClient(runFetchServer(ctx, t, te))
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "content %s", r.URL.Path)
+	}))
+	defer ts.Close()
+
+	wrongChecksum := checksumQualifierFromContent(t, strings.Repeat("0", 64), repb.DigestFunction_SHA256)
+	for _, tc := range []struct {
+		name string
+		// checksum returns the checksum.sri qualifier for content, or "".
+		checksum func(content string) string
+		wantCode gcodes.Code
+	}{
+		{
+			name:     "no_checksum",
+			checksum: func(string) string { return "" },
+			wantCode: gcodes.OK,
+		},
+		{
+			name: "checksum",
+			checksum: func(content string) string {
+				d, err := digest.Compute(strings.NewReader(content), repb.DigestFunction_SHA256)
+				require.NoError(t, err)
+				return checksumQualifierFromContent(t, d.GetHash(), repb.DigestFunction_SHA256)
+			},
+			wantCode: gcodes.OK,
+		},
+		{
+			name:     "checksum_mismatch",
+			checksum: func(string) string { return wrongChecksum },
+			wantCode: gcodes.NotFound,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testleak.CheckGrowth(t, testleak.Growth{Warmup: 2, Iterations: 20}, func(i int) {
+				// Unique paths avoid cache hits, so every RPC fetches.
+				path := fmt.Sprintf("/%s/%d", tc.name, i)
+				req := &rapb.FetchBlobRequest{Uris: []string{ts.URL + path}}
+				if q := tc.checksum("content " + path); q != "" {
+					req.Qualifiers = []*rapb.Qualifier{{Name: fetch_server.ChecksumQualifier, Value: q}}
+				}
+				resp, err := fetchClient.FetchBlob(ctx, req)
+				require.NoError(t, err)
+				require.Equal(t, int32(tc.wantCode), resp.GetStatus().GetCode(), resp.GetStatus().GetMessage())
+			})
+		})
 	}
 }
