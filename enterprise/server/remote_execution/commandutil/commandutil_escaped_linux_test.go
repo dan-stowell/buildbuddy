@@ -58,3 +58,34 @@ func TestRun_EscapedSessionPipeCancellation(t *testing.T) {
 	assert.Contains(t, res.Error.Error(), "stdout/stderr may be truncated")
 	assert.Less(t, elapsed, 3500*time.Millisecond)
 }
+
+// Exercise cancellation while the root is still alive, and after output EOF.
+// The escaped child self-terminates so this is also bounded on the baseline.
+func TestRun_ReviewCancellationOrderings(t *testing.T) {
+	for _, tc := range []struct {
+		name, script string
+		truncated    bool
+	}{
+		{"cancel_before_root_exit", `/usr/bin/setsid sh -c 'echo ready > ready; exec sleep 4' & while [ ! -f ready ]; do sleep 0.01; done; echo out; echo err >&2; sleep 4`, true},
+		{"eof_before_cancel", `echo out; echo err >&2; exec 1>/dev/null 2>/dev/null; exec sleep 4`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			flags.Set(t, "executor.output_drain_timeout", 100*time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			start := time.Now()
+			res := commandutil.Run(ctx, &repb.Command{Arguments: []string{"sh", "-c", tc.script}}, t.TempDir(), nil, nil)
+			elapsed := time.Since(start)
+			t.Logf("deterministic script; elapsed=%s error=%v", elapsed, res.Error)
+			assert.Equal(t, "out\n", string(res.Stdout))
+			assert.Equal(t, "err\n", string(res.Stderr))
+			require.True(t, status.IsDeadlineExceededError(res.Error), "%v", res.Error)
+			assert.Less(t, elapsed, 2500*time.Millisecond)
+			if tc.truncated {
+				assert.Contains(t, res.Error.Error(), "stdout/stderr may be truncated")
+			} else {
+				assert.NotContains(t, res.Error.Error(), "truncated")
+			}
+		})
+	}
+}
