@@ -1341,3 +1341,29 @@ func TestStopCancelsDelayedEnqueue(t *testing.T) {
 	require.NoError(t, scheduler.Stop())
 	require.Empty(t, scheduler.GetQueuedTaskReservations())
 }
+
+func TestCancelDelayedReservationDoesNotReappear(t *testing.T) {
+	env := testenv.GetTestEnv(t)
+	clock := clockwork.NewFakeClock()
+	env.SetClock(clock)
+	q, err := NewPriorityTaskScheduler(env, NewFakeExecutor(), &FakeRunnerPool{}, NewFakeTaskLeaser(), &Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, q.Stop()) })
+
+	// Keep the scheduling loop stopped so that queue contents can be inspected
+	// without racing execution or periodic pruning of nonexistent tasks.
+	req := newTaskReservationRequest(fakeTaskID("completed-elsewhere"), testGroupID1, 0)
+	req.Delay = durationpb.New(time.Hour)
+	_, err = q.EnqueueTaskReservation(t.Context(), req)
+	require.NoError(t, err)
+	clock.BlockUntil(1)
+	q.CancelTaskReservation(t.Context(), req.GetTaskId())
+	clock.Advance(time.Hour)
+	// Enqueue signals only after mutating the queue. A correct implementation
+	// may suppress that signal as well, so bound the wait in that case.
+	select {
+	case <-q.checkQueueSignal:
+	case <-time.After(time.Second):
+	}
+	require.Empty(t, q.GetQueuedTaskReservations(), "cancelled delayed reservation reappeared in executor queue")
+}
