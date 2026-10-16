@@ -1222,3 +1222,62 @@ type presenceTreeStream struct {
 }
 
 func (s *presenceTreeStream) Context() context.Context { return s.ctx }
+
+// This client always has the requested blob, but can overlap each presence
+// lookup with a read miss for a different digest. No sleeps or random ordering.
+type unrelatedInvalidationClient struct {
+	repb.ContentAddressableStorageClient
+	beforeResponse func()
+	calls          int
+}
+
+func (c *unrelatedInvalidationClient) FindMissingBlobs(ctx context.Context, req *repb.FindMissingBlobsRequest, opts ...grpc.CallOption) (*repb.FindMissingBlobsResponse, error) {
+	c.calls++
+	if c.beforeResponse != nil {
+		c.beforeResponse()
+	}
+	return &repb.FindMissingBlobsResponse{}, nil
+}
+func (c *unrelatedInvalidationClient) BatchReadBlobs(ctx context.Context, req *repb.BatchReadBlobsRequest, opts ...grpc.CallOption) (*repb.BatchReadBlobsResponse, error) {
+	return nil, status.Error(codes.NotFound, "unrelated blob missing")
+}
+
+// An unrelated read miss must not disable caching for a healthy hot digest.
+func TestPresenceInvalidation_UnrelatedMissesDoNotStarveFills(t *testing.T) {
+	for _, chunked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("chunked=%t", chunked), func(t *testing.T) {
+			flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
+			ctx := testContext()
+			if chunked {
+				ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(cdc.ChunkedHeaderName, cdc.ChunkedHeaderValue))
+			}
+			env := testenv.GetTestEnv(t)
+			env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+			env.SetLocalCASServer(runLocalCASS(ctx, env, t))
+			remote := &unrelatedInvalidationClient{}
+			env.SetContentAddressableStorageClient(remote)
+			proxy, err := New(env)
+			require.NoError(t, err)
+			remote.beforeResponse = func() {
+				_, err := proxy.batchReadBlobsRemote(ctx, readBlobsRequest([]*repb.Digest{digestProto(barDigest, 3)}))
+				require.Equal(t, codes.NotFound, status.Code(err))
+			}
+			req := findMissingBlobsRequest([]*repb.Digest{digestProto(fooDigest, 3)})
+			for range 20 {
+				rsp, err := proxy.FindMissingBlobs(ctx, req)
+				require.NoError(t, err)
+				require.Empty(t, rsp.GetMissingBlobDigests())
+			}
+			during := remote.calls
+			// Once invalidations stop, one lookup must populate the cache again.
+			remote.beforeResponse = nil
+			for range 20 {
+				_, err := proxy.FindMissingBlobs(ctx, req)
+				require.NoError(t, err)
+			}
+			t.Logf("deterministic schedule: backend calls during invalidations=%d/20; after=%d/20", during, remote.calls-during)
+			require.LessOrEqual(t, remote.calls-during, 1, "fills must recover when invalidations stop")
+			require.Equal(t, 1, during, "unrelated missing digest prevented healthy digest from being cached")
+		})
+	}
+}
