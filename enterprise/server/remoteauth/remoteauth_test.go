@@ -489,3 +489,52 @@ func TestHS256ReauthResultIsCached(t *testing.T) {
 	require.Equal(t, remoteES256JWT, ctx.Value(authutil.ContextTokenStringKey))
 	require.Equal(t, 1, fakeAuth.getAuthenticateCalls())
 }
+
+// After the remote auth service stops advertising an ES256 public key (key
+// rotation) and the background refresh has picked that up, JWTs signed with
+// the removed key should stop being accepted once the parsed-claims cache TTL
+// (auth.jwt_claims_cache_ttl) has elapsed.
+func TestRemovedES256KeyNotAcceptedAfterClaimsCacheTTL(t *testing.T) {
+	oldKeyPair := testkeys.GenerateES256KeyPair(t)
+	newKeyPair := testkeys.GenerateES256KeyPair(t)
+	flags.Set(t, "auth.jwt_es256_private_key", oldKeyPair.PrivateKeyPEM)
+	require.NoError(t, claims.Init())
+
+	claimsCacheTTL := 500 * time.Millisecond
+	flags.Set(t, "auth.jwt_claims_cache_ttl", claimsCacheTTL)
+	flags.Set(t, "auth.remote.use_es256_jwts", true)
+	flags.Set(t, "auth.remote.key_refresh_interval", 10*time.Millisecond)
+	authenticator, fakeAuth := setup(t)
+	fakeAuth.setPublicKeys([]string{oldKeyPair.PublicKeyPEM})
+
+	// Two JWTs signed with the old key. Only the first one is presented
+	// before the rotation.
+	usedJwt := validES256Jwt(t, "used-before-rotation")
+	unusedJwt := validES256Jwt(t, "unused-before-rotation")
+
+	ctx := authenticator.AuthenticatedGRPCContext(contextWithJwt(t, usedJwt))
+	user, err := authenticator.AuthenticatedUser(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "used-before-rotation", user.GetUserID())
+
+	// Rotate: the auth service now only advertises the new key.
+	fakeAuth.setPublicKeys([]string{newKeyPair.PublicKeyPEM})
+	callsAfterRotation := fakeAuth.getPublicKeysCalls()
+	require.Eventually(t, func() bool {
+		return fakeAuth.getPublicKeysCalls() > callsAfterRotation+1
+	}, 5*time.Second, 5*time.Millisecond)
+
+	// Control: a JWT signed by the old key that was never cached is rejected,
+	// so the refreshed key set no longer contains the old key.
+	ctx = authenticator.AuthenticatedGRPCContext(contextWithJwt(t, unusedJwt))
+	_, err = authenticator.AuthenticatedUser(ctx)
+	require.Error(t, err, "uncached JWT signed by removed key should be rejected")
+
+	// Wait well past the parsed-claims cache TTL.
+	time.Sleep(3 * claimsCacheTTL)
+
+	// The JWT that was presented before rotation should now be rejected too.
+	ctx = authenticator.AuthenticatedGRPCContext(contextWithJwt(t, usedJwt))
+	user, err = authenticator.AuthenticatedUser(ctx)
+	require.Error(t, err, "JWT signed by removed key accepted %s after rotation (claims cache TTL %s); got user %v", 3*claimsCacheTTL, claimsCacheTTL, user)
+}
