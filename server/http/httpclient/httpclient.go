@@ -27,6 +27,9 @@ func New(allowedPrivateIPNets []*net.IPNet, clientName string) *http.Client {
 			Timeout: 30 * time.Second,
 			Control: blockingDialerControl(allowedPrivateIPNets),
 		}).DialContext,
+		// Match http.DefaultTransport so discarded clients cannot retain idle
+		// connections indefinitely. Preserve the existing HTTP protocol and pool sizing.
+		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
 		Proxy:               http.ProxyFromEnvironment,
 	}
@@ -70,6 +73,14 @@ func newMetricsTransport(inner http.RoundTripper, clientName string) http.RoundT
 	return &metricsTransport{
 		inner:      inner,
 		clientName: clientName,
+	}
+}
+
+// CloseIdleConnections lets http.Client release idle connections through the
+// metrics wrapper. Transports without idle pools need not implement it.
+func (t *metricsTransport) CloseIdleConnections() {
+	if closer, ok := t.inner.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
 	}
 }
 
