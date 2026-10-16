@@ -60,14 +60,60 @@ type CASServerProxy struct {
 	//    remote-return path (local cache didn't have the digest, remote cache
 	//    did).
 	// TODO(go/b/7780): fix those issues.
-	// presenceMu serializes generation checks and cache insertion with invalidation.
-	// The global generation conservatively drops in-flight fills on any read miss,
-	// without retaining unbounded per-digest tombstones or locking across RPCs.
+	// Track only active backend lookups. Entries cannot be evicted while a
+	// lookup holds a reference, so even arbitrarily delayed RPCs cannot revive
+	// invalidated presence. At capacity, new keys bypass cache insertion.
 	presenceMu                        sync.Mutex
-	presenceGeneration                uint64
+	presenceLookups                   map[string]*presenceLookup
 	findMissingBlobsCache             lru.LRU[struct{}]
 	findMissingChunksCache            lru.LRU[struct{}]
 	findMissingCacheCountersByChunked map[bool]findMissingCacheCounters
+}
+
+// Bound auxiliary memory independently of request concurrency and digest churn.
+const maxPresenceLookups = 100_000
+
+type presenceLookup struct {
+	refs     int
+	sequence uint64
+}
+
+// beginPresenceLookups returns a snapshot for each key admitted for caching.
+func (s *CASServerProxy) beginPresenceLookups(keys map[digest.Key]string) map[string]uint64 {
+	s.presenceMu.Lock()
+	defer s.presenceMu.Unlock()
+	if s.presenceLookups == nil {
+		s.presenceLookups = make(map[string]*presenceLookup)
+	}
+	snapshot := make(map[string]uint64, len(keys))
+	for _, key := range keys {
+		if _, ok := snapshot[key]; ok {
+			continue
+		}
+		entry := s.presenceLookups[key]
+		if entry == nil {
+			if len(s.presenceLookups) >= maxPresenceLookups {
+				continue
+			}
+			entry = &presenceLookup{}
+			s.presenceLookups[key] = entry
+		}
+		entry.refs++
+		snapshot[key] = entry.sequence
+	}
+	return snapshot
+}
+
+func (s *CASServerProxy) endPresenceLookups(snapshot map[string]uint64) {
+	s.presenceMu.Lock()
+	defer s.presenceMu.Unlock()
+	for key := range snapshot {
+		entry := s.presenceLookups[key]
+		entry.refs--
+		if entry.refs == 0 {
+			delete(s.presenceLookups, key)
+		}
+	}
 }
 
 type findMissingCacheCounters struct {
@@ -308,9 +354,8 @@ func (s *CASServerProxy) FindMissingBlobs(ctx context.Context, req *repb.FindMis
 		DigestFunction: req.GetDigestFunction(),
 		Purpose:        repb.FindMissingBlobsRequest_CACHE_PROXY_CAS_PASSTHROUGH,
 	}
-	s.presenceMu.Lock()
-	generation := s.presenceGeneration
-	s.presenceMu.Unlock()
+	snapshot := s.beginPresenceLookups(cacheKeys)
+	defer s.endPresenceLookups(snapshot)
 	rsp, err := s.remote.FindMissingBlobs(ctx, remoteReq)
 	if err != nil {
 		return rsp, err
@@ -329,7 +374,7 @@ func (s *CASServerProxy) FindMissingBlobs(ctx context.Context, req *repb.FindMis
 		key := cacheKeys[digest.NewKey(d)]
 		if _, ok := missing[key]; !ok {
 			presentRemotely++
-			if generation != s.presenceGeneration {
+			if sequence, ok := snapshot[key]; !ok || sequence != s.presenceLookups[key].sequence {
 				continue
 			}
 			if chunked {
@@ -376,7 +421,9 @@ func (s *CASServerProxy) InvalidatePresence(ctx context.Context, rn *digest.CASR
 	key := groupID + "/" + digest.NewCASResourceName(rn.GetDigest(), rn.GetInstanceName(), rn.GetDigestFunction()).DownloadString()
 	s.presenceMu.Lock()
 	defer s.presenceMu.Unlock()
-	s.presenceGeneration++
+	if entry := s.presenceLookups[key]; entry != nil {
+		entry.sequence++
+	}
 	s.findMissingBlobsCache.Remove(key)
 	s.findMissingChunksCache.Remove(key)
 }
