@@ -26,6 +26,8 @@ func TestResourceSoak(t *testing.T) {
 	flags.Set(t, "grpc_server_worker_multiplier", 0)
 	rbe := rbetest.NewRBETestEnv(t)
 	app := rbe.AddBuildBuddyServer()
+	// This helper owns its connection until test cleanup; reuse it across batches.
+	bepClient := app.PublishBuildEventClient()
 	rbe.AddExecutor(t)
 	root := t.TempDir()
 	require.NoError(t, os.WriteFile(root+"/blob", make([]byte, 3<<20), 0600))
@@ -67,7 +69,7 @@ func TestResourceSoak(t *testing.T) {
 		c.Wait()
 		c.WaitDisconnected()
 		iid := fmt.Sprintf("soak-invocation-%d", batch)
-		bep, err := build_event_publisher.New(app.PublishBuildEventClient(), "", iid)
+		bep, err := build_event_publisher.New(bepClient, "", iid)
 		require.NoError(t, err)
 		bep.Start(context.Background())
 		require.NoError(t, bep.Publish(&bespb.BuildEvent{Payload: &bespb.BuildEvent_Started{Started: &bespb.BuildStarted{StartTime: timestamppb.Now()}}}))
