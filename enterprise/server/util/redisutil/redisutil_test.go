@@ -20,6 +20,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testredis"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/redisutil"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/go-redis/redis/v8"
 	"github.com/google/go-cmp/cmp"
@@ -765,4 +766,50 @@ func TestIsTransientError(t *testing.T) {
 			require.Equal(t, tc.transient, transient)
 		})
 	}
+}
+
+// pipelineStartedHook signals each time a pipeline is about to be sent.
+type pipelineStartedHook struct{ started chan struct{} }
+
+func (h pipelineStartedHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
+	return ctx, nil
+}
+func (h pipelineStartedHook) AfterProcess(ctx context.Context, cmd redis.Cmder) error { return nil }
+func (h pipelineStartedHook) BeforeProcessPipeline(ctx context.Context, cmds []redis.Cmder) (context.Context, error) {
+	select {
+	case h.started <- struct{}{}:
+	default:
+	}
+	return ctx, nil
+}
+func (h pipelineStartedHook) AfterProcessPipeline(ctx context.Context, cmds []redis.Cmder) error {
+	return nil
+}
+
+func TestCommandBuffer_StopPeriodicFlushRespectsDeadline(t *testing.T) {
+	testleak.Check(t)
+	h := testredis.StartTCP(t)
+	rdb := redis.NewClient(redisutil.TargetToOptions(h.Target))
+	t.Cleanup(func() { rdb.Close() })
+	hook := pipelineStartedHook{started: make(chan struct{}, 1)}
+	rdb.AddHook(hook)
+	ctx := context.Background()
+	require.NoError(t, rdb.Ping(ctx).Err())
+
+	buf := redisutil.NewCommandBuffer(rdb)
+	buf.StartPeriodicFlush(ctx)
+	// Make Redis accept commands but not respond, as if overloaded, so the
+	// next periodic flush blocks (until go-redis's ~3s read timeout and
+	// retries give up, ~12s with the default options).
+	require.NoError(t, h.Client().Do(ctx, "CLIENT", "PAUSE", "60000", "ALL").Err())
+	require.NoError(t, buf.IncrBy(ctx, "key", 1))
+	<-hook.started
+
+	stopCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := buf.StopPeriodicFlush(stopCtx)
+	elapsed := time.Since(start)
+	require.Less(t, elapsed, 2*time.Second, "StopPeriodicFlush blocked past its deadline")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
