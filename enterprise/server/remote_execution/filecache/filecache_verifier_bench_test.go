@@ -94,11 +94,19 @@ func makeBenchFiles(t *testing.T, dir string, n int, size func(i int) int, seed 
 // It only uses APIs that exist before and after the isolation change, so the
 // same test can be run on both versions.
 func TestVerifierMaterializationBench(t *testing.T) {
+	runVerifierMaterializationBench(t, false)
+}
+
+func TestVerifierReadOnlyBench(t *testing.T) {
+	runVerifierMaterializationBench(t, true)
+}
+
+func runVerifierMaterializationBench(t *testing.T, readOnly bool) {
 	flags.Set(t, "executor.enable_fastcopy_reflinking", false)
 	ctx := claims.AuthContextWithJWT(context.Background(), &claims.Claims{GroupID: "GR0000000003"}, nil)
 	var sfs syscall.Statfs_t
 	_ = syscall.Statfs(os.TempDir(), &sfs)
-	t.Logf("BENCH env tmp=%s fstype=0x%x", os.TempDir(), sfs.Type)
+	t.Logf("BENCH env tmp=%s fstype=0x%x seed=42 readonly=%t", os.TempDir(), sfs.Type, readOnly)
 
 	for _, tc := range []struct {
 		name string
@@ -121,18 +129,31 @@ func TestVerifierMaterializationBench(t *testing.T) {
 			w0, wb0 := procIO()
 			start := time.Now()
 			for _, f := range files {
-				require.NoError(t, fc.AddFile(ctx, f.node, f.path))
+				if readOnly {
+					require.NoError(t, fc.AddReadOnly(ctx, f.node, f.path))
+				} else {
+					require.NoError(t, fc.AddFile(ctx, f.node, f.path))
+				}
 			}
 			el := time.Since(start)
 			w1, wb1 := procIO()
 			t.Logf("BENCH %s op=AddFile files=%d logical_bytes=%d elapsed=%s wchar=%d write_bytes=%d", tc.name, tc.n, logical, el, w1-w0, wb1-wb0)
 
+			start = time.Now()
+			for _, f := range files {
+				require.NoError(t, fc.AddFile(ctx, f.node, f.path))
+			}
+			t.Logf("BENCH %s op=DuplicateAdd elapsed=%s", tc.name, time.Since(start))
 			for round := range 3 {
 				ws := testfs.MakeTempDir(t)
 				w0, wb0 := procIO()
 				start := time.Now()
 				for i, f := range files {
-					if !fc.FastLinkFile(ctx, f.node, filepath.Join(ws, fmt.Sprintf("o%05d", i))) {
+					link := fc.MaterializeWritable
+					if readOnly {
+						link = fc.LinkReadOnly
+					}
+					if !link(ctx, f.node, filepath.Join(ws, fmt.Sprintf("o%05d", i))) {
 						t.Fatalf("miss for file %d", i)
 					}
 				}
