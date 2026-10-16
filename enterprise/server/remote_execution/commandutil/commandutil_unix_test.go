@@ -377,3 +377,39 @@ func TestRun_SignalExitNeverSuccessful(t *testing.T) {
 		})
 	}
 }
+
+// The intermediate shell exits before cancellation; its child is no longer
+// discoverable by walking the still-running root's current descendants.
+func TestRun_OrphanedGrandchild_Deadline(t *testing.T) {
+	wd := testfs.MakeTempDir(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan *interfaces.CommandResult, 1)
+	go func() {
+		done <- commandutil.Run(ctx, &repb.Command{Arguments: []string{"sh", "-c", `sh -c 'sleep 30 & echo $! > child.pid'; echo partial; sleep 30`}}, wd, nil, &interfaces.Stdio{})
+	}()
+	var pid int
+	require.Eventually(t, func() bool {
+		b, err := os.ReadFile(filepath.Join(wd, "child.pid"))
+		if err != nil {
+			return false
+		}
+		pid, err = strconv.Atoi(strings.TrimSpace(string(b)))
+		return err == nil && pid > 0
+	}, 5*time.Second, 10*time.Millisecond)
+	defer syscall.Kill(pid, syscall.SIGKILL)
+	select {
+	case res := <-done:
+		assert.True(t, status.IsDeadlineExceededError(res.Error), "%v", res.Error)
+		assert.Equal(t, "partial\n", string(res.Stdout))
+	case <-time.After(3 * time.Second):
+		t.Error("orphaned grandchild survived deadline and kept Run blocked")
+		require.NoError(t, syscall.Kill(pid, syscall.SIGKILL))
+		select {
+		case res := <-done:
+			t.Logf("after test cleanup: exit=%d error=%v", res.ExitCode, res.Error)
+		case <-time.After(5 * time.Second):
+			t.Fatal("Run did not return after orphan cleanup")
+		}
+	}
+}
