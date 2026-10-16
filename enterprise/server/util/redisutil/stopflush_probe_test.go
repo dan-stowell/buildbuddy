@@ -58,7 +58,7 @@ func blackholeAddr(t *testing.T) string {
 	sa, err := syscall.Getsockname(fd)
 	require.NoError(t, err)
 	addr := fmt.Sprintf("127.0.0.1:%d", sa.(*syscall.SockaddrInet4).Port)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		c, err := net.DialTimeout("tcp", addr, 300*time.Millisecond)
 		if err != nil {
 			t.Logf("backlog full after %d dials: %v", i, err)
