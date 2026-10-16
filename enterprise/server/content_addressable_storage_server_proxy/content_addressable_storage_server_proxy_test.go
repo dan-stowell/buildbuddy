@@ -1344,7 +1344,7 @@ func TestPresenceTombstone_ExpiryAndRenewal(t *testing.T) {
 		t.Run(fmt.Sprintf("chunked=%t", chunked), func(t *testing.T) {
 			flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
 			flags.Set(t, "cache_proxy.find_missing_blobs_tombstone_ttl", 3*time.Minute)
-			ctx := testContext()
+			ctx := testauth.WithAuthenticatedUserInfo(testContext(), testauth.TestUsers("US1", "GR1")["US1"])
 			if chunked {
 				ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(cdc.ChunkedHeaderName, cdc.ChunkedHeaderValue))
 			}
@@ -1384,7 +1384,7 @@ func TestPresenceTombstone_ExpiryAndRenewal(t *testing.T) {
 
 func TestPresenceTombstone_BoundedLRU(t *testing.T) {
 	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
-	ctx := testContext()
+	ctx := testauth.WithAuthenticatedUserInfo(testContext(), testauth.TestUsers("US1", "GR1")["US1"])
 	env := testenv.GetTestEnv(t)
 	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
 	env.SetLocalCASServer(runLocalCASS(ctx, env, t))
@@ -1419,7 +1419,7 @@ func TestPresenceTombstone_BoundedLRU(t *testing.T) {
 
 func TestPresenceLookupTracking_OnlyMisses(t *testing.T) {
 	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
-	ctx := testContext()
+	ctx := testauth.WithAuthenticatedUserInfo(testContext(), testauth.TestUsers("US1", "GR1")["US1"])
 	env := testenv.GetTestEnv(t)
 	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
 	env.SetLocalCASServer(runLocalCASS(ctx, env, t))
@@ -1454,7 +1454,7 @@ func TestPresenceLookupTracking_OnlyMisses(t *testing.T) {
 func TestPresenceInvalidation_OverlapOutlivesTombstone(t *testing.T) {
 	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", time.Hour)
 	flags.Set(t, "cache_proxy.find_missing_blobs_tombstone_ttl", time.Minute)
-	ctx := testContext()
+	ctx := testauth.WithAuthenticatedUserInfo(testContext(), testauth.TestUsers("US1", "GR1")["US1"])
 	env := testenv.GetTestEnv(t)
 	clock := clockwork.NewFakeClock()
 	env.SetClock(clock)
