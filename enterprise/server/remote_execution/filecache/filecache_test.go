@@ -2017,3 +2017,28 @@ func TestFilecache_ConcurrentDirectoryEvictionAndLocking(t *testing.T) {
 	err = eg.Wait()
 	require.NoError(t, err)
 }
+
+// An action may retain a writable descriptor while its output is admitted.
+// Admission must snapshot bytes independently of writes through that descriptor.
+func TestReviewAdmissionOpenDescriptorIsolation(t *testing.T) {
+	flags.Set(t, "executor.enable_fastcopy_reflinking", false)
+	ctx := claims.AuthContextWithJWT(context.Background(), &claims.Claims{GroupID: "GR_REVIEW"}, nil)
+	fc, err := filecache.NewFileCache(testfs.MakeTempDir(t), 1<<20, false)
+	require.NoError(t, err)
+	defer fc.Close()
+	fc.WaitForDirectoryScanToComplete()
+	dir := testfs.MakeTempDir(t)
+	src := writeFileContent(t, dir, "source", "original", false)
+	f, err := os.OpenFile(src, os.O_RDWR, 0)
+	require.NoError(t, err)
+	defer f.Close()
+	node := nodeFromString("original", false)
+	require.NoError(t, fc.AddFile(ctx, node, src))
+	_, err = f.WriteAt([]byte("MUTATION"), 0)
+	require.NoError(t, err)
+	dst := filepath.Join(dir, "later")
+	require.True(t, fc.FastLinkFile(ctx, node, dst))
+	data, err := os.ReadFile(dst)
+	require.NoError(t, err)
+	require.Equal(t, "original", string(data))
+}
