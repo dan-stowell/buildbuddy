@@ -11,10 +11,12 @@ import (
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/batch_operator"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testhealthcheck"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
@@ -711,4 +713,113 @@ func TestImmediateOperator(t *testing.T) {
 	require.Equal(t, group2, update.groupID)
 	require.Equal(t, []string{"fakeheader"}, update.clientIdentity)
 	require.Empty(t, updateChan)
+}
+
+type shutdownCapturingHealthChecker struct {
+	testhealthcheck.TestingHealthChecker
+	shutdownFuncs []interfaces.CheckerFunc
+}
+
+func (h *shutdownCapturingHealthChecker) RegisterShutdownFunction(f interfaces.CheckerFunc) {
+	h.shutdownFuncs = append(h.shutdownFuncs, f)
+}
+
+// A batch being flushed by the background sender when the operator shuts down
+// must not outlive shutdown: its context is cancelled and shutdown waits for
+// the sender to exit.
+func TestShutdownCancelsInflightFlush(t *testing.T) {
+	release := make(chan struct{})
+	// Registered before testleak.Check so that, if the callback leaks, it is
+	// only released after the leak check has run.
+	t.Cleanup(func() { close(release) })
+	testleak.Check(t)
+
+	env := real_environment.NewRealEnv(&testhealthcheck.TestingHealthChecker{})
+	authenticator := testauth.NewTestAuthenticator(t, testauth.TestUsers(user1, group1))
+	env.SetAuthenticator(authenticator)
+	clock := clockwork.NewFakeClock()
+	env.SetClock(clock)
+
+	entered := make(chan struct{})
+	returned := make(chan error, 1)
+	op := func(ctx context.Context, groupID string, b *batch_operator.DigestBatch) error {
+		close(entered)
+		var err error
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		case <-release:
+		}
+		returned <- err
+		return err
+	}
+	operator, err := batch_operator.New(env, "test-operator", op, batch_operator.BatchDigestOperatorConfig{BatchInterval: time.Second})
+	require.NoError(t, err)
+
+	ctx := authenticatedContext(t.Context(), user1, authenticator)
+	require.True(t, operator.Enqueue(ctx, "", []*repb.Digest{digest0}, repb.DigestFunction_SHA256))
+	operator.ForceBatchingForTesting()
+
+	hc := &shutdownCapturingHealthChecker{}
+	operator.Start(hc)
+	require.Len(t, hc.shutdownFuncs, 1)
+	clock.Advance(time.Second)
+	<-entered
+
+	require.NoError(t, hc.shutdownFuncs[0](t.Context()))
+	select {
+	case err := <-returned:
+		require.ErrorIs(t, err, context.Canceled)
+	default:
+		require.FailNow(t, "shutdown returned while a batch flush was still in flight")
+	}
+}
+
+// An operator callback that ignores context cancellation must not block
+// shutdown past the shutdown deadline.
+func TestShutdownRespectsDeadlineWithUncancellableFlush(t *testing.T) {
+	testleak.Check(t)
+
+	env := real_environment.NewRealEnv(&testhealthcheck.TestingHealthChecker{})
+	authenticator := testauth.NewTestAuthenticator(t, testauth.TestUsers(user1, group1))
+	env.SetAuthenticator(authenticator)
+	clock := clockwork.NewFakeClock()
+	env.SetClock(clock)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	returned := make(chan struct{})
+	op := func(ctx context.Context, groupID string, b *batch_operator.DigestBatch) error {
+		close(entered)
+		<-release // Deliberately ignores ctx.
+		close(returned)
+		return nil
+	}
+	operator, err := batch_operator.New(env, "test-operator", op, batch_operator.BatchDigestOperatorConfig{BatchInterval: time.Second})
+	require.NoError(t, err)
+
+	ctx := authenticatedContext(t.Context(), user1, authenticator)
+	require.True(t, operator.Enqueue(ctx, "", []*repb.Digest{digest0}, repb.DigestFunction_SHA256))
+	operator.ForceBatchingForTesting()
+
+	hc := &shutdownCapturingHealthChecker{}
+	operator.Start(hc)
+	require.Len(t, hc.shutdownFuncs, 1)
+	clock.Advance(time.Second)
+	<-entered
+
+	// A shutdown context whose deadline has already passed.
+	shutdownCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.NoError(t, hc.shutdownFuncs[0](shutdownCtx))
+	select {
+	case <-returned:
+		require.FailNow(t, "callback returned before it was released")
+	default:
+	}
+
+	// Release the callback and wait for the workers so nothing leaks.
+	close(release)
+	operator.ForceShutdownForTesting()
+	<-returned
 }
