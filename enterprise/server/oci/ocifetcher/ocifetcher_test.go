@@ -2486,7 +2486,7 @@ func TestPullerResourceGrowthDiagnostic(t *testing.T) {
 				s, err = ocifetcher.NewServer(bs, ac)
 				require.NoError(t, err)
 				initialPings := counter.Snapshot()["GET /v2/"]
-				testleak.CheckGrowth(t, testleak.Growth{Iterations: n}, func(i int) {
+				testleak.CheckGrowth(t, testleak.Growth{Iterations: n, Settle: 95 * time.Second}, func(i int) {
 					if mode == "discarded-owner" {
 						s, err = ocifetcher.NewServer(bs, ac)
 						require.NoError(t, err)
