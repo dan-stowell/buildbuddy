@@ -34,7 +34,7 @@ go_library(
 go_test(
     name = "content_addressable_storage_server_proxy_test",
     size = "small",
-    srcs = ["content_addressable_storage_server_proxy_test.go"],
+    srcs = ["content_addressable_storage_server_proxy_test.go", "lifecycle_test.go"],
     embed = [":content_addressable_storage_server_proxy"],
     deps = [
         "//enterprise/server/atime_updater",
@@ -50,9 +50,11 @@ go_test(
         "//server/testutil/cas",
         "//server/testutil/testauth",
         "//server/testutil/testenv",
+        "//server/testutil/testleak",
         "//server/util/authutil",
         "//server/util/cdc",
         "//server/util/findmissing",
+        "//server/util/proto",
         "//server/util/testing/flags",
         "//server/util/uuid",
         "@com_github_jonboulle_clockwork//:clockwork",

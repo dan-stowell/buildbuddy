@@ -46,7 +46,7 @@ go_library(
 go_test(
     name = "byte_stream_server_proxy_test",
     size = "medium",
-    srcs = ["byte_stream_server_proxy_test.go"],
+    srcs = ["byte_stream_server_proxy_test.go", "lifecycle_test.go"],
     embed = [":byte_stream_server_proxy"],
     shard_count = 2,
     deps = [
@@ -70,6 +70,7 @@ go_test(
         "//server/testutil/testdigest",
         "//server/testutil/testenv",
         "//server/testutil/testfs",
+        "//server/testutil/testleak",
         "//server/util/authutil",
         "//server/util/bazel_request",
         "//server/util/bytebufferpool",
