@@ -3243,5 +3243,5 @@ func TestNoHedgeFailurePreservesBaselineMergeRedisWork(t *testing.T) {
 		commands = append(commands, <-hook.commands)
 	}
 	t.Logf("no-hedge failure merge Redis commands: %v", commands)
-	require.Equal(t, []string{"get"}, commands, "ordinary failure is limited to one pair lookup and no cleanup")
+	require.Equal(t, []string{"eval"}, commands, "ordinary failure is limited to one atomic pair check and cleanup")
 }

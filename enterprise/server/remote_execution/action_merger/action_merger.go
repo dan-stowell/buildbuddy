@@ -511,7 +511,21 @@ func CompleteCopy(ctx context.Context, rdb redis.UniversalClient, id string, suc
 	// Failure callers may run on a different replica than hedge registration.
 	// One shared-state lookup is required even when no hedge was dispatched.
 	reverseKey := redisKeyForPendingExecutionDigest(id)
-	mapping, err := rdb.Get(ctx, pairKey(id)).Result()
+	var mapping string
+	var err error
+	if success {
+		mapping, err = rdb.Get(ctx, pairKey(id)).Result()
+	} else {
+		// Serialize the unpaired failure with RegisterHedge in one round trip.
+		// Removing pending state prevents a hedge from registering after failure.
+		mapping, err = rdb.Eval(ctx, `
+ local pair = redis.call('GET', KEYS[1])
+ if pair then return pair end
+ local forward = redis.call('GET', KEYS[2])
+ if forward and redis.call('HGET', forward, 'execution-id') == ARGV[1] then redis.call('DEL', forward) end
+ redis.call('DEL', KEYS[2])
+ return false`, []string{pairKey(id), reverseKey}, id).Text()
+	}
 	if err == redis.Nil {
 		if !success {
 			return id, true, nil, nil
