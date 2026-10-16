@@ -2976,3 +2976,55 @@ func TestRedactCachedExecuteResponse(t *testing.T) {
 		})
 	}
 }
+
+// TestExecutionOLAP_FinalizationExactlyOnce checks the handoff to the collector
+// while the invocation is still running, including a repeated failure update.
+func TestExecutionOLAP_FinalizationExactlyOnce(t *testing.T) {
+	testExecutionOLAPHandoff(t, false)
+}
+
+func testExecutionOLAPHandoff(t *testing.T, failFirstAppend bool) {
+	t.Helper()
+	flags.Set(t, "app.enable_write_executions_to_olap_db", true)
+	flags.Set(t, "remote_execution.write_execution_progress_state_to_redis", true)
+	env, _, _ := setupEnv(t)
+	collector := &failOnceAppendCollector{ExecutionCollector: env.GetExecutionCollector(), failNext: failFirstAppend}
+	env.SetExecutionCollector(collector)
+	// The service captures the collector at construction time.
+	s, err := execution_server.NewExecutionServer(env)
+	require.NoError(t, err)
+	ctx := withIncomingMetadata(t, context.Background(), &repb.RequestMetadata{ToolInvocationId: "10243d8a-a329-4f46-abfb-bfbceed12baa"})
+	ctx, err = env.GetAuthenticator().(*testauth.TestAuthenticator).WithAuthenticatedUser(ctx, "US1")
+	require.NoError(t, err)
+	ctx, err = prefix.AttachUserPrefixToContext(ctx, env.GetAuthenticator())
+	require.NoError(t, err)
+	action := &repb.Action{}
+	arn := uploadAction(ctx, t, env, "", repb.DigestFunction_SHA256, action)
+	taskID := arn.NewUploadString()
+	require.NoError(t, s.Dispatch(ctx, &repb.ExecuteRequest{ActionDigest: arn.GetDigest()}, action, taskID))
+	for range 2 {
+		err := s.MarkExecutionFailed(ctx, taskID, status.UnavailableError("executor lost"))
+		t.Logf("MarkExecutionFailed returned: %v", err)
+	}
+	rows := getExecutions(t, env)
+	require.Len(t, rows, 1, "repeated finalization must not duplicate primary rows")
+	assert.Equal(t, int64(repb.ExecutionStage_COMPLETED), rows[0].Stage)
+	executions, err := collector.GetExecutions(ctx, "10243d8a-a329-4f46-abfb-bfbceed12baa", 0, -1)
+	require.NoError(t, err)
+	require.Len(t, executions, 1, "final execution must survive a repeated completion, including after a transient OLAP handoff failure")
+	assert.Equal(t, taskID, executions[0].GetExecutionId())
+	assert.Equal(t, int64(repb.ExecutionStage_COMPLETED), executions[0].GetStage())
+}
+
+type failOnceAppendCollector struct {
+	interfaces.ExecutionCollector
+	failNext bool
+}
+
+func (c *failOnceAppendCollector) AppendExecution(ctx context.Context, invocationID string, execution *repb.StoredExecution) error {
+	if c.failNext {
+		c.failNext = false
+		return status.UnavailableError("injected transient collector append failure")
+	}
+	return c.ExecutionCollector.AppendExecution(ctx, invocationID, execution)
+}
