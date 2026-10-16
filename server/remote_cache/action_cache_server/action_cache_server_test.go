@@ -1086,3 +1086,20 @@ func TestDigestFunctionACIsolation(t *testing.T) {
 	_, err = client.GetActionResult(ctx, &repb.GetActionResultRequest{ActionDigest: d, DigestFunction: repb.DigestFunction_BLAKE3})
 	require.True(t, status.IsNotFoundError(err), "BLAKE3 must not return SHA256 action result; got %v", err)
 }
+
+func TestDigestFunctionACRoundTrip(t *testing.T) {
+	for _, df := range digest.SupportedDigestFunctions() {
+		t.Run(df.String(), func(t *testing.T) {
+			ctx := context.Background()
+			te := testenv.GetTestEnv(t)
+			client := repb.NewActionCacheClient(runACServer(ctx, t, te))
+			d, err := digest.Compute(strings.NewReader("deterministic action"), df)
+			require.NoError(t, err)
+			_, err = client.UpdateActionResult(ctx, &repb.UpdateActionResultRequest{ActionDigest: d, DigestFunction: df, ActionResult: &repb.ActionResult{ExitCode: 7}})
+			require.NoError(t, err)
+			got, err := client.GetActionResult(ctx, &repb.GetActionResultRequest{ActionDigest: d, DigestFunction: df})
+			require.NoError(t, err)
+			require.Equal(t, int32(7), got.GetExitCode())
+		})
+	}
+}

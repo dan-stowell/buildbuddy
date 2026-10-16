@@ -801,3 +801,35 @@ func TestRestrictedPrefixBypassViaProxy(t *testing.T) {
 	require.True(t, status.IsUnauthenticatedError(updateErr),
 		"UpdateActionResult with restricted prefix via proxy: expected UnauthenticatedError (bypass fixed), got: %v", updateErr)
 }
+
+// A function-aware remote makes any loss of the request's function observable.
+type digestFunctionACClient struct {
+	repb.ActionCacheClient
+}
+
+func (c *digestFunctionACClient) GetActionResult(ctx context.Context, req *repb.GetActionResultRequest, opts ...grpc.CallOption) (*repb.ActionResult, error) {
+	return &repb.ActionResult{ExitCode: int32(req.GetDigestFunction())}, nil
+}
+
+func (c *digestFunctionACClient) UpdateActionResult(ctx context.Context, req *repb.UpdateActionResultRequest, opts ...grpc.CallOption) (*repb.ActionResult, error) {
+	return &repb.ActionResult{ExitCode: int32(req.GetDigestFunction())}, nil
+}
+
+func TestDigestFunctionACProxyForwarding(t *testing.T) {
+	flags.Set(t, "cache_proxy.cache_action_results", false)
+	ctx := context.Background()
+	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers())
+	proxy := runACProxy(ctx, t, ta, &digestFunctionACClient{})
+	for _, df := range digest.SupportedDigestFunctions() {
+		t.Run(df.String(), func(t *testing.T) {
+			d, err := digest.Compute(strings.NewReader("deterministic action"), df)
+			require.NoError(t, err)
+			updated, err := proxy.UpdateActionResult(ctx, &repb.UpdateActionResultRequest{ActionDigest: d, DigestFunction: df, ActionResult: &repb.ActionResult{}})
+			require.NoError(t, err)
+			require.Equal(t, int32(df), updated.GetExitCode())
+			got, err := proxy.GetActionResult(ctx, &repb.GetActionResultRequest{ActionDigest: d, DigestFunction: df})
+			require.NoError(t, err)
+			require.Equal(t, int32(df), got.GetExitCode())
+		})
+	}
+}

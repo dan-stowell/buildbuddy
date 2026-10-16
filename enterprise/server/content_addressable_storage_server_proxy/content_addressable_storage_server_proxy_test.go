@@ -1068,3 +1068,29 @@ func TestFindMissingBlobs_QuorumBypassesPresenceCache(t *testing.T) {
 		require.Equal(t, i, requestCount.Load())
 	}
 }
+
+func TestDigestFunctionCASProxyRoundTrip(t *testing.T) {
+	for _, df := range digest.SupportedDigestFunctions() {
+		t.Run(df.String(), func(t *testing.T) {
+			ctx := testContext()
+			conn, _, _ := runRemoteCASS(ctx, testenv.GetTestEnv(t), t)
+			env := testenv.GetTestEnv(t)
+			env.SetContentAddressableStorageClient(repb.NewContentAddressableStorageClient(conn))
+			proxy := repb.NewContentAddressableStorageClient(runCASProxy(ctx, conn, env, t))
+			data := []byte("deterministic CAS proxy")
+			d, err := digest.Compute(bytes.NewReader(data), df)
+			require.NoError(t, err)
+			rsp, err := proxy.BatchUpdateBlobs(ctx, &repb.BatchUpdateBlobsRequest{DigestFunction: df, Requests: []*repb.BatchUpdateBlobsRequest_Request{{Digest: d, Data: data}}})
+			require.NoError(t, err)
+			require.Len(t, rsp.GetResponses(), 1)
+			require.Equal(t, int32(codes.OK), rsp.GetResponses()[0].GetStatus().GetCode())
+			missing, err := proxy.FindMissingBlobs(ctx, &repb.FindMissingBlobsRequest{DigestFunction: df, BlobDigests: []*repb.Digest{d}})
+			require.NoError(t, err)
+			require.Empty(t, missing.GetMissingBlobDigests())
+			read, err := proxy.BatchReadBlobs(ctx, &repb.BatchReadBlobsRequest{DigestFunction: df, Digests: []*repb.Digest{d}})
+			require.NoError(t, err)
+			require.Len(t, read.GetResponses(), 1)
+			require.Equal(t, data, read.GetResponses()[0].GetData())
+		})
+	}
+}
