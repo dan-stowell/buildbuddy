@@ -99,7 +99,7 @@ func TestRedelivery_LegacyWebhook_SameDeliveryIDStartsOnce(t *testing.T) {
 	provider.RegisteredWebhookURL = webhookURL
 
 	codes := []int{}
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		req, err := http.NewRequest("POST", webhookURL, nil)
 		require.NoError(t, err)
 		req.Header.Set("X-GitHub-Event", "push")
@@ -136,7 +136,7 @@ func TestRedelivery_RepositoryEvent_SameEventStartsOnce(t *testing.T) {
 	repo := createWorkflow(t, te, repoURL, gid, false)
 	provider.FileContents = map[string]string{"buildbuddy.yaml": configWithLinuxWorkflow}
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		wd := redeliveryWebhookData()
 		require.NoError(t, te.GetWorkflowService().HandleRepositoryEvent(ctx, repo, wd, "faketoken"))
 	}

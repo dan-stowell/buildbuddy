@@ -68,7 +68,7 @@ func TestHandleWebhookRequest_RedeliveredPushHandledOnce(t *testing.T) {
 	sig := "sha256=" + hex.EncodeToString(mac.Sum(nil))
 
 	var codes []int
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		req, err := http.NewRequest("POST", "http://localhost/webhooks/github/app", bytes.NewReader(payload))
 		require.NoError(t, err)
 		req.Header.Set("Content-Type", "application/json")
