@@ -30,6 +30,8 @@ go_test(
     name = "persistentworker_test",
     srcs = ["persistentworker_test.go"],
     deps = [
+        "//enterprise/server/remote_execution/containers/bare",
+        "//server/testutil/testleak",
         ":persistentworker",
         "//enterprise/server/remote_execution/container",
         "//enterprise/server/remote_execution/workspace",
