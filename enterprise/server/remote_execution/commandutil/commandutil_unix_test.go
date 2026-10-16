@@ -7,6 +7,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -15,7 +19,9 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/commandutil"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testleak"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -298,4 +304,191 @@ func TestRun_EnableStats_ComplexProcessTree_RecordsStatsFromAllChildren(t *testi
 	require.LessOrEqual(
 		t, res.UsageStats.GetPeakMemoryBytes(), int64(850e6),
 		"expected not much more than 750MB peak memory")
+}
+
+// A container's signal channel and caller context may outlive an individual
+// command. Neither should keep that command's forwarding goroutine alive.
+func TestRun_SignalForwarderStopsOnExit(t *testing.T) {
+	for _, n := range []int{1, 10, 50} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			testleak.Check(t)
+			before := signalForwarderCount()
+			fds := commandFDTargets(t)
+			signal := make(chan syscall.Signal)
+			for range n {
+				result := commandutil.RunWithOpts(context.Background(), &repb.Command{Arguments: []string{"sh", "-c", "echo hi; exit 0"}}, &commandutil.RunOpts{Signal: signal})
+				require.NoError(t, result.Error)
+				require.Equal(t, 0, result.ExitCode)
+			}
+			// Poll for asynchronous cleanup; no fixed sleep is used as a fix.
+			assert.Eventually(t, func() bool { return signalForwarderCount() == before }, time.Second, 10*time.Millisecond)
+			after := commandFDTargets(t)
+			t.Logf("N=%d forwarders before=%d after=%d FDs before=%d after=%d targets=%v", n, before, signalForwarderCount(), len(fds), len(after), after)
+			assert.Equal(t, fds, after)
+		})
+	}
+}
+
+func signalForwarderCount() int {
+	buf := make([]byte, 1<<20)
+	n := runtime.Stack(buf, true)
+	return strings.Count(string(buf[:n]), "commandutil.forwardSignals(")
+}
+
+// Local Linux FD snapshot until testleak has a shared FD detector. Readlink
+// excludes the transient descriptor used by ReadDir itself.
+func commandFDTargets(t *testing.T) map[string]string {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if os.IsNotExist(err) {
+		return nil
+	}
+	require.NoError(t, err)
+	targets := make(map[string]string)
+	for _, entry := range entries {
+		target, err := os.Readlink(filepath.Join("/proc/self/fd", entry.Name()))
+		if os.IsNotExist(err) {
+			continue
+		}
+		require.NoError(t, err)
+		targets[entry.Name()] = target
+	}
+	return targets
+}
+
+func TestRun_RepeatedLifecycleResources(t *testing.T) {
+	for _, outcome := range []string{"success", "nonzero", "timeout", "cancel", "killed", "output_limit"} {
+		t.Run(outcome, func(t *testing.T) {
+			for _, n := range []int{1, 10, 50} {
+				t.Run(fmt.Sprint(n), func(t *testing.T) {
+					testleak.Check(t)
+					before := commandFDTargets(t)
+					for range n {
+						ctx, cancel := context.WithCancel(context.Background())
+						script := "echo hi"
+						stdio := &interfaces.Stdio{}
+						switch outcome {
+						case "nonzero":
+							script = "exit 7"
+						case "timeout":
+							cancel()
+							ctx, cancel = context.WithTimeout(context.Background(), 20*time.Millisecond)
+							script = "sleep 100"
+						case "cancel":
+							script = "echo ready; exec sleep 100"
+							stdio.Stdout = cancelOnWrite{cancel: cancel}
+						case "killed":
+							script = "kill -KILL $$"
+						case "output_limit":
+							// Exercise the actual output limiter with finite output so the test
+							// doesn't depend on a producer ignoring EPIPE forever.
+							flags.Set(t, "executor.stdouterr_max_size_bytes", uint64(32))
+							stdio.Stdout = commandutil.LimitStdOutErrWriter(io.Discard)
+							script = "printf '%0100d' 0"
+						}
+						result := commandutil.Run(ctx, &repb.Command{Arguments: []string{"sh", "-c", script}}, ".", nil, stdio)
+						cancel()
+						switch outcome {
+						case "success":
+							require.NoError(t, result.Error)
+							require.Zero(t, result.ExitCode)
+						case "nonzero":
+							require.NoError(t, result.Error)
+							require.Equal(t, 7, result.ExitCode)
+						default:
+							require.Error(t, result.Error)
+						}
+					}
+					assert.Eventually(t, func() bool { return len(commandFDTargets(t)) == len(before) }, time.Second, 10*time.Millisecond)
+					after := commandFDTargets(t)
+					t.Logf("outcome=%s N=%d FDs before=%d after=%d targets=%v", outcome, n, len(before), len(after), after)
+				})
+			}
+		})
+	}
+}
+
+type cancelOnWrite struct{ cancel context.CancelFunc }
+
+func (w cancelOnWrite) Write(p []byte) (int, error) { w.cancel(); return len(p), nil }
+
+// The shell has exited and been reaped before cancellation. Its background
+// child still owns the output pipes, so cancellation must kill the process
+// group even though the root no longer appears in the process tree.
+func TestRun_OrphanedOutputPipes_Cancel(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("uses Linux /proc to establish root exit and child liveness")
+	}
+	for _, n := range []int{1, 10, 50} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			testleak.Check(t)
+			before := commandFDTargets(t)
+			goroutinesBefore := runtime.NumGoroutine()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			results := make(chan *interfaces.CommandResult, n)
+			var children []int
+			// Always release the controlled children, including on baseline failures.
+			defer func() {
+				for _, pid := range children {
+					_ = syscall.Kill(pid, syscall.SIGKILL)
+				}
+				for range n {
+					select {
+					case <-results:
+					case <-time.After(5 * time.Second):
+						t.Error("Run did not finish after child cleanup")
+						return
+					}
+				}
+			}()
+			for i := range n {
+				pidFile := filepath.Join(t.TempDir(), fmt.Sprint(i))
+				go func() {
+					results <- commandutil.Run(ctx, &repb.Command{Arguments: []string{"sh", "-c", `sleep 100 & echo "$$ $!" > "$1"; echo hi`, "sh", pidFile}}, ".", nil, nil)
+				}()
+				var root int
+				require.Eventually(t, func() bool {
+					b, err := os.ReadFile(pidFile)
+					if err != nil {
+						return false
+					}
+					fields := strings.Fields(string(b))
+					if len(fields) != 2 {
+						return false
+					}
+					root, err = strconv.Atoi(fields[0])
+					if err != nil {
+						return false
+					}
+					child, err := strconv.Atoi(fields[1])
+					if err != nil {
+						return false
+					}
+					children = append(children, child)
+					return true
+				}, 5*time.Second, time.Millisecond)
+				require.Eventually(t, func() bool { _, err := os.Stat(fmt.Sprintf("/proc/%d", root)); return os.IsNotExist(err) }, 5*time.Second, time.Millisecond)
+			}
+			cancel()
+			assert.Eventually(t, func() bool { return len(results) == n }, time.Second, 10*time.Millisecond, "Run must finish after cancellation even when the root was already reaped")
+			after := commandFDTargets(t)
+			t.Logf("N=%d returned=%d/%d goroutines before=%d after=%d FDs before=%d after=%d targets=%v", n, len(results), n, goroutinesBefore, runtime.NumGoroutine(), len(before), len(after), after)
+			if n == 1 && len(results) != n {
+				buf := make([]byte, 1<<20)
+				size := runtime.Stack(buf, true)
+				t.Logf("blocked command stacks:\n%s", buf[:size])
+			}
+			assert.Equal(t, before, after)
+			live := 0
+			for _, pid := range children {
+				b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+				// Zombies have released their FDs and await the sandbox init's reaper.
+				if err == nil && !strings.Contains(string(b), ") Z ") {
+					live++
+				}
+			}
+			assert.Zero(t, live, "background children still running after cancellation")
+		})
+	}
 }
